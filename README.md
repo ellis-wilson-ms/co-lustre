@@ -17,14 +17,14 @@ co-lustre/
 │       ├── full_xml_download.xml
 │       └── page-list.txt
 ├── processed/                  # Cleaned plaintext output
-│   ├── code/lustre-release/    # Lustre source code (v2.17.52, GPL-2.0)
+│   ├── code/lustre-release/    # Lustre source code (GPL-2.0)
 │   ├── jira/                   # Plaintext JIRA issues + TSV index
 │   │   ├── index.tsv           # Tab-separated index (key, status, priority, type, …)
 │   │   └── txt/
-│   │       ├── LU/             # ~19,947 issue files (LU-1 through LU-19947)
-│   │       └── LUDOC/          # ~558 documentation issue files
-│   ├── manual/txt/             # 45+ plaintext manual chapters
-│   ├── wiki/txt/               # 1,000+ plaintext wiki pages
+│   │       ├── LU/             # Lustre bug/feature issues
+│   │       └── LUDOC/          # Lustre documentation issues
+│   ├── manual/txt/             # Plaintext manual chapters
+│   ├── wiki/txt/               # Plaintext wiki pages
 │   └── wiki_in_wikitext/txt/   # Wiki pages in original wikitext markup
 └── scripts/                    # Data collection and conversion utilities
 ```
@@ -36,7 +36,7 @@ co-lustre/
 | **JIRA Issues** | [jira.whamcloud.com](https://jira.whamcloud.com/) | XML | Plaintext + TSV index |
 | **Official Manual** | Lustre documentation (DocBook) | DocBook XML | Plaintext |
 | **Wiki** | [wiki.lustre.org](https://wiki.lustre.org/) | MediaWiki XML | Plaintext |
-| **Source Code** | [git.whamcloud.com](https://git.whamcloud.com/fs/lustre-release.git) | — | As-is (v2.17.52) |
+| **Source Code** | [git.whamcloud.com](https://git.whamcloud.com/fs/lustre-release.git) | — | As-is |
 
 ## Scripts
 
@@ -46,8 +46,8 @@ Downloads JIRA issues as XML from Whamcloud's JIRA server using parallel `curl` 
 
 ```bash
 # Usage: download_jira_xml.sh <PROJECT> <MIN_ID> <MAX_ID>
-./scripts/download_jira_xml.sh LU 1 19947
-./scripts/download_jira_xml.sh LUDOC 1 558
+./scripts/download_jira_xml.sh LU 1 <MAX_LU_ID>
+./scripts/download_jira_xml.sh LUDOC 1 <MAX_LUDOC_ID>
 ```
 
 ### `convert_jira_xml_to_text.py`
