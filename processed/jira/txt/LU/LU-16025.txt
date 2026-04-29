@@ -1,0 +1,273 @@
+Key:        LU-16025
+Summary:    Read past file size after truncate from another client
+Link:       https://jira.whamcloud.com/browse/LU-16025
+Type:       Bug
+Priority:   Critical
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Zhenyu Xu
+Reporter:   Xing Huang
+Created:    Tue, 19 Jul 2022 03:00:43 +0000
+Updated:    Fri, 12 Sep 2025 20:15:27 +0000
+Resolved:   Wed, 5 Jun 2024 16:16:05 +0000
+Links:      Related: is related to  LU-17482; Related: is related to LU-19344; Related: is related to LU-17993; Related: is related to LU-18468; Related: is related to LU-17469
+
+--- Environment ---
+RHEL 8.5 kernel 4.18.0-348.23.1.el8
+
+Whamcloud release 2.12.8
+
+--- Description ---
+It was found that if a file which was already accessed on node1 is truncated by node2 and then opened and read again by node1, calls to read() can get data past the end of the file. The extra bytes are filled with zeroes.
+
+This is usually not seen as a call to (f)stat() on the file before being opened or read will actually trigger a glimpse lock, refreshing the actual file size on node1, which is the case for most usual unix tools.
+
+Note that reading the same file on node2 a second time will actually get it right.
+
+ 
+
+Here is a reproducer:{}
+
+ 
+
+[seb@node1 ~]$ cat mycat.c
+#include 
+#include 
+#include 
+int main(int argc, char **argv)
+{
+        int i;
+        int s;
+        int fd;
+        char buffer[4096];
+        for (i = 1; i if (fd "Could not open file");
+                        return (1);
+                }
+                while ( (s = read(fd, buffer, sizeof(buffer))) > 0) {
+                        write(1, buffer, s);
+                }
+                close(fd);
+        }
+} 
+[seb@node1 ~]$ gcc -Wall mycat.c -o mycat 
+
+ 
+
+ 
+
+[seb@node1 ~]$ cp somefile.txt /lustre/seb/somefile.txt
+# Trigger a read of the file on node2 to fill up the inode informations
+# Notice the file at this time is several megabytes
+[seb@node1 ~]$ ssh node2 'cat /lustre/seb/somefile.txt > /dev/null; ls -l /lustre/seb/somefile.txt'
+-rw-r----- 1 seb seb 114052401 Jun 16 13:51 /lustre/seb/somefile.txt
+[seb@node1 ~]$ truncate -s 100000 /lustre/seb/somefile.txt
+# Now read the file from a remote node making sure no stat() call occurs before
+[seb@node1 ~]$ ssh node2 '~/mycat /lustre/seb/somefile.txt | hexdump -C | tail -n 4'
+00018690  63 73 74 30 31 5b 4f 53  54 3a 33 36 5d 0a 32 30  |cst01[OST:36].20| 
+000186a0  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................| 
+* 
+00019000 
+# bytes above 100000 up to 102400 (completing the last page) are showing zeroes
+[seb@node1 ~]$ ssh node2 '~/mycat /lustre/seb/somefile.txt | hexdump -C | tail -n 4'
+00018670  31 31 33 37 34 38 20 20  36 33 38 37 39 38 31 37  |113748  63879817| 
+00018680  31 36 20 20 34 36 25 20  2f 6c 75 73 2f 68 31 74  |16  46% /lus/h1t| 
+00018690  63 73 74 30 31 5b 4f 53  54 3a 33 36 5d 0a 32 30  |cst01[OST:36].20| 
+000186a0 
+
+This was done with a simple ftruncate() call here, but the same problem occurs with an open( "/lustre/seb/somefile.txt", O_WRONLY|O_TRUNC) + writes to a lower size than original.
+
+--- Comment (bzzz, Fri, 21 Jun 2024 03:24:38 +0000) ---
+119i suffers as well:
+
+== sanity test 119i: test unaligned aio at varying sizes ========================================================== 01:33:49 (1718933629)
+/mnt/build/lustre/tests/aiocp
+1+0 records in
+1+0 records out
+26214400 bytes (26 MB, 25 MiB) copied, 0.272656 s, 96.1 MB/s
+bs: 1024, align: 8, file_size 26214400
+/mnt/lustre/f119i.sanity.2 has type file OK
+/mnt/lustre/f119i.sanity.2 has size 26214400 OK
+
+--- Comment (bzzz, Mon, 10 Jun 2024 14:38:20 +0000) ---
+I noticed an assertion:
+
+[  218.975871] Lustre: DEBUG MARKER: == sanity test 119h: basic tests of memory unaligned dio ========================================================== 14:28:49 (1718029729)
+[  222.141045] LustreError: 6900:0:(rw26.c:426:ll_direct_rw_pages()) ASSERTION( i == pv->ldp_count ) failed: 
+[  222.214671] LustreError: 6900:0:(rw26.c:426:ll_direct_rw_pages()) LBUG
+[  222.253270] CPU: 0 PID: 6900 Comm: multiop Tainted: G        W  O     --------- -  - 4.18.0 #10
+[  222.299851] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.16.3-1.fc39 04/01/2014
+[  222.325092] Call Trace:
+[  222.328787]  dump_stack+0x6e/0xa0
+[  222.369773]  lbug_with_loc.cold.4+0x5/0x4e [libcfs]
+[  222.443826]  ll_direct_IO+0x1003/0x11c0 [lustre]
+[  222.504658]  generic_file_direct_write+0x8c/0x160
+[  222.504798]  __generic_file_write_iter+0xb2/0x1c0
+[  222.558777]  vvp_io_write_start+0xb2e/0xc80 [lustre]
+[  222.630069]  cl_io_start+0x59/0x120 [obdclass]
+[  222.630351]  cl_io_loop+0x99/0x220 [obdclass]
+[  222.694622]  ll_file_io_generic+0x4f9/0xe00 [lustre]
+[  222.756147]  do_file_write_iter+0x79a/0xa40 [lustre]
+[  222.816575]  ? do_raw_spin_unlock+0x44/0xc0
+[  222.816673]  new_sync_write+0xfa/0x130
+[  222.846449]  vfs_write+0xb9/0x1c0
+
+then I bisected this to:
+
+COMMIT		TESTED	PASSED	FAILED		COMMIT DESCRIPTION
+629d80dff8	1	0	1	BAD	LU-10003 lnet: migrate fail nid to Netlink
+bfcab56c5f	3	0	3	BAD	LU-17450 test: disable test 56x 56xa 56xb in sanity
+a3a0cced41	3	0	3	BAD	LU-16025 llite: allow unaligned DIO reaching EOF
+b6595baa7a	3	3	0	GOOD	LU-17676 build: configure should prefer to ask if
+56014bdd4a	3	3	0	GOOD	LU-17836 build: allow builds without libpthread
+
+--- Comment (gerrit, Wed, 5 Jun 2024 04:44:01 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/54718/
+
+Subject: LU-16025 llite: allow unaligned DIO reaching EOF
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: a3a0cced416ce9721f5baa7c2da458ff07b33838
+
+--- Comment (adilger, Thu, 11 Apr 2024 16:41:17 +0000) ---
+Please only "Resolve" tickets in Jira instead of "Close" them, since a "Closed" ticket cannot be modified (labels added/removed, etc).
+
+--- Comment (gerrit, Wed, 10 Apr 2024 10:41:40 +0000) ---
+"Zhenyu Xu " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/54718
+
+Subject: LU-16025 llite: don't adjust read count for DIO
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 35990e116014d95417a3bbdfe1067d603c0f4cb7
+
+--- Comment (bobijam, Tue, 30 Jan 2024 10:53:49 +0000) ---
+short read reset ki_pos issue is tracked at LU-17482
+
+--- Comment (gerrit, Fri, 26 Jan 2024 10:15:23 +0000) ---
+"Zhenyu Xu " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/53827
+
+Subject: LU-16025 llite: short read could mess up next read offset
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: be710a787d4af182d51866dd5dc09b71b880688b
+
+--- Comment (bobijam, Fri, 26 Jan 2024 10:06:23 +0000) ---
+iocb->ki_pos could be wrong so that next read could start from wrong offset.
+
+--- Comment (paf0186, Fri, 16 Jun 2023 15:52:41 +0000) ---
+Bobi commented in Gerrit - He tried it and my suggested approach doesn't work (for anyone following along here).
+
+https://review.whamcloud.com/c/fs/lustre-release/+/50689
+
+Basically the fix adds slight overhead to each read, so it's more significant for smaller reads and probably can't even be measured for large reads.  But we need the fix and the cost isn't too high, so that's where we're at for now.
+
+--- Comment (sihara, Thu, 15 Jun 2023 21:04:18 +0000) ---
+OK, that's I thought. Thanks for confirmation, Patrick. It's a trade off to fix an critical problem first and will imporve the codes later if it's possible.
+
+--- Comment (paf0186, Thu, 15 Jun 2023 14:57:02 +0000) ---
+bobijam , I posted a comment in https://review.whamcloud.com/c/fs/lustre-release/+/50689 - I think I know why we have a regression in 4K reads, and maybe have a suggestion?  But Ihara, fyi, this patch is an important correctness fix so definitely no revert.
+
+--- Comment (sihara, Thu, 15 Jun 2023 08:50:15 +0000) ---
+an constant small performance regression (-10%) detected after patch https://review.whamcloud.com/#/c/fs/lustre-release/+/50689 landed in b2_15.
+
+a workload is single process and 4k buffered IO
+
+# salloc -p 40n -N 1 --ntasks-per-node=1 /usr/mpi/gcc/openmpi-4.1.5a1/bin/mpirun --allow-run-as-root /work/tools/bin/ior -i 1 -w -r -b 256g -t 4k -C -Q 2 -e -vv -F -o /exafs/d0/d1/d2/ior.single.out/file
+
+here is list of b2_15 branch
+
+- snip -
+a4e89bffe6 LU-16369 ldiskfs: do not check enc context at lookup 
+Max Write: 539.39 MiB/sec (565.60 MB/sec)
+Max Read:  2503.16 MiB/sec (2624.75 MB/sec)
+
+48d247fcc9 LU-16025 llite: adjust read count as file got truncated
+Max Write: 538.69 MiB/sec (564.85 MB/sec)
+Max Read:  2416.74 MiB/sec (2534.13 MB/sec)
+
+b74560d74a LU-16286 ldiskfs: reimplement nodelalloc optimization
+Max Write: 533.40 MiB/sec (559.31 MB/sec)
+Max Read:  2761.09 MiB/sec (2895.21 MB/sec)
+
+Is this expected performance degradation to solve original defect, or is it possible to fix without performance impacts?
+
+NOTE: 
+
+the performance was back after reverted patch https://review.whamcloud.com/#/c/fs/lustre-release/+/50689  from b2_15 
+
+Max Write: 529.53 MiB/sec (555.25 MB/sec)
+Max Read:  2704.63 MiB/sec (2836.01 MB/sec)
+
+--- Comment (gerrit, Sat, 20 May 2023 07:08:47 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/50689/
+
+Subject: LU-16025 llite: adjust read count as file got truncated
+
+Project: fs/lustre-release
+
+Branch: b2_15
+
+Current Patch Set: 
+
+Commit: 48d247fcc97533ae10b204dd059c908344ab1d06
+
+--- Comment (gerrit, Wed, 19 Apr 2023 12:17:21 +0000) ---
+"Sebastien Buisson " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/50689
+
+Subject: LU-16025 llite: adjust read count as file got truncated
+
+Project: fs/lustre-release
+
+Branch: b2_15
+
+Current Patch Set: 1
+
+Commit: 8acf9a3ebd3f45b193436b18a4d115d3327c7a56
+
+--- Comment (pjones, Tue, 25 Oct 2022 18:58:56 +0000) ---
+Landed for 2.16
+
+--- Comment (gerrit, Tue, 25 Oct 2022 17:21:43 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/47896/
+
+Subject: LU-16025 llite: adjust read count as file got truncated
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 4468f6c9d92448cb72c5a616ec74653e83ee8e10
+
+--- Comment (adilger, Wed, 12 Oct 2022 07:04:31 +0000) ---
+Is patch also needed on b_es6_0?
+
+--- Comment (JIRAUSER17900, Tue, 9 Aug 2022 03:05:52 +0000) ---
+Hi Carlos, we are actively working on the fix patch, now we are solving the test failures of the patch.
+
+--- Comment (cthomaz, Mon, 8 Aug 2022 13:45:08 +0000) ---
+Hi Peter
+
+Any news on this one? 
+
+Thank you
+
+Carlos
+
+--- Comment (pjones, Tue, 19 Jul 2022 19:01:55 +0000) ---
+Patch pushed to master - https://review.whamcloud.com/47896

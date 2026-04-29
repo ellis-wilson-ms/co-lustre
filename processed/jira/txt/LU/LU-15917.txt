@@ -1,0 +1,139 @@
+Key:        LU-15917
+Summary:    Memory pressure prevents debug daemon / debug buffer from proper operation
+Link:       https://jira.whamcloud.com/browse/LU-15917
+Type:       Bug
+Priority:   Critical
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Oleg Drokin
+Created:    Mon, 6 Jun 2022 22:50:07 +0000
+Updated:    Thu, 16 Jun 2022 17:40:22 +0000
+
+--- Description ---
+Attempting to collect detailed data for some investigation, I noticed frequent reports from debug daemon that the buffer is overflowing, but then the actual statistic caught my eye:
+
+[1243871.266883] debug daemon buffer overflowed; discarding 10% of pages (1 of 1)
+[1243871.270173] debug daemon buffer overflowed; discarding 10% of pages (1 of 0) 
+
+So this is in effect telling us that tcd->tcd_cur_pages is 0 (or 1) while I know the tcd->tcd_max_pages cannot be any less that 1500.
+
+Which in turn means we are having an allocation failure:
+
+        if (tcd->tcd_cur_pages tcd_max_pages) {
+                if (tcd->tcd_cur_stock_pages > 0) {
+                        tage = cfs_tage_from_list(tcd->tcd_stock_pages.prev);
+                        --tcd->tcd_cur_stock_pages;
+                        list_del_init(&tage->linkage);
+                } else {
+                        tage = cfs_tage_alloc(GFP_ATOMIC);
+                        if (unlikely(tage == NULL)) {
+                                if ((!memory_pressure_get() ||
+                                     in_interrupt()) && printk_ratelimit())
+                                        printk(KERN_WARNING
+                                               "cannot allocate a tage (%ld)\n",
+                                               tcd->tcd_cur_pages);
+                                return NULL;
+                        }
+                } 
+
+but there's no printk which is a bit puzzling. Perhaps just due to mem_pressure_get() returning 1? And that would be due to increased memory pressure from caching on OSSes?
+
+There were other anecdotal reports and observations that lctl dk tends to only have a lot of old data and very little new messages when not doing the debug daemon that could be explained by the same effect?
+
+This is also hand-in hand with LU-15916 where the supposed reserve pages for debug buffer use are never filled.
+
+Sounds like we need to reinstate some sort of preallocated pages list(s).
+
+Basically the way I see it is:
+
+	We will retain the current "allocate first" logic but if the allocation fails we will use a page from an emergency buffer that's always preallocated at some level
+
+	We reinstate the stock pages thing, will likely need TCD_STOCK_PAGES  updated to something smaller as currently it's hardcoded to TCD_STOCK_PAGES = 5 megabytes.
+
+Both approaches would need to ensure we call the buffer refill from somewhere once the pages are actually consumed.
+
+Additionally I guess we can try to divine when a non-atomic allocation is possible and actually perform that one? That would have a potential performance impact though and is less desirable? All in all having preallocated pages in some form seems the most efficient?
+
+Also while we are looking into this dusty corner, perhaps we finally could do something with the arbitrary 80/10/10 split of pages for debug buffers. Restoring close to full LRU behavior seems desirable as long as we can actually achieve it without too much locking.
+
+Something along the lines of "allocate pages with abandon until we hit debug_mb value, discard oldest 10% once the limit is met". Of course we need to figure out how to actually find the oldest 10% of pages efficiently. Having a single list with corresponding locking likely going to be pretty expensive and negates the whole per-cpu stuff in place.
+
+Alternatively we can just iterate all TCDs from a separate task as we are getting close and discarding pages, but that has own complication like comparing oldest pages in different TCDs to see which ones are to be dropped and so on.
+
+I wonder if neilb has any smart ideas here by any chance?
+
+Of course the radical alternative is to get rid of this all and actually do convert to the tracepoints, but the problem here is we were not able to get the functionality we wanted from that in the past despite several attempts by simmonsja
+
+--- Comment (green, Thu, 9 Jun 2022 19:26:16 +0000) ---
+pgcount-- == 0 is true for the value of pgcount of 0 because of the post-decrement, right?
+
+I had to doublecheck this just to make sure my understanding of it is actually correct:
+
+[green@fatbox3 ~]$ cat /tmp/test.c 
+#include 
+void main(void)
+{
+    int test = 0;    printf("value1 is %d\n", test-- == 0);
+    test = 0;
+    printf("value2 is %d\n", --test == 0);    return;
+}
+[green@fatbox3 ~]$ gcc -o /tmp/test /tmp/test.c 
+[green@fatbox3 ~]$ /tmp/test 
+value1 is 1
+value2 is 0
+ 
+
+Anyway looking at this code I think the easiest way to address this might be to actually revert your LU-14428 https://review.whamcloud.com/41493 patch.
+
+Instead we'll treat the daemon list as the stok pages list (we'll remove stok pages list itself as not needed) with a pretty trivial patch like this:
+
+--- a/libcfs/libcfs/tracefile.c
++++ b/libcfs/libcfs/tracefile.c
+@@ -155,6 +155,11 @@ cfs_trace_get_tage_try(struct cfs_trace_cpu_data *tcd, unsigned long len)
+                        tage = cfs_tage_from_list(tcd->tcd_stock_pages.prev);
+                        --tcd->tcd_cur_stock_pages;
+                        list_del_init(&tage->linkage);
++               } if (!list_empty(&tcd->tcd_daemon_pages)) {
++                       /* If we have written daemon pages, grab oldest one */
++                       tage = cfs_tage_from_list(tcd->tcd_daemon_pages.next);
++                       --tcd->tcd_cur_daemon_pages;
++                       list_del_init(&tage->linkage);
+                } else {
+                        tage = cfs_tage_alloc(GFP_ATOMIC);
+                        if (unlikely(tage == NULL)) { 
+
+This way when we have daemon running already written pages would be the stok buffer (I had no idea we stored the already written pages!) and when we do not have the daemon running we will cannibalize the oldest page if we fail to allocate one.
+
+Just change the cfs_tcd_shrink() to actual pre-decrement to avoid discarding pages at all if there are less than 10 pages because we will use it up in the next step anyway and we should be ok to go I guess?
+
+The other thing I thought about was - to mark the just written pages as "flush and discard" so they don't hog memory in buffer cache needlessly. But I am not sure we have a way to do this asynchronously? I think last time I looked at it there was only a synchronous discard?
+
+ 
+
+What do you think?
+
+--- Comment (neilb, Thu, 9 Jun 2022 05:11:59 +0000) ---
+cfs_tcd_shrink() initialises "pgcount = tcd->tcd_cur_pages / 10;" which will be zero when there are fewer than 10 pages.
+
+The loop that frees pages starts "if (pgcount-- == 0) break;"  As pgcount (before being decremented) is 0, this will break at the start of the first loop, so nothing will be freed.  At least, that is how I read it.
+
+--- Comment (green, Tue, 7 Jun 2022 13:57:37 +0000) ---
+I am not sure why you think cfs_tcd_shrink() does not shrink pages below zero? My reading of it is if there are 10 pages or less it would just remove one page at all times?
+
+The log message is generated to dmesg and I don't know if it's even for the same tcd, it only happens when new log page cannot be allocated. I noticed the messages were coming in batches.
+
+I did think about moving free pages to stock pages and might try experimenting with it, but that would only help in part of the scenarios, granted probably majority we care about anyway.
+
+Unhandled case would be if there are no stock pages because we did not reach max pages yet yet we are doing an allocation and it fails.
+
+The system where I experienced this at had 150G RAM and I tried to set debug buffer size to 50G after 1-5-10-20 did not yield the messages disappearance. Amount of actually free RAM (less buffers) was kinda low, 3-4G. This means that even if there are allocations from all sorts of places, some are from the context with PF_MEMALLOC set and those are the ones failing and emitting that message? I guess I need to atry and add more debug though since it's a customer site - that's not all that easy as it is on my dev nodes.
+
+--- Comment (neilb, Tue, 7 Jun 2022 01:51:41 +0000) ---
+cfs_tcd_shrink() will never cause tcp_cur_pages to shrink below 10, then pgcount would be zero and the loop aborts immediately.
+
+But your first two log messages show that tcp_cur_pages as 1, then 0.  I can only see that happening if collect_pages() runs.  So presumable the log was extracted between these two points?
+
+The broader implication is that all logging is happening in threads where PF_MEMALLOC is set.  That seems a little unlikely - unless you have only enabled tracing for things that happen during writeback...  Even then it is a bit of a stretch.
+
+A fairly simple change that might help would be for cfs_tage_free() to move the page to tcd_stock_pages unless tcd_shutting_down were set or tcd_cur_stock_pages were too large.  That would make complete exhaustion less likely.

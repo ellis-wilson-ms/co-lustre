@@ -1,0 +1,302 @@
+Key:        LU-19014
+Summary:    Random client hung in balance_dirty_pages() with CGroup (memcg) enabled
+Link:       https://jira.whamcloud.com/browse/LU-19014
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Qian Yingjin
+Reporter:   Qian Yingjin
+Created:    Wed, 14 May 2025 08:57:02 +0000
+Updated:    Tue, 12 Aug 2025 19:13:09 +0000
+Resolved:   Tue, 8 Jul 2025 13:21:50 +0000
+Links:      Related: is related to LU-17262; Related: is related to LU-19173; Related: is related to LU-19043
+
+--- Description ---
+Two nodes at least append write a shared file in Lustre with memcg enabled.
+
+It will hang in the following call traces:
+
+[root@ouzo2 margu]$ cat /proc/2593160/stack
+[] balance_dirty_pages+0x2ee/0xd10
+[] balance_dirty_pages_ratelimited_flags+0x27a/0x380
+[] generic_perform_write+0x150/0x210
+[] vvp_io_write_start+0x516/0xc00 [lustre]
+[] cl_io_start+0x5a/0x110 [obdclass]
+[] cl_io_loop+0x97/0x1f0 [obdclass]
+[] ll_file_io_generic+0x4d2/0xe50 [lustre]
+[] do_file_write_iter+0x3e9/0x5d0 [lustre]
+[] vfs_write+0x2cb/0x410
+[] ksys_write+0x5f/0xe0
+[] do_syscall_64+0x5c/0xf0
+[] entry_SYSCALL_64_after_hwframe+0x78/0x80 
+
+After analyze the core dump of the hang system, we found that the @bdi_writeback data structure (wb) corresponded to the memcg has dirty I/O (in state 5: WB_registered | WB_has_dirty_io) with dirty pages, but can not write-out the dirty pages, and loop forever in balance_dirty_pages().
+
+ 
+
+This is a bug in Lustre memcg code. In OSC, it stops the write back dirty pages once found that the unstable pages for an OSC is zero. This is incorrect, we should still write back the dirty pages to update the wb stat accounting, thus the write process can continue instead of looping forever.
+
+--- Comment (bzzz, Sun, 20 Jul 2025 07:47:04 +0000) ---
+$ cat /tmp/tmp.GNKx9FRttJ/result.txt 
+COMMIT		TESTED	PASSED	FAILED		COMMIT DESCRIPTION
+48c0756350	7	5	1	BAD	LU-18765 tests: sanity-quota_91 interop check
+f4c9546e0a	6	4	2	BAD	LU-19124 tests: except sanity/27P on ubuntu2204
+c413d2ede5	7	5	1	BAD	LU-19014 memcg: fix client hang in balance_dirty_pages()
+deffab9868	10	10	0	GOOD	LU-16974 utils: make bandwidth options consistent
+
+this is still a problem with ZFS
+
+--- Comment (qian_wc, Tue, 15 Jul 2025 06:57:26 +0000) ---
+I understand that Fast Commit will break the transaction ordering, but for some fsync() operations, can we not update last_committted value for fast commit, only update it when commit the normal transaction group?
+
+--- Comment (adilger, Tue, 15 Jul 2025 06:12:49 +0000) ---
+There is complexity with using the fast commit feature with Lustre, because there is not a strict irdering between updates to various files modified within a single transaction. We explored this with the ZFS ZIL in LU-4009.
+
+--- Comment (qian_wc, Mon, 14 Jul 2025 01:51:21 +0000) ---
+Do you have any testing results about the performance regression?
+
+ 
+
+I think the problem is that when a memcg on a client is under memory pressure, it will trigger the fsync() on the file.
+
+But other memcg may have lots of memory available and no need to sync data.
+
+ 
+
+Fast commit in ext4 is a journaling optimization introduced in Linux 5.10 that aims to reduce commit latency, particularly in data=ordered mode. It works by storing a minimal delta of metadata changes in a shared fast commit space with the JBD2 journal. This allows for faster commits compared to traditional full commits, especially when many fsync() operations are involved.  
+
+However, the fsync() on the OST (ldiskfs-osd) is actual a sync() operation and will trigger the synchronous journal commit and all pending transactions will need to commit the the persistent storage (not just the one issues the fsync call). Lots of this kind of transaction journal commit may have the negative impact on the performance.
+
+Higher fsync() frequency on JBD2
+- Reduced application throughput
+- Higher journal overhead & interference
+- Lower availability of disk resources for useful workloads 
+
+ 
+
+The solution may be using soft sync when a certain memcg on a client is under memory pressure. In the meanwhile, using the Fast Commit (FC) in Ext4 or ZFS to just commit the data for a specific OST object not the whole transaction group.
+
+FYI, FC: https://www.usenix.org/system/files/atc24_slides-shirwadkar.pdf
+
+--- Comment (stancheff, Sat, 12 Jul 2025 04:49:08 +0000) ---
+For me this is a very large performance regression.
+
+I think the root cause is that grants are not memcg aware allowing an excessive amount of pages to be queued because the dirty page account is based on the system ram.
+
+--- Comment (bzzz, Wed, 9 Jul 2025 09:40:37 +0000) ---
+probably always enabled writeback cache in ZFS causes this somehow.
+
+--- Comment (bzzz, Wed, 9 Jul 2025 09:37:32 +0000) ---
+yes, I test with the both backends:
+
+[alexey@hd lustre-clean]$ /lt//ltest/ltest-stats -t recovery-small -f ldiskfs -d
+                     PASS FAIL TIMEOUT CRASH
+recovery-small       88   0    0       0      
+[alexey@hd lustre-clean]$ /lt//ltest/ltest-stats -t recovery-small -f zfs -d
+                     PASS FAIL TIMEOUT CRASH
+recovery-small       146  11   49      0
+
+--- Comment (qian_wc, Wed, 9 Jul 2025 09:26:36 +0000) ---
+Are you testing using ldiskfs OSD backend?
+
+Is this failure related to ZFS OSD backend only?
+
+--- Comment (bzzz, Wed, 9 Jul 2025 09:07:51 +0000) ---
+with this patch landed recovery-small/55 gets stuck sometimes (using ZFS):
+
+$ cat /tmp/tmp.GNKx9FRttJ/result.txt 
+COMMIT		TESTED	PASSED	FAILED		COMMIT DESCRIPTION
+48c0756350	7	5	1	BAD	LU-18765 tests: sanity-quota_91 interop check
+f4c9546e0a	6	4	2	BAD	LU-19124 tests: except sanity/27P on ubuntu2204
+c413d2ede5	7	5	1	BAD	LU-19014 memcg: fix client hang in balance_dirty_pages()
+deffab9868	10	10	0	GOOD	LU-16974 utils: make bandwidth options consistent
+
+this is how I ran it:
+
+ FSTYPE=zfs MDSCOUNT=2 ONLY=55 MDSSIZE=250000 OSTSIZE=500000 OSTCOUNT=4 REFORMAT=yes bash recovery-small.sh
+
+the interesting stack traces are:
+
+PID: 7        TASK: ffff957a001701c0  CPU: 1    COMMAND: "kworker/u4:0"
+ #0 [ffff957a00177888] __schedule at ffffffffab6f7e86
+    /tmp/kernel/kernel/sched/core.c: 3755
+ #1 [ffff957a001778e0] schedule at ffffffffab6f8420
+    /tmp/kernel/kernel/sched/core.c: 4602
+ #2 [ffff957a001778f8] schedule_timeout at ffffffffab6fe7a0
+    /tmp/kernel/kernel/time/timer.c: 1836
+ #3 [ffff957a001779b0] wait_for_common at ffffffffab6f8edc
+    /tmp/kernel/kernel/sched/completion.c: 86
+ #4 [ffff957a00177a00] osc_io_fsync_end at ffffffffc124aeba [osc]
+    /home/lustre/master-mine/lustre/osc/osc_io.c: 1189
+ #5 [ffff957a00177a10] cl_io_end at ffffffffc0be105e [obdclass]
+    /home/lustre/master-mine/lustre/obdclass/cl_io.c: 557
+ #6 [ffff957a00177a38] lov_io_end_wrapper at ffffffffc12aac2a [lov]
+    /home/lustre/master-mine/lustre/lov/lov_io.c: 1118
+ #7 [ffff957a00177a50] lov_io_fsync_end at ffffffffc12ab2ca [lov]
+    /home/lustre/master-mine/lustre/lov/lov_io.c: 1642
+ #8 [ffff957a00177a70] cl_io_end at ffffffffc0be105e [obdclass]
+    /home/lustre/master-mine/lustre/obdclass/cl_io.c: 557
+ #9 [ffff957a00177a98] cl_io_loop at ffffffffc0be5ea6 [obdclass]
+    /home/lustre/master-mine/lustre/obdclass/cl_io.c: 848
+#10 [ffff957a00177ad8] cl_sync_file_range at ffffffffc18cc354 [lustre]
+    /home/lustre/master-mine/lustre/llite/file.c: 5380
+#11 [ffff957a00177b30] ll_writepages at ffffffffc18f5a9e [lustre]
+    /home/lustre/master-mine/lustre/llite/rw.c: 1642
+#12 [ffff957a00177b78] do_writepages at ffffffffab1e0dc9
+    /tmp/kernel/mm/page-writeback.c: 2382
+#13 [ffff957a00177bf8] __writeback_single_inode at ffffffffab29040f
+    /tmp/kernel/fs/fs-writeback.c: 1621
+#14 [ffff957a00177c38] writeback_sb_inodes at ffffffffab290c15
+    /tmp/kernel/fs/fs-writeback.c: 1893
+#15 [ffff957a00177cd8] __writeback_inodes_wb at ffffffffab29137a
+    /tmp/kernel/fs/fs-writeback.c: 1960
+#16 [ffff957a00177d18] wb_writeback at ffffffffab2916ce
+    /tmp/kernel/fs/fs-writeback.c: 2064
+#17 [ffff957a00177da8] wb_workfn at ffffffffab2925da
+    /tmp/kernel/fs/fs-writeback.c: 2130
+#18 [ffff957a00177e60] process_one_work at ffffffffab0fc155
+    /tmp/kernel/./arch/x86/include/asm/jump_label.h: 38
+#19 [ffff957a00177ed0] worker_thread at ffffffffab0fc4c5
+    /tmp/kernel/./include/linux/compiler.h: 278
+#20 [ffff957a00177f10] kthread at ffffffffab10383e
+    /tmp/kernel/kernel/kthread.c: 354
+#21 [ffff957a00177f50] ret_from_fork at ffffffffab8001c4
+    /tmp/kernel/arch/x86/entry/entry_64.S: 328
+...
+PID: 46498    TASK: ffff957a405f4380  CPU: 1    COMMAND: "dd"
+ #0 [ffff957a3102ba20] __schedule at ffffffffab6f7e86
+    /tmp/kernel/kernel/sched/core.c: 3755
+ #1 [ffff957a3102ba78] schedule at ffffffffab6f8420
+    /tmp/kernel/kernel/sched/core.c: 4602
+ #2 [ffff957a3102ba90] cl_sync_io_wait at ffffffffc0be30ca [obdclass]
+    /home/lustre/master-mine/lustre/obdclass/cl_io.c: 1231
+ #3 [ffff957a3102bae8] cl_io_submit_sync at ffffffffc0be54a0 [obdclass]
+    /home/lustre/master-mine/lustre/obdclass/cl_io.c: 780
+ #4 [ffff957a3102bb30] vvp_io_commit_sync at ffffffffc1921eef [lustre]
+    /home/lustre/master-mine/lustre/llite/vvp_io.c: 946
+ #5 [ffff957a3102bb78] vvp_io_write_commit at ffffffffc1925c51 [lustre]
+    /home/lustre/master-mine/lustre/llite/vvp_io.c: 1242
+ #6 [ffff957a3102bbc0] vvp_io_write_start at ffffffffc1926367 [lustre]
+    /home/lustre/master-mine/lustre/llite/vvp_io.c: 1380
+ #7 [ffff957a3102bc78] cl_io_start at ffffffffc0be0f49 [obdclass]
+    /home/lustre/master-mine/lustre/obdclass/cl_io.c: 535
+ #8 [ffff957a3102bca8] cl_io_loop at ffffffffc0be5e99 [obdclass]
+    /home/lustre/master-mine/lustre/obdclass/cl_io.c: 847
+ #9 [ffff957a3102bce8] ll_file_io_generic at ffffffffc18c4609 [lustre]
+    /home/lustre/master-mine/lustre/llite/file.c: 2057
+#10 [ffff957a3102bdf0] do_file_write_iter at ffffffffc18c5879 [lustre]
+    /home/lustre/master-mine/lustre/llite/file.c: 2682
+#11 [ffff957a3102be58] new_sync_write at ffffffffab25c43a
+    /tmp/kernel/fs/read_write.c: 475
+#12 [ffff957a3102bed8] vfs_write at ffffffffab25f379
+    /tmp/kernel/fs/read_write.c: 550
+#13 [ffff957a3102bf08] ksys_write at ffffffffab25f5cd
+    /tmp/kernel/fs/read_write.c: 599
+#14 [ffff957a3102bf38] do_syscall_64 at ffffffffab002a2b
+    /tmp/kernel/arch/x86/entry/common.c: 302
+#15 [ffff957a3102bf50] entry_SYSCALL_64_after_hwframe at ffffffffab80007d
+    /tmp/kernel/arch/x86/entry/entry_64.S: 147
+
+--- Comment (pjones, Tue, 8 Jul 2025 13:21:50 +0000) ---
+Merged for 2.17
+
+--- Comment (gerrit, Tue, 8 Jul 2025 03:50:21 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/59223/
+
+Subject: LU-19014 memcg: fix client hang in balance_dirty_pages()
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: c413d2ede5dfe71a89878aed305a8d61f03a30a3
+
+--- Comment (adilger, Thu, 29 May 2025 23:21:40 +0000) ---
+[updated table to show percentage difference for each thread count]
+
+I think this showing that the patch didn't really change the performance, just a few percent variability in the test results.  Possibly the single-thread performance is measurably a bit slower (more than the +/-3% of the other runs).
+
+--- Comment (JIRAUSER19217, Mon, 26 May 2025 08:54:17 +0000) ---
+Performance Degradation Assessment
+
+[root@src27-c0 ior]# free -h
+               total        used        free      shared  buff/cache   available
+Mem:           235Gi       3.0Gi       229Gi       141Mi       5.3Gi       232Gi
+Swap:          4.0Gi          0B       4.0Gi
+[root@src27-c0 ior]# uname -r
+5.14.0-503.40.1.el9_5.x86_64
+[root@src27-c0 ior]# cat /etc/os-release 
+NAME="Rocky Linux"
+VERSION="9.5 (Blue Onyx)"
+ID="rocky"
+ID_LIKE="rhel centos fedora"
+VERSION_ID="9.5"
+PLATFORM_ID="platform:el9"
+PRETTY_NAME="Rocky Linux 9.5 (Blue Onyx)"
+ANSI_COLOR="0;32"
+LOGO="fedora-logo-icon"
+CPE_NAME="cpe:/o:rocky:rocky:9::baseos"
+HOME_URL="https://rockylinux.org/"
+VENDOR_NAME="RESF"
+VENDOR_URL="https://resf.org/"
+BUG_REPORT_URL="https://bugs.rockylinux.org/"
+SUPPORT_END="2032-05-31"
+ROCKY_SUPPORT_PRODUCT="Rocky-Linux-9"
+ROCKY_SUPPORT_PRODUCT_VERSION="9.5"
+REDHAT_SUPPORT_PRODUCT="Rocky Linux"
+REDHAT_SUPPORT_PRODUCT_VERSION="9.5"
+
+CPU: 36 core.
+
+ 
+
+mpirun ior -w -t 1m -b 64g np
+2.14.0-ddn184
+ddn184+patch
+difference
+
+1
+2077.09
+1933.73
+-6.9%
+
+2
+2390.63
+2330.47
+-2.5%
+
+4
+1597.11
+1631.55
++2.2%
+
+8
+1534.32
+1480.38
+-3.5%
+
+16
+1497.24
+1462.33
+-2.3%
+
+32
+1409.66
+1454.95
++3.2%
+
+--- Comment (gerrit, Wed, 14 May 2025 09:17:46 +0000) ---
+"Qian Yingjin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/59223
+
+Subject: LU-19014 memcg: client hang in balance_dirty_pages with memcg
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 990d0cd2f5426a6d4ed5eb7d24d6be9c366e521e

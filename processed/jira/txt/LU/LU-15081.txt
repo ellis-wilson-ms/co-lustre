@@ -1,0 +1,86 @@
+Key:        LU-15081
+Summary:    set_nlink() can race with itself corrupting s_remove_count on the client
+Link:       https://jira.whamcloud.com/browse/LU-15081
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Andrew Perepechko
+Reporter:   Andrew Perepechko
+Created:    Mon, 11 Oct 2021 19:07:25 +0000
+Updated:    Mon, 16 Jan 2023 22:32:35 +0000
+Resolved:   Wed, 27 Oct 2021 04:00:53 +0000
+Labels:     patch
+
+--- Description ---
+Mar  3 16:08:57 c-lmo161 kernel: ------------[ cut here ]------------
+Mar  3 16:08:57 c-lmo161 kernel: WARNING: CPU: 5 PID: 195090 at fs/inode.c:241 __destroy_inode+0xdb/0xf0
+Mar  3 16:08:57 c-lmo161 kernel: Modules linked in: mgc(OE) lustre(OE) lmv(OE) mdc(OE) fid(OE) lov(OE) fld(OE) osc(OE) ko2iblnd(OE) ptlrpc(OE) obdclass(OE) lnet(OE) libcfs(OE) rpcsec_gss_krb5 auth_rpcgss nfsv4 dns_resolver nfs lockd grace fscache mlx5_ib(OE) mlx5_core(OE) mlxfw sunrpc ib_isert(OE) ib_srpt(OE) ib_srp(OE) ib_ucm(OE) sb_edac intel_powerclamp coretemp intel_rapl iosf_mbi kvm irqbypass crc32_pclmul ghash_clmulni_intel aesni_intel iTCO_wdt iTCO_vendor_support lrw gf128mul glue_helper ablk_helper cryptd rpcrdma(OE) svcrdma(OE) xprtrdma(OE) ib_umad(OE) rdma_ucm(OE) rdma_cm(OE) iw_cm(OE) ib_iser(OE) ib_ipoib(OE) ib_cm(OE) pcspkr joydev lpc_ich mei_me sg i2c_i801 mei wmi ioatdma ipmi_si ipmi_devintf ipmi_msghandler ip_tables ext4 mbcache jbd2 sd_mod crc_t10dif crct10dif_generic mlx4_ib(OE) ib_uverbs(OE) mlx4_en(OE)
+Mar  3 16:08:57 c-lmo161 kernel: ib_core(OE) mgag200 mlx4_core(OE) drm_kms_helper syscopyarea isci sysfillrect igb crct10dif_pclmul crct10dif_common sysimgblt fb_sys_fops ahci crc32c_intel ttm libsas libahci scsi_transport_sas ptp drm pps_core libata dca mlx_compat(OE) drm_panel_orientation_quirks i2c_algo_bit devlink dm_mirror dm_region_hash dm_log dm_mod
+Mar  3 16:08:57 c-lmo161 kernel: CPU: 5 PID: 195090 Comm: mdtest Tainted: G        W  OE  ------------   3.10.0-957.5.1.el7.x86_64 #1
+Mar  3 16:08:57 c-lmo161 kernel: Hardware name: Intel Corporation S2600JF/S2600JF, BIOS SE5C600.86B.02.04.0003.102320141138 10/23/2014
+Mar  3 16:08:57 c-lmo161 kernel: Call Trace:
+Mar  3 16:08:57 c-lmo161 kernel: [] dump_stack+0x19/0x1b
+Mar  3 16:08:57 c-lmo161 kernel: [] __warn+0xd8/0x100
+Mar  3 16:08:57 c-lmo161 kernel: [] warn_slowpath_null+0x1d/0x20
+Mar  3 16:08:57 c-lmo161 kernel: [] __destroy_inode+0xdb/0xf0
+Mar  3 16:08:57 c-lmo161 kernel: [] destroy_inode+0x22/0x60
+Mar  3 16:08:57 c-lmo161 kernel: [] evict+0x115/0x180
+Mar  3 16:08:57 c-lmo161 kernel: [] iput+0xfc/0x190
+Mar  3 16:08:57 c-lmo161 kernel: [] do_unlinkat+0x1ae/0x2d0
+Mar  3 16:08:57 c-lmo161 kernel: [] SyS_unlink+0x16/0x20
+Mar  3 16:08:57 c-lmo161 kernel: [] system_call_fastpath+0x22/0x27
+Mar  3 16:08:57 c-lmo161 kernel: ---[ end trace f53c1dca536ee43c ]---
+
+Despite the fact that s_remove_counter itself is an atomic, set_nlink() handling is not atomic. Two racing set_nlink()'s, depending on the race, will lead to one of the two nlink values. However, this race can corrupt s_remove_counter which will lead to spam in the kernel logs.
+
+--- Comment (pjones, Wed, 27 Oct 2021 04:00:53 +0000) ---
+Landed for 2.15
+
+--- Comment (gerrit, Wed, 27 Oct 2021 00:38:14 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/45191/
+
+Subject: LU-15081 vfs: set_nlink() is not race-safe
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 12b05772fdb6d080819b6c213fcd7f8705278412
+
+--- Comment (panda, Mon, 11 Oct 2021 19:56:19 +0000) ---
+Although we did not capture the logs for this issue in the field. I believe, a possible scenario is dropping n_link to zero in the context of ll_unlink() and then raising it to 1 in some getattr context as a result of delayed getattr processing:
+
+void set_nlink(struct inode *inode, unsigned int nlink)
+{
+        if (!nlink) {
+                clear_nlink(inode);
+        } else {
+                /* Yes, some filesystems do change nlink from zero to one */
+                if (inode->i_nlink == 0)
+                        atomic_long_dec(&inode->i_sb->s_remove_count);
+
+                inode->__i_nlink = nlink;
+        }
+}
+EXPORT_SYMBOL(set_nlink);
+
+If two threads are setting nlink to 1 and simultaneously processing "if (inode->i_nlink == 0)", then both of them can drop s_remove_count while it was incremented only once when nlink initially dropped to zero in ll_unlink().
+
+--- Comment (gerrit, Mon, 11 Oct 2021 19:13:53 +0000) ---
+"Andrew Perepechko " uploaded a new patch: https://review.whamcloud.com/45191
+
+Subject: LU-15081 vfs: set_nlink() is not race-safe
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 0cf621e17c0d035ff33edf56035bce5ecb8beef2
+
+--- Comment (panda, Mon, 11 Oct 2021 19:08:11 +0000) ---
+A patch will be uploaded shortly.

@@ -1,0 +1,168 @@
+Key:        LU-9920
+Summary:    Use pagevec for marking pages dirty
+Link:       https://jira.whamcloud.com/browse/LU-9920
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Dongyang Li
+Reporter:   Patrick Farrell
+Created:    Fri, 25 Aug 2017 16:27:49 +0000
+Updated:    Thu, 22 Oct 2020 06:19:01 +0000
+Resolved:   Tue, 1 Oct 2019 03:22:10 +0000
+Links:      Related: is related to  LU-11290; Related: is related to LU-12429; Related: is related to LU-9906; Related: is related to LU-11775
+
+--- Description ---
+When doing i/o from multiple writers to a single file, the
+
+per-file page cache lock (mapping->tree_lock) becomes a
+
+bottleneck.
+
+Most current uses are single page at a time.  This converts
+
+one prominent use, marking page as dirty, to use a pagevec.
+
+This improves shared file write performance notably when
+
+many threads are writing to one file.
+
+[NB: Detailed numbers coming.  Looks like no change in
+
+uncontended case, rising to ~25% for 8 writers.]
+
+--- Comment (gerrit, Thu, 22 Oct 2020 06:19:01 +0000) ---
+Jian Yu (yujian@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/40347
+
+Subject: LU-9920 vvp: dirty pages with pagevec
+
+Project: fs/lustre-release
+
+Branch: b2_12
+
+Current Patch Set: 1
+
+Commit: b5e6d9840b8515de5102a15a11bc66f95bf25a27
+
+--- Comment (pjones, Tue, 1 Oct 2019 03:22:10 +0000) ---
+Landed for 2.13
+
+--- Comment (gerrit, Mon, 30 Sep 2019 23:12:15 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/28711/
+
+Subject: LU-9920 vvp: dirty pages with pagevec
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: a7299cb012f8c5574a0cc07ff0e32218fb49d733
+
+--- Comment (pfarrell, Sat, 15 Jun 2019 22:24:07 +0000) ---
+My word, that's quite a thread.  I should've gotten involved a few days ago.  It's also degraded a bit, since Linus and Dave are ... getting along well ... in their most recent notes.
+
+I'm going to gather my thoughts/explain a bit here, I know some of this should go on the list, but I've got a lot of catching up to do before I can comment there.
+
+So our workload is lots of threads doing buffered i/o to one file*, and we're spending lots of time on spinlocks in two functions:
+
+*I don't know where Kent gets the idea that multiple writers must mean buffered and direct, but that's a sampling from the middle and I have about another hundred messages to read...
+
+(as seen in Ihara's flame graph https://jira.whamcloud.com/secure/attachment/32772/lustre-ssf.svg)
+
+__add_to_page_cache_locked
+
+and:
+
+__set_page_dirty_nobuffers
+
+The particular spinlock is the one that protects the page cache itself.  Used to mapping->tree_lock, but it's not called a tree any more, so the lock has a new name...  Same lock, though.
+
+These functions are both modifying the radix tree/xarray (the data structure used for the page cache was renamed and re-APIed in the last year [no functional changes]) that holds the pages for this particular file.  The first is adding pages, and the second one is tagging radix tree entries as dirty.  (Pages have dirty state, but the radix tree/xarray entries are also tagged as dirty, which is a separate thing, and which allows writeback (mostly writeback) to rapidly find dirty pages.  It is this tagging that needs to write the tree.)
+
+In upstream, both of these operations are done a single page at a time, going back several calls.
+
+The dirty tagging side is quite simple to do with a pagevec of pages instead, and not release the lock for each page.  This is still tagging one page at a time, but at least it holds the lock.  That's what my patch does - Hold the lock around the loop where the pages are added.  (The latest version takes advantage of Lustre specific behavior to move several operations outside of the lock, an upstream version would look more like the earlier one...  But as Ihara proved, that didn't make much difference anyway.)
+
+The xarray/radix tree has the ability to tag pages in batches, but, bizarrely, it's only exposed with a function that does "if have TAG X, add TAG Y", which is used for marking dirty pages for writeback.  There is no way to just batch TAG X (and you can't trick the function either).  It's a slightly bizarre choice and would be very easy to fix with a modification of that function.
+
+Briefly put, the adding side is notably more complex to do in batches, mostly because there are a bunch of operations that can potentially fail, and also because the write functions deal with one page at a time, so there's no obvious place to pull in the pages.
+
+The core write function in the kernel (generic_perform_write) is a big loop that's basically:
+
+"ask file system for page at offset X"
+
+(this calls .write_begin from the address space ops...)
+
+"copy data to that page"
+
+"tell file system we're done"
+
+(this calls .write_end)
+
+All one page at a time.
+
+This is the thing Kent open-coded. He doesn't use write_begin/write_end (though he's basically got versions of them).
+
+He does each step in a separate loop over a bunch of pages each time, but he still gets his pages in the page cache one at a time - So if he allowed multiple writers to a file (I'm guessing he doesn't based on his comments), he'd crash in to the same wall we're hitting. He might get better behavior because he calls the page getting stuff in a tight loop (I have a patch for that I want to play with, but it's complicated.)
+
+Like I said, I'll have to pore over that thread carefully, but the straightforward things to do would be:
+
+Allow dirtying with a pagevec
+
+Allow bulk tagging in the xarray interface
+
+The basic problem with the rest is code complexity, and then getting anything else to benefit.  Without multiple concurrent writers to a single file (so, range locking rather than the inode mutex), there's not really contention on managing the per-file page tracking...  Any benefit experienced by anyone without that would be very small.
+
+--- Comment (adilger, Sat, 15 Jun 2019 18:58:24 +0000) ---
+Patrick, is it possible that the high lock contention is a result of something that Lustre is doing under the lock (e.g. per-page lock callbacks or something) or is it conclusive that all of the contention is in the pagecache itself?  There is an ongoing discussion in linux-fsdevel about page cache scalability w.r.t. concurrent writers, so if there is something we could usefully contribute to the upstream kernel that would help us down the road, now would be a good time to do so.
+
+--- Comment (gerrit, Wed, 12 Jun 2019 14:02:25 +0000) ---
+Patrick Farrell (pfarrell@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/35206
+
+Subject: LU-9920 vvp: dirty pages with pagevec
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 2016ba18081a2c7a0efc3829b7e1f06d6054b44c
+
+--- Comment (pfarrell, Tue, 26 Mar 2019 15:59:48 +0000) ---
+As discussed in the gerrit patch for this, the improvement isn't worth the amount of kernel code we have to copy (in slightly modified form).
+
+--- Comment (adilger, Thu, 21 Sep 2017 20:51:42 +0000) ---
+You are right.  I thought I'd seen something similar, but when searching Jira I couldn't find LU-9906 with the keywords I was using.  I've now linked these tickets together.
+
+--- Comment (paf, Thu, 21 Sep 2017 18:32:31 +0000) ---
+Ah, sorry, you've already seen that.  Still, I think it's the answer to your thought.
+
+--- Comment (paf, Thu, 21 Sep 2017 18:14:21 +0000) ---
+Andreas,
+
+See LU-9906 
+
+ And:
+
+ https://review.whamcloud.com/28667
+
+Unlike this patch (which is new and has not run in production), Cray has been using a version of LU-9906 for a while.
+
+--- Comment (adilger, Thu, 21 Sep 2017 17:32:29 +0000) ---
+Patrick, a similar issue exists when pages are dropped from cache upon lock cancellation.  It would be useful to clean this up to use invalidate_page_range() or similar to drop pages from cache (at least in stripe_size chunks) instead of doing it one page at a time as it does today.
+
+--- Comment (gerrit, Fri, 25 Aug 2017 16:28:36 +0000) ---
+Patrick Farrell (paf@cray.com) uploaded a new patch: https://review.whamcloud.com/28711
+
+Subject: LU-9920 vvp: dirty pages with pagevec
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: f30d9cb22e6461f5d5b9325448740518bc46a78c

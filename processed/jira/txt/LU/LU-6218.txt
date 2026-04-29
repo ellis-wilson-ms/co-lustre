@@ -1,0 +1,106 @@
+Key:        LU-6218
+Summary:    osd-zfs: increase redundancy for OST meta data
+Link:       https://jira.whamcloud.com/browse/LU-6218
+Type:       Improvement
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Isaac Huang
+Reporter:   Isaac Huang
+Created:    Fri, 6 Feb 2015 06:32:35 +0000
+Updated:    Sun, 31 Jul 2016 13:52:48 +0000
+Resolved:   Thu, 20 Aug 2015 13:18:03 +0000
+Labels:     zfs
+
+--- Description ---
+A site had two last_rcvd files corrupted on two OSTs. They were able to truncate the files and the OSTs mounted OK. But I wonder whether we could increase data redundancy for meta data such as the last_rcvd file, to make it harder to corrupt in the first place (or more accurately to make it easier for scrub to repair it should it ever get corrupted).
+
+The OIs already get two copies of its data blocks as they are ZAPs. But other meta data like last_rcvd get only one copy of the data. The copies property can only be applied at per file system granularity. We can put those files under a separate dataset, e.g. lustre-ost1/ost1/META, and set copies=2 for it. But it'd complicate the code as now there's two datasets per OST.
+
+--- Comment (isaac, Wed, 8 Jul 2015 20:32:54 +0000) ---
+The patch added one additional copy for data blocks of a small number of small files, e.g. last_rcvd. The added overhead is trivial compared to the OIs which already get an additional copy.
+
+--- Comment (pjones, Tue, 7 Jul 2015 11:37:35 +0000) ---
+Isaac
+
+Are you able to answer Chris's question about performance?
+
+Peter
+
+--- Comment (morrone, Fri, 27 Mar 2015 20:15:55 +0000) ---
+Are there any performance implications from this change?  Performance is already a problem on MDTs.  This redundancy applies there as well, yes?  Is the impact reasonable enough to make this the default there?
+
+--- Comment (gerrit, Wed, 25 Mar 2015 14:46:34 +0000) ---
+Oleg Drokin (oleg.drokin@intel.com) merged in patch http://review.whamcloud.com/13741/
+
+Subject: LU-6218 osd-zfs: increase redundancy for meta data
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: d9e86108724c06e3e6d25081caaf5803abf4416c
+
+--- Comment (isaac, Wed, 4 Mar 2015 21:40:39 +0000) ---
+adilger Do you happen to know what size the fs_log_size() in test-framewrok.sh returns? I'm wondering whether I should double the size returned for osd-zfs, but couldn't figure out what size fs_log_size() was actually returning.
+
+--- Comment (adilger, Thu, 12 Feb 2015 08:03:46 +0000) ---
+Great.
+
+--- Comment (isaac, Thu, 12 Feb 2015 04:40:04 +0000) ---
+Everything looked fine. The files showed up in the ZPL name space and I was able to r/w them. And zdb showed 2 copies of data blocks:
+
+[root@eagle-44vm1 ost1]# ls -li last_rcvd 
+143 -rw-r--r-- 1 root root 8448 Dec 31  1969 last_rcvd
+[root@eagle-44vm1 ost1]# zdb -e -dddddd lustre-ost1/ost1 143
+......
+    Object  lvl   iblk   dblk  dsize  lsize   %full  type
+       143    1    16K   128K  9.00K   128K  100.00  uint8 (K=inherit) (Z=inherit)
+Indirect blocks:
+               0 L0 0:25f93600:1200 0:3005dcc00:1200 20000L/1200P F=1 B=646/646
+
+Then I removed last_rcvd, umount, and mount again - didn't hit the assertion in zfs_unlinked_drain(). So it was removed from the delete queue and freed before umount. I also tested zfs send/recv and it worked fine.
+
+--- Comment (gerrit, Thu, 12 Feb 2015 01:46:55 +0000) ---
+Isaac Huang (he.huang@intel.com) uploaded a new patch: http://review.whamcloud.com/13741
+
+Subject: LU-6218 osd-zfs: more ditto copies
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 267c12243093e1fd2c92f222a6bac0167986483b
+
+--- Comment (isaac, Thu, 12 Feb 2015 01:25:21 +0000) ---
+Looks like we'd hit that assertion only if:
+
+	A DMU_OTN_UINT8_METADATA object is removed, either by ZPL or osd-zfs (with the upcoming LU-5242 fix - and I can just directly free such objects in that patch to eliminate this possibility).
+
+	Before it's actually freed the system crashed (or ZPL forced umount), so the object stayed in the ZPL delete queue.
+
+	The dataset is mounted by ZPL (not read-only)
+
+I'll experiment a bit with a simple patch.
+
+--- Comment (adilger, Wed, 11 Feb 2015 10:08:19 +0000) ---
+Would this make these objects inaccessible if mounted directly via ZPL?  That would make last_rcvd, LAST_ID, CATALOGS, other llog files, etc inaccessible for local mounts, which breaks one of the important ZFS compatibility features that we've kept to be able to mount the filesystem.  I didn't see any obvious checks for this in the zpl_read() or zpl_write() code paths, but I do see such a check in zpl_unlinked_drain():
+
+                ASSERT((doi.doi_type == DMU_OT_PLAIN_FILE_CONTENTS) ||
+                    (doi.doi_type == DMU_OT_DIRECTORY_CONTENTS));
+
+but I don't think we will encounter this in practice since Lustre rarely deletes internal file objects except llog files.
+
+The DMU_OTN_UINT8_METADATA type definitely shouldn't be used for FID_SEQ_LOCAL ZAPs, at most it should only be used for regular files.
+
+--- Comment (isaac, Tue, 10 Feb 2015 05:12:21 +0000) ---
+I just looked at DMU code and it seemed like all we'd need to do is to create these objects with type DMU_OTN_UINT8_METADATA, instead of DMU_OT_PLAIN_FILE_CONTENTS (see dmu_write_policy()).
+
+At osd-zfs, can I identify such objects by using conditional "fid_seq(fid) == FID_SEQ_LOCAL_FILE"?
+
+--- Comment (adilger, Sun, 8 Feb 2015 09:38:39 +0000) ---
+Since the OST has direct access to the DMU code, is it possible to somehow flag the dnode at create or write time to generate a ditto block copy only on that inode? I've long thought that this is useful for last_rcvd, OI files, config files, etc. just writing two copies of these files at the OSD level wouldn't actually solve this problem because ZFS wouldn't know they are copies, and couldn't automatically repair one on error.

@@ -1,0 +1,116 @@
+Key:        LU-18383
+Summary:    ksocklnd: Avoid TCP socket orphans in racy LNet hello
+Link:       https://jira.whamcloud.com/browse/LU-18383
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Josh Samuelson
+Reporter:   Josh Samuelson
+Created:    Sat, 19 Oct 2024 21:21:54 +0000
+Updated:    Wed, 17 Dec 2025 03:39:43 +0000
+Resolved:   Sun, 24 Nov 2024 15:25:48 +0000
+Labels:     LTS15
+Links:      Related: is related to  LU-18137
+
+--- Environment ---
+RHEL 8.10
+
+--- Description ---
+I've run into TCP orphan socket issue somewhat similar to what was mentioned in LU-18137 with a recent upgrade on a HPC system, going from RHEL 8.9 to 8.10 release with kernel version 4.18.0-553.16.1.el8_10.x86_64 having the Lustre clients staying in the 2.15.x/LTS release. After a couple weeks of running it became apparent that the Lustre socklnd TCP clients had TCP connections that were never being reaped. The /proc/net/sockstat would show TCP orphan counts in the 1000s and the iproute ss tool would show a combination of 10s-100s of 'CLOSING' and 1000s of 'LAST-ACK' TCP state with no active retransmit timers involved with port 988.
+
+ 
+
+Since a reboot of the system is required to clear the TCP orphans, I decided to set the priory to major.
+
+ 
+
+The following command would make the orphans pop out on the client nodes:
+
+ss -Hnt exclude established '( dport == 988 )'
+
+ 
+
+The kernel ring buffer on the Lustre client nodes also had messages similar to the following where the a.b.c.d IPv4 address was a Lustre OSS node:
+
+LNetError: 11d-d: No privileged ports available to connect to a.b.c.d@tcp at host a.b.c.d:988 
+
+ 
+
+The Luster servers are not showing this TCP orphan socket issue, however their build of 2.15.x/LTS line are still running from a RHEL 8.9 kernel build, where
+
+tcp: properly terminate timers for kernel sockets (Guillaume Nault) [RHEL-37171] {CVE-2024-35910}
+
+was not applied, RHEL's backport of https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=151c9c724d05d5b0dd8acd3e11cb69ef1f2dbada mentioned in LU-18137.
+
+ 
+
+Looking for clues to resolve this initially, the best match I found was the above mentioned LU-18137, so I merged those changes to my local 2.15.x/LTS build to see if that helped on the RHEL 8.10 clients. Unfortunately it did not; TCP orphan sockets cropped up quickly upon reboot and fresh mount of Lustre.
+
+ 
+
+Digging in a bit more, it seems certain Lustre OSS nodes have gotten into a LNet "hello storm," for a lack of a better description, with socklnd clients in my setup. Both the clients and these subset of servers connect and drop connections rapidly, over and over. The clients mount the FS and access to directories & files seems fine otherwise, thankfully - though as times goes on TCP sockets in a descending port range from ~1023 -> 512 become orphan with state LAST-ACK (predominantly) or CLOSING. The socklnd clients only have these TCP orphans if the other end of the connection is these subset of OSS nodes doing the LNet "hello storm." I found via packet capture that if the OSS requested the FIN first during TCP session shutdown over the client, the client socket would go to this LAST-ACK orphan state. The only difference I've found between the non-hello storm servers and the ones doing the storm, the non-hello storm have mostly 5 established connections going to clients while the hello storm servers only have 3 established connections to clients. I'm unclear why there would be a difference.
+
+ 
+
+I'm not sure the reasons for the hello storm on the subset of servers that seem to have 3x TCP sessions per client, but I know the orphan TCP issue can't be correct and maybe they're related somehow.
+
+ 
+
+I began wondering if the location LU-18137 fix was placed suffered from a race depending on the socket's accept/connect use prior to the sk_net_refcnt being set. LU-18137 placed the changes in ksocknal_lib_setup_sock() which is only called by ksocknal_create_conn(). ksocknal_create_conn() has calls to both ksocknal_send_hello() and ksocknal_recv_hello(), which calls happen depends on ksocknal_create_conn()'s "active" status; calls to these functions with failure checks/jumps happen prior to the ksocknal_lib_setup_sock() call where the needed sk_net_refcnt setting happens.
+
+Assuming both listening and connecting sockets would need LU-18137's fix I found lnet/lnet/lib-socket.c:lnet_sock_create(), the only spot where the call to the kernel's sock_create_kern() is made to allocate the kernel socket, would catch both lnet_connect() and lnet_sock_listen() call paths and figured moving LU-18137 changes there would cover all the bases.
+
+ 
+
+I've done some testing in my locally patched 2.15.x series on RHEL 8.10 with the above mentioned changes and it appears to avoid the orphan TCP sockets now on the few socklnd TCP clients I've updated with these changes (no orphans even faced with my odd LNet hello storm). However, I saw oddity with the /proc/net/sockstat "sockets: used" counts unless I included the percpu sock use counter as is done in sk_alloc() when the call is made for non-kernel sockets; I pulled the idea from RHEL's 8.10 kernel net/mptcp/subflow.c:mptcp_subflow_create_socket() while the kernel upstream has since added static function include/net/sock.h:sock_inuse_add() in https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=d477eb9004845cb2dc92ad5eed79a437738a868a to do the same for network code. Just pointing out this difference to what was done in LU-18137.
+
+ 
+
+I mainly want to point out the TCP orphan state seems to still be an issue with clients on RHEL 8.10 and 2.15.x release with LU-18137 applied - perhaps under racy accept/connect conditions from my as yet undiagnosed LNet hello storm.
+
+ 
+
+I'll push my updates against master but not sure of the correctness to my approach. This ticket can be used to bring attention to the issue and a proper fix by LNet experts if my attempt is incorrect.
+
+--- Comment (gerrit, Wed, 17 Dec 2025 03:33:39 +0000) ---
+"Li Xi " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/63086
+
+Subject: LU-18383 ksocklnd: Avoid TCP socket orphans in racy LNet
+
+Project: fs/lustre-release
+
+Branch: b2_15
+
+Current Patch Set: 1
+
+Commit: 3ee3adddd1034b3c1b320950e6331edc10f8433c
+
+--- Comment (pjones, Sun, 24 Nov 2024 15:25:48 +0000) ---
+Merged for 2.17
+
+--- Comment (gerrit, Sun, 24 Nov 2024 06:02:29 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/56737/
+
+Subject: LU-18383 ksocklnd: Avoid TCP socket orphans in racy LNet
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 25e1da07d70c7748be14a8a096aa0da9c3aa9644
+
+--- Comment (gerrit, Sat, 19 Oct 2024 21:28:48 +0000) ---
+"Josh Samuelson " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/56737
+
+Subject: LU-18383 ksocklnd: Avoid TCP socket orphans in racy LNet hello
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 3e3e488bc77ae67f931c54a5fe331d42092fbed6

@@ -1,0 +1,310 @@
+Title:        PFL Prototype High Level Design
+URL:          https://wiki.lustre.org/PFL_Prototype_High_Level_Design
+Page ID:      1023
+Last Updated: 2025-09-25T19:23:09Z
+Last Editor:  Adilger
+Edit Comment: Move to common Architecture category
+
+--- Content ---
+Introduction
+Note: The PFL Phase 2 High Level Design document for the full project that takes precedence over this document.
+
+The Lustre Progressive File Layouts (PFL) feature intends to simplify the use of Lustre so that users can expect reasonable performance for a variety of normal file IO patterns without the need to explicitly understand their IO model or Lustre usage details in advance. In particular, users do not necessarily need to know the size or concurrency of output files in advance of their creation and explicitly specify an optimal layout for each file in order to achieve good performance for both highly concurrent shared-single-large-file IO or parallel IO to many smaller per-process files.  The PFL Prototype Scope Statement describes the overall goals and intended outcomes of this project in more detail, and will not be repeated here.  The PFL Prototype Solution Architecture describes how the goals of the PFL project may be implemented, and how to measure the completion and outcomes of this project. This is the high level design document for the prototype implementation based on the aforementioned scope statement and solution architecture.
+
+The layout of a PFL file is stored on disk as composite layout. A PFL file is essentially an array of sub-layout components, with each sub-layout component being a plain layout covering different and non-overlapped extents of the file. For the prototype, each sub-layout component will only contain an existing RAID-0 layout (one of the existing LOV_MAGIC_V1 or LOV_MAGIC_V3 layouts), though the composite layout itself doesn't know the details of the sub-layout and it could hold other types of plain layouts. In the rest of this document, sometimes we will use component to represent a sub-layout component when the context is not ambiguous.
+
+For PFL files, the file layout is composed of a series of components, therefore it's possible that there are some file extents are not described by any components. When those unmapped file extents are being accessed, in the prototype phase of PFL, applications will be returned with ENODATA. This implies an important principle that a file range must be attached to a component before it can be accessed. In the production phase of PFL, when a file range with undefined component is accessed, clients will send a Layout Intent RPC to the MDT, and the MDT should have enough information to generate a default layout component for that specific range of file.
+
+Feature Requirements
+This is a project to implement progressive file layout based on composite layout. At the end of this project, Lustre should be able to perform the following operations:
+
+Composite Layouts
+Lustre should be able to recognize and parse composite layout on the LOD and LOV layer. Composite layouts as described in the Layout Enhancement High Level Design will be used.
+
+User Space Tools for PFL
+Create PFL files
+Users may create PFL files using the lfs setstripe command. To set file layout by components, the file must be started with an empty layout.  Once the first request is received to create a component, the MDT will create a composite layout for this file. A library function will be provided to achieve the same effect.
+
+Append components to PFL files
+The lfs setstripe command will also be used to append new components to a PFL file. New components may only be appended with increasing, non-overlapped extents. A library function will be provided to achieve the same effect.
+
+Display the layout of a PFL file
+The lfs getstripe command will be enhanced to recognize and display the layouts of PFL files.
+
+File Operations
+Whenever a component is appended to a PFL file, the layout lock of the file must be revoked, so that clients can be notified and then fetch an up-to-date file layout. To support PFL, clients must recognize and reconfigure the cl_object stack by composite layouts. Different operations will be supported as follows.
+
+Read and write support
+Before a read or write operation starts, the client side IO stack will verify if it has got an up-to-date layout, based on the client holding the MDT layout lock for that file. Otherwise, layout lock is enqueued and layout will be fetched from the MDT side. Based on the assumption that layout components must be defined before use, if it finds IOs against an undefined component, the client side will return an ENODATA error to the application.
+
+Once a component is created, it won't be altered further, only new components added after existing ones. The client knows that the existing components must be valid for the lifetime of the file. There is no concern about data inconsistency caused by changing the layout on an existing file. There is not necessarily a requirement that there are no open handles for PFL files when appending new components.
+
+Truncate support
+There are two cases for truncate: truncate down and truncate up. For truncate down, client will send truncate requests to all of the components of the file in order to ensure data consistency. Truncate will not destroy objects of components beyond the new file size.  As for files with regular layout, truncate to zero won't result in a file with empty layout.
+
+For truncate up, if the truncate size is beyond the end offset of the largest component, truncate will fail with ENODATA. The rule of defining before use applies here too.  Other than the case of truncating beyond the end of the last component, truncate up will be handled in the same manner as truncate down, by sending the truncate request to all components of the file.
+
+Glimpse support
+The client must be able to get the up-to-date file size from a PFL file.  Since the object size is fetched from all OSTs in parallel, and the number of objects contained in early components will be relatively small compared to the number of objects in the last component there appears to be little benefit to trying to optimize out the RPCs to the earlier objects, as this may cause multiple batches of sequential glimpse RPCs instead of a single batch of parallel glimpse RPCs.
+
+While the largest component will typically have a non-zero size, the extra overhead from sending a glimpse to the small number of stripes for the earlier components in parallel will not increase the overhead significantly, and would avoid significant extra latency for cases where the glimpse is sent in series for each component and the latter components have been instantiated but truncated.
+
+File delete
+Upon file removal, the objects of all components should be destroyed.  The MDS needs to iterate over all components and destroy the objects for each sub-layout.  Beyond this extra iteration, there shouldn't be any extra complexity in deleting PFL files compared to deleting existing widely-striped files.
+
+File setattr
+For operations such as chown/chmod (setattr, excluding file size) the operation must also be sent to all objects in the file.  This is no different than existing RAID-0 striped files.
+
+File sync
+For sync operations, and in the future other range-based operations such as fallocate(), the operation needs to be sent to the components and objects therein  that intersect with the requested offsets.  For sync this is commonly the full file size and the sync RPC is sent to all objects, but in some cases only a small range of the file is being sync'd or preallocated so the same mapping of syscall range to components and objects is done as for read and write.  In that case the operation will only be sent to the components and offsets within the intersecting region.
+
+Composite Layout Design
+It is desirable that the details of composite layouts is encapsulated into the LOD and LOV code as much as is possible.  That allows treating the PFL files in a manner identical to plain files with many stripes. The encapsulation of layout handling into the LOV layer is being achieved as part of the CLIO Simplification Project. The PFL prototype will be based on that work.
+
+User Space Tool
+Create and append component of PFL files
+The lfs setstripe command will be used to
+
+-  create a PFL file with initial extent END) and stripe count COUNT,
+-  append a component with extent [BEGIN, END) and stripe count COUNT.
+
+In both cases the invocation is:
+
+ lfs setstripe --component-start=<BEGIN> --component-end=<END> --stripe-count=<COUNT> [OPTIONS... (BEGIN,) 
+
+Other striping options may be specified instead of, or along with, the stripe count. The same command is used to add new extents.  If no --component-start is given it will default to the end of the last extent.  If no --component-end is given it will default to OBD_OBJECT_EOF and be the last component in the file. Applications may achieve the same effect by calling the functions llpfl_create() and llpfl_setstripe().  The llpfl_ prefix is used for the prototype implementation to avoid possible name clashes with llapi_ in case the API is changed for the production release. The production release API will use the llapi_ prefix for these functions. 
+ /**
+  * Create a PFL file at path with initial component described by param and extent end).
+  * Return an opens file descriptor on success, or a negative errno on error.
+  */
+ int llpfl_create(const char *path, int open_flags, mode_t mode,
+                  const struct llapi_stripe_param *param,
+                  loff_t begin, loff_t end);
+ 
+ /**
+  * Add a component described by param with extent [begin, end) to the PFL file at path.
+  * Return 0 on success, or a negative errno on error.
+  */
+ int llpfl_setstripe(const char *path,
+                     const struct llapi_stripe_param *param,
+                     loff_t begin, loff_t end);
+
+Adding a component to a PFL file will be implemented by the LL_IOC_LOV_COMP_MD_OP ioctl described in the Layout Enhancement HLD.
+ struct lov_comp_md_op_user {
+         struct lov_comp_md_op lcmou_op;
+         __u32                 lcmou_fd;
+ };
+ 
+ #define LL_IOC_LOV_COMP_MD_OP _IOW('f', /* TBD */, long)
+
+Given an existing PFL file at path, adding a component will be implemented as:
+ int llpfl_setstripe(const char *path,
+                     const struct llapi_stripe_param *param,
+                     loff_t begin, loff_t end)
+ {
+         int fd1 = open(path, O_RDWR | O_LOV_DELAY_CREATE);
+  
+         /* Create a volatile victim file. */
+         int fd2 = open_volatile(dirname(path), O_RDWR | O_LOV_DELAY_CREATE);
+  
+         /* Change the mode and ownership of fd2 to match that of fd1. */
+         ...
+  
+         /* Convert param to LUM and apply it to volatile file. */
+         struct lov_user_md *lum = lov_user_md(param);
+         ioctl(fd2, LL_IOC_LOV_SETSTRIPE, lum);
+  
+         /* Move volatile file striping to a component of fd1. */
+         struct lov_comp_md_op_user lcmou = {
+                 .lcmou_op = {
+                         .lcmo_opc = LCMO_MOVE_ENTRY,
+                         .lcmo_layout_gen[0 (begin,) = -1,
+                         .lcmo_layout_gen1 = -1,
+                         .lcmo_entry_id = LCME_ID_ANY,
+                         .lcmo_entry_extent = {
+                                 .le_begin = BEGIN,
+                                 .le_end = END,
+                         },
+                 },
+                 .lcmou_fd = fd2,
+         };
+         ioctl(fd1, LL_IOC_LOV_COMP_MD_OP, &lcmou);
+         close(fd2);
+         return 0;
+ }
+
+The LL_IOC_LOV_COMP_MD_OP ioctl will be handled by a new client-to-MDT RPC MDS_LOV_COMP_MD_OP which is described in the Layout Enhancement HLD.
+
+4.2. Display the layout of a PFL file
+The lfs getstripe command will be extended to display the striping of PFL files.  The entry_id:, extent_begin:, and extent_end: fields are added to describe each component, but the remaining fields are kept the same compared to the existing lfs getstripe output for code re-use and to minimize the need to change userspace parsers. 
+
+ lustre# lfs getstripe f0
+ f0
+ entry_id: 1
+     extent_begin:       0
+     extent_end:         33554432
+     lmm_stripe_count:   1
+     lmm_stripe_size:    1048576
+     lmm_pattern:        1
+     lmm_layout_gen:     0
+     lmm_stripe_offset:  0
+     obdidx         objid         objid      sequence
+          0             2           0x2             0
+ entry_id: 2
+     extent_begin:       33554432
+     extent_end:         4294967296
+     lmm_stripe_count:   4
+     lmm_stripe_size:    1048576
+     lmm_pattern:        1
+     lmm_layout_gen:     0
+     lmm_stripe_offset:  0
+     obdidx         objid         objid      sequence
+          1             3           0x3             0
+          2             3           0x3             0
+          3             3           0x3             0
+          4             3           0x3             0
+ entry_id: 3
+     ...
+
+Changes on client stack for PFL
+The client IO stack will be changed to recognize composite layouts and distribute IO from the LLITE layer to the corresponding OST objects of layout components. The principle that components must be defined before use still applies here.
+
+The current client implementation has an architecture that splits a LLITE layer IO into several sub-IOs based on stripe boundary, and then iterates over each sub-IO until the whole IO is completed. Based on the fact that PFL is stacked upon a series of plain sub-layouts of known type, we can enhance this iteration structure to make it usable on PFL files. Another goal in this design is to reuse the current code of RAID-0 implementation as much as possible.  In the future, as new plain layout types are added, it should be possible to use these as individual components within the composite file.
+
+5.1. Mapping between file offset to the offset of OST object
+For a layout component L in a PFL file covering the range of file [l_start, l_end) with stripe count S, given any file offset O, with l_start ≤ O < l_end, how to figure out the offset on the corresponding OST object?
+
+It calculates the offset on OST as if the file had stripe count S for the entire file, and uses formula of the sub-layout to work it out. Therefore, if L is not the first component of the PFL file, the objects on the OST side will be sparse files with holes for the extent covered by the previous components. One benefit of using this structure is that data migration and partial HSM restore will be easier in the future because it doesn’t have to move data around in the OST objects when they change from being plain files to PFL components. Another benefit is of course to use the existing layout handling code.
+
+It’s worth mentioning that l_start may not be stripe size aligned for this component, though it must still follow other alignment requirements for plain layouts. In that case, the first stripe of L will have less bytes than stripe size. However, l_end must be stripe size aligned.
+
+Let's show an example of how data blocks of PFL files are mapped to OST objects of components:
+
+Image:PFL_object_mapping.png
+
+The PFL file in the PFL Object Mapping diagram has 3 components and shows the mapping for the blocks of a 2055MB file. The stripe size for the first two components is 1MB, while the stripe size for the third component is 4MB.  The stripe count is increasing for each successive component. The first component only has two 1MB blocks and the single object has a size of 2MB.  The second component holds the next 254MB of the file spread over 4 separate OST objects in RAID-0, each one will have a size of 256MB / 4 objects = 64MB per object.  Note the first two objects obj 2,0 and obj 2,1 have a 1MB hole at the start where the data is stored in the first component.  The final component holds the next 1800MB spread over 32 OST objects. There is a 256MB / 32 = 8MB hole at the start each one for the data stored in the first two components.  Each object will be 2048MB / 32 objects = 64MB per object, except the obj 3,0 that holds an extra 4MB chunk and obj 3,1 that holds an extra 3MB chunk.  If more data was written to the file, only the objects in component 3 would increase in size.
+
+Note that it was considered whether the OST objects in the latter components would start with their 0 offset at the start of their component's layout offset, but this was considered to be both more complex to implement, as well as more difficult for applications to manage. This would require the in-kernel code to be modified to handle sub-layouts from PFL files differently from non-PFL files.  It would also require applications to track the stripe size of each preceding component in order to compute the optimal IO offset and size for each component.  In the current design where each component is treated as if it made up the whole file it is possible to determine the optimum IO offset and size using only the stripe size of the current component.
+
+Reverse map, which maps offset on OST object to file offset, is similar. However, one major difference is that for a file with RAID-0 layout, the layout is unique for the whole file and then can be considered as a piece of known information; but this doesn't apply to PFL files. It will need the layout of component where the OST object resides to figure out the correct file offset.
+
+Build cl_objects in Memory by Composite Layout
+Once PFL is received on the client side, it will be used to initialize or reconfigure cl_objects on the client side. The data structure lov_object will be revised to encapsulate this new form of layout.
+
+Based on the fact that PFL is composed of an array of sub-layouts (currently only RAID-0), it will be convenient to arrange sub objects of lov_object as a pointer array of lov_layout_raid0.
+
+The data structure of lov_object will be revised as follows:
+ struct lov_layout_entry {
+       struct lu_extent lle_extent;
+       struct lov_layout_raid0 lle_raid0;
+ };
+ 
+ union lov_layout_state {
+       struct lov_layout_raid0 raid0;
+       struct lov_layout_empty empty;
+       struct lov_layout_released released;
+       struct lov_layout_composite {
+                   /* current valid entry count of lo_entries */
+                   unsigned int lo_entry_count;
+                   struct lov_layout_entry *lo_entries;
+       } composite;
+ }
+
+The lo_entries store an array of lov_layout_entry items that is unpacked from composite layout. Each entry represents a layout component of the PFL file and corresponding file range attached to that layout. The array can be arranged sequentially by the start offset of component, therefore it's easier to locate the corresponding component by file offset.
+
+A new lov_layout_operations will be defined and methods for composite layout will be added. The existing RAID-0 layout code will be reused to build the operations.
+
+IO Framework to Support PFL
+The current IO framework will be enhanced to support IO against PFL files. Now that the current IO implementation is able to detect and split the IO by boundaries of stripe, one more level will be stacked upon the current IO architecture to detect and split IO by boundaries of layout component.
+ cl_io_loop() {
+     for (each layout component L within the file request I/O range) {
+         if (L is empty layout)
+             return -ENODATA;
+  
+         /* layout segment L has RAID-0 layout */
+         for (each stripe of layout component L) {
+             cl_io_lock() will be called to request cl_lock for the I/O region of this stripe;
+             do I/O;
+             cl_io_unlock() will be called to release the cl_locks;
+         }
+     }
+ }
+
+In CLIO, the callback cio_iter_init() of cl_io_operations is called to determine the sub IO size of each iteration. For PFL files, the callback on the LOV layer is lov_pfl_iter_init(). This function will detect the edge of components and split upper level IO into sub IOs, and each sub IO is within only one component. The cl_io_loop() may need to run multiple iterations to finish the whole IO. In the prototype phase of PFL, it assumes that the layout must be set before an I/O starts. This is why the iteration will exit with error if it encounters an undefined component.
+
+In order for the next operation to proceed, struct lov_io will have new information to remember the layout segment it currently works on.
+
+Once lov_pfl_iter_init() is complete, cl_io_{lock,unlock}() will be called against the layout component as if it worked on regular RAID-0 files.
+
+Unlike the current CLIO implementation for RAID-0, where the corresponding callback cio_iter_fini() pretty much does nothing, for PFL lov_pfl_iter_fini() will clean up the environment for the current component so that the memory in structure lov_io can be used for next component.
+
+This framework will apply to all kinds of IO, including read, write, setattr, and truncate, etc. In this way, we can reuse the current layout handling implementation as much as possible and the IO framework is clearer. There is no change in the OSC layer, since the individual OST objects are handled independently and are not aware of PFL or even plain layouts.
+
+Read and Write IO Support
+Basic read and write operations have already been covered by the IO framework discussed in the previous section. This section will discuss read ahead and append write, which are considered as extending read and write.
+
+For read ahead, cio_read_ahead() will be revised to handle PFL files to ensure the read ahead window does not cross the stripe boundary of each component.  Otherwise, the client may expend effort trying to read ahead data for an OST object extent covered by the next component that could never hold any data.
+
+For appending writes to a PFL file, the client needs to detect the end of the file so that it can know where the write should start. The client has to lock all the objects in the file for this purpose, as it does with plain files today.
+
+Page Cache Management
+In current implementation of client IO stack, layout change will cause page cache invalidation for the whole file. This has large overhead because applications have to warm up read cache again. In the current implementation, layout change can only happen for HSM release and migration, where the layout will be completely changed and the original OST objects become invalid. However, this is not true for PFL files as it can only append components to the end of the existing layout, which means previous components are still correct and cached pages can be kept in memory without any concerns of data corruption.
+
+Client IO stack will be optimized for PFL files under layout append. From the design of composite layout, there are two layers of layout version, one is the composite layout version for the composite file layout, and the other ones are sub layout versions for the component entries. PFL will take advantage of this to use sub layout versions for components. In the case of layout change, the client side will not only compare composite layout versions, but also check sub layout versions of components. It will keep the pages in the memory for valid components, which should be always true for PFL.
+
+To achieve this goal, lov_layout_change() will be revised to take sub layout versions into account. Function cl_object_prune() and corresponding callbacks will be revised to truncate pages by file offset.
+
+File Locking
+File extent locking will largely remain the same as it is in the current Lustre, with the addition of the changes to the IO framework to do component enumeration.  The syscall {start,end} extent will first be used to find components that intersect the syscall extent, and then will be mapped to individual objects within those components as is done today. Lock extension at the OST side does not directly cause problems with the client, though care should be taken when matching extent locks for readahead to ensure that RPCs are not generated for hidden parts of objects that are not visible to the application because of overlapping components.
+
+Truncate Support
+Truncate down will just purge the data from where it truncates but leave OST objects. This may leave some OST objects without any data, but with non-zero size (remember the objects may be sparse if the component is not the first one), if the corresponding component is beyond the truncate size.  The client will send truncate RPCs to the OST objects of all components to ensure data consistency in all cases. After truncate is finished, those component will return the truncate size for glimpse.
+
+To support truncate up, the client needs to send the truncate size to the MDT. The MDT will check the new size to make sure that it does not extend beyond the last component, or ENODATA will be returned. If no error is returned from the MDS, the truncate RPC will be sent to all components' OST objects to modify them to the new size.
+
+Glimpse support
+Glimpse may be one of the most frequent operations in Lustre. Performance is a major concern for PFL files because it has more objects than regular files.
+
+If a PFL file has not created or instantiated components for the end of the file, then glimpse will be fast since there will be only a few objects allocated to the file. 
+
+If a PFL file has never been truncated downward, the size of the largest component is likely to hold the file size. However, if a PFL file was truncated downward, the components beyond the truncate size will be trimmed so that the OST objects are still there but there is not any data in them. Later writes to components before the last component would only affect the size of the written component and not the last one. It is not possible to distinguish between these cases before the glimpse is sent. 
+
+To glimpse a PFL file, the client will send glimpse RPCs to all objects of all components in the file. When calculating the file size, the client computes the size of each components and chooses the largest file size.
+
+Server Changes for PFL
+Object Creation
+The allocation of specific OST objects to PFL files will be handled by the MDS on behalf of the client.  With the PFL prototype, objects will only be explicitly created for a new component as part of layout creation via lfs setstripe from the client.  Since the individual components will still be using RAID-0 layouts, the object allocation code on the MDS will remain largely the same.  For the prototype, there will not necessarily be coordination between OST selection of objects from one component to the next.  However, this can be managed adequately for testing purposes from userspace via lfs setstripe options.
+
+Layout Modification
+A handler for the new MDS_LOV_COMP_MD_OP RPC mentioned above will be installed to the MDT layer. The MD and DT object APIs used by the MDT, MDD, and LOD will be enhanced to accommodate the composite layout operations needed for PFL.
+
+Setattr
+Changing the file owner or group (chown() or chgrp()) requires sending an RPC from the client to the MDS, which journals the update, and then passes the attributes to the OST(s) for that file.  Since the client is not directly involved in this operation, it does not need to be modified in this regard.  The MDS LOD layer will be modified to be able to enumerate all objects in a PFL file.
+
+Other attributes such as timestamp updates are normally piggy-backed onto write RPCs, but in some cases (e.g. utimes()) the RPCs may be sent directly from the client to the OSS and will need to use the same component and object enumeration mechanism.
+
+File Deletion
+Similar to file owner or group changes, the MDS is in charge of deleting a file from the OST and destroying all the OST objects allocated to it.  This would use the same OST object enumeration mechanism on the MDS as for setattr. Since the maximum LOV EA or RPC size is not increasing, and due to other overhead for creating composite files, the total number of stripes for a PFL file will be fewer than a plain widely-striped file by some small amount, depending on how many components are created.  For a typical 3-component PFL file the total stripe count would be reduced from a maximum of 2000 stripes in a plain file to around 1991 stripes in total.  In the extreme case, a PFL file with approximately 500 single-stripe components could be created before the current maximum LOV EA or RPC size is hit.  This avoids the risk of overflowing the journal credits needed for unlink logging.
+
+Quotas
+There should be no changes required for file quotas to work with PFL files.  OST objects are not accounted under inode quota limits, only MDT objects, so a user that is out of inode quota could still add components to an existing PFL file without problems.  The block quota accounting would be the same as regular striped file, since each OST accounts quota independently and does not even know that the object is part of a composite file.
+
+In order to avoid confusing quota accounting, the OST objects added to composite files should all use the same UID/GID as the MDT inode.  Otherwise, if a different user has write permission to a file and can extend the layout (which would happen automatically during write in the production implementation) and the OST objects are created with the UID/GID of the writing process there would be quota charged to that user that wouldn't be visible from userspace.
+
+Open issues and Future Work
+Layout Intent Handling
+Right now for the prototype phase of PFL, a component has to be created first before it can be accessed. This is not that convenient because the application must know exactly what kind of layout it should have for every part of the file.
+
+In the production phase of PFL, files will be explicitly created with a layout template, or inherit it from the parent directory. The layou template describes the layout parameters of each component but the actual OST objects won’t be allocated. This is very similar to how default layouts are stored on a parent directory today, but expanded to have a default layout for each component. When a client is trying to access a file offset without a component attached, the client will send the MDT an RPC, called layout intent RPC with the affected file extent.  The MDT will get the request and figure out what kind of layout should be allocated for that range of the file.
+
+Layout intent data structure has already been defined in the current implementation of client:
+ struct layout_intent {
+         __u32 li_opc; /* intent operation for enqueue, read, write etc */
+         __u32 li_flags;
+         __u64 li_start;
+         __u64 li_end;
+ };
+but it’s reserved for future use. The li_opc can only be LAYOUT_INTENT_ACCESS, and li_{start,end,flags} are actually not used. To support layout intent for PFL, those information will be filled out by client, li_opc will be the access mode of client, li_{start, end} will be the range of access. In this way, the MDT will get enough information to generate the corresponding layout component.
+
+Category:Architecture
+Category:PFL

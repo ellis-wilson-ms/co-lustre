@@ -1,0 +1,57 @@
+Key:        LU-17326
+Summary:    Implement FALLOC_FL_COLLAPSE_RANGE and FALLOC_FL_INSERT_RANGE
+Link:       https://jira.whamcloud.com/browse/LU-17326
+Type:       Improvement
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Andreas Dilger
+Created:    Thu, 30 Nov 2023 21:06:43 +0000
+Updated:    Mon, 7 Apr 2025 16:58:14 +0000
+Labels:     medium
+Links:      Cloners: Clones LU-17055; Related: is related to  LU-3606; Related: is related to  LU-18461; Related: is related to  LU-14160; Related: is related to LUDOC-487
+
+--- Description ---
+It would be possible to implement the fallocate(FALLOC_FL_INSERT_RANGE) and FALLOC_FL_COLLAPSE_RANGE options for Lustre, with specific restrictions:
+
+	in all cases there must be a DLM write lock held on the object from offset to OBD_OBJECT_EOF to flush any dirty cache from the clients and prevent access while the layout is being modified.  If this was done on the OST it would ensure the client cache is flushed and fetched again with the correct data.
+
+	as a potentially separate step, if the client sends a lock handle in the RPC for the appropriate range of the object, then the OST could assume that the client is adjusting its page cache appropriately and avoid flushing the entire file from cache.  The ext4_fallocate() call handles flushing the page cache for local operations, so the llite code would need to do the same for the local page cache to keep it consistent (probably after the OST RPC is successful so that it does not lose local state if the RPC failed for any reason).
+
+	for 1-stripe plain layout (non-PFL) files it would only require blocksize alignment limitations for offset and len, which appear to be enforced by the backing ldiskfs filesystem code itself.  This could basically be implemented today as a straight pass-through with no effort except checking the flags and layout and continuing to return -EOPNOTSUPP from both the client and server for these modes for files with more than one stripe.
+
+	for multi-striped plain layouts the offset must be aligned to an integer multiple of lmm_stripe_size, and len must be an integer multiple of stride = lmm_stripe_count * lmm_stripe_size.  This ensures that whole "stride units" of the file are added/removed at once and the data does not need to be moved between OST stripes of the file when it is shifted.  Otherwise the client would continue to return -EOPNOTSUPP for PFL files.  The offset should be mapped in LOV to the proper starting offset of the OST object, and len should be divided by lmm_stripe_count so that there is an appropriate amount of space added/removed from each object by calling fallocate() on each object individually.
+
+	for a PFL file, this alignment/size restriction applies to both the layout of the current component (and any overlapping mirror components at that offset) and any later components in the file (if allocated), to ensure that any data shifts in the later components can also be handled without data movement since they will also need to have fallocate() called on all allocated objects for the component.  It would also be necessary to shift the lcme_extent.e_start and .e_end for the following component(s) so that the file layout is suitably mapped to the new data offset. It is also necessary for the OST to update ost_layout.ol_comp_start and ol_comp_end in the filter_fid xattr on the OST object as part of the same transaction as fallocate() so that the data stays consistent.
+
+	in a far distant future where this feature is heavily used and important for some workload, it might be possible to reduce the stride alignment to only lmm_stripe_size (largest in current and later components) by reordering the OST objects in the current and later component layouts.  That still avoids the need to move between objects on different OSTs, but is of course much more complex to get right, and can be avoided by selecting suitable stride = stripe_count * stripe_size for all components of a file (e.g. smaller stripe_size for later components to compensate for larger stripe_count).
+
+There would be some risk when using these operations on a file, since at least fallocate(FALLOC_FL_COLLAPSE_RANGE) cannot be reversed if there is an error when the operation is partially applied to multiple stripes/components of the file.  This is not totally different from truncate() or fallocate(FALLOC_FL_PUNCH_HOLE), but the added risk is that a partially-applied data shift would leave any incomplete parts of the file with the wrong data (as opposed to stale but formerly correct data).  It may be necessary to implement recoverability for a partial operation via a logged transaction from the MDS to ensure that it is applied to an OST object after recovery (in an idempotent way, since repeated shifts would also corrupt the data).  For a mirrored file, one option would be to mark a mirror stale if the shift partly fails, and leave it up to a resync agent to copy the data again with the correct offset in that case.
+
+--- Comment (adilger, Mon, 7 Apr 2025 16:58:14 +0000) ---
+For non-PFL files (striped or not) I think this is relatively straight forward to implement, with restrictions on alignment as previously discussed.
+
+I think there are a few possible mechanisms to implement INSERT_RANGE and COLLAPSE_RANGE on a PFL file:
+
+	adjust the extent start and extent end of the components to compensate for the data shift, so that data does not need to be moved between OSTs
+
+	"move" data (mirror to new overlapping object, punch from old object) between objects on OSTs to handle the shift of data across a PFL component boundary, if a later PFL component is initialized. The INSERT/COLLAPSE offset should still be aligned with the stripe width (= stripe size * stripe count) of the last component so that only a small amount of data needs to be copied across the bounary, and not the entire objects
+
+	"move" the data (mirror) from the earlier component(s) to the last initialized component, then remove the earlier component(s) from the layout completely, then do the INSERT/COLLAPSE operation.  This would essentially "de-PFL" the file to make it a plain striped file (at least up to the last initialized component) so that the aligned INSERT/COLLAPSE operation does not need to move data across PFL component boundaries.  This is more work than the previous option (move data across the component boundaries), but might be more efficient if INSERT/COLLAPSE is done repeatedly on a file.
+
+Note that there is already work being done in LU-18461 to implement "file join", which would allow S3 multi-part file uploads to be merged into a single file at the Lustre level.  I'm not aware of applications using the INSERT_RANGE and COLLAPSE_RANGE operations that are widely used, so I don't think there is a high priority to implement these changes.  There are, IMHO, more important/useful features that could be implemented, but this ticket was created to capture ideas in case this needs to be implemented for specific applications.
+
+--- Comment (JIRAUSER19404, Wed, 2 Apr 2025 08:27:14 +0000) ---
+for a PFL file with multiple components, invoke INSERT_RANGE on a full component may cause data movement onto the next component, and may cascade to all the following full components as well ?
+
+--- Comment (nrutman, Thu, 1 Aug 2024 17:11:43 +0000) ---
+That's correct, but probably rare. In such cases an S3 server could fall back to a full file copy.
+
+--- Comment (adilger, Thu, 1 Aug 2024 05:07:19 +0000) ---
+I'd asked about S3 multipart uploads in the past, and my understanding is that there is no guarantee that the size of each part is an even multiple of the blocksize.
+
+--- Comment (nrutman, Wed, 31 Jul 2024 22:30:24 +0000) ---
+Came across this ticket as it would be a good building block for another nice-to-have feature: atomic file join. One could imagine creating a native concatenated file with PFL by simply adding the layouts of two files together in PFL (and adjusting extent start/end). This requires that each part start from file offset 0, which we could do with FALLOC_FL_INSERT_RANGE. 
+
+The driving use case here is S3 multipart upload, where we could join the parts atomically (S3 doesn't provide part offsets ahead of time, so we can't just write into a single file).

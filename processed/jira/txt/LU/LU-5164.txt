@@ -1,0 +1,140 @@
+Key:        LU-5164
+Summary:    Limit lu_object cache (ZFS and osd-zfs)
+Link:       https://jira.whamcloud.com/browse/LU-5164
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Nathaniel Clark
+Reporter:   Brian Behlendorf
+Created:    Mon, 9 Jun 2014 17:24:30 +0000
+Updated:    Sat, 11 Oct 2014 04:42:07 +0000
+Resolved:   Wed, 18 Jun 2014 13:08:24 +0000
+Labels:     patch, performance, server, zfs
+Links:      Related: is related to LU-5240
+
+--- Description ---
+For OSDs like ZFS to perform optimally it's import that they be allowed to manage their own cache.  This maximizes the likelyhood that the ARC will prefetch and cache the right buffers.  In the existing ZFS OSD code a cached LU object pins buffers in the ARC preventing them from being dropped.  As the LU cache grows it can consume the entire ARC preventing buffers for other objects, such as the OIs, from being cached and severely impacting the performance for FID lookups.
+
+The proposed patch addresses this by limiting the size of the lu_cache but alternate approaches are welcome.  We are carrying this patch in LLNLs tree and it does help considerably.
+
+--- Comment (yujian, Sat, 20 Sep 2014 06:54:03 +0000) ---
+Here is the back-ported patch for Lustre b2_5 branch: http://review.whamcloud.com/12001
+
+--- Comment (bzzz, Wed, 23 Jul 2014 02:24:32 +0000) ---
+> Is there any expensive operation we want to avoid when creating an object from ARC buffers (i.e. no disk IO)?
+
+OI lookup, SA initialization.
+
+--- Comment (isaac, Tue, 22 Jul 2014 23:19:36 +0000) ---
+lu_object_put() calls ->loo_object_release() when the last reference to the object gone, but this is not what we need, I guess: this won't work for a client accessing a directory exclusively as every time RPC completes we'll be getting ->loo_object_release() while few cycles later we get another RPC to the same directory.
+
+In this case, if the ARC is doing a decent job, the buffers should still be cached and no IO will be need to create the object again. Is there any expensive operation we want to avoid when creating an object from ARC buffers (i.e. no disk IO)?
+
+--- Comment (isaac, Tue, 22 Jul 2014 23:15:04 +0000) ---
+My knowledge of the Lustre server stack is very limited, so I'm not sure whether it's feasible or not. But here's my thoughts:
+
+1. Get rid of the LRU completely. Objects are freed once the last reference is dropped. Then it'd be equivalent to the ZPL way of holding on to DMU objects/buffers only for the duration of system calls. This also gives the ARC the freedom to decide which buffers to keep or evict. After all, the ARC is supposed to do a better job than a simple LRU.
+
+2. When osd-zfs has the knowledge that certain objects are frequently used or will be used soon, hold references to those objects proactively. For example:
+
+	If last_rcvd is used for most RPCs, hold a ref for the lifetime of the MDS kernel module.
+
+	When a RPC is queued, do some preprocessing, look at the objects that will be needed, and look them up in the lu_site cache:
+	
+		If it's already there, add a ref to it so that it stays in the cache.
+
+		If it's not there already, we may do nothing if cache size is near a threshold, or load the object into the cache aggressively.
+
+	
+	
+
+This way ARC has the freedom it needs, and osd-zfs also contributes when it knows better what to cache. It should be able to handle to case Alex outlined where a client accesses a directory exclusively, because the queued RPCs will keep objects used by the current RPC in the cache.
+
+--- Comment (bzzz, Mon, 7 Jul 2014 10:33:22 +0000) ---
+> That sounds reasonable to me. Do we have an easy way to tell the different between frequently accessed objects which should keep their SA cached and rarely accessed objects where it's less critical? I don't want to cache more than we have too.
+
+lu_object_put() calls ->loo_object_release() when the last reference to the object gone, but this is not what we need, I guess:
+
+this won't work for a client accessing a directory exclusively as every time RPC completes we'll be getting ->loo_object_release()
+
+while few cycles later we get another RPC to the same directory.
+
+we could introduce yet another method, probably.. to release resource from the objects from the tail of LRU. but this is yet additional
+
+complexity to the algorithm and additional overhead. this is why I like the idea of limiting cache. but limit I had in mind was in millions
+
+(so memory footprint isn't enormous), rather than literally few objects.
+
+> Sure, but the MM system has code to deal with this. The dentry cache is always pruned before the inode cache which ensures some number of inodes can always be freed.
+
+well, we do register lu_cache_shrink() which is the way MM recycles the memory? very similar if not the same?
+
+--- Comment (behlendorf, Wed, 2 Jul 2014 23:46:26 +0000) ---
+> IMHO, ideally we shouldn't pin SA for rarely used objects, but for frequently accessed ones
+
+That sounds reasonable to me.  Do we have an easy way to tell the different between frequently accessed objects which should keep their SA cached and rarely accessed objects where it's less critical?  I don't want to cache more than we have too.
+
+> also, notice VFS does pin inode with dentry.
+
+Sure, but the MM system has code to deal with this.  The dentry cache is always pruned before the inode cache which ensures some number of inodes can always be freed.
+
+--- Comment (bzzz, Mon, 30 Jun 2014 07:07:05 +0000) ---
+actually I do have a patch which doesn't pin dnode's dbuf, but I'm still concerned about SA overhead. in contrast with POSIX we have to modify many objects every operation (parent, child, last_rcvd, logs). IMHO, ideally we shouldn't pin SA for rarely used objects, but for frequently accessed ones (like logs, last_rcvd, shared directories) it's be better to have SA ready. this is why I agree it's probably better to limit LU cache - frequently accessed objects are here and cheap to use.
+
+also, notice VFS does pin inode with dentry. literally meaning once you have resolved a path to specific dentry you have the inode found. for sure this isn't free - dentry pins amount of data and MM algorithms has to deal with this.
+
+having that said, I'm fine to experiment with the approach holding neither dbuf nor SA handle.
+
+--- Comment (behlendorf, Sat, 28 Jun 2014 00:05:44 +0000) ---
+> they can't be free, especially when OI is huge.
+
+Right, they can't be free.  And we knew adding this layer of indirection would cost us a lookup.  But we can strive to make them as cheap as possible.  If fact, if the configuration contains a respectable number of OSTs (>10) it does become very reasonable to cache the entire OI.
+
+> dnodes are cached and you don't need to go through metadnode
+
+It seems to me that the Lustre LU object cache is directly analogous to the VFS inode cache.  A lu_object in the cache should be able to behave just like a inode/znode.  That means a few things.
+
+1) The number of objects in the cache should be allowed to grow and will be pruned due under memory pressure.
+
+2) Each object in the cache can have a long lived shared SA handle (znodes do)
+
+3) Each object cached object may only reference its assoicated dnode by object number.
+
+4) All holds for a dnode must be dropped before returning from the system call or RPC.
+
+Correct me if I'm wrong, but it looks to me like the Lustre code does 1) and 2) today.  If we update the OSD so the lu_object only references the dnode when needed by its object numberr.  The I don't think we'd need to impose any artificial limits on the cache.  The key bit is the cached but inactive object must not have any outstanding holds.  This would allow the ARC to evict whatever buffers it needed too regardless of what lu_objects are cached.  This exactly how the Posix layer works.
+
+--- Comment (bzzz, Wed, 25 Jun 2014 07:06:09 +0000) ---
+yes, I think we need some golden middle here. it's not just SA, it's also OI lookups themselves. they can't be free, especially when OI is huge.
+
+as for ZFS/posix, I'm not sure I agree - dnodes are cached and you don't need to go through metadnode, initialize dnode structures again and again. it's just that ARC knows how to deal with payload properly?
+
+--- Comment (behlendorf, Tue, 24 Jun 2014 23:32:06 +0000) ---
+It sounds like we're going to need to run some benchmarks to get a handle of the real performance implications of this.  When the cache is very small (effectively zero) you have concerns about the cost of initializing a SA for nearly every RPC.  Conversely when the LU cache is allowed to grow to fill memory it forces all the OI ZAP blocks out of the ARC meaning nearly every FID lookup must go to disk.  There's perhaps some reasonable middle ground we can settle on for the short term based on the benchmark results.  
+
+Longer term we should think about how to restructure the OSD to avoid both of these problems.  The posix layer avoids this issue by only keeping a hold on the dnode for the duration of the relevant system call.  Arguably the OSD should be doing something analogous and only holding the dnode for the length of the RPC.
+
+--- Comment (bzzz, Tue, 24 Jun 2014 19:21:47 +0000) ---
+we discussed this yet another time on the call today and it seems I missed the important thing in the original patch. I don't think making LU cache tiny is a good idea - it means we'll have to lookup in OI very often and initialize SA handler very often. I do understand the original reason and that we want more flexibility for ARC, but I'd think even many thousands of objects in LU won't make it worse at all, rather better - because we don't need to lookup in OI and do expensive SA initialization nearly every RPC.
+
+--- Comment (pjones, Wed, 18 Jun 2014 13:08:24 +0000) ---
+Landed for 2.6
+
+--- Comment (behlendorf, Tue, 17 Jun 2014 17:50:08 +0000) ---
+Unfortunately, I've been swamped and haven't been able to collect any actual before and after test results.  However, without this patch we would clearly see virtually all the ARC buffers which back the OI ZAPs get forced out of the ARC cache.  That meant at least one physical IO for every look up.  With the patch the active sections of the OIs now stay cached in the ARC and we see a much better hit rate.  Which is got to help performance considerably but I just haven't collected the data.  I think this patch really should go in to 2.6, we're running with it in our tree and have seen no issues.
+
+--- Comment (isaac, Tue, 17 Jun 2014 00:29:26 +0000) ---
+Hi Brian, do you have some data to share about "it does help considerably"?
+
+--- Comment (pjones, Mon, 9 Jun 2014 17:39:30 +0000) ---
+Hi Nathaniel
+
+Could you please review this patch?
+
+Thanks
+
+Peter
+
+--- Comment (behlendorf, Mon, 9 Jun 2014 17:33:03 +0000) ---
+http://review.whamcloud.com/#/c/10237/1

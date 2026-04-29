@@ -1,0 +1,548 @@
+Key:        LU-4008
+Summary:    Reduce vmalloc usage on MDS
+Link:       https://jira.whamcloud.com/browse/LU-4008
+Type:       Bug
+Priority:   Critical
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Oleg Drokin
+Reporter:   Prakash Surya
+Created:    Wed, 25 Sep 2013 16:55:05 +0000
+Updated:    Tue, 29 Apr 2014 13:45:44 +0000
+Resolved:   Tue, 15 Apr 2014 13:03:24 +0000
+Labels:     mn4
+
+--- Description ---
+Using "perf" and "oprofile" on Grove's MDS (768 OSTs in the FS), I see an absurd amount of CPU time being spent contending on the kernel's vmlist_lock.
+
+I ran oprofile for 10 mins on grove-mds1 to collect some CPU profiling information and it shows the top 5 CPU consumers being:
+
+                                                                      
+%                symbol_name                                                    
+50.2404     __write_lock_failed                                                 
+  7.5581     __vmalloc_node                                                     
+  6.9957     remove_vm_area                                                     
+  5.2425     cfs_percpt_lock                                                    
+  4.9054     intel_idle                                                         
+
+                                                                      
+
+If I dig into the details of __vmalloc_node and remove_vm_area, most of the time is being spent on these two lines vmalloc.c:1285 and vmalloc.c:1434 respectively. Both of these lines correspond to a linear traversal of the global vmlist while holding write privileges of the vmlist_lock.
+
+Using "perf" during a 1 min interval, I collected stack traces of the threads to try and better understand to code path leading to the contention. I've copied a few of these traces below:
+
+                                                                      
+* 1.11% - kiblnd_sd_01_00                                                       
+          __write_lock_failed                                                   
+          100% - remove_vm_area                                                 
+                 __vunmap                                                       
+                 vfree                                                          
+                 cfs_free_large                                                 
+                 null_free_rs                                                   
+                 sptlrpc_svc_free_rs                                            
+                 lustre_free_reply_state                                        
+                 reply_out_callback                                             
+                 lnet_eq_enqueue_event                                          
+                 lnet_msg_detach_md                                             
+                 lnet_finalize                                                  
+                 kiblnd_tx_done                                                 
+                 kiblnd_complete                                                
+                 kiblnd_scheduler                                               
+                 child_rip                                                      
+* 0.65% - kiblnd_sd_01_01                                                       
+          _spin_lock                                                            
+          98.97% - cfs_percpt_lock                                              
+                   55.89% - lnet_finalize                                       
+                            kiblnd_tx_done                                      
+                            kiblnd_tx_complete                                  
+                            kiblnd_complete                                     
+                            kiblnd_scheduler                                    
+                            child_rip                                           
+                   43.93% - lnet_ptl_match_md                                   
+                            lnet_parse                                          
+                            kiblnd_handle_rx                                    
+                            kiblnd_rx_complete                                  
+                            kiblnd_complete                                     
+                            kiblnd_scheduler                                    
+                            child_rip                                           
+* 0.46% - mdt_rdpg01_001                                                        
+          __write_lock_failed                                                   
+          69.34% - __vmalloc_node                                               
+                   vmalloc                                                      
+                   cfs_alloc_large                                              
+                   null_alloc_rs                                                
+                   sptlrpc_svc_alloc_rs                                         
+                   lustre_pack_reply_v2                                         
+                   lustre_pack_reply_flags                                      
+                   lustre_pack_reply                                            
+                   req_capsule_server_pack                                      
+                   mdt_close                                                    
+                   mdt_handle_common                                            
+                   mds_readpage_handle                                          
+                   ptlrpc_server_handle_request                                 
+                   ptlrpc_main                                                  
+                   child_rip                                                    
+          30.66% - remove_vm_area                                               
+                   __vunmap                                                     
+                   vfree                                                        
+                   cfs_free_large                                               
+                   null_free_rs                                                 
+                   sptlrpc_svc_free_rs                                          
+                   lustre_free_reply_state                                      
+                   ptlrpc_server_free_request                                   
+                   ptlrpc_server_drop_request                                   
+                   ptlrpc_server_finish_request                                 
+                   ptlrpc_server_finish_active_request                          
+                   ptlrpc_server_handle_request                                 
+                   ptlrpc_main                                                  
+                   child_rip
+* 0.35% - mdt00_047                                                             
+          __write_lock_failed                                                   
+          68.66% - __vmalloc_node                                               
+                   vmalloc                                                      
+                   cfs_alloc_large                                              
+                   null_alloc_rs                                                
+                   sptlrpc_svc_alloc_rs                                         
+                   lustre_pack_reply_v2                                         
+                   lustre_pack_reply_flags                                      
+                   lustre_pack_reply                                            
+                   req_capsule_server_pack                                      
+                   70.48% - mdt_unpack_req_pack_rep                             
+                            mdt_intent_policy                                   
+                            ldlm_lock_enqueue                                   
+                            ldlm_handle_enqueue0                                
+                            mdt_enqueue                                         
+                            mdt_handle_common                                   
+                            mds_regular_handle                                  
+                            ptlrpc_server_handle_request                        
+                            ptlrpc_main                                         
+                            child_rip                                           
+                   29.52% - mdt_reint_internal                                  
+                            mdt_intent_reint                                    
+                            mdt_intent_policy                                   
+                            ldlm_lock_enqueue                                   
+                            ldlm_handle_enqueue0                                
+                            mdt_enqueue                                         
+                            mdt_handle_common                                   
+                            mds_regular_handle                                  
+                            ptlrpc_server_handle_request                        
+                            ptlrpc_main                                         
+                            child_rip                                           
+          31.34% - remove_vm_area                                               
+                   __vunmap                                                     
+                   vfree                                                        
+                   cfs_free_large                                               
+                   null_free_rs                                                 
+                   sptlrpc_svc_free_rs                                          
+                   lustre_free_reply_state                                      
+                   ptlrpc_server_free_request                                   
+                   ptlrpc_server_drop_request                                   
+                   ptlrpc_server_finish_request                                 
+                   ptlrpc_server_finish_active_request                          
+                   ptlrpc_server_handle_request                                 
+                   ptlrpc_main                                                  
+                   child_rip                                                    
+
+These vmalloc and vfree calls need to be eliminated from the common code paths.
+
+--- Comment (jamesanunez, Fri, 18 Apr 2014 16:52:56 +0000) ---
+b2_5 patches at
+
+http://review.whamcloud.com/#/c/9942/
+
+http://review.whamcloud.com/#/c/10018/
+
+--- Comment (pjones, Tue, 15 Apr 2014 13:20:32 +0000) ---
+It's ok Matt - we already have this one tracked to be included in 2.5.2 and 2.4.4.
+
+--- Comment (ezell, Tue, 15 Apr 2014 13:10:25 +0000) ---
+These need to be landed to b2_5.  Patch 9322 for b2_5 is 9942 - it should be ready to land.  The b2_5 version of 9571 has not yet been cherry-picked, since it will depend on 9942.
+
+--- Comment (jlevi, Tue, 15 Apr 2014 13:03:24 +0000) ---
+Both 9322 and 9571 patches have landed to Master. Please reopen ticket if more work is needed.
+
+--- Comment (ezell, Mon, 7 Apr 2014 15:16:55 +0000) ---
+The three are 9322, 9409, and 9571.  9409 was abandoned and its functionality was merged into 9322.  So you only need to track 9322 and 9571.
+
+--- Comment (jlevi, Mon, 7 Apr 2014 14:46:00 +0000) ---
+I see 2 patches for this ticket. Can you point me to the third so I can track?
+
+Thank you!
+
+--- Comment (ezell, Sat, 29 Mar 2014 03:05:41 +0000) ---
+Just an update - we are running the first two patches in production, and we haven't been seeing ridiculous numbers of vmallocs.  When we added in some 2.5 clients, we saw vmallocs again.  Patch 9571 appears to successfully avoid those.  9571 will go into production next Tuesday.
+
+We do still see vmallocs for wide-striped files (those over 650-ish stripes).  This is expected, but we expect use of wide-stripe files to be somewhat rare.  The exception to this is users that specify '-1' for the stripe count, resulting in 1008-way striped files.
+
+We need all three of these to land to master and then be backported to 2.5
+
+--- Comment (ezell, Tue, 11 Mar 2014 04:39:52 +0000) ---
+Yes, that is an example of the lock data related to an enqueue that caused a vmalloc.
+
+You are correct, bits 8 is for layout:
+
+#define MDS_INODELOCK_LAYOUT 0x000008 /* for layout */
+
+I pushed http://review.whamcloud.com/9571/ that I want to do some testing with this week on our thin-lun wide-stripe file system.  Does this look safe?
+
+The only reason that the actual size is available there is because of LU-3142.  In that case, according to Hongchao, after failover the new MDS still had the default mdt_max_mdsize.  The MDS returned -ERANGE.  mdt_lvbo_fill will fail with -ERANGE if the layout data is larger than the passed buffer.  Is this going to hit us anywhere else, if we continue to shrink default buffers?
+
+Can/should these patches be marked for additional failover tests to ensure they are safe in those situations?
+
+--- Comment (green, Mon, 10 Mar 2014 22:48:41 +0000) ---
+When you say "A typical lock enqueue for this looks like" - what do you mean by this? Remaining vmalloc enqueue?
+
+bits 8 is likely IT_LAYOUT that will trigger that not yet fixed path for large lvb alloc I suspect.
+
+We'll need to tackle it separately.
+
+--- Comment (ezell, Fri, 7 Mar 2014 02:21:46 +0000) ---
+Thanks for the help Oleg.  We deployed the second patch to production today and it has greatly reduced vmalloc calls.  
+
+The following data is the number of vmallocs from our RPC trace report data collection.  Each report covers approximately 60 seconds.  We took the MDS down at 201403061330 and it took around an hour to go through recovery.
+
+report.201403061000/rpctrace-mds1.bz2:3204
+report.201403061010/rpctrace-mds1.bz2:7230
+report.201403061020/rpctrace-mds1.bz2:5056
+report.201403061030/rpctrace-mds1.bz2:1676
+report.201403061040/rpctrace-mds1.bz2:7014
+report.201403061050/rpctrace-mds1.bz2:679
+report.201403061100/rpctrace-mds1.bz2:2916
+report.201403061110/rpctrace-mds1.bz2:3578
+report.201403061120/rpctrace-mds1.bz2:5015
+report.201403061130/rpctrace-mds1.bz2:2832
+report.201403061140/rpctrace-mds1.bz2:5216
+report.201403061150/rpctrace-mds1.bz2:2981
+report.201403061200/rpctrace-mds1.bz2:1902
+report.201403061210/rpctrace-mds1.bz2:2454
+report.201403061220/rpctrace-mds1.bz2:12722
+report.201403061230/rpctrace-mds1.bz2:2017
+report.201403061240/rpctrace-mds1.bz2:2571
+report.201403061250/rpctrace-mds1.bz2:2891
+report.201403061300/rpctrace-mds1.bz2:3474
+report.201403061310/rpctrace-mds1.bz2:2544
+report.201403061320/rpctrace-mds1.bz2:3009
+report.201403061330/rpctrace-mds1.bz2:3039
+report.201403061550/rpctrace-mds1.bz2:139
+report.201403061600/rpctrace-mds1.bz2:99
+report.201403061610/rpctrace-mds1.bz2:140
+report.201403061620/rpctrace-mds1.bz2:127
+report.201403061630/rpctrace-mds1.bz2:91
+report.201403061640/rpctrace-mds1.bz2:58
+report.201403061650/rpctrace-mds1.bz2:13
+report.201403061700/rpctrace-mds1.bz2:12
+report.201403061710/rpctrace-mds1.bz2:0
+report.201403061720/rpctrace-mds1.bz2:0
+report.201403061730/rpctrace-mds1.bz2:0
+report.201403061740/rpctrace-mds1.bz2:0
+report.201403061750/rpctrace-mds1.bz2:0
+report.201403061800/rpctrace-mds1.bz2:0
+report.201403061810/rpctrace-mds1.bz2:0
+report.201403061820/rpctrace-mds1.bz2:0
+report.201403061830/rpctrace-mds1.bz2:0
+report.201403061840/rpctrace-mds1.bz2:0
+report.201403061850/rpctrace-mds1.bz2:2
+report.201403061900/rpctrace-mds1.bz2:1
+report.201403061910/rpctrace-mds1.bz2:0
+
+A typical lock enqueue for this looks like:
+
+00010000:00010000:13.0:1394140205.643177:0:13482:0:(ldlm_lock.c:1090:ldlm_granted_list_add_lock()) ### About to add lock: ns: mdt-atlas1-MDT0000_UUID lock: ffff883ec0a0f900/0xdc79d3b3eb5bf392 lrc: 3/0,0 mode: CR/CR res: [0x20008e3a7:0x8592:0x0].0 bits 0x8 rrc: 1 type: IBT flags: 0x0 nid: 10.36.202.130@o2ib remote: 0x7096ce8691f14c60 expref: 143537 pid: 13482 timeout: 0 lvb_type: 3 used 0
+
+I looked into it, and it seems like most of the ones after we changed the RPMs are coming from the same node.  It's a 2.5 client used for data transfer.  I looked at the FIDs and determined that they were all stripe-count 4 in a stripe-count 4 directory.  Looking at the process table, I was able to figure out what process was causing them; it is a data transfer app called 'bbcp'.
+
+It will take a couple days before we get user feedback about file system responsiveness, but CPU load seems to have been reduced nicely.
+
+--- Comment (ezell, Thu, 27 Feb 2014 17:27:15 +0000) ---
+We have about 300 2.4+ clients, so it may be possible that they are adding to the problem through the mdt_intent_layout code path.
+
+--- Comment (green, Thu, 27 Feb 2014 16:08:05 +0000) ---
+Yes, this is used to supply a layout to the client, I guess we can try to tame this as a next step. There's also an extra path to this if mdt_intent_layout is called, but old clients have no way of triggering this.
+
+Also note that currently there's only one kind of lock that could be enqueued by the client with no intent: the PR UPDATE lock to guard pages during readdir. Everything else comes in as intent.
+
+--- Comment (ezell, Thu, 27 Feb 2014 05:38:33 +0000) ---
+Thanks Oleg.  After applying 9322 PS3 today we no longer see vmallocs associated with MDS_CLOSE opcodes, but we do see them with LDLM_ENQUEUE.  I briefly looked at patch 9409 and I don't see how it would enqueues.
+
+I plan on looking into it more tomorrow, but my current train of thought is:
+
+	In ldlm_handle_enqueue0() if the request doesn't have an intent, it calls
+
+req_capsule_set_size(&req->rq_pill, &RMF_DLM_LVB, RCL_SERVER, ldlm_lvbo_size(lock));
+
+	mdt_lvbo_size() returns mdt_max_mdsize if (it's not a quota request and) the lock includes the layout lock
+
+Is this used to supply the layout to the client along with the layout lock?  If we could assign this size based on the actual stripe data length it would certainly help.  Or if we could default to something smaller and have the lower layers reallocate for wide-striped files.
+
+We don't currently have a test setup with > 650 OSTs, which has made testing this a little more difficult.
+
+--- Comment (green, Thu, 27 Feb 2014 05:02:05 +0000) ---
+first stab at dynamic reply allocation in: http://review.whamcloud.com/#/c/9409/
+
+seems to  pass my testing even when I reduce my default allocation to just 12 bytes.
+
+Please try it on your many-osts testbed. Also with files striped mo than 100-way and see in what cases do you have any vmallocs left.
+
+--- Comment (green, Mon, 24 Feb 2014 08:53:38 +0000) ---
+Ok, I updated the patch that hopefully should reduce the allocation burden during closes, unlinks and lockless getattrs (those are rares than locked ones, though). Lightly tested.
+
+Now the more complicated dynamic management one is next, I guess.
+
+--- Comment (green, Sat, 22 Feb 2014 21:20:44 +0000) ---
+I am reworking the patch into two.
+
+Not to alllocate EA data in mds_close RPCs and some other places.
+
+And one to try and more dynamically manage rpc allocations.
+
+--- Comment (ezell, Fri, 21 Feb 2014 16:41:37 +0000) ---
+We just checked on a smaller system (280 OSTs) and we didn't see any vmallocs.
+
+I commented in patch 9322 that I don't think it will alleviate our issue here.  The problem, at least for the MDS_CLOSE RPCs, seems to be using mdt_max_mdsize to size the buffer.  Since sizeof(lov_ost_data) is 24, the max LOV EA on our 1008-OST systems is 24K (greater than the 16K boundary to force vmallocs).
+
+Like in patch 6339, can the server allocate a smaller buffer and ptlrpc will expand it if it has overflowed?
+
+Alex Zhuravlev made the following comment in the patch:
+
+we discussed few times in the past, that for the majority of RPCs we should be using some "normal" (i.e. not huge) size and let the client to re-try with a larger buffer if needed.
+
+How do we move forward?
+
+--- Comment (adilger, Fri, 21 Feb 2014 00:53:02 +0000) ---
+The http://review.whamcloud.com/6339 patch will not directly help on the server. That patch is only fixing the reply buffer allocation on the client. It might help indirectly by virtue of the server not allocating its own reply buffer as large to match the client allocating the full-sized buffer.
+
+--- Comment (ezell, Thu, 20 Feb 2014 22:38:41 +0000) ---
+Quick analysis doesn't show anything obvious that points to a particular lock mode, flag, etc.  Here are some samples of lock creates immediately followed by a vmalloc of size 25440:
+
+00010000:00010000:3.0:1392931201.154293:0:15472:0:(ldlm_lockd.c:1333:ldlm_handle_enqueue0()) ### server-side enqueue handler, new lock created ns: mdt-atlas1-MDT0000_UUID lock: ffff882657d60b40/0xfc2e1fc34eb83ce5 lrc: 2/0,0 mode: --/CR res: [0x200030c2a:0x10588:0x0].0 bits 0x0 rrc: 3 type: IBT flags: 0x0 nid: local remote: 0x8e120b6c361d690b expref: -99 pid: 15472 timeout: 0 lvb_type: 0 used 0
+02000000:00000010:3.0:1392931201.154501:0:15472:0:(sec_null.c:320:null_alloc_rs()) vmalloced 'rs': 25440 at ffffc9006a82c000.
+--
+00010000:00010000:3.0:1392931201.155705:0:15472:0:(ldlm_lockd.c:1333:ldlm_handle_enqueue0()) ### server-side enqueue handler, new lock created ns: mdt-atlas1-MDT0000_UUID lock: ffff883ebe0a0d80/0xfc2e1fc34eb83d01 lrc: 2/0,0 mode: --/CR res: [0x200030c2a:0x10588:0x0].0 bits 0x0 rrc: 3 type: IBT flags: 0x0 nid: local remote: 0x8e120b6c361d6935 expref: -99 pid: 15472 timeout: 0 lvb_type: 0 used 0
+02000000:00000010:3.0:1392931201.155917:0:15472:0:(sec_null.c:320:null_alloc_rs()) vmalloced 'rs': 25440 at ffffc9006a834000.
+--
+00010000:00010000:3.0:1392931201.156706:0:15472:0:(ldlm_lockd.c:1333:ldlm_handle_enqueue0()) ### server-side enqueue handler, new lock created ns: mdt-atlas1-MDT0000_UUID lock: ffff883eaf3fc900/0xfc2e1fc34eb83d1d lrc: 2/0,0 mode: --/CR res: [0x200030c2a:0x10588:0x0].0 bits 0x0 rrc: 3 type: IBT flags: 0x0 nid: local remote: 0x8e120b6c361d6966 expref: -99 pid: 15472 timeout: 0 lvb_type: 0 used 0
+02000000:00000010:3.0:1392931201.156926:0:15472:0:(sec_null.c:320:null_alloc_rs()) vmalloced 'rs': 25440 at ffffc9006a83c000.
+--
+00010000:00010000:3.0:1392931201.157814:0:15472:0:(ldlm_lockd.c:1333:ldlm_handle_enqueue0()) ### server-side enqueue handler, new lock created ns: mdt-atlas1-MDT0000_UUID lock: ffff88253b373d80/0xfc2e1fc34eb83d39 lrc: 2/0,0 mode: --/CR res: [0x200030c2a:0x10588:0x0].0 bits 0x0 rrc: 3 type: IBT flags: 0x0 nid: local remote: 0x8e120b6c361d6990 expref: -99 pid: 15472 timeout: 0 lvb_type: 0 used 0
+02000000:00000010:3.0:1392931201.158021:0:15472:0:(sec_null.c:320:null_alloc_rs()) vmalloced 'rs': 25440 at ffffc9006a844000.
+--
+00010000:00010000:3.0:1392931201.158715:0:15472:0:(ldlm_lockd.c:1333:ldlm_handle_enqueue0()) ### server-side enqueue handler, new lock created ns: mdt-atlas1-MDT0000_UUID lock: ffff88259560ed80/0xfc2e1fc34eb83d55 lrc: 2/0,0 mode: --/CR res: [0x200030c2a:0x10588:0x0].0 bits 0x0 rrc: 3 type: IBT flags: 0x0 nid: local remote: 0x8e120b6c361d69ba expref: -99 pid: 15472 timeout: 0 lvb_type: 0 used 0
+02000000:00000010:3.0:1392931201.158931:0:15472:0:(sec_null.c:320:null_alloc_rs()) vmalloced 'rs': 25440 at ffffc9006a84c000.
+--
+00010000:00010000:3.0:1392931201.159783:0:15472:0:(ldlm_lockd.c:1333:ldlm_handle_enqueue0()) ### server-side enqueue handler, new lock created ns: mdt-atlas1-MDT0000_UUID lock: ffff883f65bbcb40/0xfc2e1fc34eb83d71 lrc: 2/0,0 mode: --/CR res: [0x200030c2a:0x10588:0x0].0 bits 0x0 rrc: 3 type: IBT flags: 0x0 nid: local remote: 0x8e120b6c361d69eb expref: -99 pid: 15472 timeout: 0 lvb_type: 0 used 0
+02000000:00000010:3.0:1392931201.159995:0:15472:0:(sec_null.c:320:null_alloc_rs()) vmalloced 'rs': 25440 at ffffc9006a854000.
+--
+00010000:00010000:3.0:1392931201.160900:0:15472:0:(ldlm_lockd.c:1333:ldlm_handle_enqueue0()) ### server-side enqueue handler, new lock created ns: mdt-atlas1-MDT0000_UUID lock: ffff883fc4e0f6c0/0xfc2e1fc34eb83d8d lrc: 2/0,0 mode: --/CR res: [0x200030c2a:0x10588:0x0].0 bits 0x0 rrc: 3 type: IBT flags: 0x0 nid: local remote: 0x8e120b6c361d6a15 expref: -99 pid: 15472 timeout: 0 lvb_type: 0 used 0
+02000000:00000010:3.0:1392931201.161112:0:15472:0:(sec_null.c:320:null_alloc_rs()) vmalloced 'rs': 25440 at ffffc9006a85c000.
+--
+00010000:00010000:3.0:1392931201.162075:0:15472:0:(ldlm_lockd.c:1333:ldlm_handle_enqueue0()) ### server-side enqueue handler, new lock created ns: mdt-atlas1-MDT0000_UUID lock: ffff88266ac5b000/0xfc2e1fc34eb83da9 lrc: 2/0,0 mode: --/CR res: [0x200030c2a:0x10588:0x0].0 bits 0x0 rrc: 3 type: IBT flags: 0x0 nid: local remote: 0x8e120b6c361d6a3f expref: -99 pid: 15472 timeout: 0 lvb_type: 0 used 0
+02000000:00000010:3.0:1392931201.162290:0:15472:0:(sec_null.c:320:null_alloc_rs()) vmalloced 'rs': 25440 at ffffc9006a864000.
+--
+00010000:00010000:3.0:1392931201.163049:0:15472:0:(ldlm_lockd.c:1333:ldlm_handle_enqueue0()) ### server-side enqueue handler, new lock created ns: mdt-atlas1-MDT0000_UUID lock: ffff88251fe1a6c0/0xfc2e1fc34eb83dc5 lrc: 2/0,0 mode: --/CR res: [0x200030c2a:0x10588:0x0].0 bits 0x0 rrc: 3 type: IBT flags: 0x0 nid: local remote: 0x8e120b6c361d6a70 expref: -99 pid: 15472 timeout: 0 lvb_type: 0 used 0
+02000000:00000010:3.0:1392931201.163261:0:15472:0:(sec_null.c:320:null_alloc_rs()) vmalloced 'rs': 25440 at ffffc9006a86c000.
+--
+00010000:00010000:3.0:1392931201.164044:0:15472:0:(ldlm_lockd.c:1333:ldlm_handle_enqueue0()) ### server-side enqueue handler, new lock created ns: mdt-atlas1-MDT0000_UUID lock: ffff88251fe1a240/0xfc2e1fc34eb83dfd lrc: 2/0,0 mode: --/CR res: [0x200030c2a:0x10588:0x0].0 bits 0x0 rrc: 3 type: IBT flags: 0x0 nid: local remote: 0x8e120b6c361d6a9a expref: -99 pid: 15472 timeout: 0 lvb_type: 0 used 0
+02000000:00000010:3.0:1392931201.164257:0:15472:0:(sec_null.c:320:null_alloc_rs()) vmalloced 'rs': 25440 at ffffc9006a874000.
+--
+00010000:00010000:3.0:1392931201.165015:0:15472:0:(ldlm_lockd.c:1333:ldlm_handle_enqueue0()) ### server-side enqueue handler, new lock created ns: mdt-atlas1-MDT0000_UUID lock: ffff88263ffaeb40/0xfc2e1fc34eb83e19 lrc: 2/0,0 mode: --/CR res: [0x200030c2a:0x10588:0x0].0 bits 0x0 rrc: 3 type: IBT flags: 0x0 nid: local remote: 0x8e120b6c361d6acb expref: -99 pid: 15472 timeout: 0 lvb_type: 0 used 0
+02000000:00000010:3.0:1392931201.165228:0:15472:0:(sec_null.c:320:null_alloc_rs()) vmalloced 'rs': 25440 at ffffc9006a87c000.
+--
+00010000:00010000:3.0:1392931201.165992:0:15472:0:(ldlm_lockd.c:1333:ldlm_handle_enqueue0()) ### server-side enqueue handler, new lock created ns: mdt-atlas1-MDT0000_UUID lock: ffff883fbc84bd80/0xfc2e1fc34eb83e35 lrc: 2/0,0 mode: --/CR res: [0x200030c2a:0x10588:0x0].0 bits 0x0 rrc: 3 type: IBT flags: 0x0 nid: local remote: 0x8e120b6c361d6af5 expref: -99 pid: 15472 timeout: 0 lvb_type: 0 used 0
+02000000:00000010:3.0:1392931201.166204:0:15472:0:(sec_null.c:320:null_alloc_rs()) vmalloced 'rs': 25440 at ffffc9006a884000.
+--
+00010000:00010000:22.0:1392931201.186975:0:14836:0:(ldlm_lockd.c:1333:ldlm_handle_enqueue0()) ### server-side enqueue handler, new lock created ns: mdt-atlas1-MDT0000_UUID lock: ffff881d41d7b240/0xfc2e1fc34eb83eba lrc: 2/0,0 mode: --/CR res: [0x2000346c3:0x1e3e1:0x0].0 bits 0x0 rrc: 2 type: IBT flags: 0x0 nid: local remote: 0xb81ed23ed695939d expref: -99 pid: 14836 timeout: 0 lvb_type: 0 used 0
+02000000:00000010:22.0:1392931201.187670:0:14836:0:(sec_null.c:320:null_alloc_rs()) vmalloced 'rs': 25440 at ffffc9006a8a4000.
+--
+00010000:00010000:22.0:1392931201.206093:0:14836:0:(ldlm_lockd.c:1333:ldlm_handle_enqueue0()) ### server-side enqueue handler, new lock created ns: mdt-atlas1-MDT0000_UUID lock: ffff881b61d52000/0xfc2e1fc34eb83ef9 lrc: 2/0,0 mode: --/CR res: [0x2000346c3:0x1e3e1:0x0].0 bits 0x0 rrc: 2 type: IBT flags: 0x0 nid: local remote: 0xb81ed23ed69593e3 expref: -99 pid: 14836 timeout: 0 lvb_type: 0 used 0
+02000000:00000010:22.0:1392931201.206463:0:14836:0:(sec_null.c:320:null_alloc_rs()) vmalloced 'rs': 25440 at ffffc9006a8b4000.
+--
+00010000:00010000:22.0:1392931201.231631:0:14836:0:(ldlm_lockd.c:1333:ldlm_handle_enqueue0()) ### server-side enqueue handler, new lock created ns: mdt-atlas1-MDT0000_UUID lock: ffff881b8febc000/0xfc2e1fc34eb83f38 lrc: 2/0,0 mode: --/CR res: [0x2000346c3:0x164a2:0x0].0 bits 0x0 rrc: 2 type: IBT flags: 0x0 nid: local remote: 0xb81ed23ed6959429 expref: -99 pid: 14836 timeout: 0 lvb_type: 0 used 0
+02000000:00000010:22.0:1392931201.231850:0:14836:0:(sec_null.c:320:null_alloc_rs()) vmalloced 'rs': 25440 at ffffc9006a8cc000.
+
+--- Comment (ezell, Thu, 20 Feb 2014 21:08:33 +0000) ---
+Jason turned on +malloc to our mdstrace utility and I extracted the following statistics:
+
+# At 201402201540
+$ bzgrep vmalloc rpctrace-mds1.bz2 |awk '{print $4}'|sort -n|uniq -c|sort -nr
+   7023 25440
+   3240 25184
+      5 24832
+$ bzgrep "Handling RPC" rpctrace-mds1.bz2 | awk -F":" '{print $20}'|sort -n|uniq -c|sort -nr
+  19734 400
+  11101 101
+   3240 35
+    901 103
+    702 36
+    625 33
+    109 37
+     45 41
+     12 44
+     11 49
+
+# At 201402201550
+$ bzgrep vmalloc rpctrace-mds1.bz2 |awk '{print $4}'|sort -n|uniq -c|sort -nr
+   5674 25440
+   3278 25184
+      2 24832
+$ bzgrep "Handling RPC" rpctrace-mds1.bz2 | awk -F":" '{print $20}'|sort -n|uniq -c|sort -nr
+  19537 400
+   9423 101
+   3278 35
+    940 36
+    889 103
+    385 33
+    174 37
+     31 41
+      3 44
+      2 49
+
+$ bzgrep vmalloc rpctrace-mds1.bz2 |awk '{print $4}'|sort -n|uniq -c|sort -nr
+   3362 25440
+   2813 25184
+$ bzgrep "Handling RPC" rpctrace-mds1.bz2 | awk -F":" '{print $20}'|sort -n|uniq -c|sort -nr
+  19551 400
+   6903 101
+   2813 35
+    408 33
+    342 103
+    200 36
+     62 37
+     32 41
+     10 44
+
+This is telling me that:
+
+	The 24832 byte vmallocs could be from any opcode, or just some routine bookkeeping task. More investigation is needed, but it's comparatively infrequent
+
+	The 25184 byte vmallocs are coming from OPC=35=MDS_CLOSE, 100% of the time
+
+	The 25440 byte vmallocs are coming from either OPC=101=LDLM_ENQUEUE or OCP=400=OBD_PING.  James' analysis above indicated it was enqueue.  Enqueue seems much more likely, but I don't know how to tell what type of lock enqueue is causing it.  Maybe if we also turn on +dlmtrace I can get some more data to point fingers.
+
+--- Comment (green, Thu, 20 Feb 2014 05:08:05 +0000) ---
+Patch is at http://review.whamcloud.com/9322
+
+--- Comment (green, Thu, 20 Feb 2014 04:55:04 +0000) ---
+I guess it's really unfortunate that we allocate full-sized buffer for close.
+
+We could be smarter about it:
+
+if nlink is not 0 - no need to allocate this cookies buffer at all (a bit racy, but should be ok most of the time).
+
+if nlink is 0 - we can take a look at striping and only allocate as much as we actually need.
+
+And in master - since unlinks are now done by MDT anyway, there's no need to even allocate this, I guess as it's not being sent back.
+
+In fact it appears that this is implemented since 2.4 in the exactly same form, or so it seems.
+
+So this patch does not seem to have any ill effects in my light sanity testing:
+
+diff --git a/lustre/mdt/mdt_open.c b/lustre/mdt/mdt_open.c
+index f5a244a..645f069 100644
+--- a/lustre/mdt/mdt_open.c
++++ b/lustre/mdt/mdt_open.c
+@@ -2275,7 +2275,7 @@ int mdt_close(struct tgt_session_info *tsi)
+         req_capsule_set_size(info->mti_pill, &RMF_MDT_MD, RCL_SERVER,
+                              info->mti_mdt->mdt_max_mdsize);
+         req_capsule_set_size(info->mti_pill, &RMF_LOGCOOKIES, RCL_SERVER,
+-                             info->mti_mdt->mdt_max_cookiesize);
++                             0);
+         rc = req_capsule_server_pack(info->mti_pill);
+         if (mdt_check_resent(info, mdt_reconstruct_generic, NULL)) {
+                 mdt_client_compatibility(info);
+
+In fact all other places like mdt_reint_internal() already set it to 0, so this must be just one forgotten place.
+
+As such I am going to submit this patch for inclusion into master.
+
+--- Comment (prakash, Wed, 19 Feb 2014 23:39:41 +0000) ---
+Prakash - Move away from vmalloc to use what instead?
+
+That's kind of a loaded question which really depends on the use case, which highlights my gripes with OBD_ALLOC in the fist place. Memory allocations, and the method used to allocate, are delicate in the linux kernel and should be chosen with care.
+
+Use __get_free_page(), or kmalloc, or slabs. If you really, really need a large allocation use a vector of pages. If you really, really need a large allocation and you really, really need it to have a contiguous address space use vmalloc (but you're probably doing something "wrong"; the linux kernel frowns heavily on vmalloc usage AFAIK).
+
+--- Comment (simmonsja, Wed, 19 Feb 2014 21:08:33 +0000) ---
+I bet he is think scatter gather list.
+
+--- Comment (paf, Wed, 19 Feb 2014 20:27:29 +0000) ---
+Prakash - Move away from vmalloc to use what instead?
+
+--- Comment (prakash, Wed, 19 Feb 2014 18:05:05 +0000) ---
+Do we increase the boundary of vmalloc from 16K to 32K or put the MDS_CLOSE reply rpc on a diet.
+
+IMO, you most certainly should not increase the vmalloc/kmalloc threshold to 32K. That would mean on a 4K page system, you would need 8 contiguous pages to satisfy the request, which just isn't acceptable. On some of our servers, we've often seen order 2 page requests (i.e. 4 contiguous pages) go unfulfilled (i.e. fail) after it has been running for awhile and the memory has become sufficiently fragmented.
+
+The real solution is to move away from vmalloc entirely, but honestly, I don't see upstream buying in to that idea. The way vmalloc is hidden away is troubling at best. This being a performance critical piece of systems software, I don't really understand why such a expensive call would be brushed under the rug like it is.
+
+--- Comment (simmonsja, Wed, 19 Feb 2014 17:04:00 +0000) ---
+At ORNL we have been doing more analysis of what is causing the problem. From the lctl dk we did we got:
+
+00000100:00100000:6.0:1392825143.344295:0:8600:0:(service.c:2011:ptlrpc_server_handle_request()) Handling RPC pname:cluuid+ref:pid:xid:nid:opc mdt_rdpg01_049:15b455e6-de55-2b3a-2739-59d55e9a8b55+228882:45709:x1458489733340076:12345-10.36.205.208@o2ib:35
+
+02000000:00000010:6.0:1392825143.345700:0:8600:0:(sec_null.c:320:null_alloc_rs()) vmalloced 'rs': 25184 at ffffc90067437000.
+
+and not so often.
+
+00000100:00100000:6.0:1392825143.352790:0:15055:0:(service.c:2011:ptlrpc_server_handle_request()) Handling RPC pname:cluuid+ref:pid:xid:nid:opc mdt01_354:fbd7b694-dc61-6f11-a2ce-dd71afe2b28d+1242:11359:x1459714658729504:12345-10.36.226.81@o2ib:101
+
+00010000:00000010:6.0:1392825143.352794:0:15055:0:(ldlm_lock.c:478:ldlm_lock_new()) slab-alloced 'lock': 520 at ffff8801bbd4e480.
+
+02000000:00000010:6.0:1392825143.353979:0:15055:0:(sec_null.c:320:null_alloc_rs()) vmalloced 'rs': 25440 at ffffc900674f7000.
+
+From the op codes we see that sometimes LDLM_ENQUEUE is the offender but it's allocations are a mixture of vmallocs and kmallocs. The constant big offender is MDS_CLOSE. As a test we created
+
+a application that open many files waited then closed them all at the same time. The client node appeared to have locked up but then it completed the job. The size of the MDS_CLOSE reply is a constant 25184 bytes in size. So the question is how to approach this problem. Do we increase the boundary of vmalloc from 16K to 32K or put the MDS_CLOSE reply rpc on a diet.
+
+--- Comment (ezell, Tue, 18 Feb 2014 14:54:39 +0000) ---
+Sorry, I mean the LU-3338 patch (http://review.whamcloud.com/#/c/6339).  I don't fully understand the interactions, but since we don't have PPC clients I'm hoping it may help.
+
+--- Comment (ezell, Tue, 18 Feb 2014 14:47:56 +0000) ---
+ORNL is seeing similar oprofile data.  We have 1008 OSTs/fs.  It looks like the patch passed tests in Maloo, can we get it re-reviewed and possibly landed?
+
+--- Comment (adilger, Wed, 16 Oct 2013 22:28:46 +0000) ---
+Prakash, one of my review comments for http://review.whamcloud.com/#/c/6339/4..10/lustre/include/lustre_mdc.h was that the client is only tracking the maximum request size, and not the average request size.  I see that you made the same comment on a later version of the patch as well.  I suspect that if the client tracked an average (decaying mean is probably easiest) and that average is low, it would resolve the problem being seen here.  If the average is actually so large (e.g. default stripe count is 768) then there really isn't anything to be done about it.  Having the server track the average size would also make sense.
+
+--- Comment (prakash, Thu, 26 Sep 2013 16:32:27 +0000) ---
+Could it be possible for you to attach the full opreport and perf reports of your profiling sessions ??
+
+No, unfortunately Grove is on the SCF so the best I can do is hand copy relevant information.
+
+Also do you have some idea about the workload fron Clients that can lead to this situation ? Or is it almost permanent ?
+
+I don't know the specific workload, this was taken from a "random" point in time with a production environment user workload. With that said, we can see from the stacks that ldlm_enqueue's and mdt_closes's were occurring.
+
+Here's what I think the problem is (please correct me if I'm wrong)..
+
+Grove's filesystem has 768 OSTs in it. This means any buffer allocated based on the max stripe count on the system will be sizeof(struct lov_mds_md) + 768 * sizeof(struct lov_ost_data) bytes, or about 18K. This is bigger than the 4 * PAGE_SIZE limit for kmallocs.
+
+The clients are PPC64 with 64K pages, so even though we're running with http://review.whamcloud.com/#/c/6339 , the "default" size used for EA buffers can (and did) grow to the "max" size of 18K (18K is still less than the 64K limit on PPC64). When this buffer is sent to the x86_64 MDS, it results in a vmalloc because the server only has 4K pages (18K is bigger than the 16K kmalloc limit in OBD_ALLOC_LARGE). Thus, for every enqueue a client sends, a vmalloc is performed on the MDS causing the contention on the global kernel vmlist_lock rwlock.
+
+That is for enqueue's, the story for closes is similar but slightly different. On a mdt_close call, a buffer is allocated based on the mdt_device's mdt_max_mdsize field. This appears to be sized based on the maximum stripe count encountered (similar to how the clients max_easize is maintained). Thus, the MDS must have seen a file striped over all 768 OSTs, now causing all closes to perform an 18K vmalloc.
+
+To compound the issue, these vmalloc calls are made even more expensive on Grove because it is using ZFS as a backend, which currently makes heavy usage of vmalloc. Dumping /proc/vmallocinfo, I see over 85K entries attributed to the SPL and about 100K overall. So the linear traversal of the vmlist is more expensive than it would be on an ldiskfs FS, which only has about 3K entries listed in /proc/vmallocinfo (based on our test systems using ldiskfs).
+
+So, to summarize a little, the issue has to do the subtle interaction between 64K page clients and 4K page servers, a large OST filesystem, and vmalloc performance degradation due to a its higher usage with ZFS backends.
+
+I see a few different ways to solve this:
+
+ 1. Change the client to limit the "default" easize to something else:
+    1.1. Maybe a hardcoded 4K?
+    1.2. Maybe a "page size" the server and client agree on at connect time
+    1.3. Something else entirely?
+
+ 2. Change the server to ignore the buffer size given by the client entirely.
+    2.1. The server already determines the "correct" size to use if the buffer is too small. This can become the default case.
+    2.2. If the client allocated a buffer too big, how do we handle this? A "too small" buffer is already handled.
+    2.3. Prevents a malicious client from endangering the server
+
+ 3. Make a more dramatic change to use a scatter-gather type implementation for the stripe information
+    3.1. This would probably be the "best" fix as it removes vmalloc's for even large striped files, but would be the most intrusive.
+
+--- Comment (bfaccini, Thu, 26 Sep 2013 14:15:48 +0000) ---
+Hello Prakash,
+
+Thanks to report this and have made this so interesting profiling!
+
+Could it be possible for you to attach the full opreport and perf reports of your profiling sessions ?? Something puzzles me when I think 50% of all CPUs/Cores time can be spent in __write_lock_failed() !!
+
+Also do you have some idea about the workload fron Clients that can lead to this situation ? Or is it almost permanent ?

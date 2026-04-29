@@ -1,0 +1,118 @@
+Key:        LU-12507
+Summary:    llapi: llapi_layout_pool_name_set() should "nuke" the ost objects in the layout structure
+Link:       https://jira.whamcloud.com/browse/LU-12507
+Type:       New Feature
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Peter Jones
+Reporter:   CEA
+Created:    Thu, 4 Jul 2019 15:54:59 +0000
+Updated:    Thu, 18 Sep 2025 08:59:49 +0000
+Links:      Related: is related to  LU-9961
+
+--- Description ---
+The llapi provides setters and getters around the struct llapi_layout. One of them is llapi_layout_pool_name_set(). The function's description gives the impression that it can be used to change an already existing layout's pool name to something else. In practice, there is information in the struct llapi_layout that is tied to the pool's name that must be erased after (or before) a pool name is set. Here is the definition of struct llapi_layout:
+
+/**
+ * Layout component, which contains all attributes of a plain
+ * V1/V3 layout.
+ */
+struct llapi_layout_comp {
+	uint64_t	llc_pattern;
+	uint64_t	llc_stripe_size;
+	uint64_t	llc_stripe_count;
+	uint64_t	llc_stripe_offset;
+	/* Add 1 so user always gets back a null terminated string. */
+	char		llc_pool_name[LOV_MAXPOOLNAME + 1];
+	/** Number of objects in llc_objects array if was initialized. */
+	uint32_t	llc_objects_count;
+	struct		lov_user_ost_data_v1 *llc_objects;
+	/* fields used only for composite layouts */
+	struct lu_extent	llc_extent;	/* [start, end) of component */
+	uint32_t		llc_id;		/* unique ID of component */
+	uint32_t		llc_flags;	/* LCME_FL_* flags */
+	uint64_t		llc_timestamp;	/* snapshot timestamp */
+	struct list_head	llc_list;	/* linked to the llapi_layout
+						   components list */
+};
+
+/**
+ * An Opaque data type abstracting the layout of a Lustre file.
+ */
+struct llapi_layout {
+	uint32_t	llot_magic; /* LLAPI_LAYOUT_MAGIC */
+	uint32_t	llot_gen;
+	uint32_t	llot_flags;
+	bool		llot_is_composite;
+	uint16_t	llot_mirror_count;
+	/* Cursor pointing to one of the components in llot_comp_list */
+	struct llapi_layout_comp *llot_cur_comp;
+	struct list_head	  llot_comp_list;
+};
+
+ 
+
+llc_objects_count and llc_objects are the fields that must be reset. This can be done with a call to llapi_layout_ost_index_set() with stripe_number = 0 and ost_index = LLAPI_LAYOUT_DEFAULT.
+
+I think llapi_pool_name_set() should do this work itself. What do you think? Are there use cases to keeping a component's object list after a pool change?
+
+--- Comment (bougetq, Mon, 15 Jul 2019 13:21:15 +0000) ---
+Thank you for the detailed answers. We will keep them in mind in our future developments.
+
+Since this item is not particularly high-priority for us, I doubt we implement it anytime soon though.
+
+Thanks again.
+
+--- Comment (adilger, Thu, 4 Jul 2019 19:31:30 +0000) ---
+This is very similar to LU-9961, which is related to migrating a single object vs. migrating a single component that is described here.
+
+The main complexity that exists in all such approaches is that we cannot allow a user/client application to specify the exact OST objects to be put into the layout, since this could allow file data to be corrupted (connecting the wrong objects into a file or into multiple files), or allow file access to bypass permission checks (connecting to objects of a file the user does not have access permission on).
+
+Doing per-component rather than per-object migration seems relatively straight-forward.  We would need to allow adding a new "mirror" component to an existing file (marked STALE) without adding a full mirror, and using the existing "lfs mirror resync" command to resync the new component, then remove the original component (verifying that the removed component has an exact extent start/end match with the new component.
+
+--- Comment (pfarrell, Thu, 4 Jul 2019 17:40:48 +0000) ---
+I don't think we've got a ticket for "migrate a single component of a PFL/composite" file yet.  If you're interested in working on that, Quentin, maybe we could just make this that ticket?  Like I said, I know various people are interested in this already.
+
+--- Comment (pfarrell, Thu, 4 Jul 2019 17:38:35 +0000) ---
+Actually, that makes perfect sense and it's a bit of feature functionality that we've been interested in for a while.
+
+So as part of that, clearing those components of a layout makes sense, but not just as part as setting the pool name.  There's no clear link to just setting the pool name.  (You might want to migrate but not from pool to pool.)
+
+I think it would be better to - as part of your migrate operation, which of course has to also delete the old component & its associated objects - simply clear these fields explicitly in the new layout.  Not link it in to some particular existing API call.
+
+So this is mostly obvious, but the migration would be something like (assuming locking similar to that used for full file migrate, maybe exactly the same):
+
+Create a copy of the existing file layout, in every detail including objects
+
+ For the component you are migrating, in the new layout, convert that component to be your 'new' component.  This probably means removing anything that is only for instantiated components (the flag, the OST objects & object count, possibly some of the timestamps...?), and then replacing any fields you are changing with migration (like the pool name or stripe count).
+
+ Apply this layout to a temp file.  This will require some work because you have to make sure that connecting this new file to the existing objects works OK - This means basically providing that info from userspace.  For the migrated component, you could leave it uninitialized or initialize it at this time.  Both would require tweaking the existing code, but neither would be overwhelming.  (I would argue for leaving it uninstantiated because you're about to write to it, and that mechanism can take care of it.  This would require allowing gaps in layouts, at least temporarily...)
+
+ Then, for the component you're migrating, do a data copy from the relevant region of the existing layout to the new one
+
+ Then, and this is just a shortcut to make removing the migrated objects easily, you could remove all components from the existing layout except the one you migrated
+
+ Write this layout back to the file
+
+rm the original file
+
+Rename the temp file, and component migrate is complete.
+
+Note the importance of removing the existing objects corresponding to the migrated component.
+
+--- Comment (bougetq, Thu, 4 Jul 2019 17:12:46 +0000) ---
+> What is your use case here?
+
+The migration of a single PFL component. But maybe that does not make sense...
+
+--- Comment (pfarrell, Thu, 4 Jul 2019 16:04:56 +0000) ---
+If I understand this correctly, we need to be careful here.
+
+At least when a layout has been read from an existing file, llc_objects should point to the actual OST objects on disk.  We can't just blow away that field without corrupting the existing layout by removing our association with those objects.
+
+What is stored in llc_objects at the time you want to remove it?  The same question applies to llc_object_count - What is stored there when you want to remove it?  It kind of sounds like it's the OST index, which I would believe.  But again, for an instantiated layout, one that has been read up from disk, this is the number of actual objects and cannot be changed.
+
+What is your use case here?  Are you copying the layout of an existing file and modifying it...?  Why are you changing the pool of a component with an object list?  For an instantiated component, changing the pool doesn't do anything because the OSTs are already selected.
+
+I am not saying you're wrong, just that I'm a little confused by what you're doing.

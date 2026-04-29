@@ -1,0 +1,271 @@
+Key:        LU-17711
+Summary:    ldiskfs corruption on el9 (dx_probe: Corrupt directory)
+Link:       https://jira.whamcloud.com/browse/LU-17711
+Type:       Bug
+Priority:   Critical
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Dongyang Li
+Reporter:   Dominique Martinet
+Created:    Sat, 6 Apr 2024 11:33:02 +0000
+Updated:    Tue, 17 Sep 2024 14:31:22 +0000
+Resolved:   Mon, 10 Jun 2024 13:16:49 +0000
+Links:      Related: is related to LU-18225
+
+--- Description ---
+Hello,
+
+Opening this for Stanford (thanks @sthiell!).
+
+We're seeing ldiskfs corruptions on MDTs on 2.15.59_32 / el9.2 servers (also confirmed with 2.15.61_225 on el9.3 with LU-17700 fixes).
+
+There's a message like this in dmesg:
+
+Apr 03 22:58:53 elm-rcf-md1-s1 kernel: LDISKFS-fs warning (device dm-1): dx_probe:1138: inode #1259905629: comm mdt_rdpg01_001: dx entry: limit 0 != root limit 509
+Apr 03 22:58:53 elm-rcf-md1-s1 kernel: LDISKFS-fs warning (device dm-1): dx_probe:1289: inode #1259905629: comm mdt_rdpg01_001: Corrupt directory, running e2fsck is recommended
+
+Running e2fsck as suggested does yield some actual corruption (this is on a test system, but the fixed inode is the same as the one in dmesg):
+
+# e2fsck -f mdt0
+e2fsck 1.47.0-wc6 (07-Dec-2023)
+Pass 1: Checking inodes, blocks, and sizes
+HTREE directory inode 27370 has an invalid root node.
+Clear HTree index? yes
+Pass 2: Checking directory structure
+Setting filetype for entry '..' in /ROOT/repro/d4 (27370) to 2.
+[rest as normal]
+
+This happens normally with minio when uploading a large file and then accessing it, but I've trimmed down the reproducer to a few lines of shell:
+
+# - removes /mnt/lustre0/foo
+# - create /mnt/lustre0/foo/tmp/subdir, fill it
+# - move it to /mnt/lustre0/foo/subdir
+# - list its contents
+dir="/mnt/lustre0/foo"
+# number of items in subdir -- might need more depending on setup
+count=120
+
+# cleanup
+rm -rf "$dir"
+
+set -e
+
+mkdir -p "$dir/tmp/subdir"
+seq 1 "$count" | while read -r i; do
+        touch "$dir/tmp/subdir/part.$i"
+done
+mv "$dir/tmp/subdir" "$dir/"
+ls "$dir/subdir" > /dev/null 
+
+Since it's a ldiskfs corruption it obviously doesn't happen with zfs. It also doesn't happen with el8.5 on the same lustre, so it would be a problem with the newer el9 ldiskfs (either newer kernel or patches).
+
+I've spent half a dozen of hours investigating this in details and it turns out it's caused by these memsets in namei.c introduced upstream in 6c0912739699 ("ext4: wipe ext4_dir_entry2 upon file deletion"). The snippet below "fixes" this:
+
+diff --git a/fs/ext4/namei.c b/fs/ext4/namei.c
+index efac7e276d4e..2085fa384240 100644
+--- a/fs/ext4/namei.c
++++ b/fs/ext4/namei.c
+@@ -3285,18 +3285,8 @@ int ldiskfs_generic_delete_entry(struct inode *dir,
+                                        ldiskfs_rec_len_from_disk(de->rec_len,
+                                                               blocksize),
+                                        blocksize);
+-
+-                               /* wipe entire dir_entry */
+-                               memset(de, 0, ldiskfs_rec_len_from_disk(de->rec_len,
+-                                                               blocksize));
+                        } else {
+-                               /* wipe dir_entry excluding the rec_len field */
+                                de->inode = 0;
+-                               memset(&de->name_len, 0,
+-                                       ldiskfs_rec_len_from_disk(de->rec_len,
+-                                                               blocksize) -
+-                                       offsetof(struct ldiskfs_dir_entry_2,
+-                                                               name_len));
+                        }                        inode_inc_iversion(dir); 
+
+There's probably a better fix (and there's at least another memset in dx_move_dirents that'll need adusting), but for now I've confirmed this diff indeed makes the problem go away, and conversely adding identical memsets to the el8 code generates the same problem.
+
+From testing it looks like we also can't erase the type either (I assume it's because of LDISKFS_DIRENT_LUFID in type?), and there's some code that puts a length in the first byte of the data so we can't clear that either (I tried clearing inode + memset(&de->name, 0, rec_len - offset(name)) to no avail)... I'll leave that to people who understand ldiskfs more than me.
+
+For now I guess we can just revert 6c0912739699 ("ext4: wipe ext4_dir_entry2 upon file deletion"), I'll send a patch adding such a revert to the el9* series if there isn't any better idea.
+
+Longer term I guess if someone can tell me what we need to preserve we can make some surgery here, but I'm running out of time for today 
+
+Thanks!
+
+--- Comment (pjones, Mon, 10 Jun 2024 13:16:49 +0000) ---
+Merged for 2.16
+
+--- Comment (gerrit, Mon, 10 Jun 2024 06:08:58 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/54723/
+
+Subject: LU-17711 osd-ldiskfs: do not delete dotdot during rename
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 0536b2a26992f5d2ef9e3537a196afac81281f60
+
+--- Comment (gerrit, Thu, 25 Apr 2024 02:39:18 +0000) ---
+(No need to review/merge, since patch merged to https://review.whamcloud.com/c/fs/lustre-release/+/54723)
+
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/54905
+
+Subject: LU-17711 tests: add test for '..' after rename
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 3a29b0a99c92816e2c7cfeebb13ceda7eefd9d7d
+
+--- Comment (gerrit, Thu, 18 Apr 2024 02:55:06 +0000) ---
+(Need to review since it is duplicate of https://review.whamcloud.com/54723)
+
+"Li Dongyang " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/54837
+
+Subject: LU-17711 osd-ldiskfs: do not delete dotdot during rename
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 4a0fa27729d97a1780f16d73b8fc4709e7615a17
+
+--- Comment (gerrit, Wed, 10 Apr 2024 15:24:56 +0000) ---
+"Li Dongyang " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/54723
+
+Subject: LU-17711 mdd: do not delete dotdot during rename
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: ef77855d002e093bdb430d24dbb973977b1ce486
+
+--- Comment (asmadeus, Mon, 8 Apr 2024 23:13:16 +0000) ---
+In HPC context I'm really not convinced how much sense it makes – privacy concerns from old file names? Most places will have some form of audit logs and keep these for a while anyway...
+
+But, sure, I guess it can help detect use after free patterns at least. Given what I explained in my last reply keeping data intact would need to interleave quite a few memsets which isn't practical, but we could e.g. compute the dirdata size total upfront, update name_len and keep it there (hopefully that'll fit in 64KB? not sure we have a max without checking)
+
+Well, if you're working on it I'll be leaving it up to you. Feel free to ping me if you need something
+
+--- Comment (dongyang, Mon, 8 Apr 2024 11:44:58 +0000) ---
+I think the upstream commit  6c0912739699 ("ext4: wipe ext4_dir_entry2 upon file deletion") does have some points. The issue is it's colliding with dir_data. We need to figure out how to safely clear the data when deleting dir entry with dir_data in mind. I'm working on this.
+
+--- Comment (asmadeus, Sat, 6 Apr 2024 19:58:01 +0000) ---
+FWIW just a note on the order things happen with this reproducer if that helps:
+
+ 
+
+	While files are created, at some point there's enough items that ldiskfs decides it's worth indexing and calls `make_indexed_dir`
+
+	as more files are added they're added through `ldiskfs_dx_add_entry`
+
+	When we rename `subdir` to another directory, its `..` link gets updated. I've trimmed this quite a bit:
+
+# retsnoop -T -S -e mdt_reint_rename -a 'dx_*' -a 'ldiskfs_*' -a 'osd_*' -a make_indexed_dir            
+
+16:06:33.464402 -> 16:06:33.474593 TID/PID 412537/412537 (mdt00_004/mdt00_004):                         
+                        
+FUNCTION CALL TRACE                                                    RESULT                   DURATION
+--------------------------------------------------------------------   --------------------  -----------
+→ mdt_reint_rename                                                                             
+    [...]
+     ↔ osd_trans_create                                                 [0x202a0000]              7.264us
+    [...]
+    ↔ osd_trans_start                                                  [0]                      56.024us
+    → osd_index_ea_delete
+    [...] // two deletes: delete 'subdir' from 'tmp' and '..' from 'subdir'
+        → ldiskfs_delete_entry
+            ↔ ldiskfs_generic_delete_entry                             [0]                       4.289us
+            ↔ ldiskfs_handle_dirty_dirblock                            [0]                       0.912us
+        ← ldiskfs_delete_entry                                         [0]                      21.009us
+    ← osd_index_ea_delete                                              [0]                     139.069us
+    ↔ osd_ref_del                                                      [0]                      88.375us
+    ↔ osd_write_unlock                                                 [1]                       6.542us
+    → osd_index_ea_delete
+    [...]
+        → ldiskfs_delete_entry
+            ↔ ldiskfs_generic_delete_entry                             [0]                       6.983us
+            ↔ ldiskfs_handle_dirty_dirblock                            [0]                       6.472us
+        ← ldiskfs_delete_entry                                         [0]                      18.795us
+    ← osd_index_ea_delete                                              [0]                     110.115us
+    → osd_index_ea_insert
+        // add new '..' to 'subdir' pointing to new dir
+        ↔ osd_idc_find                                                 [0xffffffff85ccf000]      0.721us
+        → osd_ea_add_rec
+            ↔ ldiskfs_htree_lock                                       [4096]                    3.606us
+            → osd_add_dot_dotdot.isra.0
+                ↔ osd_get_ldiskfs_dirent_param                         [0]                       0.871us
+                ↔ ldiskfs_get_dquots                                   [0xffffffff9057fe88]      7.805us
+                → osd_ldiskfs_add_entry
+                    → ldiskfs_add_entry_locked
+                        → ldiskfs_update_dotdot
+                            → ldiskfs_bread
+                                → ldiskfs_getblk
+                                    → ldiskfs_map_blocks
+                                        ↔ ldiskfs_es_lookup_extent     [1]                       0.622us
+                                        → ldiskfs_inode_block_valid
+                                            ↔ ldiskfs_sb_block_valid   [1]                       0.611us
+                                        ← ldiskfs_inode_block_valid    [1]                       7.604us
+                                    ← ldiskfs_map_blocks               [1]                      18.635us
+                                ← ldiskfs_getblk                       [0xffffffff8b55ad00]     28.824us
+                            ← ldiskfs_bread                            [0xffffffff8b55ad00]     35.967us
+                            ↔ ldiskfs_handle_dirty_dirblock            [0]                      19.317us
+                            → ldiskfs_reserve_inode_write
+                                → ldiskfs_get_inode_loc
+                                    ↔ ldiskfs_get_group_desc           [0xffffffff914fd040]      0.912us
+                                    ↔ ldiskfs_inode_table              [13678]                   0.821us
+                                ← ldiskfs_get_inode_loc                [0]                       5.280us
+                            ← ldiskfs_reserve_inode_write              [0]                       8.215us
+                            → ldiskfs_mark_iloc_dirty
+                                ↔ ldiskfs_fc_track_inode               [16384]                   0.762us
+                                → ldiskfs_do_update_inode.isra.0
+                                    → ldiskfs_fill_raw_inode
+                                        ↔ ldiskfs_inode_csum_set       [-278359040]              0.771us
+                                    ← ldiskfs_fill_raw_inode           [0]                       2.735us
+                                ← ldiskfs_do_update_inode.isra.0       [0]                       8.346us
+                            ← ldiskfs_mark_iloc_dirty                  [0]                      18.003us
+                        ← ldiskfs_update_dotdot                        [0]                    7281.977us
+                    ← ldiskfs_add_entry_locked                         [0]                    7284.382us
+                ← osd_ldiskfs_add_entry                                [0]                    7292.496us
+            ← osd_add_dot_dotdot.isra.0                                [0]                    7320.648us
+        ← osd_ea_add_rec                                               [0]                    7341.898us
+    ← osd_index_ea_insert                                              [0]                    7352.417us
+    → osd_index_ea_insert
+        [...] // add 'subdir' to new parent dir
+    ← osd_index_ea_insert                                              [0]                     257.110us
+    ↔ osd_write_lock                                                   [0xffffffff83960000]      6.893us
+    ↔ osd_ref_add                                                      [0]                     101.078us
+    ↔ osd_write_unlock                                                 [1]                       3.737us
+    ↔ osd_write_lock                                                   [0xffffffff83960000]      3.617us
+    ↔ osd_xattr_set                                                    [0]                     217.235us
+    ↔ osd_write_unlock                                                 [1]                      10.009us
+    ↔ osd_attr_set                                                     [0]                      91.380us
+    ↔ osd_attr_set                                                     [0]                     111.318us
+    ↔ osd_trans_stop                                                   [0]                     284.631us
+
+	Before that rename, adding some debug in `dx_get_dx_info()` we could see that when called from ldiskfs_dx_add_entry `LDISKFS_DIR_ENTRY_LEN(de, i_dir))` for the second `..` entry was 0x1c in size, but after rename (called from ldiskfs_readdir when we list the directory) it became 0xc as `ldiskfs_get_dirent_data_len()` was no longer able to find extra data flags in file type + data after name.
+
+This last function also confirms what I thought about the entry length: we need to preseve at least type (flags), name_len (to find start of extra data), and the first byte after each valid segment there (encoded one byte length then data, so if there's two extra data segements we'd get `[data length worth of data][one byte with length][this length of data][one bye with length][this length of data]` and we'd need to preserve the two length bytes. That makes memset pretty blut and difficult to use here, it probably makes as much sense to just remove the memsets as I don't think we want to move everything after an inode...
+
+This variable entry length is ldiskfs specific so this isn't a bug in ext4, it's introduced by the ext4-data-in-dirent patch.
+
+--- Comment (pjones, Sat, 6 Apr 2024 12:23:11 +0000) ---
+Dongyang
+
+Can you please advise?
+
+Thanks
+
+Peter

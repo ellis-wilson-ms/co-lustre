@@ -1,0 +1,177 @@
+Key:        LU-17124
+Summary:    fiemap FIEMAP_FLAG_SYNC flag expects filemap_write_and_wait() or similar
+Link:       https://jira.whamcloud.com/browse/LU-17124
+Type:       Bug
+Priority:   Critical
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Shaun Tancheff
+Reporter:   Shaun Tancheff
+Created:    Mon, 18 Sep 2023 10:40:44 +0000
+Updated:    Fri, 16 Jan 2026 18:58:47 +0000
+Resolved:   Thu, 28 Sep 2023 15:21:13 +0000
+Links:      Related: is related to  LU-11621
+Attachments: SHOT02_09010.exr.trace.bad, SHOT02_09010.exr.trace.good
+
+--- Description ---
+fiemap FIEMAP_FLAG_SYNC can race while client is writing data to disk
+
+In such a case fiemap() call returns that the data is not on disk (no data for the range) and cp can just truncates (or sparse fill) based on the size of the file/extent.
+
+strace shows that FIEMAP_FLAG_SYNC was sent. Further and the user reports that a 'sync; cp ' does not fail and a newer cp that uses copy_file_range() also does not fail.
+
+Looking further FIEMAP_FLAG_SYNC expects the data to be on disk aka filemap_write_and_wait() not just filemap_fdatawrite()
+
+--- Comment (eaujames, Fri, 16 Jan 2026 18:55:32 +0000) ---
+The CEA hit this issue in production with rhel 9.4 (lustre 2.15.6).
+
+--- Comment (gerrit, Fri, 16 Jan 2026 17:31:16 +0000) ---
+"Etienne AUJAMES " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/63430
+
+Subject: LU-17124 llite: Write and wait on FIEMAP_FLAG_SYNC
+
+Project: fs/lustre-release
+
+Branch: b2_15
+
+Current Patch Set: 1
+
+Commit: 2abed91120ea77eee901835bebd8fd029c0dda5a
+
+--- Comment (simmonsja, Wed, 15 Nov 2023 14:48:07 +0000) ---
+A ticket exist for copy_file_range(). I just never got the cycles to implement for Lustre. Also RHEL7 doesn't support a proper hook for copy_file_range.
+
+--- Comment (lflis, Wed, 15 Nov 2023 13:11:10 +0000) ---
+Thank you for the patch. We tested the changes and unfortunately we still see corrupted destnation files.
+
+--- Comment (stancheff, Wed, 15 Nov 2023 07:52:25 +0000) ---
+Please try the patch and see if the sync() occurs early enough to resolve the corruption you are finding.
+
+If not we may need to implement a file-system specific copy_file_range()
+
+Thanks!
+
+--- Comment (gerrit, Wed, 15 Nov 2023 07:46:52 +0000) ---
+"Shaun Tancheff " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/53140
+
+Subject: LU-17124 llite: sync on splice write
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: c6c5e7c6664fcaeb4b4df51f6e0562f35a91d985
+
+--- Comment (lflis, Tue, 14 Nov 2023 22:18:20 +0000) ---
+Quick update.
+
+Forcing fsync(fd_out) before copy_file_range() call fixes the problem with truncated output files
+
+ 
+
+ /*
+ *   gcc -c -Wall -Werror -fpic ./this.c -o cfr.o
+ *   gcc -ldl -shared -o ./cfr.so ./cfr.o
+ *   LD_PRELOAD=/full_path_to/cfr.so cp A B
+ *
+ * */
+
+#define _GNU_SOURCE 1
+#include 
+#include 
+#include 
+#include 
+#include 
+#include 
+
+typedef ssize_t *(*cfr_t)(int, loff_t*, int, loff_t*, size_t, unsigned int);
+static cfr_t p = NULL;
+ssize_t copy_file_range(int fd_in, loff_t *off_in, int fd_out, loff_t *off_out, size_t len, unsigned int flags)
+{
+    fsync(fd_out);
+    ssize_t r=-1;
+    if (p == NULL) {
+        p =  dlsym(RTLD_NEXT, "copy_file_range");
+        if (p == NULL) {
+            /* Error handling */
+            return r;
+        }
+    }    r = (ssize_t) p(fd_in, off_in, fd_out, off_out, len,flags);
+    return r;
+}
+
+--- Comment (lflis, Tue, 14 Nov 2023 16:47:28 +0000) ---
+Two traces in the attachment, both captured for the same file
+
+#good
+...
+uname({sysname="Linux", nodename="t0006", ...}) = 0
+copy_file_range(3, NULL, 4, NULL, 9223372035781033984, 0) = 62924467
+copy_file_range(3, NULL, 4, NULL, 9223372035781033984, 0) = 0
+...
+#bad
+...
+uname({sysname="Linux", nodename="t0006", ...}) = 0
+copy_file_range(3, NULL, 4, NULL, 9223372035781033984, 0) = 19005440
+copy_file_range(3, NULL, 4, NULL, 9223372035781033984, 0) = 1441792
+copy_file_range(3, NULL, 4, NULL, 9223372035781033984, 0) = 0
+
+--- Comment (stancheff, Tue, 14 Nov 2023 15:23:28 +0000) ---
+If you are copying from Lustre to Lustre on the same file system then I do not see this patch would have any obvious effect on your use case. I do not see fiemap() being involved on el9.2 when copy_file_range() can be used.
+
+So I think your find | xargs -P32 cp  case is may be exposing a separate bug.
+
+If you could capture strace(s) of the cp -v and provide / attach a 'good' sample and a 'bad' sample we may be able to see what is happening.
+
+--- Comment (lflis, Tue, 14 Nov 2023 12:12:16 +0000) ---
+This is how we copy the files:
+
+find ./source_dir -name *.exr | xargs -P32 -I'{}' cp -v {} ./dest_dir
+
+Parameter -P32 keeps 32 processes running in parallel
+
+--- Comment (lflis, Tue, 14 Nov 2023 12:09:00 +0000) ---
+Cyfronet here,
+
+Server: 2.15.3 
+
+Client 2.15.3 +  LU-17124 llite: Write and wait on FIEMAP_FLAG_SYNC
+
+Cllient OS: Rocky 9, cp is using copy_file_range instead of read/write
+
+We have observed the same issue prior applying the patch. When copying 4096 files from one directory to another (on the same fs), in parallel using 32 processes, some copies where corrupted. Some files were truncated more or less, around 10-30 destination files corrupted in total.
+
+Having applied the patch we observe less corrupted files and less bytes are missing. 
+
+It seems that solution doesn't fix the problem completly, or maybe we miss some other patches between 2.15.3 and 2.16.0
+
+--- Comment (pjones, Thu, 28 Sep 2023 15:21:13 +0000) ---
+Landed for 2.16
+
+--- Comment (gerrit, Thu, 28 Sep 2023 08:02:49 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/52402/
+
+Subject: LU-17124 llite: Write and wait on FIEMAP_FLAG_SYNC
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 1af966fe6983f28e9d438b57944c4dccb8941c61
+
+--- Comment (gerrit, Mon, 18 Sep 2023 10:42:50 +0000) ---
+"Shaun Tancheff " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/52402
+
+Subject: LU-17124 llite: Write and wait on FIEMAP_FLAG_SYNC
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 39825b198f06234da2876637660663981d866bf1

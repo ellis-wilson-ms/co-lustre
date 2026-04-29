@@ -1,0 +1,205 @@
+Key:        LU-2477
+Summary:    Poor MDS create performance due to ARC cache growth
+Link:       https://jira.whamcloud.com/browse/LU-2477
+Type:       Technical task
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Alex Zhuravlev
+Reporter:   Prakash Surya
+Created:    Wed, 18 Jan 2012 13:02:01 +0000
+Updated:    Tue, 6 May 2014 19:14:48 +0000
+Resolved:   Tue, 11 Dec 2012 13:54:18 +0000
+Attachments: image.png
+
+--- Description ---
+When running million file runs of createmany with the '-o' (open) option we are seeing a drop in performance from it's starting rate of about 500 creates per second, to about 150 creates per second. This drop in performance seems to hit at the same time as when the ZFS ARC's 'arc_meta_used' hits and then exceeds it's 'arc_meta_limit'. We believe that since Lustre is doing it's own caching and holds a reference to all of it's objects, the ARC is unable to limit it's cache to 'arc_meta_limit'. Thus, the ARC is spending useless effort trying to uphold it's limit and drop objects (but can't because of Lustre's references) which is causing the create rate decrease.
+
+One method to slightly relive this, is to use the ARC prune callback feature that was recently added to the ZFS on Linux project in commit: https://github.com/zfsonlinux/zfs/commit/ab26409db753bb087842ab6f1af943f3386c764f
+
+This would allow the ARC to notify Lustre that it needs to release some of the objects it is holding so the ARC can free up part of it's cache and uphold it's 'arc_meta_limit'.
+
+--- Comment (behlendorf, Tue, 6 May 2014 19:14:48 +0000) ---
+We have pretty much confirmed that the current LU object caching approach for ZFS has the side effect of preventing the ARC from caching any of the OIs.  This makes FID lookups terribly expensive.  The following patch disables the LU object cache for ZFS OSDs which allows the OIs to be properly cached.  I don't have any solid performance numbers for specific workloads.  But I wanted to post the patch to start a discussion on what the right way to fix this is.
+
+http://review.whamcloud.com/10237
+
+--- Comment (bzzz, Tue, 22 Apr 2014 16:09:24 +0000) ---
+SAs are held for the period lu_object stays in the cache. any modifying operation touches some attributes usually (e.g. size, mtime, ctime). I wouldn't mind to benchmark this at some point (a bit busy at the moment) and will try to cook a patch soon. from my previous experience SAs are pretty expensive even in the current design where we don't need to call sa_handle_get() on many objects. say, to create a regular file we have to touch: new MDT object, the directory, the object storing last used OST ID, last_rcvd. then potentially it's changelog.
+
+--- Comment (prakash, Tue, 22 Apr 2014 15:09:21 +0000) ---
+we do pin dbuf's holding dnodes (e.g. osd_object_init() -> __osd_obj2dbuf() -> sa_buf_hold()), but at the moment there is another reasons to do so - we do cache a handle for SA, which stores all the normal attributes (size/blocks/[acm]time/etc) and which we access quite often. that handle, in turn, pins dnode's dbuf anyway. if we do not cache SA's handle, we'd have to initialize it every time, which I believe, is quite expensive.
+
+That's very interesting. Keep in mind, each held dnode pins the dnode_t (~930 bytes, iirc) and the dnode's object block (16K block). So, worst case, each held SA held will pin an additional ~16.5K. If the dnode_t's all belong to the same dnode object block (32 per 16K block) then best case it'll be an addition 1.5K each ((32*930+16K)/32).
+
+How long are the SA's held for? And for which operations? It'd be nice to have some benchmarks to say if it's better for Lustre to manage them (e.g. keep holds) or have the ARC manage them (e.g. using the MRU/MFU lists). I hope Lustre doesn't keep holds on them for long..?
+
+--- Comment (bzzz, Tue, 22 Apr 2014 11:17:48 +0000) ---
+we do pin dbuf's holding dnodes (e.g. osd_object_init() -> __osd_obj2dbuf() -> sa_buf_hold()), but at the moment there is another reasons to do so - we do cache a handle for SA, which stores all the normal attributes (size/blocks/[acm]time/etc) and which we access quite often. that handle, in turn, pins dnode's dbuf anyway. if we do not cache SA's handle, we'd have to initialize it every time, which I believe, is quite expensive.
+
+--- Comment (isaac, Tue, 22 Apr 2014 10:29:29 +0000) ---
+Thanks for answers. I assumed that the callback was added because the osd was pinning pages. Is there any reason for the callback to be still there now that it's believed that the osd doesn't pin any page?
+
+--- Comment (bzzz, Tue, 15 Apr 2014 01:23:28 +0000) ---
+there is no strong requirement to reference dbuf from osd_object. we discussed this a bit with ZFS team at Oracle (so long ago) to change DMU API so that we can pass dbuf instead of dnode# and save on dnode#->dbuf. it looked like they are aware of potential performance improvement, but that wasn't done.
+
+--- Comment (prakash, Sat, 5 Apr 2014 01:26:44 +0000) ---
+Isaac, I'll try to elaborate some more if I get time (idk if that'll happen with LUG next week), but I wanted to give you a couple quick answers before I forget.
+
+1. We introduced the callback awhile ago because I thought the osd-zfs was pinning data in the cache, but after looking at the ARC in greater detail, I'm no longer convinced this is happening. So, while it's definitely possible for the OSD to pin ARC pages by holding references to objects, it shouldn't do this and I no longer think it is. I haven't looked at the OSD code much though, do you have some evidence that it is holding references for an extended period of time?
+
+2. Yes, if only a single read occurred then it wont go on the MFU. But, is that bad? If it's being cached in the upper layers, then does it matter what the ARC thinks (i.e. MRU or MFU) since you won't be going to disk for it anyway?
+
+--- Comment (isaac, Tue, 1 Apr 2014 22:36:59 +0000) ---
+I'm reading relevant code lately and have been wondering about two things.
+
+1. My understanding is: ARC can't free objects in the metadata part of its cache because osd-zfs holds references on them. So osd-zfs registers a callback which is called by ARC to tell it to release objects. In other words, ARC can only free those objects which are chosen to be released by osd-zfs. But osd-zfs's choice is based on a simple LRU. Therefore, it seems to me that, the ARC (at least the metadata part) has essentially been turned into LRU because it's the LRU policy of the osd-zfs that ultimately determines which objects can be freed. Is this the case or have I missed something? If it is the case, then isn't it bad?
+
+2. If multiple accesses to a same object can be handled totally in the osd-zfs layer (in its hashed/cached objects) without going into ARC, then would it prevent the ARC from seeing the access pattern and thus from learning and adapting? E.g. two accesses to a same object would move it from MRU to MFU in the ARC, but it probably stays in the MRU if the ARC sees only one access due to caching in osd-zfs.
+
+Alex or Prakash, can you please comment?
+
+--- Comment (prakash, Mon, 9 Jul 2012 11:33:00 +0000) ---
+I think it would be safe to close this. The prune function was landed, although I'm not entirely sure if that fixed the drop in create rate. The code has changed considerably, so I'm fine with opening a new ticket with updated info if needed.
+
+--- Comment (bzzz, Mon, 9 Jul 2012 07:34:19 +0000) ---
+any update here? iirc, the prune function was landed and we fixed memory leak in SA-related code.
+
+--- Comment (hudson, Wed, 2 May 2012 15:37:27 +0000) ---
+Integrated in  lustre-dev » x86_64,client,el6,inkernel #340
+
+     ORI-481 osd-zfs: Register prune function with ARC (Revision c29aef2356638d93b418f23f2835980c8a944703)
+
+     Result = SUCCESS
+
+Mikhail Pershin : c29aef2356638d93b418f23f2835980c8a944703
+
+Files : 
+
+	lustre/osd-zfs/osd_internal.h
+
+	lustre/osd-zfs/osd_handler.c
+
+--- Comment (hudson, Wed, 2 May 2012 15:19:40 +0000) ---
+Integrated in  lustre-dev » x86_64,server,el5,inkernel #340
+
+     ORI-481 osd-zfs: Register prune function with ARC (Revision c29aef2356638d93b418f23f2835980c8a944703)
+
+     Result = SUCCESS
+
+Mikhail Pershin : c29aef2356638d93b418f23f2835980c8a944703
+
+Files : 
+
+	lustre/osd-zfs/osd_handler.c
+
+	lustre/osd-zfs/osd_internal.h
+
+--- Comment (hudson, Wed, 2 May 2012 15:14:44 +0000) ---
+Integrated in  lustre-dev » i686,client,el5,inkernel #340
+
+     ORI-481 osd-zfs: Register prune function with ARC (Revision c29aef2356638d93b418f23f2835980c8a944703)
+
+     Result = SUCCESS
+
+Mikhail Pershin : c29aef2356638d93b418f23f2835980c8a944703
+
+Files : 
+
+	lustre/osd-zfs/osd_handler.c
+
+	lustre/osd-zfs/osd_internal.h
+
+--- Comment (hudson, Wed, 2 May 2012 15:13:53 +0000) ---
+Integrated in  lustre-dev » x86_64,server,el6,inkernel #340
+
+     ORI-481 osd-zfs: Register prune function with ARC (Revision c29aef2356638d93b418f23f2835980c8a944703)
+
+     Result = SUCCESS
+
+Mikhail Pershin : c29aef2356638d93b418f23f2835980c8a944703
+
+Files : 
+
+	lustre/osd-zfs/osd_handler.c
+
+	lustre/osd-zfs/osd_internal.h
+
+--- Comment (hudson, Wed, 2 May 2012 14:58:14 +0000) ---
+Integrated in  lustre-dev » i686,server,el5,inkernel #340
+
+     ORI-481 osd-zfs: Register prune function with ARC (Revision c29aef2356638d93b418f23f2835980c8a944703)
+
+     Result = SUCCESS
+
+Mikhail Pershin : c29aef2356638d93b418f23f2835980c8a944703
+
+Files : 
+
+	lustre/osd-zfs/osd_handler.c
+
+	lustre/osd-zfs/osd_internal.h
+
+--- Comment (hudson, Wed, 2 May 2012 14:55:02 +0000) ---
+Integrated in  lustre-dev » i686,client,el6,inkernel #340
+
+     ORI-481 osd-zfs: Register prune function with ARC (Revision c29aef2356638d93b418f23f2835980c8a944703)
+
+     Result = SUCCESS
+
+Mikhail Pershin : c29aef2356638d93b418f23f2835980c8a944703
+
+Files : 
+
+	lustre/osd-zfs/osd_internal.h
+
+	lustre/osd-zfs/osd_handler.c
+
+--- Comment (hudson, Wed, 2 May 2012 14:53:03 +0000) ---
+Integrated in  lustre-dev » x86_64,client,el5,inkernel #340
+
+     ORI-481 osd-zfs: Register prune function with ARC (Revision c29aef2356638d93b418f23f2835980c8a944703)
+
+     Result = SUCCESS
+
+Mikhail Pershin : c29aef2356638d93b418f23f2835980c8a944703
+
+Files : 
+
+	lustre/osd-zfs/osd_internal.h
+
+	lustre/osd-zfs/osd_handler.c
+
+--- Comment (prakash, Fri, 27 Jan 2012 18:24:36 +0000) ---
+http://review.whamcloud.com/#change,2032
+
+--- Comment (prakash, Tue, 24 Jan 2012 13:28:58 +0000) ---
+Is there a specific `env` variable I should pass to the `lu_site_purge` function? It's unclear to me exactly how the environments are used.
+
+My initial thinking is I can use a call to `lu_site_purge` similar to the one found in `osd_device_free` in the osd-zfs layer.
+
+--- Comment (behlendorf, Fri, 20 Jan 2012 12:16:24 +0000) ---
+Yes, it would be best to keep this code in the zfs-osd.  It just wasn't clear to us if it was possible to drop entries the the lu site safely from within the zfs-osd code.  If we can use lu_site_purge() for this that would be perfect.
+
+--- Comment (bzzz, Fri, 20 Jan 2012 00:32:48 +0000) ---
+hmm. Lustre does not bypass kernel infrastructure related to memory management: it registers lu_cache_shrink() and it's called by the kernel as expected.
+
+given this callback is specific to ARC, it should be done within zfs-osd which in turn can call lu_site_purge()
+
+on own site (in contrast with all registered sites).
+
+--- Comment (prakash, Thu, 19 Jan 2012 16:29:06 +0000) ---
+Here's a graph of our create rate performance. This is on a freshly rebooted MDS. We believe the first drop to ~300 corresponds to reaching the 'arc_meta_limit' but having enough non-lustre buffers to drop to stay at the limit. And the second drop to ~150 corresponds to all non-lustre buffers dropped and now exceeding the 'arc_meta_limit'.
+
+--- Comment (prakash, Thu, 19 Jan 2012 16:11:26 +0000) ---
+Alex, I believe the ARC is already doing this coordination with the kernel. From my understanding, when the ARC reaches this limit, it will try and use the existing shrinkers to have the kernel/ZPL drop any referneces it can, allowing the ARC to drop it completely. The problem is that Lustre bypasses the ZPL and kernel infrastructure, talking directly with the DMU. Thus, bypassing all the existing shrinker infrastucture.
+
+Without the callback, Lustre pin's it's data in the ARC by always holding a reference to it and there's no current functionality to tell Lustre to drop this reference. This callback is used to inform Lustre to drop what it can.
+
+Also, I don't think the kernel can sort this out, because it has no idea of the ARC's meta limit. As far as I understand it, the ARC is providing similar functionality as Linux's pagecache, but without using any of the Linux infrastructure. From the kernel's perspective, the ARC is using X bytes and there is no need to reclaim since the system still has plenty of available memory. But from the ARC's perspective, it want's to limit itself to Y bytes, and when X surpasses Y, it needs to reclaim no matter the available memory on the system as a whole.
+
+--- Comment (adilger, Thu, 19 Jan 2012 11:19:25 +0000) ---
+Changing this bug summary to reflect issues with ARC cache shrinking.  Other aspects of this performance include xattr overhead (addressed in ORI-361 - SA-based xattrs).
+
+--- Comment (bzzz, Wed, 18 Jan 2012 13:07:24 +0000) ---
+I tend to think the better approach would be to ask kernel for more pages and let kernel to sort this problem out (using all shrinkers, pagecache, etc) - it might be that a lot of memory is consumed by somebody else in some cases.

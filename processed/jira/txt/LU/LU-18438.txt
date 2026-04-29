@@ -1,0 +1,101 @@
+Key:        LU-18438
+Summary:    sanity test_398p: @@@@@@ FAIL: aio copy 1 w/bsize 4096 failed: 1
+Link:       https://jira.whamcloud.com/browse/LU-18438
+Type:       Bug
+Priority:   Minor
+Status:     Closed
+Resolution: Duplicate
+Assignee:   Vladimir Saveliev
+Reporter:   Vladimir Saveliev
+Created:    Mon, 11 Nov 2024 16:56:40 +0000
+Updated:    Tue, 12 Nov 2024 11:41:25 +0000
+Resolved:   Tue, 12 Nov 2024 11:41:25 +0000
+
+--- Description ---
+Lustre Gerrit Janitor
+..
+Initial testing failed: IMPORTANT: these tests appear to be new failures unique to this patch
+..
+test_398p(Seen in reviews: 54073 53997 53912 53857 53835 53802 53719 53202 53051 53035 52794 52566 52266 52167 52113 52087 41308)
+
+Regular sanity.sh:test_389p crash may be a result of a client eviction caused by the following race:
+
+dd
+  cl_io_loop
+    cl_io_lock
+      ldlm_cli_enqueue_fini
+        ldlm_lock_enqueue
+          ldlm_grant_lock.   for (; ext; ext = next_extent(ext)) {
+                  if (overlapped(ext, cur)) {
+                    conflict = osc_extent_get(ext);
+
+                if (conflict != NULL) {
+                  rc = osc_extent_wait(env, conflict, OES_INV);  this assumes waiting for completion of RPC in progress
+                }
+
+    cl_io_end
+    cl_io_unlock
+      osc_lock_cancel
+        osc_lock_detach.  
+
+Writing of conflict extent may get blocked if tmax_rpcs_in_flight lockless write rpcs try to obtain lock on server, blocking ast gets sent to the client, but the lock can not be cancelled. That leads to the client eviction.
+
+ 
+
+Here are log (https://review.whamcloud.com/c/fs/lustre-release/+/54625) excerpts which match the above description:
+
+Server sends blocking ast:
+
+00010000:00010000:2.0:1711703057.781579:0:4369:0:(ldlm_lock.c:701:ldlm_add_bl_work_item()) ### lock incompatible; sending blocking AST. ns: filter-lustre-OST0001_UUID lock: ffff8800789d98c0/0x84b3485a578c344e lrc: 2/0,0 mode: PW/PW res: [0x280000402:0xc32f:0x0].0x0 rrc: 149 type: EXT [7340032->40894463] (req 7340032->7348223) gid 0 flags: 0x40000000000000 nid: 192.168.204.11@tcp remote: 0x4d0bec30efe9ee3c expref: 156 pid: 8441 timeout: 0 lvb_type: 0
+00010000:00010000:2.0:1711703057.787862:0:4369:0:(ldlm_lockd.c:494:ldlm_add_waiting_lock()) ### adding to wait list(timeout: 100, AT: on) ns: filter-lustre-OST0001_UUID lock: ffff8800789d98c0/0x84b3485a578c344e lrc: 4/0,0 mode: PW/PW res: [0x280000402:0xc32f:0x0].0x0 rrc: 152 type: EXT [7340032->40894463] (req 7340032->7348223) gid 0 flags: 0x70000400000020 nid: 192.168.204.11@tcp remote: 0x4d0bec30efe9ee3c expref: 158 pid: 8441 timeout: 10054 lvb_type: 0
+
+Watchdog reports that the thread is stuck as it is waiting for lock cancel:
+
+ 9995.001938] Pid: 4369, comm: ll_ost_io00_003 3.10.0-7.9-debug #1 SMP Sat Mar 26 23:28:42 EDT 2022
+[ 9995.001939] Call Trace:
+[ 9995.002054] [] ldlm_completion_ast+0x963/0xd00 [ptlrpc]
+[ 9995.002088] [] ldlm_cli_enqueue_local+0x259/0x880 [ptlrpc]
+[ 9995.002144] [] tgt_extent_lock+0xea/0x2a0 [ptlrpc]
+[ 9995.002187] [] tgt_brw_lock.isra.29+0x143/0x320 [ptlrpc]
+[ 9995.002229] [] tgt_brw_write+0x6a5/0x2790 [ptlrpc]
+[ 9995.002264] [] tgt_request_handle+0x74e/0x1a50 [ptlrpc]
+[ 9995.002292] [] ptlrpc_server_handle_request+0x26c/0xcb0 [ptlrpc]
+
+Server evicts the client after 100s:
+
+00010000:00020000:2.0:1711703157.930758:0:15532:0:(ldlm_lockd.c:261:expired_lock_main()) ### lock callback timer expired after 100s: evicting client at 192.168.204.11@tcp  ns: filter-lustre-OST0001_UUID lock: ffff8800789d98c0/0x84b3485a578c344e lrc: 3/0,0 mode: PW/PW res: [0x280000402:0xc32f:0x0].0x0 rrc: 154 type: EXT [7340032->40894463] (req 7340032->7348223) gid 0 flags: 0x60000400000020 nid: 192.168.204.11@tcp remote: 0x4d0bec30efe9ee3c expref: 160 pid: 8441 timeout: 10054 lvb_type: 0
+
+client is evicted:
+
+00000100:02020000:0.0:1711703159.091792:0:18173:0:(import.c:1557:ptlrpc_import_recovery_state_machine()) 167-0: lustre-OST0001-osc-ffff880081c63800: This client was evicted by lustre-OST0001; in progress operations using this service will fail.
+
+client’s dd:osc_extent_find() continues after eviction, gets -5 from osc_extent_wait(env, conflict, OES_INV) and releases the lock:
+
+00000008:00000001:1.0:1711703159.101355:0:13118:0:(osc_cache.c:817:osc_extent_find()) Process leaving via out (rc=18446744073709551611 : -5 : 0xfffffffffffffffb)
+00010000:00010000:1.0:1711703159.101595:0:13118:0:(ldlm_lock.c:906:ldlm_lock_decref_internal()) ### final decref done on CBPENDING lock ns: lustre-OST0001-osc-ffff880081c63800 lock: ffff88012c0b3a80/0x4d0bec30efe9ee3c lrc: 3/0,0 mode: PW/PW res: [0x280000402:0xc32f:0x0].0x0 rrc: 146 type: EXT [7340032->40894463] (req 7340032->7348223) gid 0 flags: 0x810420400000000 nid: local remote: 0x84b3485a578c344e expref: -99 pid: 13118 timeout: 0 lvb_type: 1
+
+--- Comment (vsaveliev, Tue, 12 Nov 2024 11:41:25 +0000) ---
+duplicate of LU-17190
+
+--- Comment (qian_wc, Tue, 12 Nov 2024 02:17:09 +0000) ---
+Yes, we solved this deadlock by using high prior I/O under BAST (LU-17190).
+
+The topmost patch is https://review.whamcloud.com/#/c/fs/lustre-release/+/56327/.
+
+This bug can be easily reproduced with hybrid BIO and DIO (using server-side locking) case.
+
+--- Comment (paf0186, Mon, 11 Nov 2024 17:10:12 +0000) ---
+qian_wc I believe you have a bug/patch related to this?
+
+--- Comment (gerrit, Mon, 11 Nov 2024 16:58:10 +0000) ---
+"Vladimir Saveliev " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/56956
+
+Subject: LU-18438 osc: do not osc_extent_wait on conflicting extent
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 5cd2239b73634f6faeb020342f46fcccc04d6fb6

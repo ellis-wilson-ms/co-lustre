@@ -1,0 +1,492 @@
+Key:        LU-10262
+Summary:    Lock contention when doing creates for the same name
+Link:       https://jira.whamcloud.com/browse/LU-10262
+Type:       Improvement
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Etienne Aujames
+Reporter:   Oleg Drokin
+Created:    Mon, 20 Nov 2017 21:57:28 +0000
+Updated:    Mon, 21 Nov 2022 20:31:17 +0000
+Resolved:   Tue, 28 Jun 2022 06:10:29 +0000
+Links:      Related: is related to  LU-10235; Related: is related to LU-9193; Related: is related to LU-15546
+Attachments: multiop.patch
+
+--- Description ---
+It was frequently documented that using e.g. fortran programs that write into same file is kind of slow. The reason is every time you open a file for write in fortran, it adds O_CREAT flag to the open causing the locking to be much less cooperative and when the name is the same, basically every thread gets bottlenecked on that same lock as the opens are processed because we currently decide the locking mode based on open flags only.
+
+Similar problem exists for other kind of creates like mkdirs.
+
+For the open-create case it's in mdt_reint_open():
+
+again:
+        lh = &info->mti_lh[MDT_LH_PARENT];
+        mdt_lock_pdo_init(lh,
+                          (create_flags & MDS_OPEN_CREAT) ? LCK_PW : LCK_PR,
+                          &rr->rr_name);
+
+        parent = mdt_object_find(info->mti_env, mdt, rr->rr_fid1);
+        if (IS_ERR(parent))
+                GOTO(out, result = PTR_ERR(parent));
+
+        result = mdt_object_lock(info, parent, lh, MDS_INODELOCK_UPDATE);
+
+Similar code for mkdir/mknod/... in mdt_create
+
+        lh = &info->mti_lh[MDT_LH_PARENT];
+        mdt_lock_pdo_init(lh, LCK_PW, &rr->rr_name);
+        rc = mdt_object_lock(info, parent, lh, MDS_INODELOCK_UPDATE);
+
+It looks like we should be able to do a lockless lookup on the parent and then in the parent (internal fs locking should ensure that the parent does not disappear from under us) then relock with desired read/write mode and relookup. If the file has disappeared by then and we are in PR lock mode for the parent - we need to drop the PR lock and reobtain the PW one and try again.
+
+The risk is there that if many threads do it for non-existing file there's still going to be some number of them stuck on the same ldlm lock, but hopefully fewer than before.
+
+--- Comment (adilger, Tue, 28 Jun 2022 06:10:29 +0000) ---
+This bug was fixed in 2.14.0 and patch backported for 2.12.7.
+
+--- Comment (gerrit, Thu, 4 Mar 2021 08:35:36 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/41172/
+
+Subject: LU-10262 mdt: mdt_reint_open: check EEXIST without lock
+
+Project: fs/lustre-release
+
+Branch: b2_12
+
+Current Patch Set: 
+
+Commit: 515255019d4589354eb3bf393dabc689fc37407c
+
+--- Comment (gerrit, Fri, 8 Jan 2021 14:14:33 +0000) ---
+Etienne AUJAMES (eaujames@ddn.com) uploaded a new patch: https://review.whamcloud.com/41172
+
+Subject: LU-10262 mdt: mdt_reint_open: check EEXIST without lock
+
+Project: fs/lustre-release
+
+Branch: b2_12
+
+Current Patch Set: 1
+
+Commit: dca678c450d517a3fce631eac076bc1ea4c502d7
+
+--- Comment (gerrit, Wed, 9 Dec 2020 07:48:45 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/33098/
+
+Subject: LU-10262 mdt: mdt_reint_open: check EEXIST without lock
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 33dc40d58ef6eb8b384fce1da9f8d21cad4ef6d8
+
+--- Comment (adilger, Fri, 13 Nov 2020 19:06:42 +0000) ---
+Thanks for the update. 
+
+Could you please put a condensed version of these results into the commit message of the patch, showing a simple table of without/with results absolute times in the last table, and the last column %improvement.
+
+--- Comment (eaujames, Fri, 13 Nov 2020 12:12:42 +0000) ---
+Hello,
+
+I have done some performances tests to evaluate the impact the Dominique patch [33098|https://review.whamcloud.com/33098]
+
+Environment:
+
+Hardware:
+VM (Qemu)
+
+OS:
+Centos 7.6
+
+Kernel :
+3.10.0-1127.8.2el7_lustre
+
+Lustre :
+V2.13.55_139_g382d6f1 (master)
+
+OSS:
+3 (6 OST ldiskfs)
+
+MDS :
+1 (2 MDT ldiskfs)
+
+Clients :
+400
+
+NTP :
+chrony (ref: vm5)
+
+Tools:
+clush
+
+ modify multiop binary to measure operations time and to synchronize processes on clients by specifying a common start date (patch joined in tickets).
+
+Description:
+
+Common:
+For each test case, each client call performs 20 "open" call on different files store on a common parent directory. To evaluate parent directory availability, each client performs "opendir + stat" call on directory while accessing to files.
+
+ Each files or directories operations is measured and performed simultaneously.
+
+Test cases
+ 
+
+readonly
+Open operations on the files are performs with "O_RDONLY" flag. The files are precreated on the parent directory with one client. Then all FS caches are dropped for all the nodes.
+
+readonly (cached)
+Same conditions that for "readonly" tests case, except that "ls" command is called on parent directory for each client node before performing the "open" syscall on the files (cached the dentries).
+
+_O_CREAT +precreate
+Open operations on the files are performs with "O_RDONLY + O_CREAT" flag. The files are precreated on the parent directory with one client. Then all FS caches are dropped for all the nodes.
+
+_O_CREAT cached_
+Same conditions that for "_O_CREAT +precreat_" tests case, except that "ls" command is called on parent directory for each client node before performing the "open" syscall on the files (cached the dentries).
+
+_O_CREAT_
+Open operations on the files are performs with "O_RDONLY + O_CREAT" flag. The files does not exist before performing "open" syscall on the files.
+
+Results:
+
+ 
+Mean values
+ 
+ 
+ 
+Max values
+ 
+ 
+ 
+
+Without 33098
+Files access (s)
++/- % (ref: readonly)
+Directory access (s)
++/- % (ref: readonly)
+Files access (s)
++/- % (ref: readonly)
+Directory access (s)
++/- % (ref: readonly)
+
+readonly
+0.96
+0.00%
+0.554
+0.00%
+1.446
+0.00%
+0.999
+0.00%
+
+readonly cached
+0.372
+-61.28%
+0.404
+-27.09%
+0.906
+-37.36%
+0.903
+-9.65%
+
+O_CREAT +precreate
+1.645
++71.43%
+1.024
++84.80%
+2.461
++70.18%
+2.321
++132.33%
+
+O_CREAT cached
+0.632
+-34.17%
+0.829
++49.53%
+1.394
+-3.58%
+1.4
++40.13%
+
+O_CREAT
+1.261
++31.44%
+0.732
++32.16%
+1.703
++17.78%
+1.047
+4.77%
+
+ 
+
+ 
+Mean values
+ 
+ 
+ 
+Max values
+ 
+ 
+ 
+
+With 33098 
+Files access (s)
++/- % (ref: readonly)
+Directory access (s)
++/- % (ref: readonly)
+Files access (s)
++/- % (ref: readonly)
+Directory access (s)
++/- % (ref: readonly)
+
+readonly
+0.973
+0.00%
+0.508
+0.00%
+1.451
+0.00%
+0.895
+0.00%
+
+readonly cached
+0.372
+-61.82%
+0.418
+-17.68%
+0.890
+-38.71%
+0.890
+-0.53%
+
+O_CREAT +precreate
+0.968
+-0.48%
+0.480
+-5.65%
+1.454
++0.19%
+0.725
+-18.98%
+
+O_CREAT cached
+0.623
+-35.95%
+0.790
++55.44%
+1.389
+-4.27%
+1.391
++55.48%
+
+O_CREAT
+1.093
++12.35%
+0.653
++28.44%
+1.533
++5.63%
+1.000
++11.76%
+
+ 
+
+ 
+Files access
+ 
+ 
+ 
+Directory access
+ 
+ 
+ 
+
+Comparative mean values
+Without patch (s)
+With patch (s)
+Diff (s)
++/- % (ref: without patch)
+Without patch (s)
+With patch (s)
+Diff (s)
++/- % (ref: without patch)
+
+readonly
+0.960
+0.973
+0.013
++1.40%
+0.554
+0.508
+-0.046
+-8.28%
+
+readonly cached
+0.372
+0.372
+0.000
+-0.01%
+0.404
+0.418
+0.014
++3.56%
+
+O_CREAT +precreate
+1.645
+0.968
+-0.677
+-41.13%
+1.024
+0.480
+-0.545
+-53.17%
+
+O_CREAT cached
+0.632
+0.623
+-0.008
+-1.34%
+0.829
+0.790
+-0.039
+-4.65%
+
+O_CREAT
+1.261
+1.093
+-0.168
+-13.32%
+0.732
+0.653
+-0.079
+-10.85%
+
+ 
+
+  
+
+ 
+Files access
+ 
+ 
+ 
+Directory access
+ 
+ 
+ 
+
+Comparative max values
+Without patch (s)
+With patch (s)
+Diff (s)
++/- % (ref: without patch)
+Without patch (s)
+With patch (s)
+Diff (s)
++/- % (ref: without patch)
+
+readonly
+1.446
+1.451
+0.005
++0.37%
+0.999
+0.895
+-0.105
+-10.47%
+
+readonly cached
+0.906
+0.890
+-0.016
+-1.80%
+0.903
+0.890
+-0.013
+-1.44%
+
+O_CREAT +precreate
+2.461
+1.454
+-1.007
+-40.91%
+2.321
+0.725
+-1.597
+-68.78%
+
+O_CREAT (cached)
+1.394
+1.389
+-0.005
+-0.35%
+1.400
+1.391
+-0.009
+-0.66%
+
+O_CREAT
+1.703
+1.533
+-0.170
+-9.99%
+1.047
+1.000
+-0.047
+-4.50%
+
+ 
+
+  
+
+ Conclusion:
+
+The patch 33098 optimizes files O_CREAT concurent access when the files are not cached by the clients.
+
+--- Comment (gerrit, Thu, 24 Sep 2020 11:53:26 +0000) ---
+Etienne AUJAMES (eaujames@ddn.com) uploaded a new patch: https://review.whamcloud.com/40026
+
+Subject: LU-10262 mdc: Avoid requesting CW when MDS_OPEN_BY_FID is set
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: cc43e2229a90f284b74c52793048956028d0e60b
+
+--- Comment (martinetd, Fri, 17 Jul 2020 07:44:42 +0000) ---
+Just an update on this – we've started seeing this again recently for some reason (new users with large (12-32k processes) jobs all opening files synchronously in the same directory).
+
+ 
+
+The patch I had submitted two years ago doesn't miss much but I unfortunately really won't have time to finish it (it's just missing rebase+add some tests and run benchmarks as far as I understand) ; I think Étienne (our lustre on-site support) will be working on it and take over the patch if I got this right. Guidance would be appreciated
+
+--- Comment (gerrit, Fri, 31 Aug 2018 09:05:59 +0000) ---
+Dominique Martinet (dominique.martinet@cea.fr) uploaded a new patch: https://review.whamcloud.com/33098
+
+Subject: LU-10262 mdt: mdt_reint_open: check EEXIST without lock
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 250b7ed7b7f994a1469d4948afffe8728e448417
+
+--- Comment (martinetd, Fri, 31 Aug 2018 08:17:31 +0000) ---
+Definitely - this is probably even more important than mkdir in practice. I had originally planned to do this one after the first landed, but I think we're getting close now.
+
+ 
+
+i've got something that tries to mimic what Lai did with mkdir but it's a bit more complicated as I'm not 100% sure on what to do if the mdo_create() fails with EEXIST – it's not complete (I'd like to add some test that hit the race with an OBD_FAIL_TIMEOUT like he did) but I'll push what I have to get comments.
+
+--- Comment (adilger, Fri, 31 Aug 2018 06:10:09 +0000) ---
+It would be good to get a similar fix for open(O_CREAT) as patch https://review.whamcloud.com/30880 "LU-10235 mdt: mdt_create: check EEXIST with PR lock first" did for mkdir().

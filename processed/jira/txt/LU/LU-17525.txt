@@ -1,0 +1,623 @@
+Key:        LU-17525
+Summary:    Unaligned DIO interop with different page sizes fails
+Link:       https://jira.whamcloud.com/browse/LU-17525
+Type:       Bug
+Priority:   Critical
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Shaun Tancheff
+Reporter:   Shaun Tancheff
+Created:    Sun, 11 Feb 2024 05:40:03 +0000
+Updated:    Mon, 8 Dec 2025 17:34:35 +0000
+Resolved:   Sun, 27 Oct 2024 22:55:38 +0000
+Labels:     arm, arm-server, ppc64le
+Links:      Duplicate: is duplicated by LU-17993; Related: is related to  LU-17598; Related: is related to  LU-17524; Related: is related to  LU-18368; Related: is related to  LU-13805; Related: is related to LU-17168; Related: is related to LU-18366; Related: is related to LU-19180; Related: is related to LU-17450; Related: is related to LU-17597; Related: is related to LU-17927; Related: is related to LU-18319
+
+--- Description ---
+Unaligned DIO interop with differnt page sizes fails
+
+When doing DIO 4k  64k page unaligned I/O in the brw/ptlrpc bulk ops due to a differing number of pages that can be added to the initial MD while fitting within the LNET_MTU limit.
+
+One solution is to restrict the initial unaligned MD to the maximum page size of all the interoperable machines. In this case aarch64 and a few other arches have 64k pages.
+
+Limiting the first I/O to the limit of what can fit in (LNET_MTU - 64k bytes) ensures that MDs are sized to the same maximum that all architectures can support. This is only done when initial MD is unaligned and the vectors are nominally aligned thereafter.
+
+When client and server page sizes are different then the client and server prepare MDs differently, each based on their local page size. When the offset
+
+When the system with the larger page size is writing at an offset greater than the smaller page size and the resulting (first) MD number of bytes + larger page size offset is greater then the LNET MTU (1M) the number of bytes that can fit is greater for the smaller page size system. In this case the MD (send or receiving) will match on xid/match_bits and fail on the message length check:
+
+lnet_try_match_md()
+{
+....
+	} else if ((md->md_options & LNET_MD_TRUNCATE) == 0) {
+		/* this packet _really_ is too big */
+		CERROR("Matching packet from %s, match %llu"
+		       " length %d too big: %d left, %d allowed\n",
+		       libcfs_idstr(&info->mi_id), info->mi_mbits,
+		       info->mi_rlength, md->md_length - offset, mlength);
+
+		return LNET_MATCHMD_DROP;
+...
+}
+
+This then triggers a resend, both sides recompute and resend, however the lengths are still wrong so the I/O never completes.
+
+So adjust the fitting logic in {__ptlrpc_prep_bulk_page()} for the first MD when all of the following is true:
+
+	I/O is direct-io
+
+	write is not aligned on the largest allowed page_size (64k)  boundary
+
+	offset is > smallest page size (MD_MIN_INTEROP_PAGE_SIZE)
+
+For interop the first page is assumed to be 64k which then causes the smaller paged system
+
+to stop adding pages/bytes to the MD at the same point as the larger pages system except when:
+
+	number of bytes + 64k offset 
+
+A quick survey of systems with page sizes (or configurable PAGE_SIZE) that Linux supports shows a few uncommon architectures that support page sizes > 64k however those systems are also configurable for 64k (or smaller) page sizes.
+
+In addition no current supported platform appears to allow a page size of less than 4k.  Therefore restricting lustre to 4k to 64k page sizes (along with the MD_MAX_INTEROP_PAGE_SIZE) should not be controversial.
+
+Finally to accommodate the possible additional MD needed for a full bulk I/o that is also restricted due to offset and page alignment increase the maximum to PTLRPC_BULK_OPS_COUNT + 1.
+
+To do this we have to double the theoretical maximum from 6 bits to 7 to correctly deal with the mbits/xid logic.
+
+Finally to indicate to the server that a client has in fact adjusted the MD size(s) for 64k alignment the unused lower 16 bits of struct obd_ioobj.ioo_max_brw can be used for flags of which one bit can be used to indicate OBD_IOOBJ_INTEROP_PAGE_ALIGNMENT is needed.
+
+Without this patch a 64k unaligned I/O where the client and server have different native page sizes cannot agree on how big the MD is (one side will abort MD with 'too big' [see: lnet_try_match_md() => LNET_MATCHMD_DROP] for the allocated space and trigger a retry, but the MD math never changes so the effect is a hang.
+
+--- Comment (pjones, Sun, 27 Oct 2024 22:55:38 +0000) ---
+Merged for 2.16
+
+--- Comment (gerrit, Sat, 26 Oct 2024 23:57:55 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/56775/
+
+Subject: LU-17525 llite: soft fail unaligned dio
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: a5546155a87a245f40062b68d26e53bed7dca44f
+
+--- Comment (gerrit, Fri, 25 Oct 2024 09:32:02 +0000) ---
+"Shaun Tancheff " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/56789
+
+Subject: LU-17525 llite: soft fail unaligned dio
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: ab0d6222421e9e5dc68cfa4afbc55da129eebdfe
+
+Sad that such an auspicious patch number 56789 was abandoned. ;-(
+
+--- Comment (adilger, Fri, 25 Oct 2024 07:10:31 +0000) ---
+See my comments in LU-18368.
+
+--- Comment (yujian, Fri, 25 Oct 2024 00:43:08 +0000) ---
+After reverting commit ff018bb77a37 (LU-18284 llite: disallow udio exceptions) from master branch, sanity tests passed with 2.15.5 server:
+
+https://testing.whamcloud.com/test_sets/8a856ba2-26b6-4339-ba14-488bb625ebea
+
+--- Comment (adilger, Thu, 24 Oct 2024 19:21:52 +0000) ---
+I'm wondering if this issue is being hit (e.g. for "lfs migrate") when a "normal" DIO read is issued with a proper PAGE_SIZE sized and aligned buffer (so not unaligned), but the file size is not a multiple of this?  That would happen when trying to migrate a file that is not an even number of pages in size.  It may be enough to determine which check is causing this to be blocked and only allow this one case.
+
+--- Comment (gerrit, Thu, 24 Oct 2024 08:13:49 +0000) ---
+"Shaun Tancheff " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/56775
+
+Subject: LU-17525 llite: soft fail unaligned dio
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: c49d578c87cb165fa909643d54f3801ae6b6a27b
+
+--- Comment (adilger, Wed, 23 Oct 2024 09:56:02 +0000) ---
+I can't say if "lfs migrate" is the only application that depends on this behavior.  At least one other test tool is expecting this to work, and I suspect some user applications may be the same.  IMHO, no fix should be needed to "lfs migrate", it should "just work" however it was previously working, and would likely serve as a useful test tool to see if this code is working.
+
+--- Comment (stancheff, Wed, 23 Oct 2024 04:07:26 +0000) ---
+Likely a consequence of the the unaligned dio flag quashing.
+
+Should we treat these as regressions and re-enable some unaligned dio exceptions?
+
+Or should we fix lfs migrate and except these tests when unaligned dio is not available?
+
+I think we want to continue with the migrate fix and add the unaligned dio exceptions.
+
+--- Comment (adilger, Wed, 23 Oct 2024 03:41:12 +0000) ---
+It looks like sanity test_398o has also started failing in interop testing.  It is doing a 1-byte DIO read, which (for better or worse) was previously working with older clients/servers, but not with the master client and any old server:
+
+https://testing.whamcloud.com/search?horizon=2332800&status%5B%5D=FAIL&test_set_script_id=f9516376-32bc-11e0-aaee-52540025f9ae&sub_test_script_id=a18212de-787b-40c6-8b6c-b63a4e43f85e&source=sub_tests#redirect
+
+There are several other tests doing "lfs migrate" (e.g. test_389s) that are failing in b2_14 interop testing:
+
+https://testing.whamcloud.com/test_sets/c2e89b09-33e9-49d2-b82e-61b6bfcbce00
+
+--- Comment (adilger, Tue, 22 Oct 2024 01:29:20 +0000) ---
+stancheff, it looks like these subtests are still failing during interop testing with older servers:
+
+https://testing.whamcloud.com/test_sets/c2e89b09-33e9-49d2-b82e-61b6bfcbce00
+
+https://testing.whamcloud.com/test_sets/67fbf2fd-3aa3-4bed-b806-ef5e1542cd5a
+
+They shouldn't be doing anything fancy ("lfs migrate" doing direct read/write) so it seems like there is still something wrong here...
+
+--- Comment (pjones, Fri, 4 Oct 2024 00:28:34 +0000) ---
+Seems to be all merged for 2.16
+
+--- Comment (gerrit, Fri, 4 Oct 2024 00:16:35 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/55647/
+
+Subject: LU-17525 test: re-enable sanity tests: 56x 56xa 56xb
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: c81f140168964db07a30b7102efffc4dfe5b6c5e
+
+--- Comment (simmonsja, Sun, 29 Sep 2024 00:16:18 +0000) ---
+https://review.whamcloud.com/#/c/fs/lustre-release/+/55647 is left. That patch just enables some sanity test that failed before.
+
+--- Comment (adilger, Mon, 16 Sep 2024 17:21:10 +0000) ---
+stancheff what is the current status of this issue?  Is there still a problem with UDIO and 64KB pages, or has that issue been fixed?
+
+--- Comment (gerrit, Fri, 16 Aug 2024 23:55:40 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/55895/
+
+Subject: LU-17525 llite: unaligned DIO zfs detection
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: b07b31d44ffee44c9044cdebedf1d42a35c82929
+
+--- Comment (gerrit, Sat, 27 Jul 2024 04:19:28 +0000) ---
+"Shaun Tancheff " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/55875
+
+Subject: LU-17525 test: aarch64 interop
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 62700139df2cb8a614b70b31a61074d53af3871d
+
+--- Comment (gerrit, Fri, 26 Jul 2024 09:11:48 +0000) ---
+"Shaun Tancheff " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/55870
+
+Subject: LU-17525 test: aarch64 interop
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: a35218181c700605040e57960dfad13e0b756aa8
+
+--- Comment (pjones, Thu, 25 Jul 2024 19:04:22 +0000) ---
+As per discussion on the LWG call today, moving tickets that do not appear to be essential to fix version 2.17. If the fix lands before code freeze we will update the fix version to reflect that but we want to focus on activities on the critical path. Please speak up if you think that this issue definitely needs to be fixed before we could issue a 2.16 release.
+
+--- Comment (gerrit, Sat, 6 Jul 2024 08:32:49 +0000) ---
+"Shaun Tancheff " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/55647
+
+Subject: LU-17525 test: re-enable sanity tests: 56x 56xa 56xb
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: d320acd6c75a9c9f7e343537a814f25197bb5ddc
+
+--- Comment (gerrit, Sat, 6 Jul 2024 02:05:53 +0000) ---
+"Shaun Tancheff " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/55646
+
+Subject: LU-17525 test: re-enable sanity tests: 56x 56xa 56xb
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: f9d3f4c672807582c815d70817d6dcc944fd844f
+
+--- Comment (adilger, Thu, 4 Jul 2024 22:01:50 +0000) ---
+This ticket is being used to exclude sanity test_56x, test_56xa, test_56xb, but those subtests were not re-enabled in the patch https://review.whamcloud.com/53997 "LU-17525 llite: unaligned DIO interop page alignment" that was landed.
+
+So it isn't really clear whether that patch actually fixed these test failures or not.
+
+Could you please submit a patch to remove the exception for those subtests, and run them in interop mode, maybe with aarch64 clients, to confirm that the client is handling these cases properly.
+
+--- Comment (pjones, Tue, 25 Jun 2024 12:44:11 +0000) ---
+Merged for 2.16
+
+--- Comment (gerrit, Tue, 25 Jun 2024 03:23:21 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/53997/
+
+Subject: LU-17525 llite: unaligned DIO interop page alignment
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 07a1272233c56ac0191a4e9e20d77234b3fb3d90
+
+--- Comment (adilger, Wed, 12 Jun 2024 23:17:34 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/54962/
+
+Subject: LU-17450 test: disable test 56x 56xa 56xb in sanity
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set:
+
+Commit: bfcab56c5f35ae33c42325326f9141d9c48412b1
+
+--- Comment (gerrit, Wed, 29 May 2024 04:41:10 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/55076/
+
+Subject: LU-17525 tests: fix sanity hash 2.15 interop
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: aa463a7946ee82c181a8c84f982a44e7e175c475
+
+--- Comment (gerrit, Sat, 11 May 2024 05:38:52 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/55076
+
+Subject: LU-17525 tests: fix sanity interop with 2.15
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 3c54b7aaf4a4ff4da50d00c679b76015dd35fb11
+
+--- Comment (gerrit, Tue, 2 Apr 2024 20:56:58 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/54466/
+
+Subject: LU-17525 tests: sanity/133a interop version checking
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: c5e80faaee65c15bccf3d81a4504bba862cd8fbe
+
+--- Comment (gerrit, Tue, 26 Mar 2024 04:25:17 +0000) ---
+Abandoned: https://review.whamcloud.com/c/fs/lustre-release/+/54566
+
+--- Comment (gerrit, Mon, 25 Mar 2024 13:30:08 +0000) ---
+Abandoned: 
+
+https://review.whamcloud.com/c/fs/lustre-release/+/54559
+
+--- Comment (gerrit, Mon, 25 Mar 2024 02:47:33 +0000) ---
+Abandoned: https://review.whamcloud.com/c/fs/lustre-release/+/54550
+
+--- Comment (gerrit, Mon, 25 Mar 2024 02:09:08 +0000) ---
+Abandoned: https://review.whamcloud.com/c/fs/lustre-release/+/54548
+
+--- Comment (gerrit, Wed, 20 Mar 2024 02:15:51 +0000) ---
+"Shaun Tancheff " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/54466
+
+Subject: LU-17525 tests: sanity/65p and 133a version checking
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 472c7654370078725e4dd837126120f0592c519c
+
+--- Comment (xinliang, Wed, 20 Mar 2024 01:49:55 +0000) ---
+Hi adilger, sure. There some Lnet/ptlrpc communication explanation in the old "Understanding Lustre Filesystem Internals, ", and we can explain in more detail how Lnet/ptlrpc is working in the new "Understanding Lustre Filesystem Internals" wiki.
+
+--- Comment (adilger, Tue, 19 Mar 2024 15:56:18 +0000) ---
+xinliang thank you for the excellent comment and explanation. This should really go into a wiki page, or probably even better into the Internals document to explain how this bulk RDMA transfer is working. 
+
+I also see you have provided feedback on Shaun's patch, which is great.
+
+--- Comment (xinliang, Tue, 19 Mar 2024 07:13:40 +0000) ---
+Following up last comment, so how the server side should count the first MD size here? 
+
+Md0_size is important, if it is correct, then the rest mds' sizes are all correct too.
+
+We count the number of pages md0 can contain, or count its size directly.
+
+Assuming max_md_interop_page_size is the bigger page size of the two peers.
+
+In this case, 
+
+file_offset = 524287, buffer_size = 1048577, remote_page_size=64K, page_size=4k 
+
+Then,
+
+max_md_interop_page_size = MAX(page_size, remote_page_size)
+min_md_interop_page_size = MAX(page_size, remote_page_size)
+
+offset_in_max_page = file_offset % max_md_interop_page_size = 65535
+offset_in_page = file_offset % page_size = 4095
+
+size_in_first_max_page = max_md_interop_page_size - offset_in_max_page = 1
+size_in_first_page = page_size - offset_in_page = 1 
+
+rest_bulk_size = MIN(LNET_MTU-max_md_interop_page_size, buffer_size-size_in_first_max_page) = 1048576 - 65536= 983040
+
+The npages of md0 is counting by two parts,
+
+First part is size_in_first_max_page:
+
+npages_1 = (size_in_first_max_page + page_size - 1) / page_size = 1
+
+Second part is the rest part of the MD:
+
+npages_2 = (rest_bulk_size + page_size - 1) / page_size = 240
+
+Then,
+
+npages = npages_1 + npages_2
+       = (size_in_first_max_page + page_size - 1 + rest_bulk_size + page_size - 1) / page_size
+       = (size_in_first_max_page + rest_bulk_size + page_size * 2 - 2)/ page_size
+And make sure that, npages  
+
+Then,
+
+md0_size = size_in_first_page + (npages - 1) * page_size = 1 + 240 * 4096 = 983041 
+
+ 
+
+Or just count its size directly,
+
+md0_size = size_in_first_max_page + rest_bulk_size = 1 + 983040 = 983041
+
+ 
+
+The counting idea is, that the md0_size on both sides are the same and count the  md0_size of the max_md_interop_page_size side.
+
+（Note that, on the client side md0_size also should be counted in the same way. ）
+
+--- Comment (xinliang, Tue, 19 Mar 2024 02:30:05 +0000) ---
+After reading some Lnet/Ptlrpc background knowledge of Understanding Lustre Filesystem Internals and adding some extra Lnet MD(Memory Description) debug prints, I finally managed to know why the below error prints, just record it here FYI.
+
+LNetError: 230016:0:(lib-ptl.c:223:lnet_try_match_md()) Matching packet from 12345-192.168.1.203@tcp, match 1792859979923328 length 1044481 too big: 983041 left, 983041 allowed
+
+Debug prints
+
+ --- a/lnet/lnet/lib-md.c
++++ b/lnet/lnet/lib-md.c
+@@ -190,6 +190,9 @@ lnet_md_build(const struct lnet_md *umd, int unlink)
+                                return ERR_PTR(-EINVAL); /* invalid length */
+                        }
++                       CDEBUG(D_NET, "iov[%d/%d]: length %d, offset %d\n",
++                             i, niov, lmd->md_kiov[i].bv_len, lmd->md_kiov[i].bv_offset);
++
+                        total_length += lmd->md_kiov[i].bv_len;
+                }@@ -221,6 +224,9 @@ lnet_md_build(const struct lnet_md *umd, int unlink)
+                        lmd->md_kiov[i].bv_offset = offset_in_page(pa);
+                        lmd->md_kiov[i].bv_len = plen;
++                       CDEBUG(D_NET, "iov[%d/%d]: length %d, offset %d\n",
++                             i, niov, lmd->md_kiov[i].bv_len, lmd->md_kiov[i].bv_offset);
++
+                        len -= plen;
+                        pa += plen;
+                        i += 1;
+@@ -238,6 +244,9 @@ lnet_md_build(const struct lnet_md *umd, int unlink)
+                lmd->md_options |= LNET_MD_KIOV;
+        }
++       CDEBUG(D_NET, "===>MD: offset/length[%d/%d], npages(niov) %d\n",
++               lmd->md_offset, lmd->md_length, lmd->md_niov);
++
+        return lmd;
+
+ --- a/lustre/ptlrpc/niobuf.c
++++ b/lustre/ptlrpc/niobuf.c
+@@ -226,6 +226,11 @@ int ptlrpc_start_bulk_transfer(struct ptlrpc_bulk_desc *desc)
+                        CFS_FAIL_CHECK_RESET(OBD_FAIL_PTLRPC_CLIENT_BULK_CB3,
+                                             CFS_FAIL_PTLRPC_OST_BULK_CB2);
++               CDEBUG(D_NET, "Start to transfer bulk %s buffer, portal:%u, peer:%s, mbits:x%llu, md[%d/%d], %u pages(niovs)\n",
++                               ptlrpc_is_bulk_put_source(desc->bd_type) ? "LnetPut" : "LnetGet",
++                             desc->bd_portal, libcfs_idstr(&peer_id), mbits,
++                             posted_md, total_md, md.length);
++
+                /* Network is about to get at the memory */
+                if (ptlrpc_is_bulk_put_source(desc->bd_type))
+                        rc = LNetPut(&self_nid, desc->bd_mds[posted_md],
+@@ -405,6 +410,10 @@ int ptlrpc_register_bulk(struct ptlrpc_request *req)
+                               posted_md, rc);
+                        break;
+                }
++               CDEBUG(D_NET, "Register(posted) bulk %s buffer, portal:%u, peer:%s, mbits:x%llu, md[%d/%d], %u pages(niovs)\n",
++                              ptlrpc_is_bulk_op_get(desc->bd_type) ? "get-source" : "put-sink",
++                               desc->bd_portal, libcfs_idstr(&peer), mbits,
++                               posted_md, total_md, md.length);
+        }
+
+And the call trace is shown as below, when adding a LBUG() line. 
+
+[433963.854476] LNetError: 538390:0:(lib-ptl.c:230:lnet_try_match_md()) LBUG
+[433963.857017] CPU: 0 PID: 538390 Comm: socknal_sd00_01 Kdump: loaded Tainted: P           OE     4.19.90-2312.6.0.0232.oe1.aarch64 #1
+[433963.861674] Hardware name: QEMU KVM Virtual Machine, BIOS 0.0.0 02/06/2015
+[433963.864249] Call trace:
+[433963.865823]  dump_backtrace+0x0/0x1a0
+[433963.867683]  show_stack+0x24/0x30
+[433963.869421]  dump_stack+0xa4/0xe8
+[433963.871183]  lbug_with_loc+0x6c/0xa0 [libcfs]
+[433963.873171]  LNetSetLazyPortal+0x0/0x138 [lnet]
+[433963.875183]  lnet_mt_match_md+0x84/0x1d8 [lnet]
+[433963.877133]  lnet_ptl_match_md+0x308/0x990 [lnet]
+[433963.879133]  lnet_parse_local+0x24c/0xd68 [lnet]
+[433963.881065]  lnet_parse+0xb8c/0x13f0 [lnet]
+[433963.882928]  ksocknal_process_receive+0x2dc/0xe40 [ksocklnd]
+[433963.885067]  ksocknal_scheduler+0x1ec/0xcd8 [ksocklnd]
+[433963.887101]  kthread+0x134/0x138
+[433963.888661]  ret_from_fork+0x10/0x18 
+
+ 
+
+The root cause is,
+
+according to Understanding Lustre Filesystem Internals, Lnet is a Memory-Oriented Communication Semantics, maybe it is an abstract layer of RDMA(Remote Direct Memory Access?). Which means two peers in order to communication with each other, one peer must post a memory or buffer first, then the other peer gets this memory info, finally the two peers do the communication (send/receive msg) based on this memory. The other peer must know exactly the size of the posted memory, otherwise communication will fail, because both peers filling(receiving) msg based on the same memory size.  Current unaligned DIO 4k server  64k client communication hits this issue, because server gets the wrong memory size. 
+
+ 
+
+Let's see why test 119p hits this issue on unaligned DIO 4k server  64k client.
+
+test_119p()
+{
+        rwv -f $DIR/$tfile -Dw -n 3 0x7ffff 0x100001 0x180000 ||
+                        error "DIO unaligned writev test failed"
+...
+} 
+
+The test directly writes 3 buffer to file $DIR/$tfile, the buffer sizes are 0x7FFFF(=524287), 0x100001(=1048577), 0x180000(=1572864).
+
+The problem happens when writing the second unaligned buffer 1048577. Remember the size 1048577.
+
+Firstly, the client posted the  1048577 buffer into two memories(MDs) for writing:
+
+client side: 
+# MD0
+(lib-md.c:194:lnet_md_build()) iov[0/16]: length 1, offset 65535
+(lib-md.c:194:lnet_md_build()) iov[1/16]: length 65536, offset 0
+...
+(lib-md.c:194:lnet_md_build()) iov[15/16]: length 65536, offset 0
+(lib-md.c:248:lnet_md_build()) ===>MD: offset/length[0/983041], npages(niov) 16
+(niobuf.c:416:ptlrpc_register_bulk()) Register(posted) bulk get-source buffer, portal:8, peer:12345-192.168.1.203@tcp, mbits:x1793835949633280, md[0/2], 16 pages(niovs)
+# MD1
+(lib-md.c:194:lnet_md_build()) iov[0/1]: length 65536, offset 0
+(lib-md.c:248:lnet_md_build()) ===>MD: offset/length[0/65536], npages(niov) 1
+(niobuf.c:416:ptlrpc_register_bulk()) Register(posted) bulk get-source buffer, portal:8, peer:12345-192.168.1.203@tcp, mbits:x1793835949633281, md[1/2], 1 pages(niovs)
+(niobuf.c:444:ptlrpc_register_bulk()) Setup 2 bulk get-source buffers: 17 pages 1048577 bytes, mbits x0x65f7bfa902f00-0x65f7bfa902f01, portal 8 
+
+Then the server gets this posted buffer info, and prepares two memories(MDs) for receiving: 
+
+server side:
+# MD0
+(lib-md.c:193:lnet_md_build()) iov[0/256]: length 1, offset 4095
+...
+(lib-md.c:193:lnet_md_build()) iov[1/256]: length 4096, offset 0
+(lib-md.c:193:lnet_md_build()) iov[255/256]: length 4096, offset 0
+(lib-md.c:246:lnet_md_build()) ===>MD: offset/length[0/1044481], npages(niov) 256
+(niobuf.c:228:ptlrpc_start_bulk_transfer()) Start to transfer bulk LnetGet buffer, portal:8, peer:12345-192.168.1.56@tcp, mbits:x1793835949633280, md[0/2], 256 pages(niovs)
+# MD1
+(lib-md.c:193:lnet_md_build()) iov[0/1]: length 4096, offset 0
+(lib-md.c:246:lnet_md_build()) ===>MD: offset/length[0/4096], npages(niov) 1
+(niobuf.c:228:ptlrpc_start_bulk_transfer()) Start to transfer bulk LnetGet buffer, portal:8, peer:12345-192.168.1.56@tcp, mbits:x1793835949633281, md[1/2], 1 pages(niovs)
+(niobuf.c:267:ptlrpc_start_bulk_transfer()) Transferring 257 pages 1048577 bytes via portal 8 id 12345-192.168.1.56@tcp mbits 0x65f7bfa902f00-0x65f7bfa902f01 
+
+You can see on the server side, it prepares two different MDs in size, although the total size is the same 1048577. But this makes lnet_try_match_md() matching failed which resulting communication failed.
+
+lnet_try_match_md()
+{
+....
+	} else if ((md->md_options & LNET_MD_TRUNCATE) == 0) {
+		/* this packet _really_ is too big */
+		CERROR("Matching packet from %s, match %llu"
+		       " length %d too big: %d left, %d allowed\n",
+		       libcfs_idstr(&info->mi_id), info->mi_mbits,
+		       info->mi_rlength, md->md_length - offset, mlength);
+
+		return LNET_MATCHMD_DROP;
+...
+} 
+
+ 
+
+So why the sever side counting two different size MDs?
+
+Because the bulk(MD) size is limited by LNET_MTU(=1MB) and number of pages is limited by LNET_MAX_IOV(=256). See how to count an MD in __ptlrpc_prep_bulk_page().  And because the first page's offset is not 0, this non-zero offset makes the npages of the first MD unaligning the client's page size(64K) on the server side, thus makes server side counting a different size first MD. And of course,  the second MD is in different size too, because the buffer total size is the same in both client and server sides. 
+
+ __ptlrpc_prep_bulk_page()
+{
+ ...
+ 262         if (((desc->bd_iov_count % LNET_MAX_IOV) == 0) ||
+ 263              ((desc->bd_nob_last + len) > LNET_MTU)) {
+ 264                 desc->bd_mds_off[desc->bd_md_count] = desc->bd_iov_count;
+ 265                 desc->bd_md_count++;
+ 266                 desc->bd_nob_last = 0;
+ 267                 LASSERT(desc->bd_md_count
+
+--- Comment (stancheff, Wed, 6 Mar 2024 09:13:19 +0000) ---
+Yes, this is the hang:
+
+https://review.whamcloud.com/c/fs/lustre-release/+/52266#message-7d97d6a5805cb447246922aec3ba997c069e7a66
+
+--- Comment (xinliang, Wed, 6 Mar 2024 07:58:17 +0000) ---
+It should be this hang?  I am to test the patch and reproduce the problem.
+
+https://review.whamcloud.com/c/fs/lustre-release/+/52266#message-7d97d6a5805cb447246922aec3ba997c069e7a66
+
+--- Comment (stancheff, Wed, 6 Mar 2024 02:14:00 +0000) ---
+IIRC the failure is a hang (forever) with lots of re-sending of MDs that cannot be completed.
+
+--- Comment (adilger, Wed, 6 Mar 2024 00:01:13 +0000) ---
+It looks like this issue may be important to fix before the 2.16 release is made. The bug description doesn't say what "fails" means.  Am I correct to understand that this could corrupt data from a client with PAGE_SIZE > 4KB when using UDIO, or will the RPC fail and return an error, or the client or server crash, or ...?
+
+--- Comment (xinliang, Tue, 27 Feb 2024 03:47:16 +0000) ---
+Thanks adilger , we notice this issue and just come back from Lunar New Year holidays, will take a look at it.
+
+--- Comment (gerrit, Fri, 16 Feb 2024 05:37:12 +0000) ---
+Abandoned duplicate
+
+--- Comment (gerrit, Mon, 12 Feb 2024 17:38:48 +0000) ---
+Abandoned duplicate
+
+--- Comment (gerrit, Sun, 11 Feb 2024 18:54:35 +0000) ---
+Abandoned duplicate
+
+--- Comment (adilger, Sun, 11 Feb 2024 16:11:00 +0000) ---
+kevin.zhao, xinliang,
+
+the patches in this series are likely of interest to you.
+
+--- Comment (stancheff, Sun, 11 Feb 2024 09:02:55 +0000) ---
+Shaun Tancheff " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/53997
+
+Subject: LU-17525 llite: unaligned DIO iterop 64k page size
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 70b4def6469235493b74f6aa8062c2a7f5e
+
+--- Comment (gerrit, Sun, 11 Feb 2024 08:57:30 +0000) ---
+Abandoned duplicate

@@ -1,0 +1,74 @@
+Key:        LU-2160
+Summary:    Implement ZFS dmu_tx_hold_append() declarations for llog
+Link:       https://jira.whamcloud.com/browse/LU-2160
+Type:       Improvement
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Alex Zhuravlev
+Reporter:   Andreas Dilger
+Created:    Wed, 26 Oct 2011 01:56:33 +0000
+Updated:    Wed, 3 May 2023 15:27:53 +0000
+Labels:     llnl, zfs
+Links:      Duplicate: is duplicated by LU-7409; Related: is related to  LU-5242; Related: is related to LU-12336
+
+--- Description ---
+llog records are written in append fashion and holes in llog files are not allowed. Lustre doesn't know until late into transaction life cycle if it will need to write llog record for this operation, at what offset and to what llog file. In other words at dmu_tx_assign() time Lustre only knows the size of a potential llog record it might write during this transaction but doesn't know the exact start offset and object id for this write into llog file (it also knows the maximum llog file size). But dmu_tx_ APIs assume that the caller knows precise offset of a future write before dmu_tx_assign(). This is needed to calculate precise amount of space that will be consumed by a given write and this amount may differ for the same write size at different offsets (a second reason is that in debug mode dmu_tx_dirty_buf() verifies all writes are done only to offsets declared with dmu_tx_hold_write()). Changing Lustre code to calculate precise offset in llog before dmu_tx_assign() step doesn't seem to yield an efficient solution therefore we propose to add 2 new dmu_tx APIs to accommodate Lustre requirements.
+
+1)
+
+void
+dmu_tx_hold_append(dmu_tx_t *tx, uint64_t object, uint64_t startoff,
+                   uint64_t obj_maxsize, uint64_t len, int bs, int ibs)
+
+This API will reserve the maximum possible amount of space needed to append len bytes to any plain file within tx->tx_objset objset. The caller guarantees the size of this file is at most obj_maxsize but the actual start offset for the write may be anywhere from startoff to max_objsize-len (assert(len dmu_tx_hold_append() should pick the worst range for len bytes write. This will be the range where start and end byte are covered by a different indirect block at every level of the tree (i.e. seems like it should be [obj_maxsize/2 - len/2, obj_maxsize/2 + len/2)). dmu_tx_hold_append() can assume all writes to data blocks will only create new data and metadata blocks even if there's no snapshot. Therefore only txh_space_towrite field needs to be calculated for txh structure created by dmu_tx_hold_append() (space from metadnode update should be added just as in case of dmu_tx_hold_write() when dn is NULL).
+
+While dmu_tx_hold_append() may overestimate the net space consumed on disk by always assuming there's a snapshot and all writes create new metadata (this is correct assumption for data since we only write in append fashion to llog) it will avoid over reservation done by dmu_tx_hold_write() in other respects. Specifically dmu_tx_count_write() (called by dmu_tx_hold_write()) assumes the object size can be up to 2^64-1 when either dnode is not specified or declared write extends beyond current dn_maxblkid. In this case dmu_tx_count_write() accounts for maximum number of indirect blocks (and for the first write when maxblkid is 0 it uses the worst possible overhead from indirect blocks by computing the number of indirect blocks based on smallest indir blksz but using max indir blkzs as block size).
+
+dmu_tx_hold_append() can avoid that by knowing max file size and actual indirect/direct blocks sizes the caller guarantees to use. Specifically for 4K direct and 16K indirect blocksizes and 512MB max_objsize dmu_tx_hold_append() for 40 byte write will reserve 5 indirect blocks and 2 direct blocks or 88KB excluding metadnode file write.
+
+In the same case dmu_tx_hold_write() will reserve from this code (used when we extend the object into new block):
+
+	/*
+	 * 'end' is the last thing we will access, not one past.
+	 * This way we won't overflow when accessing the last byte.
+	 */
+	start = P2ALIGN(off, 1ULL txh_space_towrite += end - start + 1;
+
+	start >>= min_bs;
+	end >>= min_bs;
+
+	epbs = min_ibs - SPA_BLKPTRSHIFT;
+        /*
+	 * The object contains at most 2^(64 - min_bs) blocks,
+	 * and each indirect level maps 2^epbs.
+	 */
+	for (bits = 64 - min_bs; bits >= 0; bits -= epbs) {
+		start >>= epbs;
+		end >>= epbs;
+		ASSERT3U(end, >=, start);
+		txh->txh_space_towrite += (end - start + 1) txh_space_towrite += 1ULL 
+
+at least (52/7 + 1) * 16K + 16K + 4K = 148KB (I added extra 16K for all writes when start is > 64MB).
+
+That's greater than 88KB reserved by dmu_tx_hold_append() excluding metadnode reservation (metadnode reservation would be the same if we don't know object id upfront). And when dnode id is unknown (which is the actual case for llog writes) dmu_tx_count_write() would reserve much more (as it uses 3 not 7 for epbs above).
+
+--- Comment (bzzz, Wed, 3 May 2023 15:27:53 +0000) ---
+great, Brian.. will try that ASAP. thanks a lot.
+
+--- Comment (behlendorf, Wed, 3 May 2023 15:09:03 +0000) ---
+Alex, I've opened PR https://github.com/openzfs/zfs/pull/14819 which adds something close to the interface you suggested above.  I was able to simplify your original proposal because in 2017 we relaxed the strict space accounting which was being done, https://github.com/openzfs/zfs/commit/3ec3bc2167352df525c10c99cf24cb24952c2786,  With the following interface you just need to specify a minimum starting offset and a length for the write.
+
+void dmu_tx_hold_append(dmu_tx_t *tx, uint64_t object, uint64_t off, int len);
+
+void dmu_tx_hold_append_by_dnode(dmu_tx_t *tx, dnode_t *dn, uint64_t off, int len)
+
+As proposed this interface will still prefetch the L0 block at the specified offset to catch I/O errors early and to help make sure the block is in the ARC (for partial writes).  That said, any offset beyond what's provided is still allowed but may result in some unnecessary reads so the more accurate you can be the better.
+
+I haven't had a chance to test this new interface yet but wanted to open up the PR to get your feedback.  I'd love to finally make some progress on this so we can get one step closer to enabling debugging on the OpenZFS side.
+
+--- Comment (bzzz, Sat, 5 Dec 2015 05:28:36 +0000) ---
+Andreas, reservation itself isn't a big issue. and I think we could just declare at high offset to reserve enough credits. the issue is debugging code which doesn't like when a write is going out of declared ranges.
+
+--- Comment (adilger, Thu, 26 Nov 2015 02:53:49 +0000) ---
+Alex, how hard would it be to actually implement this in the DMU?  My recollection was that it is mostly a matter of adding a new API, and the actual code complexity is low?

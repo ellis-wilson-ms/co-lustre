@@ -1,0 +1,159 @@
+Key:        LU-16691
+Summary:    optimize ldiskfs prealloc (PA) under random read workloads
+Link:       https://jira.whamcloud.com/browse/LU-16691
+Type:       Improvement
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Alex Zhuravlev
+Reporter:   Andreas Dilger
+Created:    Fri, 31 Mar 2023 05:01:25 +0000
+Updated:    Fri, 20 Jun 2025 09:57:26 +0000
+Resolved:   Sun, 9 Jul 2023 14:25:08 +0000
+Labels:     ldiskfs
+Links:      Related: is related to  LU-12970
+Attachments: oss07.perf.svg
+
+--- Description ---
+In some cases, ldiskfs block allocation can consume a large amount of CPU cycles handling block allocations and cause OST threads to become blocked:
+
+crmd[16542]:  notice: High CPU load detected: 261.019989
+crmd[16542]:  notice: High CPU load detected: 258.720001
+crmd[16542]:  notice: High CPU load detected: 265.029999
+crmd[16542]:  notice: High CPU load detected: 270.309998
+
+ INFO: task ll_ost00_027:20788 blocked for more than 90 seconds.
+ ll_ost00_027    D ffff92242eda9080     0 20788      2 0x00000080
+ Call Trace:
+ schedule+0x29/0x70
+ wait_transaction_locked+0x85/0xd0 [jbd2]
+ add_transaction_credits+0x278/0x310 [jbd2]
+ start_this_handle+0x1a1/0x430 [jbd2]
+ jbd2__journal_start+0xf3/0x1f0 [jbd2]
+ __ldiskfs_journal_start_sb+0x69/0xe0 [ldiskfs]
+ osd_trans_start+0x1e7/0x570 [osd_ldiskfs]
+ ofd_trans_start+0x75/0xf0 [ofd]
+ ofd_attr_set+0x586/0xb00 [ofd]
+ ofd_setattr_hdl+0x31d/0x960 [ofd]
+ tgt_request_handle+0xb7e/0x1700 [ptlrpc]
+ ptlrpc_server_handle_request+0x253/0xbd0 [ptlrpc]
+ ptlrpc_main+0xc09/0x1c30 [ptlrpc]
+
+Perf stats show that a large amount of CPU time is used in preallocation:
+
+Samples: 86M of event 'cycles', 4000 Hz, Event count (approx.): 25480688920 lost: 0/0 drop: 0/0
+Overhead  Shared Object               Symbol
+  23,81%  [kernel]                    [k] _raw_qspin_lock
+  21,90%  [kernel]                    [k] ldiskfs_mb_use_preallocated
+  20,16%  [kernel]                    [k] __raw_callee_save___pv_queued_spin_unlock
+  15,46%  [kernel]                    [k] ldiskfs_mb_normalize_request
+   1,21%  [kernel]                    [k] rwsem_spin_on_owner
+   0,98%  [kernel]                    [k] native_write_msr_safe
+   0,54%  [kernel]                    [k] apic_timer_interrupt
+   0,51%  [kernel]                    [k] ktime_get
+
+--- Comment (pjones, Sun, 9 Jul 2023 14:25:08 +0000) ---
+Landed for 2.16
+
+--- Comment (gerrit, Sat, 8 Jul 2023 22:34:56 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/50481/
+
+Subject: LU-16691 ldiskfs: limit length of per-inode prealloc list
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: b16c9333a00802faea419dfe6fbb013c4477c9c6
+
+--- Comment (gerrit, Fri, 31 Mar 2023 05:42:31 +0000) ---
+"Alex Zhuravlev " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/50481
+
+Subject: LU-16691 ldiskfs: limit preallocation list
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: acf2f540db47d223e6999e5923aec8549be52d0b
+
+--- Comment (bzzz, Fri, 31 Mar 2023 05:17:20 +0000) ---
+https://lore.kernel.org/all/d7a98178-056b-6db5-6bce-4ead23f4a257@gmail.com/ 
+
+this one looks simple enough
+
+--- Comment (adilger, Fri, 31 Mar 2023 05:04:41 +0000) ---
+Looking at the flame graphs, I would suspect that something may be wrong with the preallocation (PA), for example too many PA regions, or something else that is causing these functions to be slow.  According to the flame graph oss07.perf.svg, for each call to ldiskfs_mb_new_blocks() there is a large amount of time spent in _raw_spin_lock(), ldiskfs_mb_normalize_request(), and ldiskfs_mb_use_preallocated().
+
+ldiskfs_fsblk_t ldiskfs_mb_new_blocks(handle_t *handle,
+                                struct ldiskfs_allocation_request *ar, int *errp)
+{
+        :
+        :
+        if (!ldiskfs_mb_use_preallocated(ac)) {
+                ac->ac_op = LDISKFS_MB_HISTORY_ALLOC;
+                ldiskfs_mb_normalize_request(ac, ar);
+repeat:
+                /* allocate space in core */
+                *errp = ldiskfs_mb_regular_allocator(ac);
+
+so these heavy functions are before ldiskfs_mb_regular_allocator() is called.  There is a loop in ldiskfs_mb_use_preallocated() that is repeatedly getting a spinlock, but it doesn't appear to be successful in finding a good PA, since the function ends up returning "0" and then ldiskfs_mb_normalize_request() is called anyway:
+
+ldiskfs_mb_use_preallocated(struct ldiskfs_allocation_context *ac)
+{
+        /* first, try per-file preallocation */
+        list_for_each_entry_rcu(pa, &ei->i_prealloc_list, pa_inode_list) {
+                :
+                /* found preallocated blocks, use them */
+                spin_lock(&pa->pa_lock);
+                if (pa->pa_deleted == 0 && pa->pa_free) {
+                        :
+                        /* this branch is never taken */
+                        :
+                        return 1;
+                }
+                spin_unlock(&pa->pa_lock);
+        }
+        :
+        /*
+         * search for the prealloc space that is having
+         * minimal distance from the goal block.                
+         */             
+        for (i = order; i lg_prealloc_list[i],
+                                        pa_inode_list) {
+                        spin_lock(&pa->pa_lock);
+                        if (pa->pa_deleted == 0 &&
+                            pa->pa_free >= ac->ac_o_ex.fe_len) {
+        
+                                cpa = ldiskfs_mb_check_group_pa(goal_block,
+                                                                pa, cpa);
+                        }
+                        spin_unlock(&pa->pa_lock);
+                }
+
+and then in ldiskfs_mb_normalize_request() it looks like the same PA lists are walked again and the same locks are contended:
+
+ldiskfs_mb_normalize_request(struct ldiskfs_allocation_context *ac,
+                                struct ldiskfs_allocation_request *ar)
+{
+         :
+        list_for_each_entry_rcu(pa, &ei->i_prealloc_list, pa_inode_list) {
+                ldiskfs_lblk_t pa_end;
+
+                if (pa->pa_deleted)
+                        continue;
+                spin_lock(&pa->pa_lock);
+                :
+                /* lots of checks */
+                :
+                spin_unlock(&pa->pa_lock);
+        }
+}
+
+By all rights, since these PA lists are on a single inode, there shouldn't be much contention, but it seems to fit the pattern shown by the flame graphs.  Unfortunately, it isn't possible to know if the slow threads were all accessing a single file or different files.
+
+I think it makes sense to backport either https://patchwork.ozlabs.org/project/linux-ext4/list/?series=346731 to ldiskfs, or at least the prealloc list fixed limit patch https://lore.kernel.org/all/d7a98178-056b-6db5-6bce-4ead23f4a257@gmail.com/ to prevent the PA list from getting too long...

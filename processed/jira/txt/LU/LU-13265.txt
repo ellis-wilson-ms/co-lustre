@@ -1,0 +1,321 @@
+Key:        LU-13265
+Summary:    ln_push_target can be overwritten leading to incorrect lnet_peer objects.
+Link:       https://jira.whamcloud.com/browse/LU-13265
+Type:       Bug
+Priority:   Critical
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Chris Horn
+Reporter:   Chris Horn
+Created:    Wed, 19 Feb 2020 20:28:39 +0000
+Updated:    Fri, 12 Feb 2021 14:28:39 +0000
+Resolved:   Tue, 17 Mar 2020 17:55:55 +0000
+
+--- Description ---
+Discovery thread wakes:
+
+00000400:00000200:8.0:1581433433.357910:000000:12105:0:(peer.c:3226:lnet_peer_discovery_wait_for_work()) woken: 0
+
+Processing lnet_peer ffff91992ec44d00 which has lp_primary_nid == 523@gni99:
+
+00000400:00000200:8.0:1581433433.357918:000000:12105:0:(peer.c:3330:lnet_peer_discovery()) peer 523@gni99(ffff91992ec44d00) state 0x200d5
+
+We can see LNET_PEER_DATA_PRESENT is set in the state:
+
+*hornc@cflosbld09 fs3 $ lpst2str.sh 0x200d5
+LNET_PEER_RTR_DISCOVERED
+LNET_PEER_MULTI_RAIL
+LNET_PEER_ROUTER_ENABLED
+LNET_PEER_DISCOVERED
+LNET_PEER_DISCOVERING
+LNET_PEER_DATA_PRESENT
+*hornc@cflosbld09 fs3 $
+
+So we call lnet_peer_data_present():
+
+static int lnet_peer_discovery(void *arg)
+...
+                        if (lp->lp_state & LNET_PEER_DATA_PRESENT)
+                                rc = lnet_peer_data_present(lp);
+
+The next message in the log is:
+
+00000400:00000200:8.0:1581433433.357932:000000:12105:0:(peer.c:1910:lnet_peer_queue_for_discovery()) Queue peer 531@gni99: 0
+
+Note, we went from 523@gni99 to 531@gni99. How did that happen?
+
+In lnet_peer_data_present(), we pull primary nid from the discovery ping buffer (pbuf):
+
+        nid = pbuf->pb_info.pi_ni[1].ns_nid;
+
+We then compare it to the lp->lp_primary_nid for the lnet_peer that was passed as an argument. If they do not match, then we perform a lookup on the nid from pbuf. If we find an existing lpni for that nid, then we consolidate the peer that was passed as an argument with the peer that is associated with the lpni that we just looked up.
+
+Here's the code:
+
+static int lnet_peer_data_present(struct lnet_peer *lp)
+...
+        pbuf = lp->lp_data;
+...
+        nid = pbuf->pb_info.pi_ni[1].ns_nid;
+        if (LNET_NETTYP(LNET_NIDNET(lp->lp_primary_nid)) == LOLND) { lp_primary_nid == nid || lp_primary_nid, &pbuf->pb_info) &&
+                    lnet_is_discovery_disabled(lp))) { lpni_peer_net->lpn_peer;
+...
+                        rc = lnet_peer_set_primary_data(new_lp, pbuf);
+                        lnet_consolidate_routes_locked(lp, new_lp);
+
+The first thing we do in lnet_peer_set_primary_data() is force "new_lp" onto the discovery queue:
+
+lnet_peer_set_primary_data(struct lnet_peer *lp, struct lnet_ping_buffer *pbuf)
+{
+        struct lnet_handle_md mdh;
+
+        /* Queue lp for discovery, and force it on the request queue. */
+        lnet_net_lock(LNET_LOCK_EX);
+        if (lnet_peer_queue_for_discovery(lp))
+                list_move(&lp->lp_dc_list, &the_lnet.ln_dc_request);
+        lnet_net_unlock(LNET_LOCK_EX);
+
+Hence that message in the log:
+
+00000400:00000200:8.0:1581433433.357932:000000:12105:0:(peer.c:1910:lnet_peer_queue_for_discovery()) Queue peer 531@gni99: 0
+
+Okay, so the primary nid we pull out of the ping buffer (pbuf) is for a different peer. That's weird, but it gets weirder! After we force that peer on the discovery queue lnet_peer_set_primary_data() basically just does some sanity checking before calling lnet_peer_merge_data(). That function is where the actual merge takes place of an lnet_peer object with the information in the discovery ping buffer (pbuf).
+
+In lnet_peer_merge_data() we build up three arrays:
+
+1. curnis - NIs that are currently associated with the lnet_peer object that was passed as an argument.
+
+2. addnis - NIs that are defined in the ping buffer, but not in the array of curnis.
+
+3. delnis - NIs that are defined in curnis, but not in the ping buffer.
+
+Once we have addnis and delnis, we iterate over addnis and add those NIs to the lnet_peer, and then we iterate over delnis and delete those NIs from the peer.
+
+Here are the next four messages in the log:
+
+00000400:00000010:8.0:1581433433.357933:000000:12105:0:(api-ni.c:1618:lnet_ping_buffer_free()) kfreed 'pbuf': 88 at ffff91948d275180 (tot 353953968).
+00000400:00000010:8.0:1581433433.357935:000000:12105:0:(peer.c:2583:lnet_peer_merge_data()) alloc '(curnis)': 32 at ffff919831aa7cc0 (tot 353954000).
+00000400:00000010:8.0:1581433433.357936:000000:12105:0:(peer.c:2584:lnet_peer_merge_data()) alloc '(addnis)': 64 at ffff919842b8c080 (tot 353954064).
+00000400:00000010:8.0:1581433433.357936:000000:12105:0:(peer.c:2585:lnet_peer_merge_data()) alloc '(delnis)': 32 at ffff919831aa7c60 (tot 353954096).
+00000400:00000200:8.0:1581433433.357950:000000:12105:0:(peer.c:450:lnet_peer_del_locked()) peer 520@gni99
+
+We have a third NID! We went from 523@gni99 to 531@gni99 and now we're at 520@gni99! Curious why we're deleting nids when I said the first thing we do is iterate over the addnis? Let's go to the code:
+
+        for (i = 0; i lpni_peer_net->lpn_peer);
+...
+
+We can see the peer being deleted in the logs:
+
+00000400:00000200:8.0:1581433433.357953:000000:12105:0:(peer.c:370:lnet_peer_detach_peer_ni_locked()) peer 520@gni99 NID 10.10.100.60@o2ib3
+00000400:00000200:8.0:1581433433.357955:000000:12105:0:(peer.c:370:lnet_peer_detach_peer_ni_locked()) peer 520@gni99 NID 520@gni99
+00000400:00000200:8.0:1581433433.357956:000000:12105:0:(peer.c:1700:lnet_destroy_peer_ni_locked()) ffff9198eab83c00 nid 520@gni99
+00000400:00000010:8.0:1581433433.357957:000000:12105:0:(peer.c:1723:lnet_destroy_peer_ni_locked()) kfreed 'lpni': 272 at ffff9198eab83c00 (tot 353953824).
+00000400:00000200:8.0:1581433433.357958:000000:12105:0:(peer.c:227:lnet_destroy_peer_net_locked()) ffff919843abde80 net gni99
+00000400:00000010:8.0:1581433433.357959:000000:12105:0:(peer.c:234:lnet_destroy_peer_net_locked()) kfreed 'lpn': 64 at ffff919843abde80 (tot 353953760).
+00000400:00000200:8.0:1581433433.357960:000000:12105:0:(peer.c:370:lnet_peer_detach_peer_ni_locked()) peer 520@gni99 NID 520@gni6
+00000400:00000200:8.0:1581433433.357961:000000:12105:0:(peer.c:1700:lnet_destroy_peer_ni_locked()) ffff9198eab80c00 nid 520@gni6
+00000400:00000010:8.0:1581433433.357961:000000:12105:0:(peer.c:1723:lnet_destroy_peer_ni_locked()) kfreed 'lpni': 272 at ffff9198eab80c00 (tot 353953488).
+00000400:00000200:8.0:1581433433.357962:000000:12105:0:(peer.c:227:lnet_destroy_peer_net_locked()) ffff919843abd340 net gni6
+00000400:00000010:8.0:1581433433.357963:000000:12105:0:(peer.c:234:lnet_destroy_peer_net_locked()) kfreed 'lpn': 64 at ffff919843abd340 (tot 353953424).
+
+After which we add 520@gni99:
+
+00000400:00000010:8.0:1581433433.357964:000000:12105:0:(peer.c:160:lnet_peer_ni_alloc()) alloc '(lpni)': 272 at ffff9195399b3400 (tot 353953696).
+00000400:00000200:8.0:1581433433.357965:000000:12105:0:(peer.c:199:lnet_peer_ni_alloc()) ffff9195399b3400 nid 520@gni99
+00000400:00000200:8.0:1581433433.357971:000000:12105:0:(peer.c:1311:lnet_peer_attach_peer_ni()) peer 531@gni99 NID 520@gni99 flags 0x8011
+
+And add 520@gni6:
+
+00000400:00000010:8.0:1581433433.357972:000000:12105:0:(peer.c:160:lnet_peer_ni_alloc()) alloc '(lpni)': 272 at ffff9195399b3000 (tot 353953720).
+00000400:00000200:8.0:1581433433.357973:000000:12105:0:(peer.c:199:lnet_peer_ni_alloc()) ffff9195399b3000 nid 520@gni6
+00000400:00000200:8.0:1581433433.357974:000000:12105:0:(peer.c:1311:lnet_peer_attach_peer_ni()) peer 531@gni99 NID 520@gni6 flags 0x11
+
+And add 10.10.100.60@o2ib3
+
+00000400:00000010:8.0:1581433433.357976:000000:12105:0:(peer.c:160:lnet_peer_ni_alloc()) alloc '(lpni)': 272 at ffff9195399b3a00 (tot 353953992).
+00000400:00000200:8.0:1581433433.357977:000000:12105:0:(peer.c:199:lnet_peer_ni_alloc()) ffff9195399b3a00 nid 10.10.100.60@o2ib3
+00000400:00000200:8.0:1581433433.357985:000000:12105:0:(peer.c:1311:lnet_peer_attach_peer_ni()) peer 531@gni99 NID 10.10.100.60@o2ib3 flags 0x11
+
+We then enter the loop to delete the NIs that were present in curnis but not in the ping buffer:
+
+        for (i = 0; i lp_rtr_refcount > 0)
+                        flags |= LNET_PEER_RTR_NI_FORCE_DEL;
+                rc = lnet_peer_del_nid(lp, delnis[i], flags);
+
+In the logs we can see that we delete 10.10.100.66@o2ib3:
+
+00000400:00000200:8.0:1581433433.357990:000000:12105:0:(peer.c:370:lnet_peer_detach_peer_ni_locked()) peer 531@gni99 NID 10.10.100.66@o2ib3
+00000400:00000200:8.0:1581433433.357991:000000:12105:0:(peer.c:1700:lnet_destroy_peer_ni_locked()) ffff91992a506600 nid 10.10.100.66@o2ib3
+00000400:00000010:8.0:1581433433.357991:000000:12105:0:(peer.c:1723:lnet_destroy_peer_ni_locked()) kfreed 'lpni': 272 at ffff91992a506600 (tot 353952928).
+00000400:00000200:8.0:1581433433.357993:000000:12105:0:(peer.c:532:lnet_peer_del_nid()) peer 531@gni99 NID 10.10.100.66@o2ib3 flags 0x8011: 0
+
+And 531@gni99
+
+00000400:00000200:8.0:1581433433.358001:000000:12105:0:(peer.c:370:lnet_peer_detach_peer_ni_locked()) peer 531@gni99 NID 531@gni99
+00000400:00000200:8.0:1581433433.358001:000000:12105:0:(peer.c:532:lnet_peer_del_nid()) peer 531@gni99 NID 531@gni99 flags 0x8011: 0
+
+And 531@gni6
+
+00000400:00000200:8.0:1581433433.358005:000000:12105:0:(peer.c:370:lnet_peer_detach_peer_ni_locked()) peer 531@gni99 NID 531@gni6
+00000400:00000200:8.0:1581433433.358006:000000:12105:0:(peer.c:1700:lnet_destroy_peer_ni_locked()) ffff9198fc239e00 nid 531@gni6
+00000400:00000010:8.0:1581433433.358006:000000:12105:0:(peer.c:1723:lnet_destroy_peer_ni_locked()) kfreed 'lpni': 272 at ffff9198fc239e00 (tot 353952832).
+00000400:00000200:8.0:1581433433.358008:000000:12105:0:(peer.c:532:lnet_peer_del_nid()) peer 531@gni99 NID 531@gni6 flags 0x8011: 0
+
+Free up the arrays we allocated at the start:
+
+00000400:00000010:8.0:1581433433.358008:000000:12105:0:(peer.c:2689:lnet_peer_merge_data()) kfreed 'curnis': 32 at ffff919831aa7cc0 (tot 353952800).
+00000400:00000010:8.0:1581433433.358009:000000:12105:0:(peer.c:2690:lnet_peer_merge_data()) kfreed 'addnis': 64 at ffff919842b8c080 (tot 353952736).
+00000400:00000010:8.0:1581433433.358010:000000:12105:0:(peer.c:2691:lnet_peer_merge_data()) kfreed 'delnis': 32 at ffff919831aa7c60 (tot 353952704).
+
+Free the ping buffer now that we're done with it:
+
+00000400:00000010:8.0:1581433433.358010:000000:12105:0:(api-ni.c:1618:lnet_ping_buffer_free()) kfreed 'pbuf': 88 at ffff9198537d1540 (tot 353952176).
+
+A successful merge!:
+
+00000400:00000200:8.0:1581433433.358011:000000:12105:0:(peer.c:2693:lnet_peer_merge_data()) peer 531@gni99 (ffff91992ec44000): 0
+
+lnet_peer_data_present() finishes with lnet_peer ffff91992ec44d00 who has lp_primarY_nid == 523@gni99:
+
+00000400:00000200:8.0:1581433433.358014:000000:12105:0:(peer.c:2888:lnet_peer_data_present()) peer 523@gni99(ffff91992ec44d00): 0. state = 0x20155
+
+The main discovery loop finishes this iteration. The "rc 1" means it will immediately "rediscover" this peer again
+
+00000400:00000200:8.0:1581433433.358015:000000:12105:0:(peer.c:3349:lnet_peer_discovery()) peer 523@gni99(ffff91992ec44d00) state 0x20155 rc 1
+                        if (rc == LNET_REDISCOVER_PEER) {
+                                list_move(&lp->lp_dc_list,
+                                          &the_lnet.ln_dc_request);
+
+On the next go around we just mark the peer has having completed discovery and remove it from the queue:
+
+00000400:00000200:8.0:1581433433.358017:000000:12105:0:(peer.c:3330:lnet_peer_discovery()) peer 523@gni99(ffff91992ec44d00) state 0x20155
+00000400:00000200:8.0:1581433433.358018:000000:12105:0:(peer.c:3147:lnet_peer_discovered()) peer 523@gni99
+00000400:00000200:8.0:1581433433.358019:000000:12105:0:(peer.c:3349:lnet_peer_discovery()) peer 523@gni99(ffff91992ec44d00) state 0x20115 rc 0
+00000400:00000200:8.0:1581433433.358026:000000:12105:0:(peer.c:1928:lnet_peer_discovery_complete()) Discovery complete. Dequeue peer 523@gni99
+
+In summary, the following appears to have occurred:
+
+1. Discovery thread wakes up and starts processing 523@gni99
+
+2. It grabs the primary nid out of the ping buffer that it associated with 523@gni99. That nid is 531@gni99.
+
+3. 531@gni99 != 523@gni99, so it believes the primary nid of 523@gni99 has changed.
+
+4. It takes the 531@gni99 peer, and uses it as the new "primary". 
+
+5. When it goes to merge the data in the ping buffer, with the 531@gni99 peer, the ping buffer appears to contain the NI configuration of a third node, 520@gni99.
+
+6. This information is then merged into the 531@gni99 peer, which involves tearing down the 520@gni99 peer.
+
+We can see the corrupted peer object in the dump:
+
+crash_x86_64> lnet_peer ffff91992ec44000 | grep prim
+  lp_primary_nid = 3659599899001363,
+crash_x86_64> epython nid2str.py 3659599899001363
+531@gni99
+crash_x86_64> struct -o lnet_peer ffff91992ec44000 | grep lp_peer_nets
+  [ffff91992ec44010] struct list_head lp_peer_nets;
+crash_x86_64> list -H ffff91992ec44010
+ffff919840a9f5c0
+ffff919839af7440
+ffff919839af71c0
+crash_x86_64> struct -o lnet_peer_net ffff919840a9f5c0 | grep lpn_peer_nis
+  [ffff919840a9f5d0] struct list_head lpn_peer_nis;
+crash_x86_64> struct -o lnet_peer_net ffff919839af7440 | grep lpn_peer_nis
+  [ffff919839af7450] struct list_head lpn_peer_nis;
+crash_x86_64> struct -o lnet_peer_net ffff919839af71c0 | grep lpn_peer_nis
+  [ffff919839af71d0] struct list_head lpn_peer_nis;
+crash_x86_64> list -H ffff919840a9f5d0 -s lnet_peer_ni.lpni_nid
+ffff9195399b3a00
+  lpni_nid = 1407387936908348
+crash_x86_64> list -H ffff919839af7450 -s lnet_peer_ni.lpni_nid
+ffff9195399b3400
+  lpni_nid = 3659599899001352
+crash_x86_64> list -H ffff919839af71d0 -s lnet_peer_ni.lpni_nid
+ffff9195399b3000
+  lpni_nid = 3659200467042824
+crash_x86_64> epython nid2str.py 1407387936908348
+10.10.100.60@o2ib3
+crash_x86_64> epython nid2str.py 3659599899001352
+520@gni99
+crash_x86_64> epython nid2str.py 3659200467042824
+520@gni6
+crash_x86_64>
+
+--- Comment (pjones, Tue, 17 Mar 2020 17:55:55 +0000) ---
+Landed for 2.14
+
+--- Comment (gerrit, Tue, 17 Mar 2020 03:40:01 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/37677/
+
+Subject: LU-13265 lnet: Modify push MD to have single threshold
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 6612e57a233fa22af00173366e1121b68bb5524e
+
+--- Comment (gerrit, Fri, 21 Feb 2020 17:42:07 +0000) ---
+Chris Horn (chris.horn@hpe.com) uploaded a new patch: https://review.whamcloud.com/37677
+
+Subject: LU-13265 lnet: Modify push MD to have single threshold
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: b82377a3b6e2f073a83b1a3aa59ecf96886d1dca
+
+--- Comment (hornc, Thu, 20 Feb 2020 21:10:55 +0000) ---
+I think I hit a variation of this bug.
+
+I repeatedly had (40) clients push to a single server by deleting the server peer from the clients and performing manual discovery:
+
+saturn-p2:~ # pcmd -n ALL_COMPUTE -s 'lnetctl peer del --prim_nid 10.12.0.53@o2ib40; lnetctl discover 10.12.0.53@o2ib40'
+Output from 56-63,96-127:
+discover:
+    - primary nid: 10.12.0.53@o2ib40
+      Multi-Rail: True
+      peer ni:
+        - nid: 10.12.0.53@o2ib40
+Node(s) 56-63,96-127 had exit code 0
+saturn-p2:~ #
+
+I then checked the output of lnetctl peer show on the server to look for any anomalies. I noticed that while all of the clients are configured with two nids, one on gni4 and one on gni99, there was one peer entry that only listed the gni4 nid.
+
+[root@snx11922n005 ~]# lnetctl peer show --nid 63@gni4
+peer:
+    - primary nid: 63@gni4
+      Multi-Rail: True
+      peer ni:
+        - nid: 63@gni4
+          state: NA
+[root@snx11922n005 ~]#
+nid00063:~ # lctl list_nids
+63@gni99
+63@gni4
+nid00063:~ #
+
+Checking the dk log on the server we can see similarities to other instances of this bug.
+
+00000400:00000200:0.0:1582230353.141723:0:10567:0:(peer.c:3330:lnet_peer_discovery()) peer 63@gni4(ffff8f7b0f79b000) state 0xc1
+00000400:00000200:0.0:1582230353.141725:0:10567:0:(peer.c:1910:lnet_peer_queue_for_discovery()) Queue peer 114@gni99: -114
+00000400:00000200:0.0:1582230353.141726:0:10567:0:(peer.c:2693:lnet_peer_merge_data()) peer 114@gni99 (ffff8f7af9b5ba00): 0
+00000400:00000200:0.0:1582230353.141727:0:10567:0:(peer.c:2888:lnet_peer_data_present()) peer 63@gni4(ffff8f7b0f79b000): 0. state = 0x141
+00000400:00000200:0.0:1582230353.141728:0:10567:0:(peer.c:3349:lnet_peer_discovery()) peer 63@gni4(ffff8f7b0f79b000) state 0x141 rc 1
+00000400:00000200:0.0:1582230353.141729:0:10567:0:(peer.c:3330:lnet_peer_discovery()) peer 63@gni4(ffff8f7b0f79b000) state 0x141
+
+--- Comment (hornc, Wed, 19 Feb 2020 20:31:16 +0000) ---
+Alexey Lyashkov noted that the ln_push_target buffer is created with LNET_MD_MANAGE_REMOTE, and:
+
+00000400:00000200:19.0:1581433433.357872:000000:12040:0:(lib-ptl.c:200:lnet_try_match_md()) Incoming put index 0 from 12345-523@gni99 of length 80/80 into md 0x41 [1] + 0
+00000400:00000200:12.0:1581433433.357906:000000:12026:0:(lib-ptl.c:200:lnet_try_match_md()) Incoming put index 0 from 12345-520@gni99 of length 80/80 into md 0x41 [1] + 0
+
+offset in MD is always + 0
+
+so two transfers will be put a data to the same offset.

@@ -1,0 +1,129 @@
+Key:        LU-11486
+Summary:    FLR allows overlapping "write preferred" segments
+Link:       https://jira.whamcloud.com/browse/LU-11486
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Not a Bug
+Assignee:   WC Triage
+Reporter:   Patrick Farrell
+Created:    Tue, 9 Oct 2018 16:15:21 +0000
+Updated:    Fri, 21 Jan 2022 01:09:20 +0000
+Resolved:   Fri, 21 Jan 2022 01:09:20 +0000
+Links:      Related: is related to LU-11485
+
+--- Description ---
+Close examination of sanity-flr test 0h shows something troubling.
+
+Simply run the test to completion, but add an error statement so the file is retained.  Here's what the getstripe output on the file looks like after 0h (again, with no modification):
+
+[root@cent7c01 lustre]# lfs getstripe f0h.sanity-flr 
+f0h.sanity-flr
+ lcm_layout_gen: 9
+ lcm_mirror_count: 3
+ lcm_entry_count: 4
+ lcme_id: 65537
+ lcme_mirror_id: 1
+ lcme_flags: init
+ lcme_extent.e_start: 0
+ lcme_extent.e_end: 1048576
+ lmm_stripe_count: 1
+ lmm_stripe_size: 1048576
+ lmm_pattern: raid0
+ lmm_layout_gen: 0
+ lmm_stripe_offset: 0
+ lmm_objects:
+ - 0: { l_ost_idx: 0, l_fid: [0x100000000:0x10:0x0] }
+lcme_id: 65538
+ lcme_mirror_id: 1
+ lcme_flags: init,prefer
+ lcme_extent.e_start: 1048576
+ lcme_extent.e_end: EOF
+ lmm_stripe_count: 1
+ lmm_stripe_size: 1048576
+ lmm_pattern: raid0
+ lmm_layout_gen: 0
+ lmm_stripe_offset: 0
+ lmm_objects:
+ - 0: { l_ost_idx: 0, l_fid: [0x100000000:0x11:0x0] }
+lcme_id: 131075
+ lcme_mirror_id: 2
+ lcme_flags: init,prefer
+ lcme_extent.e_start: 0
+ lcme_extent.e_end: EOF
+ lmm_stripe_count: 1
+ lmm_stripe_size: 1048576
+ lmm_pattern: raid0
+ lmm_layout_gen: 0
+ lmm_stripe_offset: 1
+ lmm_objects:
+ - 0: { l_ost_idx: 1, l_fid: [0x100010000:0x10:0x0] }
+lcme_id: 196612
+ lcme_mirror_id: 3
+ lcme_flags: init
+ lcme_extent.e_start: 0
+ lcme_extent.e_end: EOF
+ lmm_stripe_count: 1
+ lmm_stripe_size: 1048576
+ lmm_pattern: raid0
+ lmm_layout_gen: 0
+ lmm_stripe_offset: 1
+ lmm_objects:
+ - 0: { l_ost_idx: 1, l_fid: [0x100010000:0x11:0x0] } 
+
+The key part is these two components, the second and third in the list above:
+
+    lcme_id:             65538
+    lcme_mirror_id:      1
+    lcme_flags:          init,prefer
+    lcme_extent.e_start: 1048576
+    lcme_extent.e_end:   EOF
+      lmm_stripe_count:  1
+      lmm_stripe_size:   1048576
+      lmm_pattern:       raid0
+      lmm_layout_gen:    0
+      lmm_stripe_offset: 0
+      lmm_objects:
+      - 0: { l_ost_idx: 0, l_fid: [0x100000000:0x11:0x0] }    lcme_id:             131075
+    lcme_mirror_id:      2
+    lcme_flags:          init,prefer
+    lcme_extent.e_start: 0
+    lcme_extent.e_end:   EOF
+      lmm_stripe_count:  1
+      lmm_stripe_size:   1048576
+      lmm_pattern:       raid0
+      lmm_layout_gen:    0
+      lmm_stripe_offset: 1
+      lmm_objects:
+      - 0: { l_ost_idx: 1, l_fid: [0x100010000:0x10:0x0] } 
+
+ 
+
+The first component is in mirror 1, and runs from 1 MiB to EOF, and is preferred for write.  The second component is in mirror 2 and runs from 0 to EOF...  and is preferred for write.
+
+This seems to be inherently conflicted.  I would think the tools should prevent setting overlapping "prefer" flags...?
+
+--- Comment (jinshan, Thu, 11 Oct 2018 17:56:16 +0000) ---
+It depends on the first byte to be written when choosing mirror for writing. As long as a mirror is chosen, this mirror will be used to serve all writes after. Staling components from different mirrors should be avoided for good reasons. We had a long discussion about this before.
+
+--- Comment (paf, Thu, 11 Oct 2018 17:30:24 +0000) ---
+Hmm, OK.  So what happens if we have mirror 0 with component 0 from, say, 0MB to 100MB, and mirror 1 with component 0 at 0MB to 50MB and component 1 at 50MB to EOF.  Mirror 0 component 0 and mirror 1 component 1 are marked write prefer.
+
+What happens if I write to 75MB?  Assume it picks mirror 0, then both components of mirror 1 will be marked stale, since they overlap with component 0 of mirror 0.  So then what happens if I try to write to 125MB?  Will it reject using mirror 1 because it's stale?
+
+The answer, from testing just now, is yes.  And as you said in the other LU, FLR picks entire mirrors for write preference.  That, combined with "won't use stale mirrors", seems sound.  So in my example above, it if I wrote to 125 MB first (mirror 1 write preferred there), I'd expect to end up using that mirror for write...
+
+But it doesn't work that way.  It still ends up using mirror 0.  In fact, a little more testing suggests that if write prefer is set on any components of mirror 0 it's preferred to mirror 1, regardless of where we're writing.
+
+It seems, then, that write prefer should be a full mirror flag, rather than settable on individual components, since that seems to be how it works..  (I have not verified this in the code.)
+
+--- Comment (adilger, Tue, 9 Oct 2018 22:05:58 +0000) ---
+During development, I discussed the case of overlapping prefer components with Jinshan.  The decision was that this was a correct situation.
+
+The reasoning for this is as follows:
+
+	you might have multiple mirrors on flash (for redundancy or performance), and you still want to prefer writes to one of those mirrors over one of the HDD mirrors
+
+	if there as only a single prefer component and it becomes unavailable, you don't necessarily want writes to go to the HDD first (as would be the case if there are multiple mirrors but only one can be marked prefer)
+
+The MDS will pick among the components marked prefer first, and if the site policy/architecture is to only have a single such mirror then it is as you want, but it shouldn't be a restriction.

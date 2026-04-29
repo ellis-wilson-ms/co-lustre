@@ -1,0 +1,173 @@
+Key:        LU-3044
+Summary:    LSeek SEEK_CUR gives incorrect value after write when file is open with O_APPEND
+Link:       https://jira.whamcloud.com/browse/LU-3044
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Emoly Liu
+Reporter:   Patrick Farrell
+Created:    Wed, 27 Mar 2013 20:33:43 +0000
+Updated:    Sun, 3 Jun 2018 20:36:32 +0000
+Resolved:   Tue, 23 Apr 2013 13:13:31 +0000
+Labels:     patch
+Links:      Related: is related to LU-11069; Related: is related to LU-3440
+Attachments: lseek_simple.c
+
+--- Environment ---
+SLES11SP1/SP2.  Lustre 2.x.
+
+--- Description ---
+When a file is opened with O_APPEND set, and data is written, the resulting value of the file pointer is incorrect. This is observed when using lseek with SEEK_CUR set.
+
+This does not result in corruption on subsequent writes because with O_APPEND set, the file pointer is reset to EOF before each write.  (See ULK3 on VFS)
+
+I'm attaching a trivial reproducer for this problem.
+
+A bit of debugging showed me that a correct value of the file pointer is available at the same point where it is set to the incorrect value in ll_file_io_generic. 
+
+Here's the sample (this is from 2.3, but the code is effectively the same in all 2.x releases) with my debug code in it to make clear exactly what I'm talking about:
+
+ppos_out = (unsigned long) *ppos;
+printk(KERN_NOTICE "ll_file_io_generic (before if) ppos: %lu\n",ppos_out);
+if (io->ci_nob > 0) { 
+    result = io->ci_nob; 
+    *ppos = io->u.ci_wr.wr.crw_pos; 
+    ppos_out = (unsigned long) *ppos;
+    printk(KERN_NOTICE "ll_file_io_generic io->u.ci_wr.wr.crw_pos ppos:     %lu\n",ppos_out); 
+}
+
+The value of ppos before the *ppos = io->u.ci_wr.wr.crw_pos is correct, but the value in io->u.ci_wr.wr.crw_pos is not.  It is greater than expected by approximately the number of bytes in the write.  (See comment for further details.)
+
+An if statement around the assignment checking for O_APPEND corrects the issue and passes acceptance-small sanity:
+
+if(!cl_io_is_append(io)) { 
+    *ppos = io->u.ci_wr.wr.crw_pos; 
+}
+
+Still, I am concerned this is a band-aid and a deeper fix may be necessary.
+
+I have some more detailed information on exactly how much io->u.ci_wr.wr.crw_pos; that I'll put in a subsequent comment - It's lengthy, and may not be relevant to fixing the issue.
+
+--- Comment (mabraham, Tue, 25 Jun 2013 23:10:05 +0000) ---
+For the record, as reported in LU-3440, this bug can produce problems, including corruption.
+
+If an ftell returns the incorrect file pointer, and the client assumes it is EOF like it should be, further processing based on (for example) a computed current file size will be wrong.
+
+But I'm glad to see it is fixed
+
+--- Comment (green, Mon, 10 Jun 2013 15:22:39 +0000) ---
+This is also oalnded into b2_1 for 2.1.6
+
+--- Comment (pjones, Tue, 23 Apr 2013 13:13:31 +0000) ---
+Landed for 2.4
+
+--- Comment (paf, Fri, 5 Apr 2013 17:46:00 +0000) ---
+Jinshan,
+
+I am still waiting for review on the mod.  Is there anyone else you would suggest to have review it?
+
+Thanks,!
+
+--- Comment (paf, Fri, 29 Mar 2013 19:01:17 +0000) ---
+Jinshan,
+
+Thank you, I follow now.  I've pushed a patch set with an updated commit message with your information.
+
+	Patrick
+
+--- Comment (jay, Fri, 29 Mar 2013 18:12:25 +0000) ---
+We used to adjust crw_pos in ll_prepare_write() to survive the sanity check of LASSERT(cl_page_in_io(page, io)) in cl_io_prepare_write(). However, crw_pos is changed again cl_io_rw_advance() therefore append write has the issue of setting ppos wrong.
+
+The adjustment is not needed anymore as we have changed cl_page_in_io() to exclude append write case.
+
+--- Comment (paf, Fri, 29 Mar 2013 18:00:07 +0000) ---
+Jinshan,
+
+I tested your change locally and it appears OK.  I've pushed a patch to Gerrit for testing.
+
+The only issue is the commmit message.  I need more details from you to write that correctly.
+
+Thanks!
+
+--- Comment (paf, Fri, 29 Mar 2013 14:16:47 +0000) ---
+Jinshan,
+
+Sure.  I'll build and test locally before pushing it upstream.
+
+To be clear I understand, you're saying this comment and the line of code associated with it are obsolete now:
+
+—
+
+/**
+
+	* In VFS file->page write loop, for appending, the
+
+	* write offset might be reset according to the new
+
+	* file size before holding i_mutex. So crw_pos should
+
+	* be reset here. BUG:17711.
+
+	*/
+
+	io->u.ci_wr.wr.crw_pos = i_size_read(inode);
+
+—
+
+Could you explain why?  I'd both just like to know and need it for the mod header.
+
+[Edit]
+
+One more thing - When you explain why, could you clarify if this applies to all 2.x versions, or if not, to which ones it does apply?
+
+[/Edit]
+
+	Patrick
+
+--- Comment (pjones, Thu, 28 Mar 2013 17:46:39 +0000) ---
+Emoly
+
+Could you please look into this one?
+
+Thanks
+
+Peter
+
+--- Comment (jay, Thu, 28 Mar 2013 00:27:03 +0000) ---
+This piece of code is already obsoleted, we don;t need to adjust crw_pos to survive cl_page_in_io().
+
+The patch is as follows:
+
+index c8b0626..9a5a243 100644
+--- a/lustre/llite/rw.c
++++ b/lustre/llite/rw.c
+@@ -237,17 +237,6 @@ int ll_prepare_write(struct file *file, struct page *vmpage, unsigned from,
+                 struct cl_page *page = lcc->lcc_page;
+ 
+                 cl_page_assume(env, io, page);
+-                if (cl_io_is_append(io)) {
+-                        struct cl_object   *obj   = io->ci_obj;
+-                        struct inode       *inode = ccc_object_inode(obj);
+-                        /**
+-                         * In VFS file->page write loop, for appending, the
+-                         * write offset might be reset according to the new
+-                         * file size before holding i_mutex. So crw_pos should
+-                         * be reset here. BUG:17711.
+-                         */
+-                        io->u.ci_wr.wr.crw_pos = i_size_read(inode);
+-                }
+                 result = cl_io_prepare_write(env, io, page, from, to);
+                 if (result == 0) {
+                         /*
+
+Patrick, can you please productize it? Thanks in advance.
+
+--- Comment (jay, Thu, 28 Mar 2013 00:23:19 +0000) ---
+Let's fix it by disabling crw_pos adjustment in ll_prepare_write().
+
+--- Comment (paf, Wed, 27 Mar 2013 20:55:27 +0000) ---
+http://review.whamcloud.com/#change,5861
+
+--- Comment (paf, Wed, 27 Mar 2013 20:36:13 +0000) ---
+Sorry, the original neglects to mention - This code is in lustre/llite/file.c

@@ -1,0 +1,169 @@
+Key:        LU-6085
+Summary:    racer stuck on mutex_lock in ll_setattr_raw()
+Link:       https://jira.whamcloud.com/browse/LU-6085
+Type:       Bug
+Priority:   Blocker
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Jinshan Xiong
+Reporter:   Jinshan Xiong
+Created:    Wed, 7 Jan 2015 00:22:27 +0000
+Updated:    Fri, 16 Jan 2015 18:11:07 +0000
+Resolved:   Fri, 16 Jan 2015 18:11:07 +0000
+Labels:     mq115
+Links:      Related: is related to  LU-5285; Related: is related to LU-6088; Related: is related to LU-5968
+
+--- Description ---
+With stack trace of:
+
+chmod         D 0000000000000000     0 25015      1 0x00000000
+ ffff880175afdca8 0000000000000086 ffff880175afdc88 ffffffffa077c842
+ ffff880175afdc28 ffff880182b3d400 ffffffff8100b9ce ffff880175afdca8
+ ffff88018162baf8 ffff880175afdfd8 000000000000fb88 ffff88018162baf8
+Call Trace:
+ [] ? __req_capsule_get+0x162/0x6d0 [ptlrpc]
+ [] ? common_interrupt+0xe/0x13
+ [] ? mutex_spin_on_owner+0x9b/0xc0
+ [] __mutex_lock_slowpath+0x13e/0x180
+ [] mutex_lock+0x2b/0x50
+ [] ll_setattr_raw+0x58c/0x1ae0 [lustre]
+ [] ? user_path_at+0x62/0xa0
+ [] ll_setattr+0x65/0xd0 [lustre]
+ [] notify_change+0x168/0x340
+ [] sys_fchmodat+0xc3/0x100
+ [] ? sys_newstat+0x36/0x50
+ [] ? do_device_not_available+0xe/0x10
+ [] system_call_fastpath+0x16/0x1b
+
+It turned out that the inode mutex is already held by the current thread itself. The root cause of this issue is in function ll_md_setattr() where it calls simple_setattr() even setting attribute on the MDT fails:
+
+                ptlrpc_req_finished(request);
+                if (rc == -ENOENT) {
+                        clear_nlink(inode);
+                        /* Unlinked special device node? Or just a race?
+                         * Pretend we done everything. */
+                        if (!S_ISREG(inode->i_mode) &&
+                            !S_ISDIR(inode->i_mode)) {
+                                ia_valid = op_data->op_attr.ia_valid;
+                                op_data->op_attr.ia_valid &= ~TIMES_SET_FLAGS;
+                                rc = simple_setattr(dentry, &op_data->op_attr);
+                                op_data->op_attr.ia_valid = ia_valid;
+                        }
+                } else if (rc != -EPERM && rc != -EACCES && rc != -ETXTBSY) {
+                        CERROR("md_setattr fails: rc = %d\n", rc);
+                }
+                RETURN(rc);
+
+In racer, it may try to change a SOCK file to a regular file which will definitely fail. If that file happens to have been deleted, it will call simple_setattr() because it encounters ENOENT error, then the file's mode will be changed to regular file and then causes mutex_lock stuck.
+
+I will push a patch to fix this issue.
+
+--- Comment (jlevi, Fri, 16 Jan 2015 18:11:07 +0000) ---
+Patch landed to Master.
+
+--- Comment (yujian, Fri, 16 Jan 2015 04:19:04 +0000) ---
+Hi Jinshan,
+
+While back-porting the patch to Lustre b2_5 branch, I hit some conflicts. Could you please create a patch on b2_5 to resolve the similar failure in LU-5968? Thank you.
+
+--- Comment (gerrit, Fri, 16 Jan 2015 03:26:16 +0000) ---
+Oleg Drokin (oleg.drokin@intel.com) merged in patch http://review.whamcloud.com/13344/
+
+Subject: LU-6085 mdt: return valid attribute only to client
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 0e638c2fb9dd45323ccff0d9fb43f378faf6127f
+
+--- Comment (jay, Thu, 15 Jan 2015 20:41:48 +0000) ---
+I think the patch is correct. The call trace shows that the process was waiting for inode mutex instead of an RPC request to finish.
+
+--- Comment (vinayak_clogeny, Mon, 12 Jan 2015 14:27:28 +0000) ---
+Hi Jinshan,
+
+I did not understand how the patch http://review.whamcloud.com/13344 will resolve this issue.
+
+Call Trace:
+ [] ? __req_capsule_get+0x162/0x6d0 [ptlrpc]
+
+If I am not wrong the fix you introduced will come into picture only after getting the reply but as call trace tells that the client is stuck on waiting for the request.
+
+Please give me some information or correct me if I am wrong.
+
+--- Comment (gerrit, Mon, 12 Jan 2015 07:52:35 +0000) ---
+Jinshan Xiong (jinshan.xiong@intel.com) uploaded a new patch: http://review.whamcloud.com/13344
+
+Subject: LU-6085 mdt: return valid attribute only to client
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 39ea3db98654d09b926c3166afcf42c5076608d2
+
+--- Comment (jay, Wed, 7 Jan 2015 01:57:45 +0000) ---
+This issue is more complex than I thought. After I made and applied a patch on the client side, I found that MDT actually returns different file type in the setattr reply. I patched my client code as follows:
+
+diff --git a/lustre/llite/llite_lib.c b/lustre/llite/llite_lib.c
+index ee14f15..81d9906 100644
+--- a/lustre/llite/llite_lib.c
++++ b/lustre/llite/llite_lib.c
+@@ -1498,15 +1498,18 @@ static int ll_md_setattr(struct dentry *dentry, struct md_op_data *
+                ptlrpc_req_finished(request);
+                if (rc == -ENOENT) {
+                        clear_nlink(inode);
++#if 0
+                        /* Unlinked special device node? Or just a race?
+                         * Pretend we done everything. */
+                        if (!S_ISREG(inode->i_mode) &&
+                            !S_ISDIR(inode->i_mode)) {
+                                ia_valid = op_data->op_attr.ia_valid;
+                                op_data->op_attr.ia_valid &= ~TIMES_SET_FLAGS;
++                               op_data->op_attr.ia_valid &= ~ATTR_MODE;
+                                rc = simple_setattr(dentry, &op_data->op_attr);
+                                op_data->op_attr.ia_valid = ia_valid;
+                        }
++#endif
+                } else if (rc != -EPERM && rc != -EACCES && rc != -ETXTBSY) {
+                        CERROR("md_setattr fails: rc = %d\n", rc);
+                }
+@@ -1520,6 +1523,14 @@ static int ll_md_setattr(struct dentry *dentry, struct md_op_data *o
+                 RETURN(rc);
+         }
+ 
++        if (md.body->mbo_valid & OBD_MD_FLTYPE)
++                LASSERTF((inode->i_mode & S_IFMT) == (md.body->mbo_mode & S_IFMT),
++                         "mode changed: %o -> %o, ia_valid = %x, mode = %o,"
++                        " FID = "DFID"/"DFID" \n",
++                        inode->i_mode & S_IFMT, md.body->mbo_mode & S_IFMT,
++                        ia_valid, op_data->op_attr.ia_mode,
++                        PFID(ll_inode2fid(inode)), PFID(&md.body->mbo_fid1));
++
+        ia_valid = op_data->op_attr.ia_valid;
+        /* inode size will be in ll_setattr_ost, can't do it now since dirty
+         * cache is not cleared yet. */
+
+and this is what I got:
+
+LustreError: 26785:0:(llite_lib.c:1543:ll_md_setattr()) ASSERTION( (inode->i_mode & S_IFMT) == (md.body->mbo_mode & S_IFMT) ) failed: mode changed: 40000 -> 100000, ia_valid = 10000046, mode = 0, FID = [0x200000403:0x8f5:0x0]/[0x200000403:0x8f5:0x0] 
+LustreError: 26785:0:(llite_lib.c:1543:ll_md_setattr()) LBUG
+Pid: 26785, comm: chown
+
+Call Trace:
+ [] libcfs_debug_dumpstack+0x55/0x80 [libcfs]
+ [] lbug_with_loc+0x47/0xb0 [libcfs]
+ [] ll_setattr_raw+0x1304/0x1c60 [lustre]
+ [] ll_setattr+0x65/0xd0 [lustre]
+ [] notify_change+0x168/0x340
+ [] ? user_path_at+0x62/0xa0
+ [] chown_common+0x6e/0x90
+ [] sys_fchownat+0x96/0xb0
+ [] system_call_fastpath+0x16/0x1b
+
+It clearly shows that client and MDT had a different idea about the type of the file. This needs further investigation.

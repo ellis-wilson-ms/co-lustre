@@ -1,0 +1,1272 @@
+Key:        LU-8964
+Summary:    use parallel I/O to improve performance on machines with slow single thread performance
+Link:       https://jira.whamcloud.com/browse/LU-8964
+Type:       New Feature
+Priority:   Major
+Status:     Resolved
+Resolution: Duplicate
+Assignee:   James A Simmons
+Reporter:   Dmitry Eremin
+Created:    Wed, 21 Dec 2016 15:02:02 +0000
+Updated:    Tue, 5 Nov 2019 05:41:12 +0000
+Resolved:   Thu, 7 Mar 2019 23:39:04 +0000
+Links:      Duplicate: is duplicated by LU-1056; Related: is related to  LU-6658; Related: is related to  LU-8709; Related: is related to LU-11069; Related: is related to LU-10367; Related: is related to LU-9618; Related: is related to LU-11825; Related: is related to LU-12043
+Attachments: 40ost_rpc_stats.txt, read_readahead_test.c
+
+--- Description ---
+On machines with slow single thread performance like KNL the bottleneck of I/O performance moved into code which just copy memory from one buffer to other (from user space to kernel or vice versa). In current Lustre implementation all I/O performs in single thread and this is become an issue for KNL. Significantly improve performance can be with solution which do parallel memory transfer of large buffers.
+
+--- Comment (spitzcor, Tue, 22 Oct 2019 19:11:58 +0000) ---
+simmonsja, for the record, you mean LU-12043.  LU-12403 is "add e2fsprog support for RHEL-8".
+
+--- Comment (simmonsja, Thu, 7 Mar 2019 23:39:04 +0000) ---
+LU-12403 will do this work correctly.
+
+--- Comment (simmonsja, Wed, 28 Nov 2018 14:40:07 +0000) ---
+Thanks Patrick for the heads up on ktask. I will be watching it closely and give it a spin under this ticket.
+
+--- Comment (dmiter, Thu, 26 Apr 2018 11:26:05 +0000) ---
+Thanks for slides. I will loop at them carefully. But for now I disagree that padata API have a big overhead. It's mostly negligible comparing with other overhead to pass work into different thread. But having many threads will leads a sheduler delay to switch under heavy loads. So, I think padata will work more stable and predictable in this case.
+
+--- Comment (paf, Wed, 25 Apr 2018 14:51:28 +0000) ---
+Also, apologies for not posting these last year.
+
+--- Comment (paf, Wed, 25 Apr 2018 14:50:59 +0000) ---
+https://www.eofs.eu/_media/events/devsummit17/patrick_farrell_laddevsummit_pio.pdf
+
+This is old and out of date, but I wanted to make sure these slides were seen.  I think the performance of the readahead code would probably be helped a lot by changes to the parallelization framework (as would the performance of pio itself).
+
+So slides 8, 9, and 10 would probably be of particular interest here.  There are significant performance improvements available for PIO just by going from padata to something simpler.  Also, the CPU binding behavior of padata is pretty bad - Binding explicitly to one CPU is problematic.  Padata seems to assume the whole machine is dedicated, which is not a friendly assumption.  (I discovered its CPU binding behavior because I saw performance problems - A particular CPU would be busy and the work assigned to that CPU would be delayed, which delays the completion of the whole i/o.  At this time, other CPUs were idle, and not binding to a specific CPU would have allowed one of them to be used.)
+
+--- Comment (paf, Thu, 14 Dec 2017 17:32:41 +0000) ---
+Great
+
+--- Comment (dmiter, Thu, 14 Dec 2017 17:15:56 +0000) ---
+The last version of patch don't have an issue with RPC splitting. For reading in my VM machine I have the following:
+
+with PIO disabled:
+
+                        read                    write
+pages per rpc         rpcs   % cum % |       rpcs   % cum %
+1:                       3   4   4   |          0   0   0
+2:                       0   0   4   |          0   0   0
+4:                       0   0   4   |          0   0   0
+8:                       0   0   4   |          0   0   0
+16:                      0   0   4   |          0   0   0
+32:                      0   0   4   |          0   0   0
+64:                      0   0   4   |          0   0   0
+128:                     0   0   4   |          0   0   0
+256:                     0   0   4   |          0   0   0
+512:                     1   1   6   |          0   0   0
+1024:                   62  93 100   |          0   0   0
+
+with PIO enabled:
+
+                        read                    write
+pages per rpc         rpcs   % cum % |       rpcs   % cum %
+1:                       2   2   2   |          0   0   0
+2:                       0   0   2   |          0   0   0
+4:                       0   0   2   |          0   0   0
+8:                       0   0   2   |          0   0   0
+16:                      0   0   2   |          0   0   0
+32:                      0   0   2   |          0   0   0
+64:                      0   0   2   |          0   0   0
+128:                     0   0   2   |          0   0   0
+256:                     1   1   4   |          0   0   0
+512:                     4   5  10   |          0   0   0
+1024:                   61  89 100   |          0   0   0
+
+--- Comment (dmiter, Fri, 8 Dec 2017 09:58:54 +0000) ---
+This is regreassion of last version of my patch when I turned off async read ahead if PIO flag is not enabled. I'm going to fix this. But anyway I cannot avoid several 1K requests. I think we should not fix this because of this leed low latency in requests. This happens when user request miss page and async read ahead is initiated but minwhile it request a single page only and then unlock user application. In the next loop of reading next page will be available from async read ahead.
+
+--- Comment (paf, Thu, 7 Dec 2017 21:17:11 +0000) ---
+Looking at when these smaller reads happen, they're clustered in the middle of the job, to the point where there are no 1024 page reads for a while (I used the D_INODE debug in osc_build_rpc for this).
+
+This is for the 4000 MiB case.
+
+This is the first RPC, which is naturally enough 1 page:
+
+00000008:00000002:0.0F:1512684358.524801:0:5975:0:(osc_request.c:2073:osc_build_rpc()) @@@ 1 pages, aa ffff880034753170. now 1r/0w in flight  req@ffff8
+
+That's followed by a large # of 1024 page RPCs, though with 1 page RPCs mixed in every so often, which seems weird.  It looks like there is no point at which we hit a steady state of only 1024 page RPCs.
+
+Then, here's the first of the set of only 1 page RPCs:
+
+00000008:00000002:2.0:1512684366.335774:0:5973:0:(osc_request.c:2073:osc_build_rpc()) @@@ 1 pages, aa ffff88023602c170. now 1r/0w in flight  req@ffff88
+
+There are then NO 1024 page RPCs for some thousands of RPCs.  Weirdly, at the end it seems to recover and we do some 1024 page RPCs again.  Here's the first of those:
+
+00000008:00000002:0.0:1512684370.524090:0:5974:0:(osc_request.c:2073:osc_build_rpc()) @@@ 1024 pages, aa ffff8800a506c770. now 1r/0w in flight  req@fff
+
+And here's the last RPC period:
+
+00000008:00000002:1.0:1512684371.129494:0:5972:0:(osc_request.c:2073:osc_build_rpc()) @@@ 1022 pages, aa ffff88021f8c1c70. now 2r/0w in flight  req@fff
+
+So spend 8 second sending mostly large RPCs, then 4 seconds sending only 4 KiB RPCs, then another ~1 second sending large RPCs again.
+
+That means that, as you said, we're only sending a few % of the data in those RPCs - about 3% in this case.
+
+But they're taking about 30% of the total time, and it's all in one big lump.
+
+Something's wrong.
+
+--- Comment (paf, Thu, 7 Dec 2017 21:09:15 +0000) ---
+I see what you're getting at, but then I would expect the % of small RPCs to drop as we go up in file size, but I in fact see the opposite.  Something goes badly wrong for me around 4 GiB in size, which is 50% of memory on this VM node (which is unlikely to be a coincidence).
+
+Examples - 1000 MiB:
+
+[root@cent7c01 cent7s02]# ls -la ost0; cat ost0 > /dev/null; cat /proc/fs/lustre/osc/cent7s02-OST0000-osc-ffff88022437c800/rpc_stats
+
+rw-rr- 1 root root 1048576000 Dec  7 16:52 ost0
+
+snapshot_time:         1512683598.957290341 (secs.nsecs)
+
+read RPCs in flight:  0
+
+write RPCs in flight: 0
+
+pending write pages:  0
+
+pending read pages:   0
+
+			read			write
+
+pages per rpc         rpcs   % cum % |       rpcs   % cum %
+
+1:		        22   8   8   |          0   0   0
+
+2:		         0   0   8   |          0   0   0
+
+4:		         0   0   8   |          0   0   0
+
+8:		         0   0   8   |          0   0   0
+
+16:		         0   0   8   |          0   0   0
+
+32:		         0   0   8   |          0   0   0
+
+64:		         0   0   8   |          0   0   0
+
+128:		         0   0   8   |          0   0   0
+
+256:		         0   0   8   |          0   0   0
+
+512:		         0   0   8   |          0   0   0
+
+1024:		       250  91 100   |          0   0   0
+
+2000 MiB:
+
+[root@cent7c01 cent7s02]# dd if=/dev/zero bs=1M count=2000 of=./ost0; echo 3 > /proc/sys/vm/drop_caches ; echo clear > /sys/fs/lustre/ldlm/namespaces/cent7s02-OST0000-osc-ffff88022437c800/lru_size; echo c > /proc/fs/lustre/osc/cent7s02-OST0000-osc-ffff88022437c800/rpc_stats; cat ost0 > /dev/null; cat /proc/fs/lustre/osc/cent7s02-OST0000-osc-ffff88022437c800/rpc_stats
+
+2000+0 records in
+
+2000+0 records out
+
+2097152000 bytes (2.1 GB) copied, 7.99026 s, 262 MB/s
+
+snapshot_time:         1512683716.923342172 (secs.nsecs)
+
+read RPCs in flight:  0
+
+write RPCs in flight: 0
+
+pending write pages:  0
+
+pending read pages:   0
+
+			read			write
+
+pages per rpc         rpcs   % cum % |       rpcs   % cum %
+
+1:		        37   6   6   |          0   0   0
+
+2:		         0   0   6   |          0   0   0
+
+4:		         0   0   6   |          0   0   0
+
+8:		         0   0   6   |          0   0   0
+
+16:		         0   0   6   |          0   0   0
+
+32:		         0   0   6   |          0   0   0
+
+64:		         0   0   6   |          0   0   0
+
+128:		         0   0   6   |          0   0   0
+
+256:		         0   0   6   |          0   0   0
+
+512:		         0   0   6   |          0   0   0
+
+1024:		       500  93 100   |          0   0   0
+
+3000 MiB:
+
+[root@cent7c01 cent7s02]# dd if=/dev/zero bs=1M count=3000 of=./ost0; echo 3 > /proc/sys/vm/drop_caches ; echo clear > /sys/fs/lustre/ldlm/namespaces/cent7s02-OST0000-osc-ffff88022437c800/lru_size; echo c > /proc/fs/lustre/osc/cent7s02-OST0000-osc-ffff88022437c800/rpc_stats; cat ost0 > /dev/null; cat /proc/fs/lustre/osc/cent7s02-OST0000-osc-ffff88022437c800/rpc_stats
+
+3000+0 records in
+
+3000+0 records out
+
+3145728000 bytes (3.1 GB) copied, 10.6623 s, 295 MB/s
+
+snapshot_time:         1512683893.046695412 (secs.nsecs)
+
+read RPCs in flight:  0
+
+write RPCs in flight: 0
+
+pending write pages:  0
+
+pending read pages:   0
+
+			read			write
+
+pages per rpc         rpcs   % cum % |       rpcs   % cum %
+
+1:		        53   6   6   |          0   0   0
+
+2:		         0   0   6   |          0   0   0
+
+4:		         0   0   6   |          0   0   0
+
+8:		         0   0   6   |          0   0   0
+
+16:		         0   0   6   |          0   0   0
+
+32:		         0   0   6   |          0   0   0
+
+64:		         0   0   6   |          0   0   0
+
+128:		         0   0   6   |          0   0   0
+
+256:		         0   0   6   |          0   0   0
+
+512:		         0   0   6   |          0   0   0
+
+1024:		       750  93 100   |          0   0   0
+
+4000 MiB:
+
+[root@cent7c01 cent7s02]# dd if=/dev/zero bs=1M count=4000 of=./ost0; echo 3 > /proc/sys/vm/drop_caches ; echo clear > /sys/fs/lustre/ldlm/namespaces/cent7s02-OST0000-osc-ffff88022437c800/lru_size; echo c > /proc/fs/lustre/osc/cent7s02-OST0000-osc-ffff88022437c800/rpc_stats; cat ost0 > /dev/null; cat /proc/fs/lustre/osc/cent7s02-OST0000-osc-ffff88022437c800/rpc_stats
+
+4000+0 records in
+
+4000+0 records out
+
+4194304000 bytes (4.2 GB) copied, 13.1352 s, 319 MB/s
+
+snapshot_time:         1512683761.337612432 (secs.nsecs)
+
+read RPCs in flight:  0
+
+write RPCs in flight: 0
+
+pending write pages:  0
+
+pending read pages:   0
+
+			read			write
+
+pages per rpc         rpcs   % cum % |       rpcs   % cum %
+
+1:		      8074  89  89   |          0   0   0
+
+2:		         0   0  89   |          0   0   0
+
+4:		         0   0  89   |          0   0   0
+
+8:		         0   0  89   |          0   0   0
+
+16:		         0   0  89   |          0   0   0
+
+32:		         0   0  89   |          0   0   0
+
+64:		         0   0  89   |          0   0   0
+
+128:		         0   0  89   |          0   0   0
+
+256:		         1   0  89   |          0   0   0
+
+512:		         0   0  89   |          0   0   0
+
+1024:		       992  10 100   |          0   0   0
+
+—
+
+Larger sizes remain problematic.  So when I hit the cached mb limit on the node, something goes totally off the rails, I think.  Perhaps we're getting that from the kernel, but it's still a major degradation.
+
+--- Comment (adilger, Thu, 7 Dec 2017 20:45:09 +0000) ---
+Not to downplay the significance of the 4KB RPCs, since there are a lot of them, but it is worthwhile to note that the bulk of the IO is still being transferred by 4MB RPCs - 1729/1731 in the patched case vs 1751 in the unpatched case.  So 98% of the data is still using 4MB RPCs, vs 2% of the data is using 4KB RPCs.
+
+My first guess is that the small RPC sizes are caused by a smaller readahead window at the start being split across multiple threads/RPCs, and then as the readahead window grows it starts using larger reads?  It may also be that a small number of 4KB RPCs are being handled separately for each 4MB RPC, but we don't see this because of binning in the histogram.  That would have to be checked in the client debug logs with lctl set_param debug=+reada.
+
+--- Comment (paf, Thu, 7 Dec 2017 17:12:13 +0000) ---
+I thought I'd try a quick, simple test, and I'm seeing significant issues.
+
+Here's the file, a single stripe on OST 0, around 7 GB in size:
+
+[root@cent7c01 cent7s02]# ls -la ost0
+
+rw-rr- 1 root root 7345393664 Dec  7 13:04 ost0
+
+[root@cent7c01 cent7s02]# lfs getstripe ost0
+
+ost0
+
+lmm_stripe_count:  1
+
+lmm_stripe_size:   1048576
+
+lmm_pattern:       raid0
+
+lmm_layout_gen:    0
+
+lmm_stripe_offset: 0
+
+	obdidx		 objid		 objid		 group
+
+	     0	           579	        0x243	             0
+
+When I read it (after clearing my rpc stats) without this patch, here's what that looks like:
+
+[root@cent7c02 cent7s02]# cat ost0 > /dev/null; cat /proc/fs/lustre/osc/cent7s02-OST0000-osc-ffff880034222000/rpc_stats
+
+snapshot_time:         1512669699.623744 (secs.usecs)
+
+read RPCs in flight:  0
+
+write RPCs in flight: 0
+
+pending write pages:  0
+
+pending read pages:   0
+
+			read			write
+
+pages per rpc         rpcs   % cum % |       rpcs   % cum %
+
+1:		         1   0   0   |          0   0   0
+
+2:		         0   0   0   |          0   0   0
+
+4:		         0   0   0   |          0   0   0
+
+8:		         0   0   0   |          0   0   0
+
+16:		         0   0   0   |          0   0   0
+
+32:		         0   0   0   |          0   0   0
+
+64:		         0   0   0   |          0   0   0
+
+128:		         0   0   0   |          0   0   0
+
+256:		         0   0   0   |          0   0   0
+
+512:		         1   0   0   |          0   0   0
+
+1024:		      1751  99 100   |          0   0   0
+
+There is 1 single page RPC, which is pretty good.  A few more would be acceptable too, of course.
+
+Here's what it looks like with this patch:
+
+[root@cent7c01 cent7s02]# cat /proc/fs/lustre/osc/cent7s02-OST0000-osc-ffff8800b24b7000/rpc_stats
+
+snapshot_time:         1512670149.589299551 (secs.nsecs)
+
+read RPCs in flight:  0
+
+write RPCs in flight: 0
+
+pending write pages:  0
+
+pending read pages:   0
+
+			read			write
+
+pages per rpc         rpcs   % cum % |       rpcs   % cum %
+
+1:		     22218  92  92   |          0   0   0
+
+2:		         0   0  92   |          0   0   0
+
+4:		         0   0  92   |          0   0   0
+
+8:		         0   0  92   |          0   0   0
+
+16:		         2   0  92   |          0   0   0
+
+32:		         1   0  92   |          0   0   0
+
+64:		         0   0  92   |          0   0   0
+
+128:		         0   0  92   |          0   0   0
+
+256:		         0   0  92   |          0   0   0
+
+512:		         2   0  92   |          0   0   0
+
+1024:		      1729   7 100   |          0   0   0
+
+That's 92% 4K RPCs.  That's... definitely not OK.
+
+Here's a quick test with dd, with 1 MiB reads, just in case cat was the problem:
+
+[root@cent7c01 cent7s02]# dd if=./ost0 of=/dev/null bs=1M
+
+7005+1 records in
+
+7005+1 records out
+
+7345393664 bytes (7.3 GB) copied, 26.8776 s, 273 MB/s
+
+[root@cent7c01 cent7s02]# cat /proc/fs/lustre/osc/cent7s02-OST0000-osc-ffff8800b24b7000/rpc_stats
+
+snapshot_time:         1512670262.741210431 (secs.nsecs)
+
+read RPCs in flight:  0
+
+write RPCs in flight: 0
+
+pending write pages:  0
+
+pending read pages:   0
+
+			read			write
+
+pages per rpc         rpcs   % cum % |       rpcs   % cum %
+
+1:		     20687  92  92   |          0   0   0
+
+2:		         0   0  92   |          0   0   0
+
+4:		         0   0  92   |          0   0   0
+
+8:		         4   0  92   |          0   0   0
+
+16:		         0   0  92   |          0   0   0
+
+32:		         0   0  92   |          0   0   0
+
+64:		         0   0  92   |          0   0   0
+
+128:		         0   0  92   |          0   0   0
+
+256:		         0   0  92   |          0   0   0
+
+512:		         1   0  92   |          0   0   0
+
+1024:		      1731   7 100   |          0   0   0
+
+Note that the performance #s aren't really relevant, these are relatively slow VMs.  But the RPC size #s very much are.
+
+--- Comment (ihara, Fri, 1 Dec 2017 07:09:04 +0000) ---
+Firstly, I think one problem is that IOR is being run with a 1Mb transfer size (“-t 1m”) so the kernel-side parallelism doesn’t get used. Try running with “-t 16m” so that the kernel threads can help do the copies from userspace and RPCs in parallel.
+
+I haven't never seen any behefits with -t 16M unless we use O_DIRECT.  I just dobule checked -t 16mb with patched client, 
+
+IOR -a POSIX -r -k -e -vv -t 16m -b 256g -F -o /scratch0/dir/file
+
+Max Read:  779.65 MiB/sec (817.53 MB/sec)
+
+Also, how many IOR threads running on the client? Just one?
+
+Just one thread.
+
+One thing I was wondering is if the 16MB stripe_size is potentially hurting the parallelism? That means multiple threads are doing the copying, but they are all sending to the same OST. Try with the 1MB stripe size so that the kernel threads can send to multiple OSTs in parallel.
+
+1MB stripe size is even worse.
+
+# lfs setstripe -S 1M -c -1 /scratch0/dir
+# mpirun -np 1 IOR -a POSIX -w -k -e -vv -t 1m -b 256g -F -o /scratch0/dir/file
+# echo 3 > /proc/sys/vm/drop_caches (on OSS/MDS and client)
+# mpirun -np 1 IOR -a POSIX -r -k -e -vv -t 1m -b 256g -F -o /scratch0/dir/file
+
+Summary:
+	api                = POSIX
+	test filename      = /scratch0/dir/file
+	access             = file-per-process
+	pattern            = segmented (1 segment)
+	ordering in a file = sequential offsets
+	ordering inter file= no tasks offsets
+	clients            = 1 (1 per node)
+	repetitions        = 1
+	xfersize           = 1 MiB
+	blocksize          = 256 GiB
+	aggregate filesize = 256 GiB
+
+Using Time Stamp 1512108853 (0x5a20f335) for Data Signature
+[RANK 000] open for reading file /scratch0/dir/file.00000000 XXCEL
+Commencing read performance test.
+Fri Dec  1 15:14:13 2017
+
+access    bw(MiB/s)  block(KiB) xfer(KiB)  open(s)    wr/rd(s)   close(s) total(s)  iter
+------    ---------  ---------- ---------  --------   --------   --------  --------   ----
+read      111.75     268435456  1024.00    0.000296   2345.81    0.001064   2345.81    0    XXCEL
+Operation  Max (MiB)  Min (MiB)  Mean (MiB)   Std Dev  Max (OPs)  Min (OPs)  Mean (OPs)   Std Dev  Mean (s)  Op grep #Tasks tPN reps  fPP reord reordoff reordrand seed segcnt blksiz xsize aggsize
+
+---------  ---------  ---------  ----------   -------  ---------  ---------  ----------   -------  --------
+read          111.75     111.75      111.75      0.00     111.75     111.75      111.75      0.002345.80832   1 1 1 1 0 1 0 0 1 274877906944 1048576 274877906944 -1 POSIX EXCEL
+
+Max Read:  111.75 MiB/sec (117.18 MB/sec)
+
+--- Comment (jay, Fri, 1 Dec 2017 06:42:05 +0000) ---
+16% 4K read should be problematic.
+
+--- Comment (ihara, Fri, 1 Dec 2017 05:44:18 +0000) ---
+Please see attached. 40ost_rpc_stats.txt 
+
+this is rpc_stats for all 40 OSTs.  Please keep in mind, all my testing are single IOR thread.
+
+there are a lot of small read on some of OSCs.
+
+osc.scratch0-OST0000-osc-ffff88203a33e000.rpc_stats=
+snapshot_time:         1512106460.010766948 (secs.nsecs)
+read RPCs in flight:  0
+write RPCs in flight: 0
+pending write pages:  0
+pending read pages:   0
+
+			read			write
+pages per rpc         rpcs   % cum % |       rpcs   % cum %
+1:		      3764  81  81   |          0   0   0
+2:		         0   0  81   |          0   0   0
+4:		         0   0  81   |          0   0   0
+8:		         0   0  81   |          0   0   0
+16:		         0   0  81   |          0   0   0
+32:		        24   0  82   |          0   0   0
+64:		         9   0  82   |          0   0   0
+128:		        18   0  82   |          0   0   0
+256:		        54   1  83   |          0   0   0
+512:		        62   1  85   |          0   0   0
+1024:		       125   2  87   |          0   0   0
+2048:		       160   3  91   |          0   0   0
+4096:		       398   8 100   |          0   0   0
+
+majority of  RPCs are large (4MB, 8MB or 16MB, but not all 16MB) on some of other OSCs.
+
+osc.scratch0-OST0022-osc-ffff88203a33e000.rpc_stats=
+snapshot_time:         1512106460.012210601 (secs.nsecs)
+read RPCs in flight:  0
+write RPCs in flight: 0
+pending write pages:  0
+pending read pages:   0
+
+			read			write
+pages per rpc         rpcs   % cum % |       rpcs   % cum %
+1:		        33   3   3   |          0   0   0
+2:		         0   0   3   |          0   0   0
+4:		         2   0   3   |          0   0   0
+8:		         0   0   3   |          0   0   0
+16:		         4   0   4   |          0   0   0
+32:		        23   2   7   |          0   0   0
+64:		        11   1   8   |          0   0   0
+128:		        15   1   9   |          0   0   0
+256:		        52   5  15   |          0   0   0
+512:		        62   7  22   |          0   0   0
+1024:		       115  12  35   |          0   0   0
+2048:		       169  19  54   |          0   0   0
+4096:		       399  45 100   |          0   0   0
+
+--- Comment (ihara, Fri, 1 Dec 2017 04:45:53 +0000) ---
+Have you collected rpc_stats from client side to see if it actually sends full size RPC?
+
+this is single OST testing. I see some small 4K reads.
+
+osc.scratch0-OST0009-osc-ffff88203a33e000.rpc_stats=
+snapshot_time:         1512103327.914410097 (secs.nsecs)
+read RPCs in flight:  0
+write RPCs in flight: 0
+pending write pages:  0
+pending read pages:   0
+
+			read			write
+pages per rpc         rpcs   % cum % |       rpcs   % cum %
+1:		      3358  16  16   |          0   0   0
+2:		         1   0  16   |          0   0   0
+4:		         0   0  16   |          0   0   0
+8:		         0   0  16   |          0   0   0
+16:		         0   0  16   |          0   0   0
+32:		         2   0  16   |          0   0   0
+64:		         7   0  16   |          0   0   0
+128:		        15   0  16   |          0   0   0
+256:		        27   0  16   |          9   0   0
+512:		        54   0  17   |          7   0   0
+1024:		       139   0  17   |          2   0   0
+2048:		       281   1  19   |          5   0   0
+4096:		     16441  80 100   |      16384  99 100
+
+			read			write
+rpcs in flight        rpcs   % cum % |       rpcs   % cum %
+0:		         0   0   0   |          0   0   0
+1:		      5854  28  28   |         38   0   0
+2:		      2654  13  41   |      14182  86  86
+3:		      2652  13  54   |       1753  10  97
+4:		      2634  12  67   |        140   0  98
+5:		      1523   7  75   |        113   0  98
+6:		      1472   7  82   |         59   0  99
+7:		      1463   7  89   |         34   0  99
+8:		      1428   7  96   |         11   0  99
+9:		       248   1  98   |          5   0  99
+10:		       178   0  98   |          4   0  99
+11:		       139   0  99   |          3   0  99
+12:		        67   0  99   |          4   0  99
+13:		         8   0  99   |          3   0  99
+14:		         3   0  99   |          3   0  99
+15:		         1   0  99   |          3   0  99
+16:		         1   0 100   |          3   0  99
+17:		         0   0 100   |         27   0  99
+18:		         0   0 100   |         22   0 100
+
+			read			write
+offset                rpcs   % cum % |       rpcs   % cum %
+0:		         1   0   0   |          1   0   0
+1:		         1   0   0   |          0   0   0
+2:		         0   0   0   |          0   0   0
+4:		         0   0   0   |          0   0   0
+8:		         0   0   0   |          0   0   0
+16:		         0   0   0   |          0   0   0
+32:		         0   0   0   |          0   0   0
+64:		         0   0   0   |          0   0   0
+128:		         0   0   0   |          0   0   0
+256:		         0   0   0   |          0   0   0
+512:		         0   0   0   |          0   0   0
+1024:		         0   0   0   |          0   0   0
+2048:		         0   0   0   |          0   0   0
+4096:		         1   0   0   |          1   0   0
+8192:		         3   0   0   |          2   0   0
+16384:		         5   0   0   |          4   0   0
+32768:		        11   0   0   |          8   0   0
+65536:		        21   0   0   |         16   0   0
+131072:		        35   0   0   |         32   0   0
+262144:		        69   0   0   |         64   0   0
+524288:		       139   0   1   |        128   0   1
+1048576:		       280   1   2   |        256   1   3
+2097152:		       559   2   5   |        512   3   6
+4194304:		      1114   5  11   |       1024   6  12
+8388608:		      2241  11  22   |       2052  12  24
+16777216:		      4622  22  44   |       4110  25  50
+33554432:		     11223  55 100   |       8197  49 100
+
+--- Comment (adilger, Fri, 1 Dec 2017 02:28:15 +0000) ---
+Firstly, I think one problem is that IOR is being run with a 1Mb transfer size (“-t 1m”) so the kernel-side parallelism doesn’t get used. Try running with “-t 16m” so that the kernel threads can help do the copies from userspace and RPCs in parallel.
+
+Also, how many IOR threads running on the client?  Just one?  
+
+One thing I was wondering is if the 16MB stripe_size is potentially hurting the parallelism? That means multiple threads are doing the copying, but they are all sending to the same OST.  Try with the 1MB stripe size so that the kernel threads can send to multiple OSTs in parallel.
+
+--- Comment (jay, Thu, 30 Nov 2017 22:51:51 +0000) ---
+Have you collected rpc_stats from client side to see if it actually sends full size RPC?
+
+--- Comment (ihara, Thu, 30 Nov 2017 22:24:29 +0000) ---
+1. What's the best-case bandwidth of an individual OST?
+
+Here is single OST's performance. this is same IOR test above, but no striping. Just an OST.
+
+832.16MB/s
+
+2. You're only striping to one OST, what happens if you stripe wider?
+
+No, first results were striping acrossing all OSTs (40 x OST) with "lfs setstripe -c -1".
+
+3. How many cores on that client?
+
+As I've described above 2 x E5-2650v4 means 24 CPU cores total (12 CPU cores each socket)
+
+--- Comment (paf, Wed, 29 Nov 2017 18:02:29 +0000) ---
+A few questions.
+
+1. What's the best-case bandwidth of an individual OST?
+
+2. You're only striping to one OST, what happens if you stripe wider?
+
+3. How many cores on that client?
+
+--- Comment (ihara, Wed, 29 Nov 2017 17:49:39 +0000) ---
+here is quick test resutls of patch https://review.whamcloud.com/#/c/26469/ (patch set 37)
+
+lctl set_param osc.*.max_pages_per_rpc=16M
+lctl set_param osc.*.max_rpcs_in_flight=16
+lctl set_param osc.*.max_dirty_mb=512
+lctl set_param llite.*.max_read_ahead_mb=2048
+lctl set_param osc.*.checksums=0
+
+40 x OST, 1 x client(2 x E5-2650v4, 128GB memory, 1 x FDR)
+
+# lfs setstripe -c -1 -S 16M /scratch0/dir
+# IOR -w -k -F -e -t 1m -b 256g -vv -o /scratch0/dir/file
+# sync;echo 3 > /proc/sys/vm/drop_caches (client and OSSs)
+# IOR -r -F -e -t 1m -b 256g -vv -o /scratch0/dir/file
+
+2.7.22.1
+2.10.55
+2.10.55/w patch
+
+897.34
+881.34MB/s
+911.55MB/s
+
+I didn't see big performance improvments with patches when if max_pages_per_rpc=16M.
+
+--- Comment (gerrit, Tue, 10 Oct 2017 07:45:03 +0000) ---
+Dmitry Eremin (dmitry.eremin@intel.com) uploaded a new patch: https://review.whamcloud.com/29540
+
+Subject: LU-8964 llite: Make readahead async
+
+Project: fs/lustre-release
+
+Branch: flr
+
+Current Patch Set: 1
+
+Commit: a3d49f1db481c9e4ae72693eade7bcf8729483ce
+
+--- Comment (gerrit, Tue, 30 May 2017 13:28:16 +0000) ---
+Oleg Drokin (oleg.drokin@intel.com) merged in patch https://review.whamcloud.com/26468/
+
+Subject: LU-8964 clio: Parallelize generic I/O
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: db59ecb5d1d0284fb918def6348a11e0966d7767
+
+--- Comment (gerrit, Tue, 30 May 2017 13:28:10 +0000) ---
+Oleg Drokin (oleg.drokin@intel.com) merged in patch https://review.whamcloud.com/24474/
+
+Subject: LU-8964 libcfs: Introduce parallel tasks framework
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: eca949bf83dfec5be33dc6230f55823376aef65a
+
+--- Comment (jay, Wed, 26 Apr 2017 17:40:40 +0000) ---
+I decided to write down my concern and known problems here. I wrote it on the gerrit but it was missed in the refresh and rebase.
+
+1. head of block - when a subtask is blocked due to long holding lock, for example group lock, the tasks behind that one will be blocked that means nobody could move forward;
+
+2. for pdata implementation right now, once a task has been decided to put into a queue, it has to be stuck in that queue. To some extent, the overhead performance now is limited by the slowest OST;
+
+3. lack of cancel API. This poses a problem if an error has already seen in a previous subtask, it's expected to cancel all the other pending subtasks that belong to the same I/O because it'll be just wasting of time by continuing doing those;
+
+4. pdata uses per cpu work queue. This is not perfect fit to drive Lustre I/O task because most of the time the tasks are in sleep state waiting for some resources, which means the CPU could be used to drive the other subtasks. It would be extremely difficult to work out something like ZIO pipeline in ZFS but it'll be easier to just spawn more I/O threads than the number of CPUs;
+
+5. Lack of NUMA support. This should be really easy to fix.
+
+It's not necessary to block the landing of the patch as is. However, this is something we should proceed to work post landing.
+
+--- Comment (gerrit, Mon, 10 Apr 2017 11:55:15 +0000) ---
+Dmitry Eremin (dmitry.eremin@intel.com) uploaded a new patch: https://review.whamcloud.com/26469
+
+Subject: LU-8964 llite: Make readahead async
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: d624cc9a301d1014cca088dff014176c7f61d5fc
+
+--- Comment (gerrit, Mon, 10 Apr 2017 11:55:14 +0000) ---
+Dmitry Eremin (dmitry.eremin@intel.com) uploaded a new patch: https://review.whamcloud.com/26468
+
+Subject: LU-8964 clio: Parallelize generic I/O
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: dfd26cbb6f41a956658b975b68576b8fccbbd342
+
+--- Comment (gerrit, Tue, 4 Apr 2017 19:10:01 +0000) ---
+Dmitry Eremin (dmitry.eremin@intel.com) uploaded a new patch: https://review.whamcloud.com/26350
+
+Subject: LU-8964 llite: Make readahead async
+
+Project: fs/lustre-release
+
+Branch: pfl
+
+Current Patch Set: 1
+
+Commit: 84d8bc4dcbc8f7b187f967af8dc264a6e834b9e3
+
+--- Comment (gerrit, Sun, 2 Apr 2017 17:59:21 +0000) ---
+Dmitry Eremin (dmitry.eremin@intel.com) uploaded a new patch: https://review.whamcloud.com/26315
+
+Subject: LU-8964 clio: Parallelize generic I/O
+
+Project: fs/lustre-release
+
+Branch: pfl
+
+Current Patch Set: 1
+
+Commit: ebd9846fafbe07ba576e288e28a7a6847adc5321
+
+--- Comment (gerrit, Sun, 2 Apr 2017 17:59:20 +0000) ---
+Dmitry Eremin (dmitry.eremin@intel.com) uploaded a new patch: https://review.whamcloud.com/26314
+
+Subject: LU-8964 libcfs: Introduce parallel tasks framework
+
+Project: fs/lustre-release
+
+Branch: pfl
+
+Current Patch Set: 1
+
+Commit: 4b91a6c4999ade6d1d04c89f06bc9ed535616e69
+
+--- Comment (efocht, Mon, 13 Mar 2017 12:30:08 +0000) ---
+Ah! Thanks Dmitry, now it's clear
+
+--- Comment (dmiter, Mon, 13 Mar 2017 11:30:34 +0000) ---
+Erich, I have special logic during initialization.
+
+if (cpumask_empty(par_mask) ||
+	    cpumask_equal(par_mask, cpu_online_mask)) {
+		cpumask_copy(all_mask, cpu_online_mask);
+		cpumask_clear(par_mask);
+		while (!cpumask_empty(all_mask)) {
+			int cpu = cpumask_first(all_mask);
+
+			cpumask_set_cpu(cpu, par_mask);
+			cpumask_andnot(all_mask, all_mask,
+					topology_sibling_cpumask(cpu));
+		}
+	}
+
+This means if CPU mask is empty or full use all available CPUs without HT. So, only pure cores will be used. This is done intentional. Using HT for this will disrupt performance.
+
+--- Comment (efocht, Mon, 13 Mar 2017 10:53:44 +0000) ---
+Hi Andreas,
+
+the client is a dual socket E5-2680 v4 with 14 cores per CPU and HT enabled. In /proc/cpuinfo I see 56 cores. Experiments are on top of Centos 7.2 3.10.0-514.2.2.el7 kernel.
+
+The read ahead engine is initialized with cpu_online_map:
+
+vvp_raengine = cfs_ptengine_init("read_ahead", cpu_online_mask);
+
+so I would have expected to be able to chose up to 56 ptasks, but I can only set it to 28. I'm missing some detail here. The highest active kworker thread I see is [kworker/27:1] so I suppose we stay away from the hyperthreads.
+
+Tests are with Omnipath, so additional CPU resources for the network are beneficial, that's maybe why ptasks=14 is better than ptasks=28. Rule of thumb right now: ptasks=1 for zfs-0.6.5.7, ptasks=half of maximum for zfs-0.7.0. ptasks=maximum for KNL with ldiskfs OSTs (Dmitry's choice).
+
+--- Comment (dmiter, Mon, 13 Mar 2017 10:41:55 +0000) ---
+Thanks Erich. This is a good improveement for my patch. But I have other idea how to implement it. I'm going to update my patch soon. I hope you will test it and review.
+
+--- Comment (adilger, Mon, 13 Mar 2017 09:14:56 +0000) ---
+Erich, thanks for posting your results.  Definitely 0.7.0 seems very attractive for this workload.
+
+It looks like your patch is improving the performance significantly as well.  Is the 56-code client machine NUMA, and if yes how many sockets, 4?  I'm not against changing the default ptask count to get better performance out-of-the-box, based on your test results, so long as we can determine what the best setting should be.
+
+How does ptasks=14 relate to the socket count, and is there a rule we can make there?  It seems like having a thread for each CPU is probably the wrong default, unless they are each working with a different OST?
+
+--- Comment (efocht, Sun, 12 Mar 2017 00:57:44 +0000) ---
+Just uploaded a patch on top of the series from Dmitry.
+
+It changes the size of the IOs handled by each ptask in ll_readpages(). The original version had the potential to create "odd" npages values (like 276, for example), which translated to a number of large RPCs plus one small one. Worse than the RPC problem are the offsets received by the prefetcher, which (I believe) are rather unaligned in the original case. ZFS prefetcher doesn't deal well with those, especially if they get scheduled in a different order on the OSS.
+
+Results: single stream read with dd, 1MB block size, MB/s
+
+       zfs-0.6.5.7
+       max_read_ahead_per_file_mb=256 
+rpcs                                              
+ in      LU-8964      LU-8964+EF  
+flight                ptasks=1         
+---------------------------------   
+1         553          860            
+2         638          728            
+4         630          677            
+8         520          595            
+16        568          525            
+32        533          485            
+64        476          452            
+128       479          484            
+256       542          593            
+
+ 
+
+Switching to zfs-0.7.0rc3 improves things dramatically, because the prefetcher is much better:
+
+zfs-0.7.0rc3
+
+rpcs     ra_p_file=256 ra_p_file=64 |  ra_p_file=64                          
+ in        LU-8964       LU-8964    |  LU-8964+EF     LU-8964+EF  LU-8964+EF
+flight                              |  ptasks=1       ptasks=14   ptasks=28  
+------------------------------------|-------------------------------------   
+1           449           433       |   1200           1100        1100      
+2           511           491       |   1600           1700        1600      
+4           585           582       |   1700           1900        1700      
+8           674           680       |   1400           1800         943      
+16          744           797       |   1200           1700        1600      
+32          847           881       |   1200           1600        1400      
+64          860           856       |   1100           1500        1400      
+128         933           819       |   1000           1300        1300      
+256         868           791       |    747           1300        1200
+
+--- Comment (gerrit, Sun, 12 Mar 2017 00:23:46 +0000) ---
+Erich Focht (efocht@gmail.com) uploaded a new patch: https://review.whamcloud.com/25943
+
+Subject: LU-8964 llite: tunable ptasks number with optimized IO size
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 371d804834fe72078dec82906c04e057346abbdd
+
+--- Comment (efocht, Thu, 2 Mar 2017 22:07:38 +0000) ---
+I am testing with normal clients, not KNL, by the way.
+
+With many clients, each with its own streams, things look okay. I couldn't test yet with this async readahead patchset, but the plain old Lustre prefetcher with many rpcs in flight and ZFS OSTs work okay. Even if slower, each stream contributes its share to the total bandwidth and they add up quite well to the more or less expected peak. Some annoying tweaking of max_read_ahead_per_file_mb is necessary, though, and there is no setting that is good for all workloads.
+
+--- Comment (paf, Thu, 2 Mar 2017 21:46:34 +0000) ---
+Erich,
+
+Thanks for the testing.  For what it's worth, ldiskfs is not insensitive to read patterns either.  I think splitting the I/O to these weird sizes is inherently problematic - It should be on more logical boundaries.
+
+I am really surprised to hear you say that you get better results with 1-2 max_rpcs_in_flight.  That seems like then the server would cope extremely poorly with reads from multiple clients.  Is that correct?  That seems like something is wrong, beyond just ZFS.
+
+--- Comment (efocht, Thu, 2 Mar 2017 21:25:42 +0000) ---
+I'm struggling with single stream read performance on ZFS OSTs and tested this patch set. I like it a lot because it simplifies and cleans up the code very much. But without further tunables it will IMO harm single stream sequential read performance on decent ZFS OSTs. The problem is basically that ZFS prefetch is very sensitive to the patterns it receives.
+
+My setup has OSTs which are capable of 1.8GB/s read with one dd directly on the OST (zpool, ZFS filesystem). With the old Lustre prefetcher (without the patchsets of this ticket) I get best performance if I limit the max_rpcs_in_flight to 1 or 2, thus allow for only few ll_ost_io_* threads to do the actual reads on the OSS side. Performance then is close to 1GB/s. Setting max_rpcs_in_flight to 16, 32, or even 256 spoils the performance massively, it ends up in the range of 300-500MB/s.
+
+With 2.9.0 + LU-8964 my results are:
+
+ 
+
+rpcs              dd 1M
+in                reads
+flight        bandwidth MB/s
+               zfs prefetch
+             disabled   enabled
+------------------------------------------------------
+1             302        553
+2             383        638
+4             456        630
+8             568        520
+16            668        568
+32            731        533
+64            764        476
+128           751        479
+256           689        542 
+
+I don't get to 1GB/s, that I could reach before, and best results are with disabled ZFS prefetch! Which I don't like, thinking of the 1.8GB/s that it actually is capable of reaching.
+
+The problems I see:
+
+	reads are evenly distributed across ptasks (56 in my case, big CPUs), which creates more randomness in the read pattern that ZFS is seeing on the OST. A mechanism for adjusting or tuning the number of read threads per stream of per OSC-object would be ideal.
+
+	the size of the reads is the same for all ptasks, larger than 256, but often an odd number (eg. 2341 pages), which leads probably to some large and some small RPCs. I'm playing with the values and am able to get much better results, at least in the single stream sequential case. Will report when my "scan" is done.
+
+Clearly this patch is very helpful for finally improving read-ahead, but I suppose it needs somehow two modes, one for ZFS and one for ldiskfs.
+
+--- Comment (paf, Mon, 6 Feb 2017 19:34:55 +0000) ---
+I'm wondering about Jinshan's comment that readahead is already async?  It does not look like that's the case currently (at least not async the way I would mean it) - Looking at logs here, it looks like the read syscall does not complete until all of the reading readahead is doing is complete, even if readahead is reading beyond what the read from userspace requested.
+
+Is readahead async in that way with your patch?  i.e., if I read a 1 MiB chunk of the file but readahead wants to read 5 MiB, assuming RPC size of 1 MiB, will my read call return once the 1 MiB is present, without waiting for the rest?
+
+--- Comment (paf, Mon, 6 Feb 2017 19:20:01 +0000) ---
+Hmm, that might be fine.  I was also looking at implementing reverse readahead, though I don't have a prototype yet or anything.  (That's why I had that test program around.)  It looks like we can't do anything like that when using the kernel readahead implementation, so that would be a shame.  Reverse reading of anything other than really big blocks is very slow.
+
+About the performance, two things to try, just to see what they do.
+
+I think we should probably try a much bigger stride size, in case we're just reading across the gap [i.e. we're just reading ahead covering both the pages in the gap and the next section we really read...  I don't think so, but probably worth checking.].
+
+So, instead of:
+
+if (strided) {
+                                pos = lseek(fd, pos+read_bytes, SEEK_SET);
+                                /* ATTN here: Uncomment these lines to add a one
+
+This:
+
+if (strided) {
+                                pos = lseek(fd, pos+read_bytes*10, SEEK_SET);
+                                /* ATTN here: Uncomment these lines to add a one
+
+Giving us that larger gap between reads.
+
+I'd also be curious to see what happens with larger read sizes.  But I expect that larger read sizes will look better with the async implementation, so that's good.
+
+--- Comment (dmiter, Mon, 6 Feb 2017 18:34:18 +0000) ---
+With bigger file (1772392448 bytes (1.8 GB)) the proportion become the same. Asynchronous nature of read ahead become page miss less critical than it was before.
+
+strided read pattern: 137 pages miss
+iterations: 845, read 887095296 total bytes
+real 0m2.217s
+user 0m0.000s
+sys  0m0.499s
+
+broken strided read pattern: 756 pages miss
+iterations: 844, read 886046720 total bytes
+real 0m2.571s
+user 0m0.001s
+sys  0m0.408s
+
+--- Comment (dmiter, Mon, 6 Feb 2017 18:22:26 +0000) ---
+Patrick,
+
+ Do you expect the same behavior from new version? Briefly I got the following results on my VM machine:
+
+strided read pattern: 108 pages miss
+iterations: 512, read 537919488 total bytes
+real  0m1.279s
+user  0m0.002s
+sys   0m0.283s
+
+broken strided read pattern: 471 pages miss
+iterations: 511, read 536870912 total bytes
+real  0m1.524s
+user  0m0.002s
+sys   0m0.229s
+
+So, there is no big difference between two patterns in terms of speed but in first case there are low read pages miss.
+
+Is this acceptable for you or you still will complain about regression?
+
+--- Comment (paf, Mon, 6 Feb 2017 15:54:30 +0000) ---
+Also, I should mention - It prints out the pos and bytes_read on only every 100th iteration, not every iteration.
+
+--- Comment (paf, Mon, 6 Feb 2017 15:51:22 +0000) ---
+Dmitry,
+
+As promised, here's my readahead microbenchmark.  It's pretty basic and not very well commented.
+
+You can turn on and off the 1 page offset I'm using to "break" the strided pattern (see comments on the results below) by uncommenting and commenting out the code on lines 84 and 85 of the file.
+
+With strided read pattern:
+
+[root@centclient02 reverse]# vim read_readahead_test.c; gcc read_readahead_test.c ;  echo 3 > /proc/sys/vm/drop_caches ;  lctl set_param debug=0; time ./a.out
+
+debug=0
+
+pos 0
+
+pos 1048576, read rc: 1048576
+
+pos 210763776, read rc: 1048576
+
+pos 420478976, read rc: 1048576
+
+pos 630194176, read rc: 1048576
+
+pos 839909376, read rc: 1048576
+
+pos 1049624576, read rc: 1048576
+
+pos 1259339776, read rc: 1048576
+
+pos 1469054976, read rc: 1048576
+
+pos 1678770176, read rc: 1048576
+
+pos 1888485376, read rc: 1048576
+
+pos 2098200576, read rc: 1048576
+
+amount read (0) != amount requested (1048576), stopping
+
+iterations: 1021, read 1071644672 total bytes
+
+real    0m1.178s
+
+user    0m0.002s
+
+sys     0m0.977s
+
+[root@centclient02 reverse]# cat /proc/fs/lustre/llite/centss03-ffff88013d20c000/read_ahead_stats
+
+snapshot_time             1486349623.499066 secs.usecs
+
+hits                      261333 samples [pages]
+
+misses                    45 samples [pages]
+
+readpage not consecutive  1021 samples [pages]
+
+failed grab_cache_page    4 samples [pages]
+
+zero length file          1 samples [pages]
+
+zero size window          260356 samples [pages]
+
+failed to reach end       509 samples [pages]
+
+[root@centclient02 reverse]# echo c > /proc/fs/lustre/llite/centss03-ffff88013d20c000/read_ahead_stats
+
+With slightly broken strided read pattern (1 page offset on every second read), to simulate disabling strided readahead:
+
+[root@centclient02 reverse]# vim read_readahead_test.c; gcc read_readahead_test.c ;  echo 3 > /proc/sys/vm/drop_caches ;  lctl set_param debug=0; time ./a.out
+
+debug=0
+
+pos 0
+
+pos 1052672, read rc: 1048576
+
+pos 210972672, read rc: 1048576
+
+pos 420892672, read rc: 1048576
+
+pos 630812672, read rc: 1048576
+
+pos 840732672, read rc: 1048576
+
+pos 1050652672, read rc: 1048576
+
+pos 1260572672, read rc: 1048576
+
+pos 1470492672, read rc: 1048576
+
+pos 1680412672, read rc: 1048576
+
+pos 1890332672, read rc: 1048576
+
+pos 2100252672, read rc: 1048576
+
+amount read (0) != amount requested (1048576), stopping
+
+iterations: 1020, read 1070596096 total bytes
+
+real    0m5.100s
+
+user    0m0.003s
+
+sys     0m1.416s
+
+[root@centclient02 reverse]# cat /proc/fs/lustre/llite/centss03-ffff88013d20c000/read_ahead_stats                                  
+
+snapshot_time             1486349643.260326 secs.usecs
+
+hits                      260098 samples [pages]
+
+misses                    1022 samples [pages]
+
+readpage not consecutive  1020 samples [pages]
+
+failed grab_cache_page    1020 samples [pages]
+
+zero length file          1 samples [pages]
+
+zero size window          258574 samples [pages]
+
+read-ahead to EOF         1 samples [pages]
+
+hit max r-a issue         1 samples [pages]
+
+failed to reach end       1 samples [pages]
+
+Note the huge difference in time, even though the bytes read are almost exactly the same.
+
+The misses in the strided case are 45, in the slightly off case, they are 1022.
+
+(Attachment coming in a moment)
+
+--- Comment (cengku9660, Mon, 6 Feb 2017 09:19:37 +0000) ---
+Hi Dmitry,
+
+Good to know, thanks.
+
+These series are really exciting, hope them can be merged soon.
+
+--- Comment (dmiter, Mon, 6 Feb 2017 08:58:46 +0000) ---
+Hi Gu,
+
+Those patches are different. The first one makes read ahead async and that is all. The second one makes user I/O (read/write) parallel. So, those patches are independent but beneficially to have them both.
+
+--- Comment (cengku9660, Sat, 4 Feb 2017 10:21:48 +0000) ---
+Hi Dmitry,
+
+Which is the latest patchset series?
+
+I saw two, and they conflict with each other.
+
+https://review.whamcloud.com/#/c/24933/4
+
+https://review.whamcloud.com/#/c/25046/3
+
+Thanks,
+
+Gu
+
+--- Comment (gerrit, Tue, 24 Jan 2017 08:53:29 +0000) ---
+Dmitry Eremin (dmitry.eremin@intel.com) uploaded a new patch: https://review.whamcloud.com/25046
+
+Subject: LU-8964 clio: Parallelize generic I/O
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 3414d26cb7d3bfe40311780fce60dd491d7cc445
+
+--- Comment (gerrit, Wed, 18 Jan 2017 13:45:58 +0000) ---
+Dmitry Eremin (dmitry.eremin@intel.com) uploaded a new patch: https://review.whamcloud.com/24933
+
+Subject: LU-8964 llite: Make readahead async
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 941395a2d9c93275d5fac10bf3a2cc1ee50d6fe8
+
+--- Comment (gerrit, Wed, 21 Dec 2016 16:40:28 +0000) ---
+Dmitry Eremin (dmitry.eremin@intel.com) uploaded a new patch: https://review.whamcloud.com/24476
+
+ Subject: LU-8964 llite: Parallelize readahead and make it async
+
+ Project: fs/lustre-release
+
+ Branch: master
+
+ Current Patch Set: 1
+
+ Commit: 86a24764485b980d0707a996b0cf58582a585fd3
+
+--- Comment (gerrit, Wed, 21 Dec 2016 16:40:20 +0000) ---
+Dmitry Eremin (dmitry.eremin@intel.com) uploaded a new patch: https://review.whamcloud.com/24475
+
+ Subject: LU-8964 llite: Parallelize generic I/O
+
+ Project: fs/lustre-release
+
+ Branch: master
+
+ Current Patch Set: 1
+
+ Commit: 88d7234f1a26678aebcd3adb0aeb2c17630d8965
+
+--- Comment (gerrit, Wed, 21 Dec 2016 16:40:12 +0000) ---
+Dmitry Eremin (dmitry.eremin@intel.com) uploaded a new patch: https://review.whamcloud.com/24474
+
+Subject: LU-8964 libcfs: Introduce parallel tasks framework
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 3806af960d1cee93e7643040bcee8eb23404ec3d

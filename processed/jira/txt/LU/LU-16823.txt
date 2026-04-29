@@ -1,0 +1,126 @@
+Key:        LU-16823
+Summary:    add LNet and OBD connect flags for IPv6 peers
+Link:       https://jira.whamcloud.com/browse/LU-16823
+Type:       Improvement
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   James A Simmons
+Reporter:   Andreas Dilger
+Created:    Thu, 11 May 2023 19:26:49 +0000
+Updated:    Sun, 7 Jan 2024 18:14:34 +0000
+Resolved:   Wed, 3 Jan 2024 14:23:39 +0000
+Labels:     IPv6
+Links:      Related: is related to  LU-10391; Related: is related to  LU-13306
+
+--- Description ---
+When nodes are connecting to peers the sender should set a bit in the connection that it supports IPv6 (large) NIDs.  This would inform LNet discovery whether it is safe to reply with large NIDs during connection or ping replies.
+
+At the Lustre level new clients should set an OBD_CONNECT2_LARGE_NID=0x100000000ULL flag in obd_connect_data so that the MGS knows whether it can safely reply with large NIDs in mgs_nidtbl_entry.   That avoids the need to backport a patch (ala LU-13306) to allow old clients to mount a server with both IPv4 and IPv6 NIDs configured.
+
+--- Comment (simmonsja, Wed, 3 Jan 2024 14:23:39 +0000) ---
+Work is complete
+
+--- Comment (gerrit, Wed, 3 Jan 2024 03:03:45 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/53398/
+
+Subject: LU-16823 lustre: test if large nid is support
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 165cf78ab54e6e8d172f999940c62afabc043cd5
+
+--- Comment (gerrit, Sun, 10 Dec 2023 14:57:22 +0000) ---
+"James Simmons " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/53398
+
+Subject: LU-16823 lustre: test if large nid is support
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 64bc4ffbff2c8a6927f8c9474887a32ec528e1b9
+
+--- Comment (simmonsja, Mon, 11 Sep 2023 18:56:24 +0000) ---
+Then tendency is for IPv6 to be very random in an network. Need to think about a solution for this. Looking at lmv_setup() its processing an lcfg that contains a lmv_desc. Perhaps we can in mgs_llog.c create a record for lmv_desc with new info for the index to be used?
+
+--- Comment (adilger, Fri, 8 Sep 2023 20:40:37 +0000) ---
+James, are you referring to this hunk of code to initialize the lmv_qos_rr_index starting value:
+
+        /*
+         * initialize rr_index to lower 32bit of netid, so that client
+         * can distribute subdirs evenly from the beginning.
+         */
+        while (LNetGetId(i++, &lnet_id, false) != -ENOENT) {
+                if (!nid_is_lo0(&lnet_id.nid)) {
+                        lmv->lmv_qos_rr_index = ntohl(lnet_id.nid.nid_addr[0]);
+                        break;
+                }
+        }
+
+That code doesn't really need to have the full NID.  The main goal is that each client is initialized in some way to a well-balanced starting value (instead of 0) so that clients don't all start creating subdirectories on MDT0000 and go in lockstep across MDTs.  Using the NID is deterministic and likely gives us a more uniform distribution compared to a purely random number, because it normally only changes the low bits among nearby clients in a single job.  It could use any other kind of  value that is slowly changing for each client, but it would need to be available early during the mount process.
+
+I don't know if IPv6 NIDs have the same property or not, or if they have too much "random" stuff in them that they may be wildly imbalanced?
+
+We could potentially have the MDS assign each client a sequential "client number" for this purpose in the mount reply, but that might be imbalanced for clients that are allocated into the same job because it would only "globally" be uniform (though still better than a purely random number).
+
+In any case, the lmv_qos_rr_index doesn't have to be perfect, as it drifts over time anyway, but it avoids the "thundering herd" problem at initial mount time.
+
+A similar solution is needed for lmv_select_statfs_mdt() to select an MDT to send MDS_STATFS RPCs to:
+
+        /* choose initial MDT for this client */
+        for (i = 0;; i++) {
+                struct lnet_processid lnet_id;
+                if (LNetGetId(i, &lnet_id, false) == -ENOENT)
+                        break;
+                        
+                if (!nid_is_lo0(&lnet_id.nid)) {
+                        /* We dont need a full 64-bit modulus, just enough
+                         * to distribute the requests across MDTs evenly.
+                         */
+                        lmv->lmv_statfs_start = nidhash(&lnet_id.nid) %
+                                                lmv->lmv_mdt_count;
+                        break;
+                }     
+        }
+
+and it probably makes sense that these both use the same mechanism instead of fetching the NIDs each time.
+
+--- Comment (simmonsja, Fri, 8 Sep 2023 19:19:20 +0000) ---
+I was looking at adding the final touches for this work and I found one place its not a easy replacement. For lmv_setup() we call LNetGetId() which only gets small size NIDs. I don't see an easy way to get the connect flag here.  Any suggestions? Should we move to another setup function that has an export as a parameter?
+
+--- Comment (adilger, Wed, 21 Jun 2023 03:16:34 +0000) ---
+James, adding the handling for the OBD_CONNECT2_LARGE_NID feature is relatively straight forward:
+
+	the 51108 patch has already handled the mechanics of adding a new connect flag (definition, wiretest/wirecheck, obd_connect_names[], etc.)
+
+When the client and MGS support for handling large NIDs is finished, a patch should be pushed that:
+
+	adds this flag to data->ocd_connect_flags2 on the client when they are connecting to the MGS (and possibly MDS and OSS, not sure)
+
+	adds this flag to MGS_CONNECT_SUPPORTED2 (and MDS_CONNECT_SUPPORTED2 and OSS_CONNECT_SUPPORTED2 if needed)
+
+	the old MGS will mask off OBD_CONNECT2_LARGE_NID in the reply to new clients, because it is not in the old MGS_CONNECT_SUPPORTED2
+
+	the new MGS will reply with OBD_CONNECT2_LARGE_NID to clients that send it
+
+	the MGS can check this on client exports to determine if they support large NIDs, as needed
+
+	clients can check this to determine if the MGS supports large NIDs, as needed
+
+We don't want to land the "supported" patch until the code is (substantially) working, otherwise a client/server might advertise their support for this feature, but not actually work yet.
+
+--- Comment (simmonsja, Tue, 20 Jun 2023 13:42:33 +0000) ---
+While 51108 landed we do need one more patch here to communicate that the MGS supports large NIDs.
+
+--- Comment (simmonsja, Sat, 17 Jun 2023 22:29:18 +0000) ---
+https://review.whamcloud.com/#/c/fs/lustre-release/+/51108 covers the goal of this ticket.
+
+--- Comment (adilger, Thu, 11 May 2023 19:27:57 +0000) ---
+I haven't looked into all of the details here, but this would potentially allow a better alternative to patching old clients to ignore large NIDs.

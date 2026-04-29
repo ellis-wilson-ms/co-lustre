@@ -1,0 +1,149 @@
+Key:        LU-8927
+Summary:    osp-syn processes contending for osq_lock drives system cpu usage > 80%
+Link:       https://jira.whamcloud.com/browse/LU-8927
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Won't Fix
+Assignee:   Alex Zhuravlev
+Reporter:   Olaf Faaland
+Created:    Thu, 8 Dec 2016 23:21:54 +0000
+Updated:    Mon, 18 Sep 2017 21:29:26 +0000
+Resolved:   Tue, 5 Sep 2017 16:58:09 +0000
+Labels:     llnl, zfs
+Links:      Related: is related to  LU-2435; Related: is related to  LU-8873; Related: is related to  LU-8882; Related: is related to  LU-8928
+Attachments: perf-report.txt
+
+--- Environment ---
+lustre-2.8.0_5.chaos-2.ch6.x86_64
+
+zfs-0.7.0-0.6llnl.ch6.x86_64
+
+DNE with 16 MDTs
+
+--- Description ---
+Ran jobs which created remote directories (not striped) and then ran mdtest within them, several MDS nodes are using >80% of their cpu time for osp-syn-* processes.
+
+There are 36 osp-syn-* processes.
+
+The processes are spending almost all their time contending for osq_lock.  According to perf, the offending stack is:
+
+osq_lock
+
+__mutex_lock_slowpath
+
+mutex_lock
+
+spa_config_enter
+
+bp_get_dsize
+
+dmu_tx_hold_free
+
+osd_declare_object_destroy
+
+llog_osd_declare_destroy
+
+llog_declare_destroy
+
+llog_cancel_rec
+
+llog_cat_cancel_records
+
+osp_sync_process_committed
+
+osp_sync_process_queues
+
+llog_process_thread
+
+llog_process_or_fork
+
+llog_cat_process_cb
+
+llog_process_thread
+
+llog_process_or_fork
+
+llog_cat_process_or_fork
+
+llog_cat_process
+
+osp_sync_thread
+
+kthread
+
+ret_from_fork
+
+osp-syn-X-Y
+
+--- Comment (ofaaland, Tue, 5 Sep 2017 16:57:43 +0000) ---
+This lock contention has not resulted in problems in production, and there is so much related change in 2.10 and master that it's quite possible the problem does not occur there.  Closing the ticket.
+
+--- Comment (pjones, Mon, 4 Sep 2017 14:43:46 +0000) ---
+I would like a level set on this ticket. All of the planned work to improve metadata performance for ZFS has now landed to master (and b2_10). Are there any specific tasks identified and remaining beyond that?
+
+--- Comment (ofaaland, Tue, 3 Jan 2017 20:15:05 +0000) ---
+Alex,
+
+I applied LU-7898 on top of our 2.8.0+patch stack and see the same symptoms.   The patch didn't appear to me to change any of the functions in the contending stacks, so not surprising.
+
+The full set of patches above would be too much for a stable branch, I would think.  So I've rewritten llog_cancel_rec() to destroy the llog in a second transaction, if it's necessary.   Maybe this is a poor approach; feedback or an alternative would be welcome.  In any case I've pushed it to gerrit and will do local testing after it passes maloo.
+
+https://review.whamcloud.com/#/c/24687/
+
+--- Comment (bzzz, Tue, 13 Dec 2016 19:32:16 +0000) ---
+you're right, I mean LU-8873, basically yet another point to save on dnode#->dnode_t lookup.
+
+--- Comment (ofaaland, Tue, 13 Dec 2016 19:26:40 +0000) ---
+OK, thanks.
+
+In the above list of tickets, you include LU-8893.  Did you mean LU-8873?
+
+I looked briefly at the LU-7898 patch to remove unnecessary declarations.  I'll see if I can apply and test it.
+
+--- Comment (bzzz, Tue, 13 Dec 2016 07:01:22 +0000) ---
+in very few words - I've been working to make declarations with ZFS cheap. right now those are quite expensive because DMU API works with dnode numbers, so every time it needs to translate dnode number into dnode structure using the global hash table. few patches have been landed already onto master branch and released as a part of 2.9 (e.g. LU-7898 osd: remove unnecessary declarations). yet more improvements are expected with landing of the following patches:
+
+LU-8882 osd: use bydnode methods to access ZAP
+
+LU-8928 osd: convert osd-zfs to reference dnode, not db
+
+LU-8873 osd: use sa_handle_get_from_db()
+
+LU-2435 osd-zfs: use zfs native dnode accounting
+
+and https://github.com/zfsonlinux/zfs/pull/5464
+
+this way the declarations should become mostly lockless and much cheaper.
+
+--- Comment (ofaaland, Fri, 9 Dec 2016 23:04:44 +0000) ---
+Yes, please elaborate.  I know there are many ways to work on this and it would be great to know the nature and scope of the fix you have in mind.
+
+I looked again and the MDTs are still working to clear llog records from jobs run about 45 hours ago (contended the entire time).  I don't think we can go into production without a fix for this.
+
+--- Comment (pjones, Fri, 9 Dec 2016 15:53:39 +0000) ---
+Alex
+
+Could you please elaborate about the work underway in this area?
+
+Thanks
+
+Peter
+
+--- Comment (bzzz, Fri, 9 Dec 2016 05:44:14 +0000) ---
+when we declare llog cancelation we don't known whether it will be last one or not, otherwise we'd have to lock llog since declaration upto transaction stop killing concurrency. the newer versions of Lustre will fix this problem in osd-zfs module.
+
+--- Comment (ofaaland, Thu, 8 Dec 2016 23:27:06 +0000) ---
+I see that llog_cancel_rec() contains the following:
+
+        rc = llog_declare_write_rec(env, loghandle, &llh->llh_hdr, index,
+        if (rc llh_flags & LLOG_F_ZAP_WHEN_EMPTY))
+                rc = llog_declare_destroy(env, loghandle, th);
+
+        th->th_wait_submit = 1;
+        rc = dt_trans_start_local(env, dt, th);
+
+So it seems to declare that it will destroy the llog object every time it cancels a record, as if every record is the last one.  Why is that? Shouldn't it also depend on how many active records the llog contains?
+
+--- Comment (ofaaland, Thu, 8 Dec 2016 23:23:54 +0000) ---
+Our stack is available to Intel engineers via repository named "lustre-release-fe-llnl" hosted on your gerritt server.

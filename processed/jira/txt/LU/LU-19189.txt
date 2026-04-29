@@ -1,0 +1,110 @@
+Key:        LU-19189
+Summary:    Slow DNE mkdir performance during the creation of the directory on MDS that is different from parent directory
+Link:       https://jira.whamcloud.com/browse/LU-19189
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Srinivasa Vempati
+Reporter:   Srinivasa Vempati
+Created:    Fri, 18 Jul 2025 18:34:16 +0000
+Updated:    Wed, 23 Jul 2025 19:02:46 +0000
+Links:      Related: is related to  LU-2716
+
+--- Description ---
+Summary:
+
+When creating a directory (mkdir), lustre does not “sync” by default when there is a single mdt. With multiple mdts where the child directory is a created on a different mdt than the parent (cross mdt mkdir), lustre does an osd_sync, which we suspect is for atomicity. Our experiments show that if we disable the osd_sync in the cross-mdt case, we don’t lose atomicity and system recovers if any one of the 3 hosts involved is available (similar to the single mdt case) So, we are wondering if this “osd-sync” is needed in the cross-mdt case, as the call to sync degrades performance.
+
+Issue:
+
+In a Lustre Distributed Namespace Environment (DNE) featuring multiple Metadata Targets (MDTs), the process of creating remote directories is notably slower compared to a single MDT file system utilizing the osd-zfs backend.
+
+This performance issue can be consistently replicated using a single client, specifically by creating approximately 1000 child directories with the command lfs mkdir -i 1 . The parent directory is part of MDT-0, while the child directories are created on MDT-1, following a pattern such as /parent/child-0, /parent/child-1, etc.
+
+	Creating 1000 child directories on Parent MDT (MDT0) takes ~0.9 sec and
+
+	Creating 1000 child directories on remote MDT (parent directory on MDT0, and child directory on MDT1) takes ~12 sec
+
+Testing using mdtest with mpirun involving two clients and 50 iterations, directories are generated in a round-robin fashion to utilize both MDTs, as demonstrated by the command "mpirun -mca routed direct -map-by node -np 16 mdtest -n 625 -i 50 -u -d /lfs/mdtest".
+
+	With Single MDT we observed 17260 ops/sec
+
+	With 2 MDTs we observed 856 ops/sec, which is 95% degradation
+
+Cause:
+
+The creation of a child directory on the same MDT as the parent does not force a osd_sync. The creation of a child directory on a different MDT than the parent triggers an osd_sync of the parent directory.
+
+The directory creation process first checks and cancels the parent directory lock that was previously acquired during a different operation. If the lock was established as part of the previous remote directory creation, it was done so in a protected write mode, necessitating a flush of the underlying directory. However, this cancellation process enforces a synchronization of the underlying parent Metadata Target (MDT) device.
+
+The conditions for enforcing the synchronization path are as follows:
+
+	LDLM_CB_CANCELING and BLOCKING_SYNC_ON_CANCEL
+
+	l_granted_mode is one of (LCK_EX | LCK_PW | LCK_GROUP)
+
+	OBD_CONNECT_MDS_MDS bit set in l_export
+
+I did an experiment where I have bypassed the osd_sync on remoted directory create, and observed 5659 ops/sec with 2 MDTs whic is 5X performance
+
+More details can be found at the following discussion thread http://lists.lustre.org/pipermail/lustre-discuss-lustre.org/2025-July/019552.html
+
+As per Wang Di osd_sync was actually introduced by COS for DNE(LU-3538), to ensure synchronization recovery, before cross-MDT recovery is supported. Though as Andreas mentioned, there should be enough information saved in the DNE recovery log on all MDTs now, we may not need this sync any more.
+
+Proposed fix with tunable
+
+I am proposing fix that can isolate the sync of the parent directory during remote directory creation or deletion. Based on the feedback from Andreas, I am introducing a param to keep/bypass osd_sync. By default we will keep the sync is enabled.
+
+diff --git a/lustre/target/tgt_handler.c b/lustre/target/tgt_handler.c
+index c476f98ea5..d4b773fb7a 100644
+--- a/lustre/target/tgt_handler.c
++++ b/lustre/target/tgt_handler.c
+@@ -27,6 +27,19 @@
+
+#include "tgt_internal.h"
+
++ /*
++ * Parameter: enable_dne_remote_sync
++ * Default Value: true
++ *
++ * This parameter is utilized to enable or disable the tgt_sync under the following conditions:
++ * - The operation involves both OSS and remote directories.
++ * - The inode is being updated while under the IBITS lock.
++ */
++
++static bool enable_dne_remote_sync = true;
++module_param(enable_dne_remote_sync, bool, 0644);
++MODULE_PARM_DESC(enable_dne_remote_sync, "Enable dne remote sync");
++
+char *tgt_name(struct lu_target *tgt)
+{
+LASSERT(tgt->lut_obd != NULL);
+@@ -1366,7 +1379,8 @@ int tgt_blocking_ast(struct ldlm_lock *lock, struct ldlm_lock_desc *desc,
+(tgt->lut_sync_lock_cancel == SYNC_LOCK_CANCEL_ALWAYS ||
+(tgt->lut_sync_lock_cancel == SYNC_LOCK_CANCEL_BLOCKING &&
+(lock->l_flags & LDLM_FL_CBPENDING))) &&
+- ((exp_connect_flags(lock->l_export) & OBD_CONNECT_MDS_MDS) ||
++ (((exp_connect_flags(lock->l_export) & OBD_CONNECT_MDS_MDS) &&
++ (enable_dne_remote_sync || lock->l_resource->lr_type != LDLM_IBITS)) ||
+lock->l_resource->lr_type == LDLM_EXTENT)) {
+__u64 start = 0;
+__u64 end = OBD_OBJECT_EOF;
+
+--- Comment (adilger, Wed, 23 Jul 2025 19:02:46 +0000) ---
+I also just found LU-2716 which is related specifically to osd-zfs sync performance, which coincidentally was also filed by Di (in 2012!).
+
+Is this significant performance impact for remote mkdir operations only present with osd-zfs backends?  I know there is some performance impact with osd-ldiskfs, but I'm wondering if the right place to fix this is in ZFS itself, as described in LU-2716?
+
+--- Comment (gerrit, Tue, 22 Jul 2025 20:11:47 +0000) ---
+"Srinivasa " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/60308
+
+Subject: LU-19189 target: Slow mkdir perf when MDS differs from parent
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 0e17bf80d76f3084c1082dd0a45b9ca97e190cf1

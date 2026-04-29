@@ -1,0 +1,137 @@
+Key:        LU-14463
+Summary:    stack traces not being printed to console on RHEL8
+Link:       https://jira.whamcloud.com/browse/LU-14463
+Type:       Bug
+Priority:   Critical
+Status:     Resolved
+Resolution: Fixed
+Assignee:   WC Triage
+Reporter:   Andreas Dilger
+Created:    Mon, 22 Feb 2021 19:55:06 +0000
+Updated:    Thu, 5 May 2022 13:50:48 +0000
+Resolved:   Fri, 26 Nov 2021 22:43:55 +0000
+Links:      Related: is related to  LU-14099; Related: is related to  LU-9859; Related: is related to  LU-12400
+
+--- Description ---
+I noticed in a recent test that instead of getting a stack trace printed to the console, all that is shown on the MDS console in the log is:
+
+https://testing.whamcloud.com/test_sets/92361cb8-6cb4-4045-a0df-c9efc31520ea
+
+[  508.376802] Call Trace TBD:
+[  508.378011] Pid: 31468, comm: mdt00_033 4.18.0-240.1.1.el8_lustre.x86_64 #1 SMP Fri Feb 19 20:34:57 UTC 2021
+[  508.379472] Call Trace TBD:
+[  508.379899] Pid: 31454, comm: mdt00_019 4.18.0-240.1.1.el8_lustre.x86_64 #1 SMP Fri Feb 19 20:34:57 UTC 2021
+[  508.381521] Call Trace TBD:
+
+which is not very useful.  That message comes from patch https://review.whamcloud.com/35239 "LU-12400 libcfs: save_stack_trace_tsk if ARCH_STACKWALK".  That patch was ostensibly to fix an issue with 5.4 kernels, but the MDS was running RHEL8.3 (4.18.0-240.1.1.el8_lustre.x86_64).
+
+At a minimum, in libcfs_call_trace() if tsk == current this should fall back to doing something useful:
+
+        spin_lock(&st_lock);
+        pr_info("Pid: %d, comm: %.20s %s %s\n", tsk->pid, tsk->comm,
+                init_utsname()->release, init_utsname()->version);
+        if (task_dump_stack) {
+                pr_info("Call Trace:\n");
+                nr_entries = task_dump_stack(tsk, entries, MAX_ST_ENTRIES, 0);
+                for (i = 0; i "[] %pB\n", (void *)entries[i]);
+        } else if (tsk == current) {
+                dump_stack();
+        } else {
+                pr_info("can't show stack: kernel doesn't export save_stack_trace_tsk\n");
+        }
+        spin_unlock(&st_lock);
+
+so that the stack is printed in the common case.
+
+--- Comment (adilger, Fri, 26 Nov 2021 22:43:55 +0000) ---
+It looks like Shaun's patch https://review.whamcloud.com/40503 "LU-14099 build: Fix for unconfigured arch_stackwalk" has fixed this problem.  I'm able to see an abbreviated, though still useful, stack trace on my RHEL8 server:
+
+[4439794.910865] Lustre: 1611:0:(osd_handler.c:1934:osd_trans_start()) myth-OST0000: credits 1351 > trans_max 1024
+[4439794.939134] Call Trace TBD:
+[4439794.941671] [] libcfs_call_trace+0x6f/0x90 [libcfs]
+[4439794.944169] [] osd_trans_start+0x4fd/0x520 [osd_ldiskfs]
+[4439794.946662] [] ofd_precreate_objects+0x10f2/0x1f60 [ofd]
+[4439794.949034] [] ofd_create_hdl+0x6a1/0x1740 [ofd]
+[4439794.951652] [] tgt_request_handle+0xc78/0x1910 [ptlrpc]
+[4439794.954031] [] ptlrpc_server_handle_request+0x31a/0xba0 [ptlrpc]
+[4439794.956444] [] ptlrpc_main+0xba2/0x14a0 [ptlrpc]
+[4439794.958745] [] kthread+0x112/0x130
+
+--- Comment (adilger, Mon, 22 Feb 2021 21:01:35 +0000) ---
+BTW Shaun pushed a patch - https://review.whamcloud.com/#/c/40503. Does this resolve it?
+
+I don't think for x86 at least.  The changes under CONFIG_ARCH_STACKWALK, where the Call Trace TBD: message is printed, are a no-op. It is hard to say for sure, since the review-ldiskfs sanity test_422 printed the stacks correctly, but it ran with EL8.2 on the MDS and I think the symbol_get() "fix" only appeared with EL8.3.  I think the stack_trace_save_tsk() copy may allow this to work on x86 as well.
+
+--- Comment (adilger, Mon, 22 Feb 2021 20:51:08 +0000) ---
+James, that is patch https://review.whamcloud.com/33018 "LU-9859 libcfs: add watchdog for ptlrpc service threads", but as I posted in my previous comment, the delayed work timer is in the context of another thread, so dump_stack() will not work in that case (it does not take a task_struct argument).
+
+What does look promising is that stack_trace_save_tsk() looks like it is only a thin wrapper around save_stack_trace_tsk(), and that function is exported, so it may be that instead of calling symbol_get("stack_trace_save_tsk") (which doesn't work anymore) we just make a copy of that function:
+
+unsigned int stack_trace_save_tsk(struct task_struct *task,
+                                  unsigned long *store, unsigned int size,
+                                  unsigned int skipnr)
+{               
+        struct stack_trace trace = {
+                .entries        = store,
+                .max_entries    = size,
+                /* skip this function if they are tracing us */
+                .skip   = skipnr + (current == task),
+        };
+
+        save_stack_trace_tsk(task, &trace);
+        return trace.nr_entries;
+}
+
+--- Comment (simmonsja, Mon, 22 Feb 2021 20:34:55 +0000) ---
+BTW Shaun pushed a patch - https://review.whamcloud.com/#/c/40503. Does this resolve it?
+
+--- Comment (adilger, Mon, 22 Feb 2021 20:29:54 +0000) ---
+It looks like the only place that is calling libcfs_debug_dumpstack() with a non-NULL argument is in ptlrpc_watchdog_fire(), but unfortunately this delayed work is happening in a different context from the stack being dumped, so the tsk == current case does not help that case (though it would at least fix all of the other callers):
+
+https://testing.whamcloud.com/test_sets/7a00c660-73d0-46f9-8d4b-8ff6f8a2dbac (looking at the test_425 MDS logs):
+
+00000100:02000400:0.0:1612373649.290722:0:692869:0:(service.c:2652:ptlrpc_watchdog_fire()) mdt00_001: service thread pid 710575 was inactive for 40.008 seconds. The thread might be hung, or it might only be slow and will resume later. Dumping the stack trace for debugging purposes:
+
+The Dumping the stack trace message is printed by PID 692869 but the thread being dumped is PID 710575.
+
+--- Comment (simmonsja, Mon, 22 Feb 2021 20:25:27 +0000) ---
+Which patch of Neil's is it that changes to an interrupt timer?
+
+--- Comment (adilger, Mon, 22 Feb 2021 20:16:50 +0000) ---
+One option for the servers at least would be to add an EXPORT_SYMBOL() for save_stack_trace_tsk.  Not ideal, but not having any stack traces is also bad.  It may be that Neil's patch to change the watchdog timers to be an interrupt timer on the process itself (rather than an external process) means these stacks will always be the "tsk == current" case, and the rest of this complex stack dumping machinery can just go away?
+
+It also looks like sanity test_422 needs to be further improved to check for an actual stack trace being dumped.  It is currently checking for the "Dumping the stack trace for debugging purposes" message, but no actual stack is printed:
+
+https://testing.whamcloud.com/test_sets/d99609ff-22a4-4f85-8ed8-768053b29ce5
+
+[10387.837479] Lustre: mdt00_000: service thread pid 716096 was inactive for 42.178 seconds. The thread might be hung, or it might only be slow and will resume later. Dumping the stack trace for debugging purposes:
+[10387.841359] Pid: 716096, comm: mdt00_000 4.18.0-240.1.1.el8_lustre.x86_64 #1 SMP Fri Feb 19 20:34:57 UTC 2021
+[10387.843222] Call Trace TBD:
+
+For reference, with a RHEL7.9 kernel this looks like:
+
+https://testing.whamcloud.com/test_sets/cad78b1e-832d-480f-8162-799d4358a414
+
+[13446.051452] Lustre: mdt00_004: service thread pid 370 was inactive for 40.123 seconds. The thread might be hung, or it might only be slow and will resume later. Dumping the stack trace for debugging purposes:
+[13446.054750] Pid: 370, comm: mdt00_004 3.10.0-1160.6.1.el7_lustre.x86_64 #1 SMP Wed Dec 9 21:18:48 UTC 2020
+[13446.056456] Call Trace:
+[13446.056976]  [] __cfs_fail_timeout_set+0xe1/0x200 [libcfs]
+[13446.058341]  [] ptlrpc_server_handle_request+0x1f6/0xb10 [ptlrpc]
+[13446.060104]  [] ptlrpc_main+0xb3c/0x14e0 [ptlrpc]
+[13446.061329]  [] kthread+0xd1/0xe0
+[13448.355379] Lustre: mdt00_000: service thread pid 22324 was inactive for 40.036 seconds. The thread might be hung, or it might only be slow and will resume later. Dumping the stack trace for debugging purposes:
+[13448.359101] Pid: 22324, comm: mdt00_000 3.10.0-1160.6.1.el7_lustre.x86_64 #1 SMP Wed Dec 9 21:18:48 UTC 2020
+[13448.360837] Call Trace:
+[13448.361337]  [] __cfs_fail_timeout_set+0xe1/0x200 [libcfs]
+[13448.362682]  [] mdd_rename+0x152/0x16b0 [mdd]
+[13448.363898]  [] mdo_rename+0x2b/0x60 [mdt]
+[13448.365090]  [] mdt_reint_rename+0x1b24/0x2c10 [mdt]
+[13448.366432]  [] mdt_reint_rec+0x83/0x210 [mdt]
+[13448.367591]  [] mdt_reint_internal+0x720/0xaf0 [mdt]
+[13448.368813]  [] mdt_reint+0x67/0x140 [mdt]
+[13448.369924]  [] tgt_request_handle+0x7ea/0x1750 [ptlrpc]
+[13448.371400]  [] ptlrpc_server_handle_request+0x256/0xb10 [ptlrpc]
+[13448.372849]  [] ptlrpc_main+0xb3c/0x14e0 [ptlrpc]
+[13448.374053]  [] kthread+0xd1/0xe0
+
+It would be pretty safe to check for ptlrpc_main or ptlrpc_server_handle_request() to verify that the stack is being dumped, since neither of these appear on the console.

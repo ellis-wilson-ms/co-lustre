@@ -1,0 +1,173 @@
+Key:        LU-17271
+Summary:    tn_mr_key/kp_local_session_key can be re-used resulting in data corruption
+Link:       https://jira.whamcloud.com/browse/LU-17271
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Chris Horn
+Reporter:   Chris Horn
+Created:    Tue, 7 Nov 2023 22:38:08 +0000
+Updated:    Thu, 15 Feb 2024 14:36:32 +0000
+Resolved:   Thu, 15 Feb 2024 14:36:32 +0000
+
+--- Description ---
+There are some cases where the initiator of a bulk Get/Put can re-use a tn_mr_key resulting in data corruption. The tn_mr_key is used, along with the kp_local_session_key, to generate the target tag bits when posting a tagged receive buffer:
+
+static uint64_t gen_target_tag_bits(struct kfilnd_transaction *tn)
+{
+        return (tn->tn_kp->kp_local_session_key tn_mr_key;
+}
+
+int kfilnd_ep_post_tagged_recv(struct kfilnd_ep *ep,
+                               struct kfilnd_transaction *tn)
+{
+        struct kfi_msg_tagged msg = {
+                .tag = gen_target_tag_bits(tn),
+                .context = tn,
+                .addr = tn->tn_kp->kp_addr,
+        };
+...
+
+It is possible for a tagged buffer to be posted, BULK_GET sent to target, but target's response to be delayed. If the response is delayed long enough, the originator may cancel the tagged receive and post a new one with the same target tag bits. The response for the first TN can then be applied to the second. This results in data corruption.
+
+This logging demonstrates one way this bug can manifest:
+
+klsk == kp_local_session_key
+
+tmk == tn_mr_key
+
+trr == tn_response_rx
+
+trmk == tn_response_mr_key
+
+# Server is powered off
+00000001:02000400:27.0F:1699200254.008742:0:29388:0:(debug.c:731:libcfs_debug_mark_buffer()) DEBUG MARKER: gaz38b off
+
+# 0. Client posts write but completion is delayed
+00000800:40000000:21.0:1699200385.660420:0:25131:0:(kfilnd.c:339:kfilnd_recv()) KFILND_MSG_INVALID Transaction ID 00000000ebe7ca7f: 1@kfi:5  TN_STATE_WAIT_TAG_RMA_COMP state change
+
+>>
+>>
+
+# 1. Server posts tagged receive with tmk 4 trr 5 and waits for completion
+00000800:40000000:16.0:1699200692.730297:0:125270:0:(kfilnd_tn.c:585:kfilnd_tn_state_tagged_recv_posted()) KFILND_MSG_BULK_GET_REQ Transaction ID 00000000d8152a46: 17@kfi:5 -> 1@kfi(00000000304f663f):0x0 TN_EVENT_INIT_BULK event status 0 tmk 4 trr 5
+00000800:40000000:16.0:1699200692.730302:0:125270:0:(kfilnd_tn.c:299:kfilnd_tn_state_change()) KFILND_MSG_BULK_GET_REQ Transaction ID 00000000d8152a46: 17@kfi:5 -> 1@kfi(00000000304f663f):0x0 TN_STATE_TAGGED_RECV_POSTED -> TN_STATE_WAIT_COMP state change
+
+# 2. Client drops message, the tagged send is delayed
+00000400:00020000:20.0:1699200692.730660:0:29118:0:(lib-move.c:4500:lnet_parse_get()) Dropping GET from 12345-17@kfi portal 8 match 1781680846800513 offset 0 length 1048576
+00000800:40000000:20.0:1699200692.730663:0:29118:0:(kfilnd.c:339:kfilnd_recv()) KFILND_MSG_INVALID Transaction ID 00000000cabe9e2e: 1@kfi:5  TN_STATE_WAIT_TAG_COMP state change
+
+# 3. Server hits bulk timeout on (1)
+00000800:00000100:15.0:1699200819.897630:0:125728:0:(kfilnd_tn.c:503:kfilnd_tn_timeout_work()) Transaction ID 00000000d8152a46: 17@kfi:5 -> 1@kfi(00000000304f663f):0x0 Bulk operation timeout
+00000800:40000000:15.0:1699200819.897630:0:125728:0:(kfilnd_tn.c:1249:kfilnd_tn_state_wait_tag_comp()) KFILND_MSG_BULK_GET_REQ Transaction ID 00000000d8152a46: 17@kfi:5 -> 1@kfi(00000000304f663f):0x0 TN_EVENT_TIMEOUT event status 0
+00000800:40000000:15.0:1699200819.897632:0:125728:0:(kfilnd_tn.c:299:kfilnd_tn_state_change()) KFILND_MSG_BULK_GET_REQ Transaction ID 00000000d8152a46: 17@kfi:5 -> 1@kfi(00000000304f663f):0x0 TN_STATE_WAIT_TAG_COMP -> TN_STATE_WAIT_TIMEOUT_TAG_COMP state change
+
+# 4. Server gets the TAG_TX_CANCEL. frees the bulk TN (1)
+00000800:00000200:16.0:1699200819.897907:0:124529:0:(kfilnd_tn.c:1375:kfilnd_tn_state_wait_timeout_tag_comp()) KFILND_MSG_BULK_GET_REQ Transaction ID 00000000d8152a46: 17@kfi:5 -> 1@kfi(00000000304f663f):0x0 TN_EVENT_TAG_RX_CANCEL event status 0
+00000800:40000000:16.0:1699200819.897916:0:124529:0:(kfilnd_tn.c:1481:kfilnd_tn_free()) KFILND_MSG_BULK_GET_REQ Transaction ID 00000000d8152a46: 17@kfi:5 -> 1@kfi(00000000304f663f):0x0 Transaction freed
+
+# 5. Server posts another tagged receive with tmk 4 trr 5
+00000800:40000000:17.0:1699200871.116064:0:119628:0:(kfilnd_tn.c:585:kfilnd_tn_state_tagged_recv_posted()) KFILND_MSG_BULK_GET_REQ Transaction ID 00000000e7663a1e: 17@kfi:5 -> 1@kfi(00000000304f663f):0x0 TN_EVENT_INIT_BULK event status 0 tmk 4 trr 5
+...
+00000800:40000000:15.0:1699200871.116078:0:125728:0:(kfilnd_tn.c:1084:kfilnd_tn_state_wait_comp()) KFILND_MSG_BULK_GET_REQ Transaction ID 00000000e7663a1e: 17@kfi:5 -> 1@kfi(00000000304f663f):0x0 TN_EVENT_TX_OK event status 0
+00000800:40000000:15.0:1699200871.116079:0:125728:0:(kfilnd_tn.c:299:kfilnd_tn_state_change()) KFILND_MSG_BULK_GET_REQ Transaction ID 00000000e7663a1e: 17@kfi:5 -> 1@kfi(00000000304f663f):0x0 TN_STATE_WAIT_COMP -> TN_STATE_WAIT_TAG_COMP state change
+
+# 6. The client gets TAG_TX_OK for the tagged send (0)
+00000800:40000000:21.0:1699200871.828044:0:25131:0:(kfilnd_tn.c:1214:kfilnd_tn_state_wait_tag_rma_comp()) KFILND_MSG_INVALID Transaction ID 00000000ebe7ca7f: 1@kfi:5  1@kfi(00000000304f663f):0x0 TN_EVENT_TAG_RX_OK event status 0
+00000800:40000000:15.0:1699200871.828446:0:125728:0:(kfilnd_tn.c:1481:kfilnd_tn_free()) KFILND_MSG_BULK_GET_REQ Transaction ID 00000000e7663a1e: 17@kfi:5 -> 1@kfi(00000000304f663f):0x0 Transaction freed
+
+# 8. Server posts another tagged receive with tmk 4 trr 5
+00000800:40000000:15.0:1699200871.828465:0:125728:0:(kfilnd_tn.c:585:kfilnd_tn_state_tagged_recv_posted()) KFILND_MSG_BULK_GET_REQ Transaction ID 00000000e7663a1e: 17@kfi:5 -> 1@kfi(00000000304f663f):0x0 TN_EVENT_INIT_BULK event status 0 tmk 4 trr 5
+
+# 9. The client gets TAG_TX_OK for the tagged send (2)
+00000800:40000000:23.0:1699200871.829980:0:29120:0:(kfilnd_tn.c:1249:kfilnd_tn_state_wait_tag_comp()) KFILND_MSG_INVALID Transaction ID 00000000cabe9e2e: 1@kfi:5  1@kfi(00000000304f663f):0x0 TN_EVENT_TAG_RX_OK event status -61
+00000800:40000000:15.0:1699200871.831379:0:125728:0:(kfilnd_tn.c:313:kfilnd_tn_status_update()) KFILND_MSG_BULK_GET_REQ Transaction ID 00000000e7663a1e: 17@kfi:5 -> 1@kfi(00000000304f663f):0x0 0 -> -61 status change
+00000800:40000000:15.0:1699200871.831381:0:125728:0:(kfilnd_tn.c:319:kfilnd_tn_status_update()) KFILND_MSG_BULK_GET_REQ Transaction ID 00000000e7663a1e: 17@kfi:5 -> 1@kfi(00000000304f663f):0x0 0 -> 0 health status change
+00000800:40000000:15.0:1699200871.831406:0:125728:0:(kfilnd_tn.c:1481:kfilnd_tn_free()) KFILND_MSG_BULK_GET_REQ Transaction ID 00000000e7663a1e: 17@kfi:5 -> 1@kfi(00000000304f663f):0x0 Transaction freed
+
+Basically, once we hit this bug there is sort of a rolling window of these client responses that get applied to the wrong server side transactions. Some of those client responses can be status 0, others status -61, but root cause is the same - server re-using mr key before client is finished.
+
+There has always been a narrow window where this could occur, but the window grew considerably with the landing of "LUS-11125 kfilnd: Keep stale peer entries" https://es-gerrit.hpc.amslabs.hpecorp.net/161075 . With that change, stale peers were kept around much longer, so there is greater chance for tn_mr_key to be re-used with the same kp_local_session_key.
+
+To protect against this the originator of a bulk Put/Get needs to purge the target peer from the cache whenever the bulk Put/Get TN fails in such a way that the originator does not know the state of the TN at the target. This will force a new kp_local_session_key to be generated for future sends and thus there will be no risk of re-using the same target tag bits.
+
+An associated change is that we need to generate the tn_mr_key before fetching the peer on the send path. Otherwise we could still hit corruption with a race like the following:
+
+Initiator Thread 1:
+ kfilnd_tn_alloc() ->
+  peer_get() returns peerA
+  tn_mr_key = 4
+  post_tagged_recv tmk 4 trr 5
+
+Initiator Thread 2:
+ kfilnd_tn_alloc() ->
+   peer_get() returns peerA
+
+Initiator Thread 1:
+ TAG_RX_CANCEL
+ peer_del(peerA)
+ kfilnd_tn_free()/kfilnd_ep_put_key()
+
+Initiator Thread 2:
+ kfilnd_tn_alloc() ->
+   peer_get() returns peerA
+   tn_mr_key = 4
+   post_tagged_recv tmk 4 trr 5
+
+There's a window between retrieving peerA, and fetching the mr key where peerA could be marked for removal and the key could be released
+
+--- Comment (pjones, Thu, 15 Feb 2024 14:36:32 +0000) ---
+Landed for 2.16
+
+--- Comment (gerrit, Thu, 15 Feb 2024 07:07:26 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/53029/
+
+Subject: LU-17271 kfilnd: Allocate tn_mr_key before kfilnd_peer
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 2740cf66c88e2d04126f7016cb1958ca976cd323
+
+--- Comment (gerrit, Thu, 15 Feb 2024 07:07:17 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/53028/
+
+Subject: LU-17271 kfilnd: Protect RKEY for bulk Put/Get
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: f054443e9c03b71a934fd7d05475fb55e50be8c8
+
+--- Comment (gerrit, Tue, 7 Nov 2023 22:48:46 +0000) ---
+"Chris Horn " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/53029
+
+Subject: LU-17271 kfilnd: Allocate tn_mr_key before kfilnd_peer
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 6a6d02f712a5cde05100f7b34f8dbab8805f6721
+
+--- Comment (gerrit, Tue, 7 Nov 2023 22:48:45 +0000) ---
+"Chris Horn " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/53028
+
+Subject: LU-17271 kfilnd: Protect RKEY for bulk Put/Get
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 7478a85b2c1ecc6198988d6d7e0aa2b363a978a4

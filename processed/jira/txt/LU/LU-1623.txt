@@ -1,0 +1,669 @@
+Key:        LU-1623
+Summary:    mdc_finish_enqueue(): ASSERTION(client_is_remote(exp)) failed
+Link:       https://jira.whamcloud.com/browse/LU-1623
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Oleg Drokin
+Reporter:   Ned Bass
+Created:    Wed, 11 Jul 2012 19:04:22 +0000
+Updated:    Fri, 19 Apr 2013 13:53:11 +0000
+Resolved:   Fri, 19 Apr 2013 13:53:10 +0000
+
+--- Environment ---
+https://github.com/chaos/lustre/commits/2.1.1-13chaos
+
+--- Description ---
+(mdc_locks.c:597:mdc_finish_enqueue()) ASSERTION(client_is_remote(exp)) failed
+
+A client hit the above assertion with the following backtrace
+
+machine_kexec
+
+crash_kexec
+
+panic
+
+lbug_with_loc
+
+libcfs_assertion_failed
+
+mdc_finish_enqueue
+
+mdc_enqueue
+
+mdc_intent_lock
+
+ll_revalidate_it
+
+ll_revalidate_nd
+
+do_lookup_at
+
+__link_path_walk
+
+path_walk
+
+do_path_lookup
+
+do_filp_open
+
+do_sys_open
+
+sys_open
+
+system_call_fastpath
+
+LLNL-bugzilla-ID: 1711
+
+--- Comment (jlevi, Fri, 19 Apr 2013 13:53:11 +0000) ---
+Patch landed
+
+--- Comment (nedbass, Thu, 18 Apr 2013 23:19:27 +0000) ---
+Yes, please close it.  Thanks
+
+--- Comment (jlevi, Thu, 18 Apr 2013 18:56:30 +0000) ---
+Now that this has landed on master and b2_1 can this ticket be closed?
+
+--- Comment (green, Wed, 28 Nov 2012 00:19:43 +0000) ---
+bug number + description is the ultimate pointer I think?
+
+--- Comment (nedbass, Tue, 27 Nov 2012 16:36:03 +0000) ---
+Patch for 2.1 at http://review.whamcloud.com/#change,4688
+
+--- Comment (nedbass, Tue, 27 Nov 2012 16:26:26 +0000) ---
+Will do, but did we ever agree on some other convention for linking a backported patch to the original commit in master?
+
+--- Comment (green, Tue, 27 Nov 2012 16:13:28 +0000) ---
+Please submit a separate b2_1 patch, with a different changeid, or the Gerrit will be very confused.
+
+Thanks.
+
+--- Comment (nedbass, Tue, 27 Nov 2012 15:10:31 +0000) ---
+Now that the master patch is landed:
+
+http://review.whamcloud.com/#change,4406
+
+we need to get it into b2_1. Can't be cherry-picked directly due to the lightweight connection handling in master. Should I submit a new review request with the same Change-Id?
+
+--- Comment (green, Fri, 26 Oct 2012 13:52:16 +0000) ---
+Thanks for all the digging! This is really useful.
+
+So unlike I suspected it's not the race per se in where I thought, but you were correct and we do get reconnect RPC that we abort with an error, but the client is already connected.
+
+Apparently you have some sort of a delay in your fabric and clients are resending stuff that somehow arrives faster than earlier sent stuff too.
+
+This is also apparent in some other tickets filed by LLNL, e.g. in LU-1717.
+
+My patch indeed would cover this case, though the total situation is a pretty bad oversight on our part, I guess. We need to ensure nothing like that happens in other target types with non-atomic export flags updates drawn out across totally different areas of code.
+
+And yes, the message should be updated too.
+
+--- Comment (nedbass, Fri, 26 Oct 2012 13:42:32 +0000) ---
+Now, if the last such request to get handled had a lower connection count than an earlier one
+
+does it make sense that the requests would have different connection counts?
+
+I just noticed the comparison is >= so this would happen if the connection counts were the same.
+
+However in that case the debug message doesn't agree with the code.  We should probably fix that.
+
+--- Comment (nedbass, Fri, 26 Oct 2012 13:13:51 +0000) ---
+I looked at the server's debug log entries from when one of the suspect clients connected.  There were 8 of these entries within a second of each other:
+
+target_handle_connect() ls6-MDT0000: connection from  ...
+
+In the ~30 minutes before this timestamp the client was logging many 'all routers down' and 'Request sent has failed due to network error' messages.  So I'm speculating that the network outage caused multiple delayed reconnect requests from the same client to be processed by the MDT at the same time.
+
+Now, if the last such request to get handled had a lower connection count than an earlier one, we'd return -EALREADY from target_handle_request():
+
+cfs_spin_lock(&export->exp_lock);
+if (export->exp_conn_cnt >= lustre_msg_get_conn_cnt(req->rq_reqmsg)) {
+        cfs_spin_unlock(&export->exp_lock);
+        CDEBUG(D_RPCTRACE, "%s: %s already connected at higher "
+               "conn_cnt: %d > %d\n",
+               cluuid.uuid, libcfs_nid2str(req->rq_peer.nid),
+               export->exp_conn_cnt,
+               lustre_msg_get_conn_cnt(req->rq_reqmsg));
+     
+        GOTO(out, rc = -EALREADY);
+}
+
+But it's already called mdt_connect_internal() by this point, so the connect flags have the "bad" value. And since we return a non-zero status to mdt_connect() it doesn't call mdt_init_sec_level() to fix the flags.  I'm not totally sure of the details here.  I.e. does it make sense that the requests would have different connection counts?  And how does the client handle getting a connect reply with -EALREADY?
+
+Nevertheless, if this is in fact what happened then your patch avoids the problem altogether.  If we get a hit with my systemtap probe loaded we may get better confirmation.
+
+--- Comment (nedbass, Thu, 25 Oct 2012 17:09:28 +0000) ---
+I'm going to drain one of the nodes and open() a file in the filesystem which has the "remote" bit set. This should trigger my probe that clears the bit and dumps the export.
+
+As expected, opening a new file from one of these clients triggered the mdt_finish_open() probe.  Clearing the bit prevented the client from crashing.
+
+--- Comment (nedbass, Thu, 25 Oct 2012 16:02:33 +0000) ---
+This week we had another IB network glitch that triggered more of these client assertions.
+
+I wrote a systemtap script that dumped the connect flags for every live export on the MDS.  On one MDS, 4 out of 7196 exports had the OBD_CONNECT_RMT_CLIENT flag set.  Each of these clients has the following in common:
+
+	Was evicted and reconnected to the MDS about 24 hours ago.
+
+	In the lustre debug log I see the following messages within the same second:
+
+... :1351117857.135131:0:6377:0:(import.c:1309:ptlrpc_import_recovery_state_machine()) 167-0: This client was evicted by ls6-MDT0000 ...
+... :1351117857.145399:0:107293:0:(import.c:1387:ptlrpc_import_recovery_state_machine()) ... Connection restored to ls6-MDT000 ...
+
+  These two threads were in the state machine function more or less at the same time so I wonder if there is a race.
+
+	exp_last_committed = 0
+
+I guess this confirms client hasn't used the filesystem since reconnecting which is why it hasn't crashed.
+
+My new script also logs export for failed connect requests in mdt_connect() as we discussed above.  I just loaded it today so I didn't catch the above cases.  It also clears the bit in mdt_finish_open() so the clients won't crash.
+
+I'm going to drain one of the nodes and open() a file in the filesystem which has the "remote" bit set.  This should trigger my probe that clears the bit and dumps the export.
+
+Let me know if there's any fields of the "bad" exports you want me to poke at.
+
+--- Comment (nedbass, Mon, 15 Oct 2012 17:16:52 +0000) ---
+A bit of a puzzle then is if the client is reconnecting already (and unsucesfully) then where would requests come from that would see the wrong bits? Eventually reconnect is bound to succeed and then the flags would be normalized again - so that should not influence any of it either.
+
+Suppose the reply from the server to the failed connect request gets lost (i.e. delivery is not reliable due to presence of LNET routers).  Recall we were having IB network issues so it's not unthinkable a router may have been unable to transmit a message. Then when the client tries to reconnect server returns EALREADY because it finds an export in the hash, and doesn't save the new connect flags.  So the client proceeds to use the connection because server says it's already connected.  I haven't inspected the client code to see if this is possible but it seems like a plausible explanation.
+
+--- Comment (nedbass, Mon, 15 Oct 2012 16:17:05 +0000) ---
+So we always fail the connect on error.
+
+Perhaps I'm misunderstanding something, but don't we need to call obd_disonnect() if target_handle_connect() fails? It looks to me like the error just gets passed up the call chain but never really handled.  I believe the call chain for handling a MDT connection goes like
+
+ptlrpc_main->
+ ptlrpc_server_handle_request->
+  mdt_regular_handle->
+   mdt_handle_common->
+    mdt_handle0->
+     mdt_connect->
+      target_handle_connect->
+       ...
+
+So an error returned from target_handle_connect() just gets propagated up to ptlrpc_server_handle_request() which logs the result and unconditionally does RETURN(1).  I don't see any intermediate handling that would fail the connect.
+
+Can you inject a systemtap probe in the failure part of mdt_connect to see that it really does happen? 
+
+Good idea. Will do.
+
+--- Comment (green, Mon, 15 Oct 2012 15:24:30 +0000) ---
+Well, I think it's not really possible to have an error returned from mdt_obd_reconnect and a connection still sucessful?
+
+here's the code:
+
+static int mdt_connect(struct mdt_thread_info *info)
+{
+        int rc;
+        struct ptlrpc_request *req;
+
+        req = mdt_info_req(info);
+        rc = target_handle_connect(req);
+        if (rc == 0) {
+                LASSERT(req->rq_export != NULL);
+                info->mti_mdt = mdt_dev(req->rq_export->exp_obd->obd_lu_dev);
+                rc = mdt_init_sec_level(info);
+                if (rc == 0)
+                        rc = mdt_init_idmap(info);
+                if (rc != 0)
+                        obd_disconnect(class_export_get(req->rq_export));
+        } else {
+                rc = err_serious(rc);
+        }
+        return rc;
+}
+
+So we always fail the connect on error.
+
+Now, I guess the catch is that even though connect fails, we still alter the in-memory flags in the export (which makes it's a double good reason not to do that until we are through with the reconnect completely).
+
+A bit of a puzzle then is if the client is reconnecting already (and unsucesfully) then where would requests come from that would see the wrong bits? Eventually reconnect is bound to succeed and then the flags would be normalized again - so that should not influence any of it either.
+
+Can you inject a systemtap probe in the failure part of mdt_connect to see that it really does happen? record the export pointer and we can compare it with the earlier probe to see if there's any match. (requires unpatched mdt obviously).
+
+--- Comment (nedbass, Mon, 15 Oct 2012 14:54:10 +0000) ---
+I was unable to get permission to crash the MDS.  We are trying to reproduce the problem on a test cluster but haven't been able to yet.
+
+A couple observations that might be pertinent:                                 
+
+	Clients that have crashed or been rebooted are not hitting the assertion (for now).  So it does appear that only clients that have lost and reestablished their connection to the MDT are vulnerable.
+
+	However, the lustre debug logs from crashed clients show that several days may elapse between reconnection to the MDT and the assertion.  So the bad reply from the server apparently is not due to the request being handled concurrently with a reconnection.
+
+The only other way I can see this happening is if mdt_connect() returns without calling mdt_init_sec_level(), leaving the client connected but with the extra connect flags still set.  Then the client might not crash until a job runs that uses that filesystem. I've been inspecting the reconnect code paths, and there are a few points in target_handle_connect() where errors could be returned after it calls mdt_obd_reconnect().  I don't have any evidence that we've hit any of those errors; I'm just looking for plausible explanations.
+
+In any case, as long at the initial connection always leaves the connect flags in a consistent state, your patch should fix the problem.  But I'd still like to understand the underlying bug.  It might be interesting to inject a failure point, say OBD_FAIL_TGT_RECONNECT, in target_handle_connect() to see if we can't reproduce this in a test case.
+
+--- Comment (nedbass, Wed, 10 Oct 2012 13:23:44 +0000) ---
+It has been reproducing frequently in production, apparently precipitated by Infiniband network disruptions on a large client cluster.  The network issues caused thousands of client disconnects and reconnects, which is consistent with the conditions under which we have seen this bug in the past.  I still don't have a reliable way to reproduce this at will in a test environment.  Our roll-out process doesn't allow changes to get pushed to production that quickly, but we'll start testing it.i
+
+I'll propose the idea of crashing the MDS to the system administrators.
+
+We didn't apply the patch to disable the assertion because the frequency has been low until now.  And then we probably wouldn't notice the error messages and the bug would never get fixed   However we'll consider applying it to help debugging efforts on the server side.
+
+--- Comment (green, Tue, 9 Oct 2012 21:17:58 +0000) ---
+So you have a somewhat reliable way of reproducing this now? Then perhaps trying it with the patch would be interesting?
+
+If it fails, I wonder if you can just crash the mds so that we see what else was going on around?
+
+It's kind of a pity that the client crashes when this happens so there is no easy way to see what's in the export after that, unless you try my other patch that makes client not to crash (I assumed you already had that, but apparently not).
+
+As for your other question about mdr_init_sec_level being somehow skipped, it seems the mdt_connect is the only caller of target_handle_connect that would in the end lead to the call of mdt_obd_connect or mdt_obd_reconnect, so I don't see a way sec init could be bypassed.
+
+--- Comment (nedbass, Tue, 9 Oct 2012 20:35:46 +0000) ---
+The connect flags on MDS side totally look like logical AND between client and server default capabilities
+
+Yes, I checked the math and this is exactly the case.
+
+I did a further test and added a systemtap probe on the MDS in mdt_connect_internal().  This is in addition to the existing probe in mdt_finish_open that checks for OBD_CONNECT_RMT_CLIENT in exp->exp_connect_flags.  If your theory is correct we would expect both probes to trigger about the same time.  However, I got a hit on the mdt_finish_open() probe with no corresponding hit in mdt_connect_internal().  So maybe there is some other way that the mdt_init_sec_level() processing can be left unfinished?
+
+Either way your patch looks like it should avoid sending the bad replies to the client.  We'll get that into testing. Thanks
+
+--- Comment (green, Tue, 9 Oct 2012 20:12:11 +0000) ---
+Please give this patch a try at the next opportunity: http://review.whamcloud.com/4238
+
+MDS-only patch.
+
+--- Comment (green, Tue, 9 Oct 2012 19:04:43 +0000) ---
+The connect flags on MDS side totally look like logical AND between client and server default capabilities before the additional subtracting of capabilities and other that stuff in mdt_init_sec_level/mdt_init_sec_none.
+
+It seems export flags setting is a two step process, first we are just ANDing the client and server flags and write the result to export right away in mdt_connect_internal().
+
+Then after some processing, we substract capability bits in mdt_init_sec_level()
+
+I imagine if we had a request being processed at the time on mdt it might see this incorrect info in export (this is actually pretty stretching, but I don't think I can come up with many plausible scenarios for other code being able to glimpse export flags mid-reconnect).
+
+I'll make you a patch to remove the first step shortly (after some local sanity testing), I cannot think of a good testcase though.
+
+--- Comment (nedbass, Mon, 8 Oct 2012 19:55:21 +0000) ---
+We had a couple of unclassified client crash dumps from July.  They should still be around, let me know if you'd like me to upload them.
+
+Today we started getting a lot of these on a classified client cluster.  This coincided with a disruption of the Infiniband network, so a lot of reconnects were going on.  Using systemtap I was able to dumps the obd_export structure on the MDS when a client with remote flags was seen.  Are there any fields in particular you would like to see?  The exp->exp_connect_flags are as follows:
+
+OBD_CONNECT_VERSION
+
+OBD_CONNECT_ACL
+
+OBD_CONNECT_IBITS
+
+OBD_CONNECT_ATTRFID
+
+OBD_CONNECT_NODEVOH
+
+OBD_CONNECT_RMT_CLIENT
+
+OBD_CONNECT_BRW_SIZE
+
+OBD_CONNECT_MDS_CAPA
+
+OBD_CONNECT_OSS_CAPA
+
+OBD_CONNECT_CANCELSET
+
+OBD_CONNECT_AT
+
+OBD_CONNECT_LRU_RESIZE
+
+OBD_CONNECT_FID
+
+OBD_CONNECT_VBR
+
+OBD_CONNECT_LOV_V3
+
+OBD_CONNECT_GRANT_SHRINK
+
+OBD_CONNECT_SKIP_ORPHAN
+
+OBD_CONNECT_MAX_EASIZE
+
+OBD_CONNECT_FULL20
+
+OBD_CONNECT_LAYOUTLOCK
+
+OBD_CONNECT_64BITHASH
+
+OBD_CONNECT_MAXBYTES
+
+OBD_CONNECT_IMP_RECOV
+
+OBD_CONNECT_JOBSTATS
+
+OBD_CONNECT_UMASK
+
+OBD_CONNECT_EINPROGRESS
+
+OBD_CONNECT_GRANT_PARAM
+
+While mdt_body->valid are:
+
+OBD_MD_FLID
+
+OBD_MD_FLATIME
+
+OBD_MD_FLMTIME
+
+OBD_MD_FLCTIME
+
+OBD_MD_FLMODE
+
+OBD_MD_FLTYPE
+
+OBD_MD_FLUID
+
+OBD_MD_FLGID
+
+OBD_MD_FLFLAGS
+
+OBD_MD_FLNLINK
+
+OBD_MD_FLGENER
+
+Call trace:
+
+mdt_finish_open
+
+mdt_reint_open
+
+mdt_reint_rec
+
+mdt_reint_internal
+
+mdt_intent_reint
+
+mdt_intent_policy
+
+ldlm_lock_enqueue
+
+ldlm_handle_enqueue0
+
+mdt_enqueue
+
+mdt_handle_common
+
+mdt_regular_handle
+
+ptlrpc_main
+
+child_rip
+
+--- Comment (green, Mon, 8 Oct 2012 19:25:34 +0000) ---
+Still on secure side of things, so no crash dumps for us to poke in?
+
+--- Comment (nedbass, Mon, 8 Oct 2012 15:16:24 +0000) ---
+We have hit this assertion on clients with the LU-1716 patch applied.
+
+--- Comment (nedbass, Wed, 29 Aug 2012 13:24:43 +0000) ---
+Hi Oleg,
+
+We're going to pull the LU-1716 pull the patch for testing.  I believe the symptoms were associated with client reconnects.  It's not clear that one app was responsible for overloading the system.  We've had ongoing server overload issues where heavy client reconnects have a sort of cascading effect. i.e. the server is so busy handling client connections that other clients time out and have to reconnect, and so on.  client connection" class="issue-link" data-issue-key="LU-7">LU-7 seems to make the problem worse.
+
+--- Comment (green, Sat, 25 Aug 2012 11:18:09 +0000) ---
+There is interesting new development in LU-1716 that I think might be very relevant here (and in the capa ticket as well).
+
+The issue at hand is a race in connect handler where the client has a chance to see wrong connecting flags before sending some RPCs.
+
+The particular lbug seen here was seen there as well.
+
+I believe the patch from there would be useful for you.
+
+Additionally can you check the logs of when this was occuring and see if it happened to hit soon after a client reconnect? Does the specific app that was usually hitting this and capa issue happen to load system so much clients reconnect frequently under load or something like that?
+
+--- Comment (nedbass, Thu, 26 Jul 2012 13:09:54 +0000) ---
+I agree this would be helpful but probably not something we can do in production.  We can look into building debug kernels for our test clusters, but it may not be worth the effort since we've only seen this bug in production.
+
+Note I haven't found any new occurrences of this assertion since July 16.
+
+--- Comment (green, Thu, 26 Jul 2012 00:23:44 +0000) ---
+BTW Andreas suggested and I think it's a good idea, if you can manage to build a debug kernel with all sorts of use after free checks enabled (DEBUG_PAGEALLOC ideally, note it's going to be slow) and see if anything triggers.
+
+--- Comment (green, Tue, 24 Jul 2012 01:05:26 +0000) ---
+Ok, patch to disable assertions for unexpected remote data is at http://review.whamcloud.com/3453
+
+--- Comment (green, Thu, 19 Jul 2012 00:06:40 +0000) ---
+If you can print entire export structure, that would be cool, actually.
+
+--- Comment (green, Thu, 19 Jul 2012 00:05:58 +0000) ---
+Hm... I am not sure. Assuming you can make this happen frequently, this is a good first step.
+
+--- Comment (nedbass, Wed, 18 Jul 2012 19:47:26 +0000) ---
+I'm thinking of something like this mdt_finish_open() probe before we resort to crashing the MDS.  This would log exp->exp_connect_flags or all mdt_body fields if OBD_CONNECT_RMT_CLIENT or OBD_MD_FLRMTPERM is set, then print a backtrace.  Are there any additional debug data you'd like to see?
+
+probe module("mdt").statement("*@mdt_open.c:759") {
+        OBD_MD_FLRMTPERM = 0x10000000000
+        OBD_CONNECT_RMT_CLIENT = 0x10000
+        if (($repbody->valid & OBD_MD_FLRMTPERM) != 0) {
+                printf("repbody->valui has OBD_MD_FLRMTPERM: %s\n", $repbody$);
+                print_backtrace()
+        }
+        if (($exp->exp_connect_flags & OBD_CONNECT_RMT_CLIENT) != 0) {
+                printf("exp->exp_connect_flags has OBD_CONNECT_RMT_CLIENT: %016x\n",
+                        $exp->exp_connect_flags)
+                print_backtrace()
+        }
+}
+
+--- Comment (nedbass, Tue, 17 Jul 2012 22:58:12 +0000) ---
+If it is otherwise safe to continue I think we should disable the client assertions for now.  We won't have a window to deploy such a patch in production for several weeks, but it would be good to have it ready in case it takes much longer to fix the bug.  We are also committed to pursuing the underlying server-side bug.
+
+I haven't seen this problem on our test system, but we can crank up the testing to see if it reproduces.  I also plan to work on a systemtap script to crashdump a server replying to a remote client.  I think it should be possible without modifying the code.
+
+--- Comment (green, Tue, 17 Jul 2012 21:20:31 +0000) ---
+BTW, I guess it could be added that if these LBUGs greatly annoy you, we can cook a relatively simple patch that will not assert and instead just ignore the the extra data as a temporary workaround for your production critical systems. Let me know if you are interested in such a patch (it would be client only too).
+
+We are still very much interested in understanding what goes on the server.
+
+If you are seeing this problem on a less important systems too, I guess it might be a great place to setup some dumping capability to trigger next time it reproduces to see what's happening at the server side.
+
+--- Comment (green, Tue, 17 Jul 2012 20:01:38 +0000) ---
+Well, since we have a clear case of server believing the client is remote even when the client does not, it appears as if the connect flags for the export have changed somehow or the export is otherwise corrupted.
+
+Client seems to be innocent and only asserts due to unexpected data from server.
+
+As such it would be interesting if you can actually crashdump a server while it believes it speaks to a remote client. Not sure if systemtap would allow you to or if you actually need to modify the code and insert an LBUG there.
+
+--- Comment (nedbass, Tue, 17 Jul 2012 17:45:01 +0000) ---
+We hit this assertion twice yesterday so the problem has not gone away.
+
+Also, I just checked our unclassified systems and found two of these assertions with complete crash dumps.  Let me know if you'd like me to upload them.
+
+--- Comment (nedbass, Tue, 17 Jul 2012 14:25:14 +0000) ---
+Another clue that the server believes this is a remote client: we have body->aclsize = 28, the correct size for mdt_remote_perm.  I believe that field is only set by the server when it also sets the OBD_MD_FLRMTPERM valid flag.
+
+--- Comment (nedbass, Tue, 17 Jul 2012 13:27:33 +0000) ---
+Thanks for the guidance.  Assuming I didn't screw up the math, we have
+
+struct mdt_remote_perm {
+  rp_uid = XXXX,
+  rp_gid = XXXX,
+  rp_fsuid = XXXX,
+  rp_fsuid_h = 0,
+  rp_fsgid = XXXX,
+  rp_fsgid_h = 0,
+  rp_access_perm = 6
+}
+
+where XXXX is the uid and gid of the process owner.
+
+Edit: I was off by 4 bytes.  This looks more reasonable.
+
+--- Comment (green, Mon, 16 Jul 2012 21:02:12 +0000) ---
+That's old format.
+
+For new format for this particular request what needs to be done is for req->rq_repmsg (which is the msg in our case) we need buffer #5 (starting from 1) - declared in ldlm_intent_open_server
+
+Then basically execute lustre_msg_buf_v2(req->rq_repmsg, 4, 0) which should be easy to replicate in a debugger/crash.
+
+--- Comment (nedbass, Mon, 16 Jul 2012 20:18:16 +0000) ---
+To answer my own question, I guess I'll start here: http://wiki.lustre.org/lid/agi/agi_ptlrpc.html#_principle_data_structures
+
+--- Comment (nedbass, Mon, 16 Jul 2012 20:14:17 +0000) ---
+Well I'm not having any luck finding an RMF_ACL field.  Do you have any guidance how to find it relative to the ptlrpc_request *req pointer?  Also, is there any reference material I can review to learn about the pill/capsule abstraction?
+
+--- Comment (nedbass, Mon, 16 Jul 2012 17:42:13 +0000) ---
+I see you figured out the pill magic
+
+I'm not sure I can claim that.   I ended up looking at addresses on the stack near req->rq_repmsg that appeared to be a valid mdt_body.  Still trying to decipher the RMF_ACL field.
+
+--- Comment (green, Mon, 16 Jul 2012 17:22:45 +0000) ---
+aha, thanks.
+
+So a regular striped file.
+
+I see you figured out the pill magic
+
+Is there RMF_ACL field in there? If so, what's there (casted to struct mdt_remote_perm)?
+
+--- Comment (nedbass, Mon, 16 Jul 2012 17:15:15 +0000) ---
+Can you please get body->valid value from the dump?
+
+It's value is 0x10000026f8f, which contains these flags:
+
+OBD_MD_FLID
+
+OBD_MD_FLATIME
+
+OBD_MD_FLMTIME
+
+OBD_MD_FLCTIME
+
+OBD_MD_FLMODE
+
+OBD_MD_FLTYPE
+
+OBD_MD_FLUID
+
+OBD_MD_FLGID
+
+OBD_MD_FLFLAGS
+
+OBD_MD_FLNLINK
+
+OBD_MD_FLGENER
+
+OBD_MD_FLEASIZE
+
+OBD_MD_FLRMTPERM
+
+--- Comment (green, Mon, 16 Jul 2012 17:11:17 +0000) ---
+Hm, I was under impression that when you run crash on a live system, it lets you to dump the image somehow, but that does not seem to be the case. I know you could do it with VMs with kvm, but that's not applicable here.
+
+Doing a systemtap probe might be interesting indeed.
+
+Perhaps you can even insert a probe into the mdt_finish_open() fragment I quoted above to catch it when it triggers and dump export state, complemented by a probe in mdt_pack_attr2body to trigger on body->valid having OBD_MD_FLRMTPERM set that should be pretty interesting.
+
+--- Comment (nedbass, Mon, 16 Jul 2012 16:32:50 +0000) ---
+Great to hear it's less severe, still this assertion basically cannot happen in the conditions it was happening in, so I am still interested in that dump info I requested earlier.
+
+I'm still digging in the crash dump for the info you requested.  I couldn't find the mdt_body pointer on the stack, but I have the ptlrpc_request pointer, so I'm trying to calculate the mdt_body pointer from there.  Still trying to wrap my brain around how req_capsule_server_get() works.
+
+BTW do you have capacity to take live dumps of servers on as needed basis by any chance?
+
+No, in fact I wasn't aware such a thing was possible.  Google found livedump for me, but that is a very recent patchset.  Are you aware of some solution for RHEL6?
+
+If it's the server that originates wrong valid bits, it might be interesting to capture a crash-less dump of the server at assertion time to inspect server's idea of the export.
+
+It would be tricky to initiate the server dump from the client, as they are on separate management networks.  However we could run a systemtap probe on the servers to dump some debug data if wrong valid bits are seen.
+
+--- Comment (green, Mon, 16 Jul 2012 15:34:37 +0000) ---
+Great to hear it's less severe, still this assertion basically cannot happen in the conditions it was happening in, so I am still interested in that dump info I requested earlier.
+
+BTW do you have capacity to take live dumps of servers on as needed basis by any chance?
+
+If it's the server that originates wrong valid bits, it might be interesting to capture a crash-less dump of the server at assertion time to inspect server's idea of the export.
+
+In fact that might still be interesting even now considering that capabilities just cannot be enabled anywhere if you don't have gss configured and you don't, so that other patch just appears to paper over some unrelated issue and it would be better to get to the root of it.
+
+--- Comment (nedbass, Mon, 16 Jul 2012 15:08:19 +0000) ---
+If only life were that easy.  Unfortunately we cannot put it on an unclassified system.  I am not familiar with the offending access pattern.  I've heard from people more familiar with the application that it would take significant effort to distill an unclassified test case.  With LU-1597 mitigated by the patches in https://github.com/chaos/lustre/commits/2.1.1-17chaos, we can't justify the required effort at this point.  Also, I haven't seen the assertion from this bug since last Thursday so the impact may be less severe than we feared.
+
+--- Comment (green, Mon, 16 Jul 2012 14:42:57 +0000) ---
+So this class of applications, is it sensitive or can you put it on a small unclassified test system and gather some logs for us by any chance?
+
+What does it do?
+
+--- Comment (nedbass, Mon, 16 Jul 2012 12:39:45 +0000) ---
+Also how do you disable capabilities?
+
+lctl set_param 'mdt.*.capa=0'        # MDS
+lctl set_param 'obdfilter.*.capa=0'  # OSS
+
+We are also now running this patch to disable it by default.
+
+http://review.whamcloud.com/3373
+
+--- Comment (nedbass, Mon, 16 Jul 2012 12:31:28 +0000) ---
+Just to be sure, do you use gss for that install?
+
+No.
+
+Is this a case of mixed endianness setup by any chance?
+
+No, client and server are both x86_64.
+
+Can you please get body->valid value from the dump?
+
+Even better if you can also get RMF_ACL buffer from the request to see if it's filled with sensible data
+
+I'll post this in a follow-up.
+
+From LU-1597 I gather this problem only affects a certain subset of clients in a single cluster only, so there must be something unique about those clients, any chance to have more insight into it?
+
+The bug seemed to affect a particular class of applications that mainly runs on that cluster.  So we believe it has more to do with the access pattern than something unique about the clients.
+
+--- Comment (green, Mon, 16 Jul 2012 01:00:18 +0000) ---
+Also how do you disable capabilities?
+
+--- Comment (green, Mon, 16 Jul 2012 00:59:08 +0000) ---
+Sorry for the delayed reply.
+
+Hm, this is looking strange all around.
+
+I just did a bit of digging, and the RMT_CLIENT is always off unless you have some sort of kerberos/gss configured. This is ensured by mdt_init_sec_none in mdt_idmap.c (the same code also disables all capabilities - both for the MDS and OSTs).
+
+This should ensure we never have RMT_CLIENT set on either client or the server. (also this is why I claim capabilities are off by default in that other bug too, I guess).
+
+Just to be sure, do you use gss for that install?
+
+Now to the assertion, the assertion happens when a client sees mdtbody with OBD_MD_FLRMTPERM valid flag set, which could only happen on MDT if the export for this particular client was marked as RMT_CLIENT (which should not be happening, but we cannot easily verify it at this point, I guess).
+
+For the particular path you are having the assertion failure this code in mdt_finish_open() should be triggered somehow:
+
+        if (exp_connect_rmtclient(exp)) {
+                void *buf = req_capsule_server_get(info->mti_pill, &RMF_ACL);
+
+                rc = mdt_pack_remote_perm(info, o, buf);
+                if (rc) {
+                        repbody->valid &= ~OBD_MD_FLRMTPERM;
+                        repbody->aclsize = 0;
+                } else {
+                        repbody->valid |= OBD_MD_FLRMTPERM;
+                        repbody->aclsize = sizeof(struct mdt_remote_perm);
+                }
+        }
+
+OR, the underlying buffer to be somehow primed with the wrong bit set beforehand. (I see that mdt_pack_attr2body does not zero the valid value, though before we could do that we do pack_reply that zeroes everything in there so should not be a problem).
+
+Is this a case of mixed endianness setup by any chance?
+
+Can you please get body->valid value from the dump?
+
+Even better if you can also get RMF_ACL buffer from the request to see if it's filled with sensible data (therefore confirming that server believes this is a remote client somehow) vs just a stray valid bit set.
+
+From LU-1597 I gather this problem only affects a certain subset of clients in a single cluster only, so there must be something unique about those clients, any chance to have more insight into it?
+
+--- Comment (morrone, Fri, 13 Jul 2012 12:29:38 +0000) ---
+This is a high-priority bug for us.  As Ned said, this seems to have started happening when we disabled capa on the server, which we have to do to get our center active again.  But now the same users are being hit by these client crashes.
+
+--- Comment (nedbass, Thu, 12 Jul 2012 20:47:59 +0000) ---
+We may want to consider a possible connection to LU-1597.  I believe we starting hitting this assertion on clients around the same time we disabled capabilities on the servers to mitigate LU-1597.  I also notice in the code that OBD_CONNECT_RMT_CLIENT and  OBD_CONNECT_RMT_CLIENT_FORCE flags are often accessed in conjunction with OBD_CONNECT_MDS_CAPA and OBD_CONNECT_OSS_CAPA.
+
+--- Comment (nedbass, Thu, 12 Jul 2012 13:46:26 +0000) ---
+Hm, so what happened to the flag? Do you hve a dump, how does export connection flags look like?
+
+The dumps are on our classified network, so I can't upload them.
+
+It seems client_is_remote(exp) checks exp->exp_obd->u.cli.cl_import->imp_connect_data.ocd_connect_flags which has the value 351168417952 (0x51c344d0a0).  exp->exp_connect_flags has the same value.
+
+--- Comment (green, Wed, 11 Jul 2012 21:51:28 +0000) ---
+Hm, so what happened to the flag? Do you hve a dump, how does export connection flags look like?

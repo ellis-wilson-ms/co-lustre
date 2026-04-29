@@ -1,0 +1,375 @@
+Key:        LU-13798
+Summary:    Improve direct i/o performance with multiple stripes: Submit all stripes of a DIO and then wait
+Link:       https://jira.whamcloud.com/browse/LU-13798
+Type:       Improvement
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Patrick Farrell
+Reporter:   Patrick Farrell
+Created:    Fri, 17 Jul 2020 17:04:21 +0000
+Updated:    Fri, 19 Jan 2024 07:08:09 +0000
+Resolved:   Wed, 30 Jun 2021 18:48:59 +0000
+Links:      Related: is related to  LU-13802; Related: is related to  LU-13799; Related: is related to  LU-13805; Related: is related to  LU-13814; Related: is related to LU-14828; Related: is related to LU-4198
+
+--- Description ---
+The AIO implementation created in LU-4198 is able to perform at extremely high speeds because it submits multiple i/os via the direct i/o path, in a manner similar to the buffered i/o path.
+
+Consider the case where we do 1 MiB AIO requests with a queue depth of 64 MiB.  In this case, we submit 64 1 MiB DIO requests, and then we wait for them to complete.  (Assume we do only 64 MiB of i/o total, just for ease of conversation.)
+
+Critically, we submit all the i/o requests and then wait for completion.  We do not wait for completion of individual 1 MiB writes.
+
+Compare this now to the case where we write do a 64 MiB DIO write (or some smaller size, but > stripe size).  As LU-4198 originally noted, the performance of DIO does not scale when adding stripes.
+
+Consider a file with a stripe size of 1 MiB.
+
+This 64 MiB DIO generates 64 1 MiB writes, exactly the same as AIO with a queue depth of 64.
+
+Except that while the AIO request performs at ~4-5 GiB/s, the DIO request performs at ~300 MiB/s.
+
+This is because the DIO system submits each 1 MiB request and then waits for it:
+
+(Submit 1 stripe(1 MiB)) --> wait for sync, (Submit 1 stripe (1 MiB)) --> wait for sync ... etc, 64 times.
+
+AIO submits all of the requests and then waits, so:
+
+(Submit 1 stripe(1 MiB)) -> (Submit 1 stripe(1 MiB)) -> (Submit 1 stripe(1 MiB)) -> (Submit 1 stripe(1 MiB)) -> (Submit 1 stripe(1 MiB)) -> (Submit 1 stripe(1 MiB)) ->  ... (Wait for all writes to complete)
+
+There is no reason DIO cannot work the same way, and when we make this change, large DIO writes & reads jump in performance to the same levels as AIO with an equivalent queue depth.
+
+The change consists of essentially moving the waiting from the ll_direct_rw_* code up to the ll_file_io_generic layer and waiting for the completion of all submitted i/os rather than one at a time - It is a relatively simple change.
+
+The improvement is dramatic, from a few hundred MiB/s to roughly 5 GiB/s.
+
+Quick benchmark:
+
+mpirun -np 1 $IOR -w -r -t 256M -b 64G -o ./iorfile --posix.odirect
+Before:
+Max Write: 583.03 MiB/sec (611.35 MB/sec)
+Max Read:  641.03 MiB/sec (672.17 MB/sec)
+ 
+After (w/patch):
+Max Write: 5185.96 MiB/sec (5437.87 MB/sec)
+Max Read:  5093.06 MiB/sec (5340.46 MB/sec) 
+
+The basic patch is relatively simple, but there are a number of additional subtleties to work out around when to do this and what sizes to submit, etc, etc.  Basic patch will be forthcoming shortly.
+
+--- Comment (pjones, Wed, 30 Jun 2021 18:48:59 +0000) ---
+Landed for 2.15
+
+--- Comment (gerrit, Wed, 30 Jun 2021 15:25:53 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/39436/
+
+Subject: LU-13798 llite: parallelize direct i/o issuance
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: cba07b68f9386b6169788065c8cba1974cb7f712
+
+--- Comment (paf0186, Fri, 28 May 2021 21:56:13 +0000) ---
+So I think Shilong was suggesting this, but it took me a bit to figure this out.
+
+We cannot reset the file size to the original size on error.  Not really.  It is possible it was updated by another client at almost any point during the write syscall, and we cannot figure out what updates were from the client which received an error vs another client.  (At least, not practically.)
+
+So I think the async DIO behavior will have to be like Shilong said - the same as a regular write + fsync().  It will return an error if there was an error, but it can't tell you how many bytes were written (or which bytes were written).
+
+So in this case, of a 5 MiB write to an empty file:
+
+W W X W W
+
+We would return an error, but the file size would be 5 MiB.
+
+ENOSPC is still handled 'correctly' with short writes, etc, because we have grant.
+
+Just wanted to state clearly the behavior we're going to have here.
+
+--- Comment (paf0186, Fri, 28 May 2021 00:39:40 +0000) ---
+Yes, I agree - I think that's a good way to think of it. 
+
+And yes, thank you for the reminder, I need to add that switch.  We already have to have the old non-parallel mode for pipes (next version of patch explains this), so it doesn't add any more code to the i/o path to make it switchable.
+
+--- Comment (wshilong, Thu, 27 May 2021 23:34:10 +0000) ---
+I think even "return the contiguous byte written at the beginning".  did not totally fix confusing. As still some data writting eg:
+
+W W X W
+
+If we could return 2M, this still is confusing, as we actually wrote another 1M, this is still a bit different though. If we consider this parallel DIO as something like buffer IO + fsync(): write dirty data and then call fsync(),  fsync() will return error to application if some write failed, but we have no idea how much data we really wrote...
+
+ 
+
+Maybe we could just use easy way to return error to caller, but better add an option to disable parallel DIO in case it break some existing application?
+
+--- Comment (paf0186, Thu, 27 May 2021 16:33:31 +0000) ---
+"If write is expanding file size, return error directly might be fine, as in ext4 expanding file size will be executed after IO, short write data will be discarded as file size was not updated, only question is if it is fine if IO apply on existed data."
+
+Well, we have to make sure the file size isn't updated, right?  I'm not quite sure when that occurs relative to error processing here...  OK, I'm going to add that to the list of things to verify.  (How does it work for AIO writes...?)
+
+My thinking is this:
+
+Because we can get a failure "in the middle", it's not realistic to do "short i/o" and return bytes written.  I think that's only useful if they're contiguous.
+
+So our failure cases are things like:
+
+X W W W W
+
+In that case, we could just return error, since we didn't write any bytes.
+
+OK, so now:
+
+W X W W W
+
+What do we return here?  1 MiB?
+
+Or:
+
+W W W X W
+
+3 MiB here?
+
+I think the only arguably correct choices are "just return an error" or "return the contiguous byte written at the beginning".  Because we cannot accurately represent a write with a hole in it to the application.  There's no way to describe that.
+
+Just returning an error has these advantages:
+
+It is relatively simple.  No tracking which regions completed and sorting out contiguous bytes written.
+
+But it does not let users know if we did write some contiguous bytes at the start.  The concern then is they assume that we didn't write any other bytes...  This doesn't seem very dangerous in practice, though.
+
+For extending a file...  Similar behavior - We extend it as far as the contiguous bytes written allow us.
+
+I don't really like this - we're going to have to track every submitted RPC up at the top level, so we can verify they're contiguous, and they can arrive in any order, so we're going to have to track them all basically with some sort of extent map.
+
+This is necessary if we want to give "report contiguous bytes written" as our response.
+
+I would argue that the upstream kernel no longer does this for DIO, which suggests to me we can get away with just returning an error.  That is certainly much easier.
+
+--- Comment (paf0186, Thu, 27 May 2021 16:04:14 +0000) ---
+"The first thing to check is what e.g. XFS does in such a situation (e.g. EIO from dm-flakey for a block in the middle of a large write)? I don't think error recovery in such a case is clean at all, because O_DIRECT may be overwriting existing data in-place, so truncating the file to before the start of the error is possibly worse than returning an error. However, I do believe that the VFS write() handler will truncate a file that returned a partial error, if it was doing an extending write, and discard any data written beyond EOF."
+
+I agree entirely - It's not clean at all.  I don't think truncation is a good answer except for extending writes.  And a key point here is we don't know what blocks were written successfully.  (We could figure that out, but then we're tracking that at the top level.  I would love to avoid writing that code, which seems like it would be significant, in that it requires awareness of i/o splitting among RPCs, among other things.  We're going to have to map the splitting of the write and see what chunks failed.)
+
+So not knowing which block fails means we would truncate off the entirety of the extending write in that case.  But what about when a write is partially extending?  Ew...
+
+For XFS...  I suspect if XFS DIO is split, it is submitted synchronously, ie, the failure granularity and the waiting granularity are the same.  So they would not have this issue.
+
+"Also, for buffered writes, this error should be returned to userspace if any write failed, but it would be returned via close() or fsync() from the saved error state on the file descriptor, and not write(), because the error isn't even detected until after write."
+
+Yes, agreed completely.  Sorry to be unclear on that - I meant it's not returned to the write() call.
+
+--- Comment (wshilong, Thu, 27 May 2021 13:36:07 +0000) ---
+If write is expanding file size, return error directly might be fine, as in ext4 expanding file size will be executed after IO, short write data will be discarded as file size was not updated, only question is if it is fine if IO apply on existed data.
+
+--- Comment (wshilong, Thu, 27 May 2021 13:29:25 +0000) ---
+I checked Centos7 kernel and Latest upstream linux kernel, behavior was a bit different:
+
+In latest Linux kernel, Direct IO was implemented using iomap:
+
+|->iomap_dio_rw()
+   |->__iomap_dio_rw()
+
+     |->iomap_apply()
+
+If middle of iomap_apply() failed,  iomap_dio_set_error() will set error code and it will return error to caller
+
+rather than return already written.
+
+ 
+
+However in Centos7:
+
+|->__generic_file_aio_write()
+
+We will return bytes wrotten in short IO...
+
+ 
+
+I am not sure what is posix requirements in this cases, maybe upstream codes has bug to miss short IO?  Returning error directly might confuse application, because application think IO failure, but some data was actually wroten in-place.
+
+ 
+
+ Any idea?
+
+--- Comment (adilger, Thu, 27 May 2021 03:05:34 +0000) ---
+The first thing to check is what e.g. XFS does in such a situation (e.g. EIO from dm-flakey for a block in the middle of a large write)?  I don't think error recovery in such a case is clean at all, because O_DIRECT may be overwriting existing data in-place, so truncating the file to before the start of the error is possibly worse than returning an error.  However, I do believe that the VFS write() handler will truncate a file that returned a partial error, if it was doing an extending write, and discard any data written beyond EOF.
+
+Also, for buffered writes, this error should be returned to userspace if any write failed, but it would be returned via close() or fsync() from the saved error state on the file descriptor, and not write(), because the error isn't even detected until after write.
+
+--- Comment (wshilong, Thu, 27 May 2021 00:56:30 +0000) ---
+This is reason why i would suggest we added fault injection I think it ok to just return error to make code simple, since most of case DIO should be ok except ENOSPC.
+
+--- Comment (paf0186, Wed, 26 May 2021 23:56:04 +0000) ---
+Related question...
+
+In a case like this, where we have a 5 MiB write to 1 MiB stripe size file, and a single write RPC fails in the middle (not due to ENOSPC).  (Ws represent 1 MiB write RPC, X represents a failed write RPC)
+
+W W X W W
+
+This is an unusual situation - Reporting this error back is not possible with buffered writes, because they're completely async, so it would normally be silent.
+
+With async DIO, we can return an error.  But is it acceptable to return an error?  Or do we need to return 2 MiB, because we successfully wrote the first 2 MiB of data?  Determining exactly how much we wrote before the gap seems pretty tricky - It would be much easier if we could just return an error in this case....
+
+Is that acceptable?  Note also that returning 2 MiB also seems misleading because it suggests a short write, when in fact we also wrote data further along in the file...
+
+I am hoping the answer is "error is good".
+
+--- Comment (adilger, Wed, 26 May 2021 18:51:59 +0000) ---
+That was going to be my suggestion as well.  Since patch https://review.whamcloud.com/39386 "LU-12687 osc: consume grants for direct I/O" was landed, the client should remain "fully stocked" with grant for O_DIRECT writes until the OST runs low/out of space, so this shouldn't cause any performance hit, unless (possibly) the O_DIRECT size is so large that it exceeds the total grant amount that the client has for the OST(s) the file is striped over.  It may be worthwhile to check if the client would be given e.g. 1GB+ grant when doing 1GB O_DIRECT writes (assuming enough space in the filesystem)?
+
+--- Comment (paf0186, Wed, 26 May 2021 16:25:59 +0000) ---
+Hmm, so I think I have this figured out.
+
+I asked originally because I thought working with grants would be complicated, but after thinking about it, I think the solution is very simple, and I will just implement it.
+
+DIO writes already consume grant if it is available, so we can just switch to per-RPC sync behavior if not enough grant is available.  So if there is a grant issue, we fall back to submitting each individual RPC synchronously.  This should solve the problem, and I don't think it should present a performance issue - When we are running out of grant, it is OK not to write at high speed.
+
+--- Comment (paf0186, Wed, 26 May 2021 15:20:03 +0000) ---
+Andreas, Shilong,
+
+ The change from waiting for each DIO RPC individually vs waiting for the batch raises an interesting problem, similar to buffered i/o.
+
+Specifically, previously since every RPC was individually 'sync', we would always catch errors immediately.
+
+So the only possible write failures looked like this...  Say we tried to write 5 MiB to a file with stripe size 1 MiB, that generates 5 1 MiB RPCs.
+
+ Success looks like this (W is a 1 MiB write RPC):
+
+W W W W W
+
+"X" is a failed write RPC, "-" is "we didn't try to write this 1 MiB". failure is always something like:
+
+W W W X -
+
+Or:
+
+W X - - -
+
+Failure is a short write, but there is never a gap, because we confirm each RPC is sync'ed before starting the next one.
+
+With this change, we wait for sync after all RPCs have been sent.  This means we can get a failure "in the middle", like this:
+
+W W X W W
+
+So now there is a gap, rather than just a short write.
+
+Still, I think this is probably fine in the general case.  This problem already exists for buffered writes, because they are async.  And the problem for buffered writes is worse, because they are 100% async, so the error happens after the syscall has completed.  With the modified DIO, we wait for sync before returning to userspace, so we can return an error.
+
+Since this is similar to buffered writes, I think it's OK for the general error case.
+
+Here is my actual concern.
+
+What about short writes due to ENOSPC? If one OST runs out of space, we could get a pattern like this (with the new DIO).
+
+Same as above, but "E" represents an RPC which failed with ENOSPC:
+
+W W E W W
+
+So we have a gap in the write due to ENOSPC.
+
+This is impossible with buffered writes, because we check grant for each write RPC before submitting it. So with buffered writes, the ENOSPC looks like this:
+
+W W E - -
+
+Where we stop when ENOSPC is encountered.
+
+So buffered writes hitting ENOSPC guarantee a "short" write, whereas with this change, DIO writes hitting ENOSPC can give a write with a "gap" in it.
+
+We can solve this by giving DIO similar "require grant, switch to sync if grant unavailable" behavior as is used for buffered i/o.
+
+My question:
+
+ Do you think this is necessary to solve? My instinct is yes, because the "gap" write on ENOSPC is unacceptable, because users rely on out of space generating a short write or error.
+
+--- Comment (gerrit, Tue, 21 Jul 2020 21:49:58 +0000) ---
+(See LU-13799)
+
+--- Comment (paf0186, Sat, 18 Jul 2020 20:18:05 +0000) ---
+Ihara,
+
+One other thing - I noticed that as you get to higher single threaded speeds, I found a lot of CPU time being spent in FIO itself.  IOR was more able to drive the higher rates.  Though your fio numbers are higher than anything I got, so perhaps I need to try again.
+
+--- Comment (paf0186, Sat, 18 Jul 2020 20:12:21 +0000) ---
+I opened LU-13802 for the buffered part.
+
+--- Comment (paf0186, Sat, 18 Jul 2020 19:55:43 +0000) ---
+Andreas,
+
+Yes, absolutely.  I was actually planning to sit on that a little while we worked out the details of this, but yes, absolutely.  I've tested this with a dumb "try all buffered IO as DIO" patch - The trickier part is actually the switching logic, as you alluded to.  I've got a plan in mind there, was working on it today.
+
+In fact, the threshold is as small as 1 MiB - I saw benefits splitting 1 MiB BIO(buffered) in to 4x256KiB DIOs (from around 1.3 GiB/s buffered to around 2.0 GiB/s with the 4x256 DIOs).  I don't have numbers for 512K handy, but 256 KiB buffered as 2x128 KiB DIO was too small to benefit, so 1 MiB is pushing it.  (Obviously, we also have to trade off RPC size vs performance of a single thread.)
+
+Note when to switch depends significantly on the sync latency of your back end, so basically whether or not it's spinning rust.  The good news is we put that info in to Lustre last year.
+
+Note also that this requires the buffered i/o to be aligned on page boundaries, both the buffer & the i/o size.  If it's not, you have to fall back to buffered (well, for now...).  But, that's not nearly as bad as it sounds. As you probably realize, basically all large buffers in Linux are page aligned*.  So, for example, an IOR benchmark doing 1 MiB is pretty much always aligned, at least in my testing.
+
+*(If you think about it, they must be. A memory allocator that didn't align large buffers on page boundaries wouldn't last long...)
+
+*(This turns out only to be true for IOR, since it has to deal with O_DIRECT also.)
+
+--- Comment (adilger, Sat, 18 Jul 2020 18:45:33 +0000) ---
+Patrick, would it make sense to automatically select the DIO code path once the buffer size is large enough?  AFAIK, the memcpy() and pave cache handling at high speeds burns CPU for a single thread, and there is probably a threshold above which the DIO path is a win, as long as the RPCs are being sent quickly enough, otherwise the client can increase the "queue depth" by copying data into the kernel page cache asynchronously.
+
+Initially, a static threshold could be set, but I suspect it would be best to make this dynamic based on the RPC rate or something, but that is for a later patch.
+
+--- Comment (sihara, Sat, 18 Jul 2020 03:47:33 +0000) ---
+Thanks Patrick, yeah, I realized that it's different IO submission and completion from aio. I will play and more test patch a bit.
+
+--- Comment (paf0186, Sat, 18 Jul 2020 02:09:14 +0000) ---
+Yes, AIO is still going to be much faster. 
+
+You may realize this already, but if not, it's like this...
+
+64 MiB DIO, 4 MiB stripe size:
+
+Submit io, submit io ... (16 total)... submit i/o...
+
+And then you wait for all of them.
+
+So your i/os in flight over time would look like this:
+
+0 (64 MiB write starts) 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 15 14 13 12 11 10 9 8 7 6 5 4 3 2 1 (Next 64 MiB write starts) 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 15 14 13 12 11 10 9 8 7 6 5 4 3 2 1 0 (Next 64 MiB write starts) 1 2 3 ... etc.
+
+So you have 16 i/os in flight once all the i/os are issued, but then you wait until all of them are complete (so you can 'finish' the 64 MiB write), so you don't always have 16 i/os in flight.
+
+ 
+
+For AIO, doing 4 MiB i/os at a queue depth of 16, it looks like this:
+
+0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 15 16 15 16 15 16 15 16 ... etc. and stays at 16 until you finish all the i/o.  The queue is kept full.
+
+Because each time an i/o completes, you immediately submit the next one to keep the queue at the same queue depth.  No waiting.
+
+--- Comment (sihara, Sat, 18 Jul 2020 01:24:25 +0000) ---
+Patrick, This is very interesting patch. I also had tested quickly. I couldn't wait  This is tested on 8 x OST in my environment.
+
+ without patch
+
+# fio -name=test -ioengine=sync -rw=write -blocksize=64m -iodepth=1 -direct=1 -size=64g -numjobs=1 -filename=file
+  WRITE: bw=1743MiB/s (1828MB/s), 1743MiB/s-1743MiB/s (1828MB/s-1828MB/s), io=64.0GiB (68.7GB), run=37589-37589mse
+
+with patch
+
+# fio -name=test -ioengine=sync -rw=write -blocksize=64m -iodepth=1 -direct=1 -size=64g -numjobs=1 -filename=file
+  WRITE: bw=3708MiB/s (3888MB/s), 3708MiB/s-3708MiB/s (3888MB/s-3888MB/s), io=64.0GiB (68.7GB), run=17676-17676msec
+
+O_DIRECT performance was significant boost after patches, but, O_DIRECT/AIO was still much faster. 4M, QD=16.
+
+ without patch
+
+# fio -name=test -ioengine=libaio -rw=write -blocksize=4m -iodepth=16 -direct=1 -size=64g -numjobs=1 -filename=file
+  WRITE: bw=6921MiB/s (7257MB/s), 6921MiB/s-6921MiB/s (7257MB/s-7257MB/s), io=64.0GiB (68.7GB), run=9469-9469msec
+
+--- Comment (gerrit, Fri, 17 Jul 2020 18:55:15 +0000) ---
+Patrick Farrell (farr0186@gmail.com) uploaded a new patch: https://review.whamcloud.com/39436
+
+Subject: LU-13798 llite: parallelize direct i/o RPC issuance
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: d9bdec51f56c6794e9c83a272bf1175a0804d218

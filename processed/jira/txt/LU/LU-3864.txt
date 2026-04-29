@@ -1,0 +1,282 @@
+Key:        LU-3864
+Summary:    stat() on HSM released file returns st_blocks = 0
+Link:       https://jira.whamcloud.com/browse/LU-3864
+Type:       Technical task
+Priority:   Blocker
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Bruno Faccini
+Reporter:   John Hammond
+Created:    Fri, 30 Aug 2013 15:19:45 +0000
+Updated:    Wed, 2 Oct 2013 20:39:43 +0000
+Resolved:   Wed, 2 Oct 2013 20:39:43 +0000
+Labels:     HSM
+
+--- Description ---
+HSM release in not preserving block count as reported by stat()
+
+# cd /mnt/lustre
+# dd if=/dev/zero of=Antoshka bs=1M count=10
+10+0 records in
+10+0 records out
+10485760 bytes (10 MB) copied, 0.0740321 s, 142 MB/s
+# stat Antoshka 
+  File: `Antoshka'
+  Size: 10485760  	Blocks: 20480      IO Block: 4194304 regular file
+Device: 2c54f966h/743766374d	Inode: 144115205255725060  Links: 1
+Access: (0644/-rw-r--r--)  Uid: (    0/    root)   Gid: (    0/    root)
+Access: 2013-08-30 10:13:48.000000000 -0500
+Modify: 2013-08-30 10:13:48.000000000 -0500
+Change: 2013-08-30 10:13:48.000000000 -0500
+# lfs hsm_archive Antoshka 
+# lfs hsm_release Antoshka
+# stat Antoshka
+  File: `Antoshka'
+  Size: 10485760  	Blocks: 0          IO Block: 4194304 regular file
+Device: 2c54f966h/743766374d	Inode: 144115205255725060  Links: 1
+Access: (0644/-rw-r--r--)  Uid: (    0/    root)   Gid: (    0/    root)
+Access: 2013-08-30 10:13:48.000000000 -0500
+Modify: 2013-08-30 10:13:48.000000000 -0500
+Change: 2013-08-30 10:13:48.000000000 -0500
+
+I had intended to fix this with LU-3811 but it will require some work in the MD* attr_set patch.
+
+If you're thinking (philosophically) hmm, well maybe it should report a block count of 0 here then you're just wrong.
+
+--- Comment (pjones, Wed, 2 Oct 2013 20:39:43 +0000) ---
+Landed for LU-3864
+
+--- Comment (bfaccini, Tue, 1 Oct 2013 13:56:15 +0000) ---
+http://review.whamcloud.com/7776 has land and http://review.whamcloud.com/7584 only misses reviews now.
+
+--- Comment (bfaccini, Fri, 27 Sep 2013 12:42:08 +0000) ---
+Submitted patch to have st_blocks = 1 returned for released files, at http://review.whamcloud.com/7776
+
+--- Comment (adegremont, Thu, 26 Sep 2013 13:43:15 +0000) ---
+Most of filesystem does not count the space used by inode (unless there is extra block used by metadata, like for EA) when filling st_blocks, but POSIX does not say if it is only data or not. 
+
+Anyway, I think we will have to go for the "st_blocks == 1" solution.
+
+I checked what XFS/DMF does for that. SGI says "don't use tar".... :/
+
+--- Comment (adilger, Thu, 26 Sep 2013 05:47:37 +0000) ---
+Note that returning st_blocks = 1 can still be justified as "correct" for HSM released files, since this is still consuming one sector on the MDT filesystem for the inode.
+
+--- Comment (adilger, Wed, 25 Sep 2013 19:44:56 +0000) ---
+We already do the same on the client if it only has writeback cache pages - if st_blocks == 0 but there is dirty data in the client cache we return st_blocks = 1.  See cl_glimpse_lock():
+
+                                if (cl_isize_read(inode) > 0 &&
+                                    inode->i_blocks == 0) {
+                                        /*
+                                         * LU-417: Add dirty pages block count
+                                         * lest i_blocks reports 0, some "cp" or
+                                         * "tar" may think it's a completely
+                                         * sparse file and skip it.
+                                         */
+                                        inode->i_blocks = dirty_cnt(inode);
+
+--- Comment (bfaccini, Tue, 24 Sep 2013 23:05:23 +0000) ---
+Hummm seems that "tar --sparse", instead of using FIEMAP as expected, uses an odd optimization (if st_blocks = 0) that cause a released file to be archived as a fully sparse file. I did not check all/latest versions of tar.
+
+Seems that for btrfs they encountered the problem with small files (ie, enough small to have the datas stored with the meta-datas and then report st_blocks = 0), as detailed in RedHat Bugzilla #757557 (at https://bugzilla.redhat.com/show_bug.cgi?id=757557). And if I correctly understand, they fixed it by returning st_blocks = 1. Should we do the same ??
+
+--- Comment (bfaccini, Fri, 20 Sep 2013 18:33:44 +0000) ---
+Humm during 1st patch-set testing I also found (seems not already reported) that doing a "filefrag" (ie FIEMAP syscall!) on a released file just crash with the follwing LBUG :
+
+LustreError: 13811:0:(lov_obd.c:2488:lov_fiemap()) ASSERTION( fm_local ) failed: 
+LustreError: 13811:0:(lov_obd.c:2488:lov_fiemap()) LBUG
+Pid: 13811, comm: filefrag
+
+Call Trace:
+ [] libcfs_debug_dumpstack+0x55/0x80 [libcfs]
+ [] lbug_with_loc+0x47/0xb0 [libcfs]
+ [] lov_get_info+0x10ac/0x1cb0 [lov]
+ [] ? __lru_cache_add+0x40/0x90
+ [] ? lov_lsm_addref+0x6b/0x130 [lov]
+ [] ll_do_fiemap+0x411/0x6b0 [lustre]
+ [] ll_fiemap+0x117/0x590 [lustre]
+ [] do_vfs_ioctl+0x505/0x580
+ [] sys_ioctl+0x81/0xa0
+ [] system_call_fastpath+0x16/0x1b
+
+and this with or without my patch, this is due to unconditionally freeing "fm_local" at the end of lov_fiemap() routine, even if it was not allocated because of no-object/ENOMEM and also now when released!!
+
+Will fix that in patch-set #7 in addition to answer/address Andreas comments for patch-set #6.
+
+--- Comment (adilger, Wed, 18 Sep 2013 08:42:48 +0000) ---
+There is still a patch to land for this bug.
+
+--- Comment (adegremont, Thu, 12 Sep 2013 13:32:18 +0000) ---
+> BTW, do we know what answer to FIEMAP do provide DMF and/or GHI ??
+
+Ok I got the information from SGI.
+
+XFS(for DMF) is returning 1 full extent, with normal flag (not UNKNOWN or DELALLOC, etc)
+
+I do not know for GHI.
+
+--- Comment (bfaccini, Mon, 9 Sep 2013 09:23:57 +0000) ---
+Hello Aurelien,
+
+Seems everybody "agree" with st_blocks to be Null for released files. This is the reason ticket resolution has been set as "won't fix".
+
+Concerning change in FIEMAP, this can be tracked as a new ticket (or still this one), but with lower priority.
+
+BTW, do we know what answer to FIEMAP do provide DMF and/or GHI ??
+
+Seems to me that it is not a frozen interface, because when googling I found that a FIEMAP_EXTENT_SECONDARY flag exists (to indicate that extent data are on HSM) in some implementations that may fit our needs here, but then is it used/tested by the coreutils and other tools ? 
+
+But anyway, I wrote a 1st patch attempt that returns a single extent with (FIEMAP_EXTENT_DELALLOC | FIEMAP_EXTENT_UNKNOWN | FIEMAP_EXTENT_LAST). It is http://review.whamcloud.com/7584.
+
+--- Comment (adegremont, Fri, 6 Sep 2013 08:18:56 +0000) ---
+OK, I've checked with GHI (GPFS/HPSS Interface), which is the only concurrent product of Lustre/HSM.
+
+GHI also returns st_blocks == 0 when files are RELEASED.
+
+I propose that FIEMAP is modified for RELEASED files, and st_block still return 0. We will see if lot of people complains about that.
+
+--- Comment (adegremont, Fri, 6 Sep 2013 08:12:56 +0000) ---
+Why this bug as been put as wontfix?
+
+We must, at least, fix FIEMAP.
+
+--- Comment (adegremont, Thu, 5 Sep 2013 13:30:12 +0000) ---
+John, 
+
+I agree with you that checking each possible tool is not the right way.
+
+	Users will be confused at first by this, but we should teach them. You cannot really consider this will be really fully transparent for them. I'm pretty sure that users will ask admins why their file accesses are random, because they do not realize that files could restored when accessed and this could requires mounting tapes which could be really long.
+
+	DMF, which is the major HSM in HPC environment, and probably the HSM that will be used the most with Lustre/HSM, is exactly doing this. DMF, on their XFS/CXFS frontend, reports st_block == 0 for released(offline) files. DMF is probably doing this for 20 years now. This is the main solution right now on the market and DMF is very interested by Lustre as a frontend because CXFS does not scale (and because Lustre is very well deployed).
+
+	Admins like they can see this difference between theoretical space and real disk usage through stat/du.
+
+I think this is very simple and that we're being a bit lazy here.
+
+What will be your proposal?
+
+I still consider this behavior could be changed, but this is not as simple as: this is totally wrong to reports 0 for st_blocks. I think reporting st_block as 0 is a feature, not a bug. Only the potential data corruption for some "too-smart" tools is a concern to me.
+
+--- Comment (jay, Wed, 4 Sep 2013 18:39:13 +0000) ---
+Hi John, by design, st_blocks is the actual disk blocks consumed by the file data. So it should be reasonable to report 0 for st_blocks for released files, this matches the . But I agree that reporting st_blocks to be zero is confusing here because this may cause applications to think this is a totally sparse file so fiemap won't be consulted at all.
+
+Any decisions for this problem are reasonable to me
+
+--- Comment (jhammond, Wed, 4 Sep 2013 15:41:10 +0000) ---
+I think this is very simple and that we're being a bit lazy here.
+
+It is a bug for release to change st_blocks. Remember that HSM is supposed to be transparent to the user. We shouldn't be trying to guess if some application will depend on st_blocks. Instead we should assume that some application depends on st_blocks and that there will be data loss because of this bug. It can be a blocker or not, I don't care so much. But it's a bug.
+
+The fact that we're focused on cp and tar is troubling. What about bbcp, rsync, zip, and all of those terrible data movers that the open science sites use? Have we checked them too?
+
+Moreover, it's very easy to think of situations where regular users will be confused by this. For example, when they run 'du -hs' on their homedir and then tell admin that the 8TB of data they just created must be lost. The admin who uses HSM on the other hand can be told and should know that 'dh -hs' will not always reflect the frontend FS usage.
+
+--- Comment (jay, Wed, 4 Sep 2013 15:22:09 +0000) ---
+Hi Aurelien and Bruno,
+
+If we can fix this issue by fiemap that'll be great. I was afraid that we would fix tar issue but import another one by reporting incorrect block number.
+
+Jinshan
+
+--- Comment (adegremont, Wed, 4 Sep 2013 14:07:23 +0000) ---
+> Did I understand and is this what you mean ?
+
+This is perfectly correct!
+
+> Then, only difference I see already is that we will not use the same cp logic for "real" non-sparse (plain or dense) but released files, if any specifics are made in cp mainly for performance but this could be just nothing regarding time for restore.
+
+I do not understand what you mean 
+
+What I see is that cp will read sequentially the just-previously-released-but-now-restored file, instead of doing something more efficient because the file could really be "a little bit" sparse.
+
+So before releasing the file, cp would have copied it efficiently, creating a sparse file.
+
+After restore, it will copy it fully, and the file copy will be no more sparse.
+
+I think this is acceptable.
+
+--- Comment (bfaccini, Wed, 4 Sep 2013 13:49:52 +0000) ---
+Aurelien,
+
+Just to be sure that I fully understand what you mean in your last comment :
+
+        _ for a released file, we can return st_blocks = 0 with correct st_size as already.
+
+        _ this allows cp (and tar?) to presume it is a sparse-file and go thru related special logic.
+
+        _ but then we need to change Lustre FIEMAP to return something like FIEMAP_EXTENT_DELALLOC or FIEMAP_EXTENT_UNKNOWN for released files to make cp happy.
+
+Did I understand and is this what you mean ?
+
+Then, only difference I see already is that we will not use the same cp logic for "real" non-sparse (plain or dense) but released files, if any specifics are made in cp mainly for performance but this could be just nothing regarding time for restore.
+
+--- Comment (adegremont, Wed, 4 Sep 2013 09:42:16 +0000) ---
+Jinshan, even I thought that reporting a 0 value for st_block was a good idea first, we cannot afford to keep doing this due to cp/tar issue.
+
+This is unacceptable that users doing "cp --sparse" or "tar --sparse" copy WRONG data if this is applied to a released file.
+
+After looking at coreutils code and LU-2580 I think the bug here is that FIEMAP output for released file is wrong.
+
+coreutils is just using st_blocks to detect if the file looks sparse.
+
+It seems we can return a special FIEMAP for released file, with one region, with FIEMAP_EXTENT_DELALLOC or FIEMAP_EXTENT_UNKNOWN set.
+
+I've not checked tar.
+
+Andreas, do you think this solution is reasonable?
+
+--- Comment (bfaccini, Tue, 3 Sep 2013 23:35:57 +0000) ---
+I am late in this thread (even if ticket is assigned to me !), but even if I understand the possible issue when using "smart" tools, I wonder what will happen when using "simple" tools like "du" if st_blocks no longer reflects the current number of consumed blocks ?
+
+Do we know how behave other HSMs, like DataMigration and others ? I seem to remember DM did not do anything tricky with st_blocks, but may be it changed since.
+
+--- Comment (jay, Tue, 3 Sep 2013 16:21:09 +0000) ---
+Hi Andreas, is there any side effect if we set the st_blocks to be nonzero even it doesn't consume any disk blocks in Lustre?
+
+To be honest, I'm totally okay to report st_blocks as zero for release files. Backup usually applies to latest files but HSM should move old files to secondary storage so their target are not conflicted. If backup has to restore every files in the lustre this is probably not what administrator wants.
+
+--- Comment (adegremont, Mon, 2 Sep 2013 08:55:39 +0000) ---
+Another workaround, to avoid storing the previous block count, we could be to returned a theoretical maximum block count: computing (FILESIZE / BLOCKSIZE) + 1
+
+The default of this method will be that st_blocks could be larger than what it was before the file was released. But this is must simpler to patch.
+
+I imagine we have to also hack FIEMAP for released file?
+
+--- Comment (adegremont, Mon, 2 Sep 2013 07:23:19 +0000) ---
+"This is not a bug, this is a feature" but as Andreas pointed out, we will have to modify this as this could lead to issue when using, too smart, tools.
+
+So, where could we store the original block count? There's no place for that in the inode. Should we put this in HSM EA and use this value when replying to GETATTR?
+
+--- Comment (jcl, Sat, 31 Aug 2013 06:02:57 +0000) ---
+For us the block count represent the Lustre block count, so for a released file is 0. Later for partial release, it will be the count of blocks in Lustre, not released. File size is ok, a released file is like a sparse file but with data out of Lustre.
+
+--- Comment (adilger, Fri, 30 Aug 2013 18:39:14 +0000) ---
+I think that this behaviour was by design, but I now see that this could be a source of major data corruption for newer versions of "cp" or "tar" trying to copy the file.  If they call stat() on the file and see st_blocks == 0 the file they will incorrectly assume that the file is completely sparse and not even try to read the file data.  This might easily be tested by something like:
+
+        yes | dd of=$DIR/$tfile bs=1M count=1 conv=sync || error "creating $DIR/$tfile"
+        $LFS hsm_archive --archive $HSM_ARCHIVE_NUMBER $DIR/$tfile
+        wait_request_state $(path2fid $DIR/$tfile) ARCHIVE SUCCEED
+        $LFS hsm_release $DIR/$tfile
+
+        mkdir $DIR/$tdir
+        # only newer versions of cp detect sparse files by stat/FIEMAP (LU-2580)
+        cp --sparse $DIR/$tfile $DIR/$tfile.2 || error "copying $DIR/$tfile"
+        cmp $DIR/$tfile $DIR/$tfile.2 || error "comparing copied $DIR/$tfile"
+
+        tar cf - --sparse $DIR/$tfile | tar xvf - -C $DIR/$tdir || error "tar failed"
+        cmp $DIR/$tfile $DIR/$tdir/$DIR/$tfile || error "comparing untarred $DIR/$tfile"
+
+--- Comment (pjones, Fri, 30 Aug 2013 17:42:59 +0000) ---
+Bruno
+
+Could you please look into this one?
+
+Thanks
+
+Peter
+
+--- Comment (jay, Fri, 30 Aug 2013 16:01:33 +0000) ---
+Hi Andreas, do you think we need to show original blocks for a released file? I tend to think it's fine to set block as 0 because released files won't consume any blocks in lustre file system.
+
+--- Comment (jhammond, Fri, 30 Aug 2013 15:20:49 +0000) ---
+Also note that in HSM release the client is already sending the correct LA_BLOCKS to the MDT.

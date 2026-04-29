@@ -1,0 +1,109 @@
+Key:        LU-18147
+Summary:    client page cache - page still in cache
+Link:       https://jira.whamcloud.com/browse/LU-18147
+Type:       Bug
+Priority:   Blocker
+Status:     Open
+Resolution: Unresolved
+Assignee:   Patrick Farrell
+Reporter:   Alexey Lyashkov
+Created:    Thu, 15 Aug 2024 07:59:38 +0000
+Updated:    Sat, 17 Aug 2024 13:00:52 +0000
+Attachments: fadvise_willneed_helper.c
+
+--- Environment ---
+018c4e8f25 (origin/master, origin/HEAD) LU-18110 doc: lctl multiple NIDs specification not clear
+
+--- Description ---
+While creating a test case for RA bug I started to write a test script and found anomaly in the client side.
+
+test scripts is
+
+test_117() {
+        local stripe_size
+        (( $OSTCOUNT >= 2 )) || skip "needs >= 2 OSTs"
+        $LCTL set_param llite.*.hybrid_io=0
+        rm -rf $DIR/$tdir
+        mkdir -p $DIR/$tdir
+        $LFS setstripe -c 2 -S 1M $DIR/$tdir/$tfile || error "can't set striping"
+        stripe_size=$($LFS getstripe -S $DIR/$tdir/$tfile)
+        $LCTL mark "==== write"
+        dd if=/dev/zero of=$DIR/$tdir/$tfile bs=$stripe_size count=10 oflag=sync
+        sync
+        $LCTL mark "=== read"
+        for i in /sys/devices/virtual/bdi/lustre-*; do
+        echo 2048 > $i/read_ahead_kb
+        done
+dir=/sys/kernel/debug/tracing
+set -x
+pushd $dir
+sysctl kernel.ftrace_enabled=1
+echo 0 > tracing_on
+echo 10000 > buffer_size_kb
+#echo 'nop' > current_tracer
+#echo '' >set_graph_function
+echo function_graph > current_tracer
+echo vfs_fadvise > set_graph_function
+echo > kprobe_events
+echo 'p:kp1 __do_page_cache_readahead %di +80(+0(%di)):u64 %dx %cx' > kprobe_events
+echo 'r:kp2 __do_page_cache_readahead $retval' >> kprobe_events
+echo 'p:kp3 __do_page_cache_readahead+100 %ax %cx %dx %di' >> kprobe_events
+# ax - page
+# r13 - nr_read
+echo 'p:kp4 __do_page_cache_readahead+309 %ax %r13' >> kprobe_events
+echo 1 > events/kprobes/kp1/enable
+echo 1 > events/kprobes/kp2/enable
+echo 1 > events/kprobes/kp3/enable
+echo 1 > events/kprobes/kp4/enable
+echo > trace
+echo 1 > tracing_on
+popd
+        fadvise_dontneed_helper $DIR/$tdir/$tfile
+        fadvise_willneed_helper $DIR/$tdir/$tfile 0 $((stripe_size * 4 ))
+pushd $dir
+echo 0 > events/kprobes/kp1/enable
+echo 0 > events/kprobes/kp2/enable
+echo 0 > events/kprobes/kp3/enable
+echo 0 > events/kprobes/kp4/enable
+echo 0 > tracing_on
+cat trace > /tmp/trace
+echo > trace
+echo > kprobe_events
+popd
+set +x
+}
+run_test 117 "RA should don't panic for multistripe"
+
+fadvise_willneed_helper - just issue an advice(WILLNEED) or same readahead(2) may used. 
+
+and it don't work. While inspecting a source this bug I started to trace client side and found 
+
+fadvice found a page in the page cache, while dontneed_helper invalidate a pages in cache.
+
+ftrace log don't have a readpage calls which expected as pages removed from page cache.
+
+I tries with sysctl -w vm.drop_caches=1 and it have same result - page live in page cache and have uptodate flags.
+
+Switching to the cray 2.15 code I don't see this bug and ftrace log have a records about readpage calls.
+
+--- Comment (shadow, Thu, 15 Aug 2024 20:23:57 +0000) ---
+something strange - bug move away after two days with 100% hits after clean rebuild :/ may be some race in mm..
+
+--- Comment (paf, Thu, 15 Aug 2024 18:51:33 +0000) ---
+OK.  There are a lot of changes in master other than hybrid IO, and hybrid IO is off by default.  There are no hybrid related changes in the page cache code - it's purely a bypass for the page cache code when it's enabled, which it is not here unless you turned it on.  It's almost certainly not involved here.
+
+--- Comment (shadow, Thu, 15 Aug 2024 18:45:37 +0000) ---
+Patrik, This bug don't seen on cray-2.15 without hybrid io. And yes, bug its page still live in the page cache.
+
+it's easy to check by grep readdir /tmp/trace.
+
+kprobe 'kp3' /for Alma 8.4 kernel/ show a page addresses which found in the cache.
+
+quick check say - page address from ftrace is same as from write call, but it's different from invalidate / truncate cache call.
+
+--- Comment (paf, Thu, 15 Aug 2024 18:33:19 +0000) ---
+The comments here are all about readpage behavior with fadvise but the title says hybrid IO.  What is the connection to hybrid IO?  Hybrid IO does not touch the page cache code, it bypasses it in some situations, but that is all.  It's also off by default in master, so unless you have it switched on...
+
+This looks like there is possibly a bug in page invalidation, which again isn't modified by hybrid IO.
+
+You said you found an anomaly in the client side, can you say exactly what it is?  Is it just a page not being removed by these calls?

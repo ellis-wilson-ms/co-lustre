@@ -1,0 +1,230 @@
+Key:        LU-3943
+Summary:    incorrect inode count in lfs df -i
+Link:       https://jira.whamcloud.com/browse/LU-3943
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Not a Bug
+Assignee:   Jian Yu
+Reporter:   Kit Westneat
+Created:    Thu, 12 Sep 2013 21:31:33 +0000
+Updated:    Mon, 2 Jun 2014 16:57:00 +0000
+Resolved:   Fri, 27 Sep 2013 20:46:45 +0000
+
+--- Description ---
+SFU recently reformatted their MDT to have more inodes, using -i. We did a file-level backup and restore. Everything looks good except client-side df and lfs df are both reporting the old inode count:
+
+client1# lfs df -i
+
+UUID                      Inodes       IUsed       IFree IUse% Mounted on
+
+lfs_scra-MDT0000_UUID   121693414    98842604    22850810  81% /global/scratch[MDT:0]
+
+lfs_scra-OST0000_UUID   119472128    21603481    97868647  18% /global/scratch[OST:0]
+
+...
+
+mds# df -i /dev/vg_lfs_scra/mdt
+
+Filesystem            Inodes   IUsed   IFree IUse% Mounted on
+
+/dev/vg_lfs_scra/mdt 251658240 98842604 152815636   40% /lustre/lfs_scra/mdt
+
+mds# dumpe2fs -h /dev/vg_lfs_scra/mdt
+
+...
+
+Inode count:              251658240
+
+Block count:              62914560
+
+Reserved block count:     3145728
+
+Free blocks:              22850811
+
+Free inodes:              152815677
+
+...
+
+I'm pretty puzzled by this. Is there something I'm doing wrong? Any other information I can get you?
+
+--- Comment (adilger, Wed, 18 Dec 2013 07:49:20 +0000) ---
+I found a patch on one of my systems to fix the "lfs df -i" inode summary to match "df -i" if the OST free objects count is less than the MDT free inode count:
+
+http://review.whamcloud.com/8614
+
+--- Comment (pjones, Fri, 27 Sep 2013 20:46:45 +0000) ---
+ok thanks Kit!
+
+--- Comment (kitwestneat, Fri, 27 Sep 2013 20:32:42 +0000) ---
+Ah you're right, they are actually running 1.8.6, my fault. Thanks for the explanation, I think this can be closed.
+
+--- Comment (adilger, Wed, 25 Sep 2013 04:13:50 +0000) ---
+The inode count isn't stored explicitly by Lustre anywhere (of course it is in the superblock of the underlying filesystem).
+
+I suspect the problem you are seeing is that "lfs df -i" and "df -i" are showing the worst case for the number of files that can be created in the filesystem.  In 1.8.7 there are several limits put on the statfs() value returned to the client to ensure that the reported number of free files can actually be created.  The free inode count is limited by:
+
+	the total number of OST objects divided by the default stripe count, since it isn't practical to create more files in the filesystem than there are objects on the OSTs.
+
+	Until 1.8.7 the server limited the inode count by the number of free blocks on the MDT or OST, in case each MDT inode created needs an external xattr block (for a large LOV EA, user xattrs, ACLs, etc), and obviously each OST object should be able to store at least one data block.  In most cases, there are no external xattr blocks, and the MDT limit is meaningless, and OST files have more than a single block, so this was removed from the Lustre 2.x MDT code.
+
+/*
+ * We need to hack the return value for the free inode counts because
+ * the current EA code requires one filesystem block per inode with EAs,
+ * so it is possible to run out of blocks before we run out of inodes.
+ *
+ * This can be removed when the ext3 EA code is fixed.
+ */
+static int fsfilt_ext3_statfs(struct super_block *sb, struct obd_statfs *osfs)
+{
+        struct kstatfs sfs;
+        int rc;
+
+        memset(&sfs, 0, sizeof(sfs));
+        rc = ll_do_statfs(sb,&sfs);
+
+        if (!rc && sfs.f_bfree return rc;
+}
+
+This was removed in 1.8.7 because it caused more confusion than necessary.  I believe that you must be running an older MDS server version that still has this code, because your free inode count exactly matches the free blocks count.
+
+If MDT inodes are created that do not consume OST objects (e.g. directories, internal log files, files explicitly striped with fewer than the default number of objects) or they do not consume extra MDT data blocks (e.g. most files excluding directories) then the number of free inodes in the filesystem will not decrease, and instead the total number of inodes will appear to increase.  This was done because typically users of "df" or statfs() care about the free and used space and not the total space.
+
+See the comment in ll_statfs_internal():
+
+        /* If we don't have as many objects free on the OST as inodes
+         * on the MDS, we reduce the total number of inodes to
+         * compensate, so that the "inodes in use" number is correct.
+         */
+        if (obd_osfs.os_ffree os_ffree) {
+                osfs->os_files = (osfs->os_files - osfs->os_ffree) +
+                        obd_osfs.os_ffree;
+                osfs->os_ffree = obd_osfs.os_ffree;
+        }
+
+If more OSTs are added, or if the default stripe count is reduced (if not 1) then the number of files that can be created in the filesystem will appear to increase.  It is usually desirable for the MDT to be over-provisioned with inodes so that it will not run out before the OSTs run out of space.
+
+--- Comment (kitwestneat, Tue, 24 Sep 2013 15:54:00 +0000) ---
+Yes, bytes per inode was changed and then the contents of the old MDT was copied to the new MDT. Is the inode count stored somewhere on the MDT?
+
+--- Comment (yujian, Tue, 24 Sep 2013 15:48:40 +0000) ---
+I just did an experiment on Lustre 1.8.7-wc1 and got the following results:
+
+Format the filesystem with "-i 2048" by default for MDT:
+
+[root@fat-amd-2 ~]# mkfs.lustre --mgs --mdt --fsname=lustre --device-size=240000000 --reformat /dev/sdc5
+...
+mkfs_cmd = mke2fs -j -b 4096 -L lustre-MDTffff  -J size=400 -I 512 -i 2048 -q -O uninit_bg,dir_nlink,huge_file,flex_bg -E lazy_journal_init -F /dev/sdc5 60000000
+Writing CONFIGS/mountdata
+
+[root@fat-amd-2 ~]# mkfs.lustre --ost --fsname=lustre --mgsnode=fat-amd-2@tcp --device-size=240000000 --reformat /dev/sdc6
+...
+mkfs_cmd = mke2fs -j -b 4096 -L lustre-OSTffff  -J size=400 -I 256 -i 69905 -q -O extents,uninit_bg,dir_nlink,huge_file,flex_bg -G 256 -E resize=4290772992,lazy_journal_init -F /dev/sdc6 60000000
+Writing CONFIGS/mountdata
+
+[root@fat-amd-2 ~]# mkdir -p /mnt/mds; mount -t lustre -o user_xattr /dev/sdc5 /mnt/mds
+[root@fat-amd-2 ~]# mkdir -p /mnt/ost1; mount -t lustre /dev/sdc6 /mnt/ost1
+[root@fat-amd-2 ~]# mount -t lustre -o user_xattr,flock fat-amd-2@tcp:/lustre /mnt/lustre
+
+[root@fat-amd-2 ~]# lfs df /mnt/lustre
+UUID                   1K-blocks        Used   Available Use% Mounted on
+lustre-MDT0000_UUID    179966864      483840   167483384   0% /mnt/lustre[MDT:0]
+lustre-OST0000_UUID    239105024      470300   226634660   0% /mnt/lustre[OST:0]
+
+filesystem summary:    239105024      470300   226634660   0% /mnt/lustre
+
+[root@fat-amd-2 ~]# df /mnt/lustre
+Filesystem           1K-blocks      Used Available Use% Mounted on
+fat-amd-2@tcp:/lustre
+                     239105024    470300 226634660   1% /mnt/lustre
+
+[root@fat-amd-2 ~]# df /mnt/mds
+Filesystem           1K-blocks      Used Available Use% Mounted on
+/dev/sdc5            179966864    483840 167483384   1% /mnt/mds
+
+[root@fat-amd-2 ~]# lfs df -i /mnt/lustre
+UUID                      Inodes       IUsed       IFree IUse% Mounted on
+lustre-MDT0000_UUID    120003328          25   120003303   0% /mnt/lustre[MDT:0]
+lustre-OST0000_UUID      3517440          56     3517384   0% /mnt/lustre[OST:0]
+
+filesystem summary:    120003328          25   120003303   0% /mnt/lustre
+
+[root@fat-amd-2 ~]# df -i /mnt/lustre
+Filesystem            Inodes   IUsed   IFree IUse% Mounted on
+fat-amd-2@tcp:/lustre
+                     3517409      25 3517384    1% /mnt/lustre
+
+[root@fat-amd-2 ~]# df -i /mnt/mds
+Filesystem            Inodes   IUsed   IFree IUse% Mounted on
+/dev/sdc5            120003328      25 120003303    1% /mnt/mds
+
+Unmount and reformat the filesystem with "-i 1024" for MDT:
+
+[root@fat-amd-2 ~]# mkfs.lustre --mgs --mdt --fsname=lustre --mkfsoptions="-i 1024" --device-size=240000000 --reformat /dev/sdc5
+...
+mkfs_cmd = mke2fs -j -b 4096 -L lustre-MDTffff -i 1024 -J size=400 -I 512 -q -O uninit_bg,dir_nlink,huge_file,flex_bg -E lazy_journal_init -F /dev/sdc5 60000000
+Writing CONFIGS/mountdata
+
+[root@fat-amd-2 ~]# mkfs.lustre --ost --fsname=lustre --mgsnode=fat-amd-2@tcp --device-size=240000000 --reformat /dev/sdc6
+...
+mkfs_cmd = mke2fs -j -b 4096 -L lustre-OSTffff  -J size=400 -I 256 -i 69905 -q -O extents,uninit_bg,dir_nlink,huge_file,flex_bg -G 256 -E resize=4290772992,lazy_journal_init -F /dev/sdc6 60000000
+Writing CONFIGS/mountdata
+
+[root@fat-amd-2 ~]# mkdir -p /mnt/mds; mount -t lustre -o user_xattr /dev/sdc5 /mnt/mds
+[root@fat-amd-2 ~]# mkdir -p /mnt/ost1; mount -t lustre /dev/sdc6 /mnt/ost1
+[root@fat-amd-2 ~]# mount -t lustre -o user_xattr,flock fat-amd-2@tcp:/lustre /mnt/lustre
+
+[root@fat-amd-2 ~]# lfs df /mnt/lustre
+UUID                   1K-blocks        Used   Available Use% Mounted on
+lustre-MDT0000_UUID    119901352      487936   107414036   0% /mnt/lustre[MDT:0]
+lustre-OST0000_UUID    239105024      470300   226634660   0% /mnt/lustre[OST:0]
+
+filesystem summary:    239105024      470300   226634660   0% /mnt/lustre
+
+[root@fat-amd-2 ~]# df /mnt/lustre
+Filesystem           1K-blocks      Used Available Use% Mounted on
+fat-amd-2@tcp:/lustre
+                     239105024    470300 226634660   1% /mnt/lustre
+
+[root@fat-amd-2 ~]# df /mnt/mds
+Filesystem           1K-blocks      Used Available Use% Mounted on
+/dev/sdc5            119901352    487936 107414036   1% /mnt/mds
+
+[root@fat-amd-2 ~]# lfs df -i /mnt/lustre
+UUID                      Inodes       IUsed       IFree IUse% Mounted on
+lustre-MDT0000_UUID    240046264          25   240046239   0% /mnt/lustre[MDT:0]
+lustre-OST0000_UUID      3517440          56     3517384   0% /mnt/lustre[OST:0]
+
+filesystem summary:    240046264          25   240046239   0% /mnt/lustre
+
+[root@fat-amd-2 ~]# df -i /mnt/lustre
+Filesystem            Inodes   IUsed   IFree IUse% Mounted on
+fat-amd-2@tcp:/lustre
+                     3517409      25 3517384    1% /mnt/lustre
+
+[root@fat-amd-2 ~]# df -i /mnt/mds
+Filesystem            Inodes   IUsed   IFree IUse% Mounted on
+/dev/sdc5            240046264      25 240046239    1% /mnt/mds
+
+The inode count was increased from 120003328 to 240046264 properly.
+
+--- Comment (yujian, Tue, 24 Sep 2013 13:25:32 +0000) ---
+Hi Kit,
+
+Am I correct that you changed the value of bytes-per-inode from 2048 to 1024 for the MDT?
+
+--- Comment (kitwestneat, Mon, 23 Sep 2013 20:25:20 +0000) ---
+Any updates?
+
+Thanks,
+
+Kit
+
+--- Comment (pjones, Fri, 13 Sep 2013 22:31:47 +0000) ---
+Yu, Jian
+
+Could you please advise on this one?
+
+Thanks
+
+Peter

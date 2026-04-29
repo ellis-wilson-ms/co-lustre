@@ -1,0 +1,153 @@
+Key:        LU-14610
+Summary:    Make mpiFileUtils better support statahead
+Link:       https://jira.whamcloud.com/browse/LU-14610
+Type:       Improvement
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Qian Yingjin
+Reporter:   Qian Yingjin
+Created:    Tue, 13 Apr 2021 07:50:23 +0000
+Updated:    Tue, 18 Mar 2025 06:12:59 +0000
+Labels:     performance, usability
+Links:      Related: is related to LU-17814
+
+--- Description ---
+mpiFileUtils utilizes open source MPI-based library libcircle, an API for distributing embarrassingly parallel workloads using self-stabilization, to implement distributed scalable tree walking. libcircle is an API to provide an efficient distributed queue on a cluster. Libcircle is currently used in production to quickly traverse and perform operations on a file tree which contains several hundred-million file nodes. Each MPI rank (process) maintains its queue of work items and is able to exchange work items with random process without a central coordinator. To keep the process balanced, libcircle makes work requests to random nodes when work is needed. If the node requested has work in its queue it will randomly split that queue with the requestor.
+
+Conceptually, the workload distribution in mpiFileUtils can be described with two queues. One queue is a global queue that spans all nodes in the distributed system. The other queue is a queue which is local to each process (MPI rank).
+
+The libcircle API defines a function to produce a work item initially and a function to process a work item. The libcircle work item is an array of characters describing the job to be performed. mpiFileUtils warps libCircle, and functionality that is common to multiple tools is moved to the common library, libmfu. The key data structure in libmfu is a distributed file queue. This structure represents a list of files, each with stat-like metadata, that is distributed among a set of MPI ranks. Each MPI rank "owns" a portion of the queue, and there are routines to step through the entries owned by that process. This portion is referred to as the "local" queue. Functions exist to get and set properties of the items in the local list, for example to get the path name, type, and size of a file. Functions dealing with the local list can be called by the MPI process independently of other MPI processes. Other functions operate on the global list in a collective fashion, such as deleting all items in a file list. All processes in the MPI job must invoke these functions simultaneously.
+
+In the following, it will take dwalk as an example to demonstrate how mpiFileUtils works for distributed tree walking.
+
+ 
+
+Walk_stat_process(CIRCLE Queue){ 
+    path = Queue.dequeue(); 
+    stat(path);
+    record stat() result for final summary via MPI reduce.
+    if path is a directory
+        dir = opendir(path); 
+        while dent = readdir(dir) != NULL do
+            Queue.enqueue(path + '/' + dent.name);
+        end while closedir(dir);
+   fi
+} 
+
+ 
+
+When walking a tree by using dwalk, the function to produce the initial work item takes the input parameters (a directory) passed in by the user and enqueues a string describing the directory. The function to process a work item will dequeue to get the full path name for a file, do stat call on it. If the current work item is a directory, walks a single level within its directory, and each dentry under this directory will be added into the global libcircle work queue to be processed independently.
+
+LibCircle can automatically and dynamically balance the treewalk workload across many nodes in a large distributed system. Obviously, the minimal work set for the current parallel tree walking with stat in dwalk is a single file. This may result in that the files within a same directory may be randomly distributed among different MPI ranks (different processes or nodes) and broken the sequential stat() in readdir() order.
+
+We improve the mpiFileUtils to make the minimal splitable work set is a directory. Within a directory, it uses FLAT statahead algorithm to accelerate the speed of tree walking with stat(). The pseudo code for the algorithm is described as follows:
+
+ 
+
+Walk_Flat_stat_process(CIRCLE Queue) {
+    path = Queue.dequeue();
+    dir = opendir(path);
+    while dent = readdir(dir) != NULL; do 
+        fullpath = path + "/" + dent.name; 
+        localQueue.enqueue(fullpath);
+        if dent is a directory; do
+            Queue.enqueue(fullpath);
+        fi
+    end while
+    while |localQueue| > 0 do
+       path = localQueue.dequeue() stat(path);
+       record stat() result for final summary via MPI reduce.
+    end while
+    closedir(dir);
+}
+
+The function to process a work item first dequeues to get the directory full path, and then it iterate over a single level within this directory. All children files will be added to the local producer queue of this MPI rank; while each of the sbudirectories are added to the libcircle work queue to be processed distributedly.
+
+Although the workload of sequential traversal against a directory serially, which follows readdir() plus stat() access pattern, can be optimized by using our statahead algorithm, but it will become time-consuming also when the directory is extreme larger. A trace-off strategy is propose to balance parallelization and statahead speedup. A tunning parameter named 'stmax' is defined. when the number of sub files under the directory is lower than pmax, use the algorithm above to do tree walking; while when it is larger than stmax, the stmax entry in local queue will do stat() call sequentially by using FLAT statahead algorithm; while the latter entry will add into the global queue to do stat() call distributely. 'stmax' can be set by the input parameter for dwalk. The default value is 5000. The pseudo code for the algorithm is described as follows:
+
+```
+
+struct Elem {
+    bool localQueued;
+    int type;
+    char path[];  
+}
+ElemEnqueue(Queue, type, localQueued, fullpath){
+    elem = new Elem();
+    elem.localQueued = localQueued;
+    elem.type = type;
+    elem.path = fullpath;
+    Queue.enqueue(elem)；
+}
+Walk_Xfast_stat_process(CIRCLE Queue)
+ elem = Qeueu.deqeueu();
+ if (elem.localQueued == flase){
+    stat(elem.path);
+    record stat() result for final summary via MPI reduce. 
+ }
+if (elem.type == DT_DIR) {
+ dir = opendir(elem.path);
+ count = 0;
+ while dent = readdir(dir) != NULL; do
+     fullpath = path + "/" + dent.name;
+     if (count if (dent.type == DT_DIR)
+          ElemEnqueue(Queue, dent.type, true, fullpath); }
+    } else {
+       ElemEnqueue(Queue, dent.type, false, fullpath); }
+    }
+  end while
+  }
+  while |localQueue| > 0 do
+      path = localQueue.dequeue()
+     stat(path);
+     record stat() result for final summary via MPI reduce. 
+  end while
+ closedir(dir);
+}
+
+ ```
+
+--- Comment (qian_wc, Fri, 16 Apr 2021 08:44:00 +0000) ---
+Yingjin Qian (qian@ddn.com) uploaded a new patch: https://review.whamcloud.com/43170
+
+Subject: LU-14380 statahead: divide hash space evenly among the ranks
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: f113be1941c5b18b65e94d5c364b9d69e49151c3
+
+--- Comment (adilger, Tue, 13 Apr 2021 15:31:26 +0000) ---
+In the same way that statahead currently detects if the process is not doing hash-order stats, it could detect that the process did a readdir() call and then stat() entries in that order. It could detect this on a per-readdir basis instead of only at the start of the directory?
+
+--- Comment (qian_wc, Tue, 13 Apr 2021 14:30:07 +0000) ---
+Then, how to detect that applications such as mpiFileUtils and pFind is doing readdir() + stat() in the hash order that starts in the middle of the directory and when to terminate it?
+
+--- Comment (adilger, Tue, 13 Apr 2021 14:13:05 +0000) ---
+I think we wouldn't need a new ladvise for this, since hash order is readdir() order. The main issue is that statahead only starts at the beginning of the directory, it doesn't start statahead for hash-order operations that start in the middle of the directory.
+
+--- Comment (qian_wc, Tue, 13 Apr 2021 08:34:56 +0000) ---
+Agreed,
+
+That's another stat-ahead strategy I considered to implement for mpiFileUtils or pFind: Add a new Lustre ladvise() for an opened dir file handle with hash space [start, end) as a hint to indicate the kernel to launch a statahead thread to do readdir() + stat() in the position range [start, end);
+
+The usage in mpiFileUtils may be as follows:
+
+dir=opendir(path);
+llapi_lfadivse(dirfd, STATAHEAD_HAHS_RNAGE, start, end);
+seekdir(dirfd, start);
+while dent = reader(dir) do;
+   stat(dent.name);
+   if (telldir(dirfd) >= end)
+       break;
+end while
+closedir(dir);
+
+--- Comment (adilger, Tue, 13 Apr 2021 08:22:27 +0000) ---
+It should be noted that it is possible to segment a large directory in Lustre for parallel processing by dividing the hash space [0-2^63) evenly among the ranks. For example, if there are 8 ranks waking a single directory, the maximum hash value 2^63/8 = 2^60 for each rank. That means rank 0 would read until directory cookie 2^60-1, rank 1 would seek to 2^60 and read until 2^61-1, etc.  See for example the pfind code in https://github.com/VI4IO/pfind.git that is leveraging this ability. 
+
+Since the hash cookie is not returned as part of readdir(), and callling telldir() for every file isn't very efficient, one approach would be for rank n+1 to seek to the start of its range, readdir() once to get the first entry, then pass this entry name back to rank n as the "end" marker of its readdir() processing.

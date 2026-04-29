@@ -1,0 +1,84 @@
+Key:        LU-3442
+Summary:    MDS performance degraded by reading of ZFS spacemaps
+Link:       https://jira.whamcloud.com/browse/LU-3442
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Won't Fix
+Assignee:   Niu Yawei
+Reporter:   Ned Bass
+Created:    Thu, 6 Jun 2013 18:56:35 +0000
+Updated:    Wed, 26 Apr 2017 23:55:37 +0000
+Resolved:   Wed, 26 Apr 2017 23:55:37 +0000
+Labels:     performance, zfs
+Links:      Related: is related to  LU-3443
+
+--- Environment ---
+server: lustre-2.4.0-RC2_2chaos_2.6.32_358.6.1.3chaos.ch5.1.ch5.1.x86_64
+
+clients: mix of PPC/Lustre 2.4 and x86_64/Lustre 2.1
+
+--- Description ---
+We started to experience degraded performance on our MDS with a ZFS backend.  Certain RPCs were taking many seconds or even minutes to service.  Users would accordingly see very slow interactive responsiveness. On investigation, this turned out to be due to ZFS transaction groups taking very long to sync, blocking request handlers that needed to write out an llog record.  This in turn was due to zio processing threads waiting in space_map_load_wait():
+
+[] cv_wait_common+0xed/0x100 [spl]                              
+[] __cv_wait+0x15/0x20 [spl]                                    
+[] space_map_load_wait+0x2f/0x40 [zfs]                          
+[] metaslab_activate+0x77/0x160 [zfs]                           
+[] metaslab_alloc+0x4fe/0x950 [zfs]                             
+[] zio_dva_allocate+0xaa/0x350 [zfs]                            
+[] zio_ready+0x3c0/0x460 [zfs]                                  
+[] zio_ready+0x3c0/0x460 [zfs]                                  
+[] zio_execute+0xb3/0x130 [zfs]                                 
+[] taskq_thread+0x1e7/0x3f0 [spl]                               
+[] kthread+0x96/0xa0                                            
+[] child_rip+0xa/0x20                                           
+[] 0xffffffffffffffff          
+
+We are able to mitigate this problem by setting the zfs module option metaslab_debug=1, which forces all spacemaps to stay resident in memory.  However, this solution is a bit heavy-handed, and we'd like to gain a better understanding of why we're reading spacemaps from disk so often, and what should be done about it.
+
+Our first thought was that pool fragmentation was the underlying cause, causing the block allocator to search all spacemaps to find a suitable interval.  Our thinking was that llog cancellation promotes fragmentation by punching holes in otherwise contiguously allocated regions.  But I'm not sure this theory is consistent with how llogs actually work, or with how the ZFS allocator works for that matter.
+
+Another idea is that a concurrent write and unlink workload could cause this behaviour, but it's all just speculation until we better understand the workload and how ZFS manages spacemaps.
+
+The most appealing approach we've discussed so far is to modify ZFS to use the ARC to cache spacemap objects.  I believe ZFS currently only keeps one spacemap (per vdev?) active in memory at a time, and it bypasses the ARC for these objects.  Using the ARC would keep the hot spacemaps in memory, but allow them to get pitched under memory pressure.
+
+So, I'm not sure there's a Lustre bug here, but it's an issue to be aware of when using ZFS backends.
+
+--- Comment (adilger, Wed, 26 Apr 2017 23:55:37 +0000) ---
+This is really a ZFS problem.
+
+--- Comment (pjones, Fri, 7 Jun 2013 14:19:14 +0000) ---
+Niu
+
+Do you have anything to add here?
+
+Peter
+
+--- Comment (nedbass, Thu, 6 Jun 2013 23:04:06 +0000) ---
+Opened LU-3443 to document a client-side performance issue precipitated by this issue.
+
+--- Comment (nedbass, Thu, 6 Jun 2013 21:00:22 +0000) ---
+Alex, another factor to consider is we are using Robinhood with this filesystem.  So many changelogs are continually being created and canceled.  Incidentally, I believe this issue is probably why we had so many blocked service threads in LU-3379.
+
+Andreas,
+
+it doesn't make sense that individual RPCs would take minutes to service unless they are backed up behind a large number of other RPCs that each need to do many bitmap reads from disk.
+
+In severe cases I was seeing txg's take upwards of 60s to sync (this can be monitored in /proc/spl/kstat/zfs/txgs-poolname).  In that case the currently open txg reaches its max write limit, so an RPC handler would block in txg_wait_open().  So in effect the RPC handler may wait 60s for a new txg to open, then another 60s while its txg sits in the open state, and another 60s for its txg to sync.  And it may be that a request has to wait several iterations just to get into an open txg due to the write limit, depending on how backed up things are.  We've seen cases of Lustre service threads blocking in the neighborhood of ten seconds minutes, so this could explain why.  As to why we're reading so many spacemaps from disk, that's what I would like to understand better.
+
+could you also try testing with lctl set_param ofd.*.read_cache_enable=0 on all the OSS nodes
+
+Note this issue is about MDS performance.  We may very well be having similar issues on the OSS nodes, but I haven't investigated that yet.  Is that tunable setting obsolete for Lustre 2.4?  I can't find it under proc on our 2.4/zfs-osd servers.
+
+--- Comment (adilger, Thu, 6 Jun 2013 19:47:30 +0000) ---
+This doesn't sound wholly different than similar problems seen on ldiskfs due to bitmap loading.  Definitely it makes the most sense to aggressively keep the bitmaps in cache if possible.  Unfortunately, the L2ARC won't help since the bitmaps are only useful when they need to be written.
+
+I've thought for a long time that it would be useful to have a SPA policy for writing metadata like this or the metadnode on an SSD/NVRAM device (e.g. shared with ZIL), but that introduces reliability issues if this device fails then the whole pool is unusable unless everything written there is mirrored.  Possibly that would still be be achievable that a bitmap copy is always written to the SSD device for low-latency reads, but a "write-only" copy is also sent to the VDEV in case the SSD fails.
+
+That said, it doesn't make sense that individual RPCs would take minutes to service unless they are backed up behind a large number of other RPCs that each need to do many bitmap reads from disk.  If you have a chance, could you also try testing with lctl set_param ofd.*.read_cache_enable=0 on all the OSS nodes (instead of metaslab_debug=1) to see if this has the same effect?  I'm wondering if there is any benefit to having read cache enabled at the OFD/pagecache level if there will be duplicate caching at the ARC/L2ARC?
+
+--- Comment (bzzz, Thu, 6 Jun 2013 19:03:22 +0000) ---
+llog for unlinks has two levels: a catalogs referencing "plain" llogs containing actual records. when actual record is cancelled, then only bitmap in the header of plain llog is updated. once all the records in a plain llog is cancelled, then it's removed as a whole and corresponding record in the catalog is cancelled (which is bitmap update again). IOW, it doesn't punch to cancel, but it does update 8K header containing a bitmap again and again.
+
+thanks for the report.

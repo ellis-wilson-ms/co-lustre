@@ -1,0 +1,204 @@
+Key:        LU-12739
+Summary:    Race with discovery thread completion and message queueing
+Link:       https://jira.whamcloud.com/browse/LU-12739
+Type:       Bug
+Priority:   Critical
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Chris Horn
+Reporter:   Chris Horn
+Created:    Mon, 9 Sep 2019 21:54:31 +0000
+Updated:    Tue, 20 Sep 2022 12:19:26 +0000
+Resolved:   Sat, 28 Sep 2019 03:43:16 +0000
+Labels:     patch
+Links:      Duplicate: is duplicated by LU-15234
+
+--- Description ---
+I noticed a message that was queued for discovery, and on the peer's queue, but the peer had already completed discovery.
+
+Here we see the send is queued because of discovery (this is the meaning of "rc 2"):
+
+00000001:40000000:8.0:1567808737.644190:0:14279:0:(dvsipc_lnet.c:1280:lnet_tx_request()) LNetPut src 476@gni99 to 12345-106@gni99 mdh ffffc90008a93ce8(1741073) ptl 63 mb 2, ud 18446612201357105176
+00000400:40000000:8.0:1567808737.644193:0:14279:0:(lib-move.c:4779:LNetPut()) LNetPut msg ffff881009f58000 md ffff88101ecb3880 mdh 1741073 -> 12345-106@gni99
+00000400:40000000:8.0:1567808737.644196:0:14279:0:(lib-lnet.h:101:lnet_list_add_tail()) Adding msg ffff881009f58000(ffff881009f58010) to tail of list ffff881011830320
+00000400:40000000:8.0:1567808737.644197:0:14279:0:(lib-move.c:2776:lnet_send()) msg ffff881009f58000 rc 2
+
+From the debug output above we can see the list that the message was added to. This lets us easily find the lnet_peer object, and we can confirm both that the message is still on this peer's lp_dc_pendq at the time of the dump and that lp_state shows discovery has already completed.
+
+crash_x86_64> struct -o lnet_peer | grep lp_dc_pendq
+   [32] struct list_head lp_dc_pendq;
+crash_x86_64> eval ffff881011830320 - 32
+hexadecimal: ffff881011830300
+    decimal: 18446612201327493888  (-131872382057728)
+      octal: 1777774201002140601400
+     binary: 1111111111111111100010000001000000010001100000110000001100000000
+crash_x86_64> lnet_peer ffff881011830300 | grep lp_primary_nid
+  lp_primary_nid = 3659599899000938,
+crash_x86_64> epython nid2str 3659599899000938
+106@gni99
+crash_x86_64> struct -o lnet_peer ffff881011830300 | grep lp_dc_pendq
+  [ffff881011830320] struct list_head lp_dc_pendq;
+crash_x86_64> list -H ffff881011830320
+ffff881009f58010
+crash_x86_64> lnet_peer ffff881011830300 | grep lp_state
+  lp_state = 273,
+crash_x86_64>
+
+*hornc@cflosbld09 190904221344 $ lpst2str.sh 273
+LNET_PEER_MULTI_RAIL
+LNET_PEER_DISCOVERED
+LNET_PEER_NIDS_UPTODATE
+*hornc@cflosbld09 190904221344 $
+
+Thus, we may have a race condition whereby we queue a message because discovery is in progress  (or we determine we need to start discovery on the destination peer), but discovery can complete by the time we actually add the message to the peer's queue. In this situation the message will sit on the queue until discovery is performed on that peer again. But that won't ever happen unless discovery is forced from user space, or there is some sort of configuration change.
+
+i.e. the message would potentially be stranded forever
+
+In Lustre 2.13, the relevant code path here is:
+
+LNetPut/LNetGet->lnet_send->lnet_select_pathway->lnet_initiate_peer_discovery
+
+Here's an excerpt from lnet_initiate_peer_discovery():
+
+        if (!lnet_msg_discovery(msg) || lnet_peer_is_uptodate(peer)) {
+                lnet_peer_ni_decref_locked(lpni);
+                return 0;
+        }
+
+        rc = lnet_discover_peer_locked(lpni, cpt, false);
+        if (rc) {
+                lnet_peer_ni_decref_locked(lpni);
+                return rc;
+        }
+        /* The peer may have changed. */
+        peer = lpni->lpni_peer_net->lpn_peer;
+        /* queue message and return */
+        msg->msg_rtr_nid_param = rtr_nid;
+        msg->msg_sending = 0;
+        msg->msg_txpeer = NULL;
+        spin_lock(&peer->lp_lock);
+        list_add_tail(&msg->msg_list, &peer->lp_dc_pendq);
+
+In lnet_peer_is_uptodate() we take lp->lp_lock and check lp_state to determine if the peer is "up to date" i.e. whether discovery needs to be performed on this peer. (lp_lock is released after we check this).
+
+Since the message is queued we know that this function returns false, and we continue on to the lnet_discover_peer_locked() function. From the code we can see that we expect that if lnet_discover_peer_locked() returns 0 then we need to add the message to the peer's lp_dc_pendq with the expectation that this message will later be sent by the discovery thread when discovery on this peer has completed. However, discovery on this peer could already be in progress.
+
+Looking at our synchronization mechanisms there are a lot of things at play.
+
+1. lnet_select_pathway() takes the net lock for the current cpt:
+
+cpt = lnet_net_lock_current();
+
+This net lock is held when lnet_initiate_peer_discovery() is called, and the cpt number is passed as an argument to that function.
+
+2. lnet_discovery_peer_locked() is also passed the cpt number, and it:
+
+2.a drops the net lock being held
+
+2.b acquires the net lock in exclusive mode (i.e. acquires the net locks for all cpts)
+
+2.c if necessary, adds the peer to the discovery queue under the exclusive net lock
+
+2.d releases the exclusive net lock
+
+2.e reacquires the net lock dropped in 2.a
+
+2.g returns
+
+3. The peer discovery thread:
+
+3.a Holds the net lock in exclusive mode when manipulating its work queues
+
+3.b Holds the lp_lock while manipulating the peer's lp_state.
+
+4. The lp_lock is taken by lnet_initiate_peer_discovery() when the message is added to the peer's lp_dc_pendq.
+
+5. The discovery event handler takes the lp_lock when it updates the lp_state based on the event information.
+
+Given all of the above I believe there are ample opportunities for the race scenario described above. I find it difficult to articulate a particular code path where this happens, but it is very easy to prove the theory correct.
+
+diff --git a/lnet/include/lnet/lib-types.h b/lnet/include/lnet/lib-types.h
+index e0e82b504d..238be3d368 100644
+--- a/lnet/include/lnet/lib-types.h
++++ b/lnet/include/lnet/lib-types.h
+@@ -152,6 +152,7 @@ struct lnet_msg {
+ 	unsigned int          msg_peerrtrcredit:1; /* taken a peer router credit */
+ 	unsigned int          msg_onactivelist:1; /* on the activelist */
+ 	unsigned int	      msg_rdma_get:1;
++	unsigned 	      msg_lp_state;
+
+ 	struct lnet_peer_ni  *msg_txpeer;         /* peer I'm sending to */
+ 	struct lnet_peer_ni  *msg_rxpeer;         /* peer I received from */
+diff --git a/lnet/lnet/lib-move.c b/lnet/lnet/lib-move.c
+index 15244d40ee..1ab595df83 100644
+--- a/lnet/lnet/lib-move.c
++++ b/lnet/lnet/lib-move.c
+@@ -2014,6 +2014,7 @@ lnet_initiate_peer_discovery(struct lnet_peer_ni *lpni,
+ 	msg->msg_sending = 0;
+ 	msg->msg_txpeer = NULL;
+ 	spin_lock(&peer->lp_lock);
++	msg->msg_lp_state = peer->lp_state;
+ 	list_add_tail(&msg->msg_list, &peer->lp_dc_pendq);
+ 	spin_unlock(&peer->lp_lock);
+ 	lnet_peer_ni_decref_locked(lpni);
+
+The above patch records the lp_state in the lnet_msg object under the lp_lock when the message is added to the peer's lp_dc_pendq. I reproduced this issue using the above patch and lo:
+
+crash_x86_64> lnet_msg ffff88100bf89000 | grep state
+  msg_lp_state = 273,
+crash_x86_64>
+
+--- Comment (gerrit, Tue, 20 Sep 2022 03:35:02 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/48190/
+
+Subject: LU-12739 lnet: Don't queue msg when discovery has completed
+
+Project: fs/lustre-release
+
+Branch: b2_12
+
+Current Patch Set: 
+
+Commit: 96c2b0d395ae9bd795277ae3a2607054bd9b65e6
+
+--- Comment (gerrit, Wed, 10 Aug 2022 22:06:20 +0000) ---
+"Serguei Smirnov " uploaded a new patch: https://review.whamcloud.com/48190
+
+Subject: LU-12739 lnet: Don't queue msg when discovery has completed
+
+Project: fs/lustre-release
+
+Branch: b2_12
+
+Current Patch Set: 1
+
+Commit: 094442c95f12c55a4b62c72b35f9d23b261d5ad7
+
+--- Comment (pjones, Sat, 28 Sep 2019 03:43:16 +0000) ---
+Landed for 2.13
+
+--- Comment (gerrit, Fri, 27 Sep 2019 23:12:26 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/36139/
+
+Subject: LU-12739 lnet: Don't queue msg when discovery has completed
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 4ef62976448d6821df9aab3e720fd8d9d0bdefce
+
+--- Comment (gerrit, Mon, 9 Sep 2019 21:58:03 +0000) ---
+Chris Horn (hornc@cray.com) uploaded a new patch: https://review.whamcloud.com/36139
+
+Subject: LU-12739 lnet: Don't queue msg when discovery has completed
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 61300a6cc4d682be093c465041c0bcc731f7a1f2

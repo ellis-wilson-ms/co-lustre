@@ -1,0 +1,68 @@
+Title:        Policy Engine Proposal
+URL:          https://wiki.lustre.org/Policy_Engine_Proposal
+Page ID:      1280
+Last Updated: 2018-02-06T04:12:30Z
+Last Editor:  Jxiong
+
+--- Content ---
+Introduction
+Policy engine was originally introduced to Lustre in the HSM project, where it is used to produce a series of archive and release requests by predefined or on-demand policies. Policies in HSM are a set of rules to filter files in the Lustre file system, and the output of policies is a series of jobs that will be executed by Lustre. For example, a typical policy would be "archive all files that haven't been modified in last 10days", then the execution of this policy will result in a bunch of archive requests sending to the MDT, and remembered in MDT's llog, and then eventually those jobs will distributed to agent clients and executed by them.
+The HSM policy engine has been working well for some workloads, but it has some limitations also. Firstly, it often uses an external database to replicate Lustre metadata namespace. This raises concerns of consistency between the database and Lustre file system. Also it causes performance problem when the file system becomes large. In that case, finding and filtering files wouldn't be faster than running 'lfs find' in Lustre directly. The other problem with the current HSM coordinator is that jobs are recorded and tracked internally by Lustre in the MDT's llog once created. This adds the system complexity and increases the processing overhead for HSM requests. Jobs for archive or release requests don't have to be tracked by Lustre, and should be tracked by policy engine itself and distributed directly to agent nodes.
+Due to those known problems and the new requirements of workloads in Lustre, there are some attempt to improve existing policy engine, or even create new ones. Like DDN's LiPE, it tries to discard the necessity of metadata replication and scan MDTs from disk level. Cray's been working on parallel data mover, which provides a high performance data moving framework from and to secondary storage. Intel also has new requirements to enhance policy engine after the first phase of FLR is landed to 2.11, which has become a cornerstone where a lot cool feature can be built upon. There also exist many other work around.
+It's impossible to merge all of the work mentioned above into upstream, because some work are trying to solve the exactly same problem. This proposal is intended to understand the requirements of policy engine better and combine the effort from different vendors in Lustre community, therefore Lustre would have a flexible framework of policy engine and different vendors may just have different plugins to match their need.
+Requirements
+This section will summarize the requirements from existing Lustre features and features in development. This section can be expanded if new vendors are joined the effort so that their requirements can be documented and considered in the design.
+Framework
+The framework of policy engine should parse the policies rules as inputs. The rules could be either from configure file or from user's on-demand request, and produce a series of job requests as output. Policy engine should keep track of these requests until they are completed. The framework also should restart and redistribute requests when a soft error is met in the execution. It's expected to support plugins so that it will be used in different scenarios.
+OST Retirement
+This has been a longstanding problem for Lustre. When an OST is to be retired, the data on that OST should be migrated to new OSTs, often administrators need to scan the whole filesystem and list the files that are impacted, i.e, the files that have at least one stripe on that OST.
+Policy engine should be able to handle this kind of request and produce jobs to help migrate data.
+HSM
+The existing policy engine in HSM is known as RobinHood. Ideally the HSM should be able to scan the Lustre file system and produce a list of files by recent access information. Unfortunately this is not possible because RobinHood only synchronizes with Lustre by reading the changlog, which only provides the changes that have made in Lustre. Currently RobinHood can only provide to filter files by 'static' file information like size, mtime, owner, etc. RobinHood can access those information very fast by building corresponding index in database. For any operations without index existing in database, RobinHood wouldn't be faster than scanning the file system directly.
+All in all, the requirement from HSM, in terms of policy engine, is able to get a list of files as the candidates of archive and release so that more space can be freed up in primary Lustre file system.
+Burst Buffer
+FLR based burst buffer is to provide a solution to HPC users, where the intermediate results of scientific computation need to be written out to stable storage at periodic checkpoint time. The write-out time should be as short as possible. Lustre file system will provide two or more tiers of OST storage for this purpose. The first layer may be composed of OSTs with SSD, a.k.a. burst buffer OSTs which provide high IOPS and bandwidth. The second layer could be regular HDD OSTs, which provide large capacity. At checkpoint time, the data should be written to burst buffer OSTs first so it can be completed quickly, and then mirrored and/or migrated to the slower tier(s) as time and space require.
+It's important to maintain reasonable amount of available space on the burst buffer OSTs, so that it will have enough space to accommodate the size of at least one checkpoint. Policy engine for burst buffer will take important role on this. I will cover it by using different use cases.
+Maintain Available Space
+Users should configure how much available space will be maintained on burst buffer OSTs. The size should be determined by the size of at least one checkpoint's data, often estimated at 1/3 to 1/2 of the total system RAM. It will be different from site by site, by the factor of the amount of computing nodes in the cluster. Policy engine will work with Lustre features to move data out of burst buffer OSTs to maintain the preset available space.
+Initially the checkpoint files should be created on burst buffer OSTs. Policy engine will monitor the ChangeLog of MDTs, and when the checkpoint files are closed, it will launch new jobs to replicate data to secondary OSTs. From the technology side, it will create new replicas on secondary OSTs and start a file resync. It isn't necessary to destroy the replica on burst buffer OSTs right away as long as it maintains the preset available space.  This allows these checkpoint files to remain on the burst buffer OSTs for fast re-use in case of system restart, but allows space to be released quickly if needed.
+When the available space on burst buffer OSTs is less than the preset amount, policy engine should consult the MDT for the list of files that currently reside on burst buffer OSTs. For those candidate files, policy engine will destroy the replicas on the burst buffer OST until the preset available space is met. At that time, the checkpoint files should have only replicas on secondary OSTs.
+Prestage Files
+This is the use case when HPC programs need to start or restart jobs. In this case, users would like the job input or checkpoint files to be on burst buffer OSTs to accelerate job launching speed. An on-demand request will be sent to policy engine to make this happen. Usually the latest copy of checkpoint data is already on the burst buffer OSTs as I mentioned in the above section. In case the requested checkpoint files are not on burst buffer OSTs, policy engine should create a replica on burst OSTs for each file, and do file resync correspondingly.
+The input of policy engine for burst buffer is to get a list of files on specific OSTs, the output is a series of jobs to move data from or to those OSTs.
+Erasure Coded Striping
+Erasure coded striping is not a derived work from FLR, instead it will use some fundamental technologies developed in the FLR project to provide a RAID4 like redundancy to Lustre files. Erasure coded has a special type of component in the layout, which stores the erasure code of regular RAID0 stripes. There could be multiple stripes in an erasure coded file's layout, with each store different type of erasure code, to be able to tolerate lost of multiple regular stripes, or OSTs.
+Before writing to erasure coded file in the first time, the client will send a write intent RPC to the MDT, and the MDT will mark the erasure code component as stale. After this is done, the client can manipulate the file as if it has a regular RAID0 layout. Policy engine will be notified that the corresponding files have been written by reading changelog. After the file is finally closed,  it will launch a job to (re-)compute the erasure code(s) and stored them into erasure component.
+The policy engine for this use case is relatively simple. It only needs to record the list of erasure coded files that need handling.
+File Level Redundancy
+Similar to erasure coded striping, FLR needs to get a list of files being written recently so that policy engine can launch a series of jobs to resync them.
+Lustre Modules
+As we can see from the above sections, policy engine depends on how much information it can get from Lustre file system as input. This section will describe the enhancement proposed to make into Lustre so that policy engine can work better. The improvement will focus on both input and output side.  See also File-Level Replication Solution Architecture for more details.
+MDT Object Inventory (MOI)
+The purpose of MOI is to add a mechanism to Lustre so that it will be easier to list the files that have stripes on a specific OST.  Use cases like 'OST Retirement', 'Burst Buffer', and future tiered storage will heavily rely on this feature.
+On the MDT, it will maintain an OI file with tuple <MDT FID, OST FID> for each OST. On file creation, it will insert this tuple into the OI files of the OSTs where objects are allocated. This will add a small overhead on file creation. On the file removal, the corresponding entries will be removed from OI files.
+MOI will also provide an iteration interface to user space program. Policy engine will be the major consumer of this interface.
+Server Local Client (SLC)
+Server local client improves policy engine on the output. Usually the jobs of policy agents are about moving data. SLC is proposed to improve the data movement to avoid data transfer over network, and more efficient data transfer within the IO stack. SLC is a locally mounted client on Lustre servers. It's a fully functional client but the Lustre protocol has been optimized when it connects to local targets. Especially the recovery is disabled on local imports because recovery would always time out when the local server fails, as the local client will also fail at the same time. Also, the SLC I/O stack will be optimized to reduce the cost of Lustre protocol on PtlRPC and LNet. The final goal would be to let OSCs to talk to local OSTs directly, maybe with an adapter layer in between.
+
+800x287px
+
+Policy engine should parse the layout of the file to be worked on, and split and schedule the jobs to corresponding server nodes. The principle of job split is to make sure at least one side of data movement (normally read) is on the local target.
+Better ChangeLog
+There are some known issues about the current implementation of llog, which ChangeLog is built upon. The known issues are:
+Writing scalability by multiple threads
+Can only be scanned from the first index
+Log reclamation problem
+Probably there are even more, feel free to add them.
+Better Coordinator
+There are several known issues with the HSM coordinator that could be improved:
+More efficient and scalable action handling
+Move archive, release actions out of the kernel
+More scalable archive identification
+Proposed Solution
+Based on the discussions above, we are proposing a distributed policy engine scheme. The policy engine should be running on server nodes. For HSM, when the secondary storage of HSM is running on tape and in the case the policy engine could also be running on client nodes. There are two roles for policy engine modules: masters and slaves. The masters usually run on MDS servers; and the slaves run on OSS nodes. To improve the reliability, we should run PAXOS algorithm on master nodes to elect a leader. The leader takes the responsibility of reading and parsing policies and respond to the on-demond policy request from users. It will also generate jobs and distribute them to slave nodes for job execution, and keep track of job status and restart jobs if necessary.
+
+800x363px
+
+Conclusion
+New policy engine is good.

@@ -1,0 +1,100 @@
+Key:        LU-7370
+Summary:    improve e2fsck lost+found insert performance
+Link:       https://jira.whamcloud.com/browse/LU-7370
+Type:       Improvement
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   WC Triage
+Reporter:   Andreas Dilger
+Created:    Mon, 2 Nov 2015 15:21:11 +0000
+Updated:    Thu, 11 Jun 2020 09:39:39 +0000
+Resolved:   Thu, 11 Jun 2020 09:39:39 +0000
+Labels:     e2fsck, e2fsprogs
+Links:      Related: is related to LU-8465
+
+--- Description ---
+When there are unattached inodes, e2fsck inserts entries into lost+found after a full linear search of the directory to find a slot for the name.  This means that if there are a lot of unattached inodes due to corruption of the OST object directories, it is a very lengthy O(n^2) operation to reattach all inodes.
+
+It would be much more efficient to keep a cursor pointing to the last leaf block in the directory in which an entry was inserted.  Since e2fsck is not deleting entries from lost+found, and because the entries are always getting longer (due to scanning in increasing inode number order) there is no value to search earlier blocks again.  This would make lost+found insertion O(1) and significantly improve e2fsck performance in this case.
+
+--- Comment (adilger, Thu, 11 Jun 2020 09:39:39 +0000) ---
+This will be fixed in upstream e2fsprogs-1.46 by the implementation of htree directory creation in libext2fs:
+
+commit 31fff03fa8af5b581175830cbe75890e9bf630d1
+
+Author:     Jan Kara 
+
+AuthorDate: Thu Feb 13 11:16:00 2020 +0100
+
+    tests: modify f_large_dir test to excercise indexed dir handling
+
+    Modify f_large_dir test to create indexed directory and create entries
+
+    in it. That way the new code in ext2fs_link() for addition of entries
+
+    into indexed directories gets executed including various special cases
+
+    when growing htree.
+
+    Reviewed-by: Andreas Dilger 
+
+    Signed-off-by: Jan Kara 
+
+    Signed-off-by: Theodore Ts'o 
+
+commit 9a4d2dcc8deaa1c28b3a713c2f610be503855946
+
+Author:     Jan Kara 
+
+AuthorDate: Thu Feb 13 11:15:59 2020 +0100
+
+    ext2fs: implement dir entry creation in htree directories
+
+    Implement proper creation of new directory entries in htree directories
+
+    in ext2fs_link(). So far we just cleared EXT2_INDEX_FL and treated
+
+    directory as unindexed however this results in mismatched checksums if
+
+    metadata checksums are in use because checksums are placed in different
+
+    places depending on htree node type.
+
+    Signed-off-by: Jan Kara 
+
+    Signed-off-by: Theodore Ts'o 
+
+[noformat}
+
+--- Comment (adilger, Fri, 6 Nov 2015 01:37:33 +0000) ---
+Further discussion with Ted and Darrick on the ext4 concall led to the conclusion that there should be a new series of interfaces for managing directories:
+
+	ext2fs_dir_open() to open the specified directory ino, passed a flags word for options, that reads the ext2_inode structure and links it into the directory context and returns it as an opaque pointer to the caller
+
+	ext2fs_dir_link() to link the passed filename+inode into the directory, also passed a directory context
+
+	ext2fs_dir_unlink() to unlink the passed filename from the directory, also passed a directory context
+
+	ext2fs_dir_close() to close the passed directory context
+
+The link and unlink operations should write the directory inode for every operation, to ensure consistency with other operations that may be ongoing.
+
+When a filename is linked into the directory, the leaf block iterator will scan from the start of the cursor block number (initially zero), unless it has a smaller dirent size from the previous cursor, in which case it will search leaf blocks from the beginning.  The directory context would contain the cursor (logical block number) where the previous entry was linked, along with the size of the dirent, to handle the case of a long name insertion skipping a lot of blocks with small slots.  If a directory is indexed (htree) the link operation will clear the EXT2_INDEX_FL flag from the directory, since this is only inserting linearly into the directory.
+
+If a file is unlinked it will reset the cursor to that block if it is a lower logical block number and save the dirent size with the cursor. It does not need to clear the INDEX flag in this case.
+
+The old ext2fs_link() and ext2fs_unlink() functions should just become wrappers that call ext2fs_dir_open(), ext2fs_dir_{link,unlink}(), and ext2fs_dir_close().
+
+--- Comment (adilger, Wed, 4 Nov 2015 05:50:30 +0000) ---
+Comment from e2fsprogs developer Darrick Wong:
+
+So I started to look at ext2fs_link-> ext2fs_dir_iterate2-> ext2fs_block_iterate3, to see if there was a way to skip to the last block. There isn't any such thing, currently.
+
+How about this: create a new flags value for ext2fs_link which means "only search the last block".  Weirdly, the flags argument at the moment seems to provide the ftype entry for the directory, nothing more.  So this new flag would have to be filtered out of flags before it gets used as ftype.
+
+Next we create a similar "last block only" flag for dir_iterate2 so that we can convey the append-only intent to the directory iterator, which could take a shortcut in which instead of calling the block iterator, it would instead ext2fs_bmap2() to find the pblk of the last directory block and call the function ext2fs_process_dir_block on that last block.
+
+This isn't /quite/ as efficient as simply storing a cursor, but I don't know of a non-messy way for a client program to stuff state into a libext2 call.
+
+Unfortunately, I don't think this will work directly, since we don't necessarily want to insert into lost+found in the last block, but the most recent block used.  Otherwise, the preallocated blocks in lost+found would never be used as intended and all new entries would be added in the last block and new blocks appended to the directory.

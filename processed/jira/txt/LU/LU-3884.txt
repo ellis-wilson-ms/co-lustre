@@ -1,0 +1,177 @@
+Key:        LU-3884
+Summary:    hsm_release hang at local root finding with quota enabled
+Link:       https://jira.whamcloud.com/browse/LU-3884
+Type:       Technical task
+Priority:   Blocker
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Niu Yawei
+Reporter:   Jinshan Xiong
+Created:    Thu, 5 Sep 2013 06:04:01 +0000
+Updated:    Fri, 20 Sep 2013 21:34:51 +0000
+Resolved:   Fri, 20 Sep 2013 21:34:51 +0000
+Labels:     HSM, MB
+
+--- Description ---
+I did quota test today and found a problem with hsm_release. The test script is as follows:
+
+#!/bin/bash
+
+setup() {
+        ( cd srcs/lustre/lustre/tests; sh llmount.sh )
+
+        lctl set_param mdt.*.hsm_control=enabled
+
+        rm -rf /tmp/arc
+        mkdir /tmp/arc
+        ~/srcs/lustre/lustre/utils/lhsmtool_posix --daemon --hsm-root /tmp/arc /mnt/lustre
+
+        lctl conf_param lustre.quota.ost=u
+        lctl conf_param lustre.quota.mdt=u
+}
+
+LFS=~/srcs/lustre/lustre/utils/lfs
+file=/mnt/lustre/testfile
+
+setup
+
+rm -f $file
+dd if=/dev/zero of=$file bs=1M count=30
+chown tstusr.tstusr $file
+
+set -x
+
+$LFS hsm_archive $file
+while $LFS hsm_state $file |grep -qv archived; do
+        sleep 1
+done
+$LFS hsm_state $file
+
+lctl set_param debug=-1
+lctl set_param debug_mb=500
+lctl dk > /dev/null
+
+count=0
+while :; do
+        lctl mark "############# $count"
+        count=$((count+1))
+
+        $LFS hsm_release $file
+        $LFS hsm_state $file
+
+        $LFS hsm_restore $file
+        $LFS hsm_state $file
+
+        sleep 1
+done
+
+The output on the console before the script hung:
+
++ /Users/jinxiong/srcs/lustre/lustre/utils/lfs hsm_state /mnt/lustre/testfile
++ grep -qv archived
++ /Users/jinxiong/srcs/lustre/lustre/utils/lfs hsm_state /mnt/lustre/testfile
+/mnt/lustre/testfile: (0x00000009) exists archived, archive_id:1
++ lctl set_param debug=-1
+debug=-1
++ lctl set_param debug_mb=500
+debug_mb=500
++ lctl dk
++ count=0
++ :
++ lctl mark '############# 0'
++ count=1
++ /Users/jinxiong/srcs/lustre/lustre/utils/lfs hsm_release /mnt/lustre/testfile
+
+It looks like the mdt thread was hung at finding local root object, for unknown reason, the local root object was being deleted. This sounds impossible but happened:
+
+LNet: Service thread pid 2945 was inactive for 40.00s. The thread might be hung, or it might only be slow and will resume later. Dumping the stack trace for debugging purposes:
+Pid: 2945, comm: mdt_rdpg00_001
+
+Call Trace:
+ [] cfs_waitq_wait+0xe/0x10 [libcfs]
+ [] lu_object_find_at+0xb7/0x360 [obdclass]
+ [] ? default_wake_function+0x0/0x20
+ [] lu_object_find+0x16/0x20 [obdclass]
+ [] mdt_object_find+0x56/0x170 [mdt]
+ [] mdt_mfd_close+0x15ef/0x1b60 [mdt]
+ [] ? libcfs_debug_vmsg2+0xba0/0xbb0 [libcfs]
+ [] mdt_close+0x682/0xac0 [mdt]
+ [] mdt_handle_common+0x52a/0x1470 [mdt]
+ [] mds_readpage_handle+0x15/0x20 [mdt]
+ [] ptlrpc_server_handle_request+0x385/0xc00 [ptlrpc]
+ [] ? cfs_timer_arm+0xe/0x10 [libcfs]
+ [] ? lc_watchdog_touch+0x6f/0x170 [libcfs]
+ [] ? libcfs_debug_msg+0x41/0x50 [libcfs]
+ [] ? __wake_up+0x53/0x70
+ [] ptlrpc_main+0xacd/0x1710 [ptlrpc]
+ [] ? ptlrpc_main+0x0/0x1710 [ptlrpc]
+ [] kthread+0x96/0xa0
+ [] child_rip+0xa/0x20
+ [] ? kthread+0x0/0xa0
+ [] ? child_rip+0x0/0x20
+
+I suspect this issue is related to quota because if I turned quota off everything became all right.
+
+--- Comment (pjones, Fri, 20 Sep 2013 21:34:51 +0000) ---
+Landed for 2.5.0
+
+--- Comment (yong.fan, Fri, 13 Sep 2013 13:01:01 +0000) ---
+This is the patch to release the root reference held by LFSCK:
+
+http://review.whamcloud.com/#/c/7643/
+
+--- Comment (jay, Fri, 13 Sep 2013 07:15:04 +0000) ---
+nasf, can you comment?
+
+--- Comment (bzzz, Fri, 13 Sep 2013 07:03:39 +0000) ---
+as a short term fix I'd suggest to fix LFSCK - there is no real need to hold local root object.
+
+--- Comment (niu, Fri, 13 Sep 2013 02:34:27 +0000) ---
+Hi, Mike
+
+Any input on this? Is it possible to get rid of lu_object_put_nocache() for local storage? Thanks.
+
+--- Comment (bzzz, Wed, 11 Sep 2013 05:41:03 +0000) ---
+it's not just stack initialization.. / has been accessed by few componenets during runtime. I'm trying to recall all the details.
+
+--- Comment (jay, Wed, 11 Sep 2013 05:31:58 +0000) ---
+in that case, it seems like it's not allowed to hold object before the stack is fully initialized.
+
+--- Comment (bzzz, Wed, 11 Sep 2013 05:04:56 +0000) ---
+> why does it call lu_object_put_nocache() in the first place?
+
+because different stacks may want to use this object and expect own slices (at different time).
+
+this is an known issue..
+
+I don't think NOCACHE can really help here, because it just postpones potential issues.
+
+--- Comment (jay, Wed, 11 Sep 2013 04:30:39 +0000) ---
+why does it call lu_object_put_nocache() in the first place?
+
+--- Comment (niu, Wed, 11 Sep 2013 03:08:28 +0000) ---
+http://review.whamcloud.com/7604
+
+--- Comment (jay, Tue, 10 Sep 2013 18:20:34 +0000) ---
+probably we shouldn't use nocache version of lu_object_put() at all.
+
+--- Comment (niu, Tue, 10 Sep 2013 13:56:55 +0000) ---
+I think I see the problem:
+
+lu_object_put_nocache(obj) will mark an object as dying object, so when lu_object_find_at() find the dying object, it will wait for the the dying object to be freed then try lookup again. The problem of this logic is that if the object is holding by somebody (never get freed), lu_object_find_at() will wait on the dying object forever.
+
+In this specific case: The root object is holding by lfsck (lfsck->li_local_root), and quota code calls local storage API to create quota files: local_oid_storage_init() -> lastid_compat_check() -> lu_object_put_nocache(root), then the root object is marked as dying but never been freed.
+
+Given the machanism of lu_object_put_nocache(), I think nobody should hold any object, nasf, what do you think about? Could we just remove the li_local_root and get the object on demand?
+
+--- Comment (niu, Mon, 9 Sep 2013 11:36:23 +0000) ---
+This can be reproduced even without the chown operation, and I'm not sure how quota code can affect this test, since there almost no quota code involved. I'll investigate it further.
+
+--- Comment (pjones, Thu, 5 Sep 2013 17:54:37 +0000) ---
+Niu
+
+Could you please comment on this one?
+
+Thanks
+
+Peter

@@ -1,0 +1,159 @@
+Key:        LU-8246
+Summary:    Leaks on ldlm granted locks counter on MDS leading to canceling loop
+Link:       https://jira.whamcloud.com/browse/LU-8246
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Oleg Drokin
+Reporter:   Sebastien Piechurski
+Created:    Tue, 7 Jun 2016 09:49:55 +0000
+Updated:    Thu, 14 Jun 2018 21:41:18 +0000
+Resolved:   Sun, 30 Oct 2016 11:40:40 +0000
+Links:      Related: is related to LU-8634
+
+--- Description ---
+A performance problem at one of our customers led us to find that the granted ldlm locks counter (found in  /proc/fs/lustre/ldlm/namespaces/mdt-fsname-MDT0000_UUID/pool/granted) is actually missing some decrements in some conditions (yet to be determined).
+
+This leads after some time to have this counter largely exceed the number found in /proc/fs/lustre/ldlm/namespaces/mdt-fsname-MDT0000_UUID/pool/limit. 
+
+See here:
+
+[root@prolixmds1 pool]# pwd
+/proc/fs/lustre/ldlm/namespaces/mdt-scratch-MDT0000_UUID/pool
+[root@prolixmds1 pool]# cat limit
+3203616
+[root@prolixmds1 pool]# cat granted
+54882822
+
+However, summing up all granted locks as seen by the all the clients, we get only 16k locks, which is also consistent with the slab consumption on the MDS.
+
+Once above the limit, the MDS will then constantly try to cancel locks, even those which are not above max_age. Clients then reacquire the locks, but lose time in the process (then showing the performance problem).
+
+Note that as this is only the counter which is false, we don't have any resource overconsumption tied to this problem.
+
+We found that this problem is also seen on 2.8.
+
+Can you help find where the leak comes from ?
+
+I also wonder if there is any relation with the last comment from Shuichi Ihara in LU-5727.
+
+I also think Christopher Morrone pointed this out here
+
+--- Comment (pjones, Sun, 30 Oct 2016 11:40:40 +0000) ---
+Landed for 2.9
+
+--- Comment (gerrit, Sun, 30 Oct 2016 02:50:35 +0000) ---
+Oleg Drokin (oleg.drokin@intel.com) merged in patch http://review.whamcloud.com/20839/
+
+Subject: LU-8246 ldlm: Do not grant a lock twice in a race
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 7d4106cd9fd9ef48822d19c35a711570be25d5ee
+
+--- Comment (spiechurski, Tue, 21 Jun 2016 08:18:39 +0000) ---
+Great ! Thanks Oleg for the analysis.
+
+--- Comment (green, Thu, 16 Jun 2016 23:31:00 +0000) ---
+btw to guge number of locks MDT has actually granted in total, instead of counting all clients, just check /proc/fs/lustre/ldlm/namespaces/mdt-lustre-MDT0000_UUID/lock_count
+
+This number includes number of locks given to clients + locks not given anywhere but held by the server internally (the number fluctuates of course, but if it's too different from the granted number you know there's a problem. In fact I wonder why do we need to have two trackers for essentially the same value - perhaps we can just drop the one from pools? Though I guess in pools we track number of locks granted and the namespace it's number of locks total - granted and ungranted)
+
+--- Comment (gerrit, Thu, 16 Jun 2016 20:25:42 +0000) ---
+Oleg Drokin (oleg.drokin@intel.com) uploaded a new patch: http://review.whamcloud.com/20839
+
+Subject: LU-8246 ldlm: Do not grant a lock twice in a race
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 7c8e41dfabb4e2bead4080a993903b683152bb5c
+
+--- Comment (green, Thu, 16 Jun 2016 20:12:22 +0000) ---
+Ok, o the race plays like this:
+
+We do first enqueue (in ldlm_process_inodebits_lock()), meet a conflicting lock, add ourselves into waiting list and call ldlm_run_ast_work()
+
+At the same time cancel arrives for the lock we are conflicting on, sees our lock could be granted and grants it (the original trace)
+
+Now we get back here, and receive ERESTART as return of ldlm_run_ast_work(), jump to again label, see there are no conflicts and grant us again.
+
+Every grant call increases the pl_granted counter, but since the lock is the same there is only one decrease.
+
+Hm, in fact there's even a check for that just for extent only lock, fixed as part of bug 11300.
+
+I'll try to do a similar patch for plain and ibits locks. The flock is more convoluted and would not play into this particular problem.
+
+--- Comment (green, Thu, 16 Jun 2016 19:31:18 +0000) ---
+so... a race between a lock request and lock cancel that leads to two granting threads, I guess?
+
+--- Comment (green, Thu, 16 Jun 2016 19:26:12 +0000) ---
+Hm, you are actually right.
+
+I checked some of my nodes and see the numbers are out of whack too, so I added a simple refcounter into every lock to see how many times did we call ldlm_pool_add/del and it seems to be a common occurence that we call ldlm_pool_add (from ldlm_lock_grant) twice, but free it only once.
+
+The second addition comes via:
+
+[  353.612043] Increaing pl_granted but lock ffff880046a3cc40 refc is already 1
+[  353.612660] CPU: 7 PID: 3654 Comm: mdt01_002 Tainted: G           OE  ------------   3.10.0-debug #1
+[  353.613777] Hardware name: Bochs Bochs, BIOS Bochs 01/01/2011
+[  353.614385]  ffff880046a3cc40 0000000095009a39 ffff880080ef7840 ffffffff816fe7c0
+[  353.616879]  ffff880080ef7890 ffffffffa0556e5d ffff880046a3ceb8 ffff880080ef78a8
+[  353.618213]  ffff880080ef7890 0000000095009a39 ffff880046a3cc40 ffff880042a36e80
+[  353.619201] Call Trace:
+[  353.619815]  [] dump_stack+0x19/0x1b
+[  353.620385]  [] ldlm_pool_add+0x16d/0x1f0 [ptlrpc]
+[  353.620931]  [] ldlm_grant_lock+0x11e/0x780 [ptlrpc]
+[  353.621564]  [] ldlm_process_inodebits_lock+0x362/0x420 [ptlrpc]
+[  353.622676]  [] ldlm_lock_enqueue+0x3fe/0x940 [ptlrpc]
+[  353.623327]  [] ldlm_cli_enqueue_local+0x1c6/0x850 [ptlrpc]
+[  353.623984]  [] ? ldlm_expired_completion_wait+0x250/0x250 [ptlrpc]
+[  353.625077]  [] ? mdt_register_seq_exp+0x2e0/0x2e0 [mdt]
+[  353.625710]  [] mdt_object_local_lock+0x52a/0xb00 [mdt]
+[  353.626344]  [] ? mdt_register_seq_exp+0x2e0/0x2e0 [mdt]
+[  353.627001]  [] ? ldlm_expired_completion_wait+0x250/0x250 [ptlrpc]
+[  353.628095]  [] mdt_object_lock_internal+0x5e/0x2f0 [mdt]
+[  353.628728]  [] mdt_reint_object_lock+0x20/0x60 [mdt]
+[  353.629362]  [] mdt_reint_setattr+0x67b/0x1130 [mdt]
+[  353.630001]  [] mdt_reint_rec+0x80/0x210 [mdt]
+[  353.630612]  [] mdt_reint_internal+0x5dc/0x940 [mdt]
+[  353.631246]  [] mdt_reint+0x67/0x140 [mdt]
+[  353.631888]  [] tgt_request_handle+0x925/0x1330 [ptlrpc]
+[  353.632567]  [] ptlrpc_server_handle_request+0x231/0xab0 [ptlrpc]
+[  353.633678]  [] ? ptlrpc_wait_event+0xb8/0x370 [ptlrpc]
+[  353.634353]  [] ptlrpc_main+0xa58/0x1dc0 [ptlrpc]
+[  353.635023]  [] ? _raw_spin_unlock_irq+0x27/0x50
+[  353.635657]  [] ? ptlrpc_register_service+0xe70/0xe70 [ptlrpc]
+[  353.636433]  [] kthread+0xea/0xf0
+[  353.636860]  [] ? kthread_create_on_node+0x140/0x140
+[  353.637301]  [] ret_from_fork+0x58/0x90
+[  353.637724]  [] ? kthread_create_on_node+0x140/0x140
+[  353.638163] Original trace:
+[  353.638573]     [] ldlm_pool_add+0xb0/0x1f0 [ptlrpc]
+[  353.639218]     [] ldlm_grant_lock+0x11e/0x780 [ptlrpc]
+[  353.639950]     [] ldlm_process_inodebits_lock+0x303/0x420 [ptlrpc]
+[  353.641051]     [] ldlm_reprocess_queue+0x123/0x230 [ptlrpc]
+[  353.642311]     [] ldlm_reprocess_all+0x120/0x310 [ptlrpc]
+[  353.643068]     [] ldlm_request_cancel+0x475/0x710 [ptlrpc]
+[  353.643810]     [] ldlm_handle_cancel+0xba/0x250 [ptlrpc]
+[  353.644555]     [] ldlm_cancel_handler+0x141/0x490 [ptlrpc]
+[  353.645330]     [] ptlrpc_server_handle_request+0x231/0xab0 [ptlrpc]
+[  353.651045]     [] ptlrpc_main+0xa58/0x1dc0 [ptlrpc]
+[  353.651478]     [] kthread+0xea/0xf0
+[  353.651899]     [] ret_from_fork+0x58/0x90
+[  353.652327]     [] 0xffffffffffffffff
+
+--- Comment (pjones, Tue, 7 Jun 2016 17:07:56 +0000) ---
+Oleg
+
+Could you please advise?
+
+Peter

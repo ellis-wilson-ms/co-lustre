@@ -1,0 +1,185 @@
+Key:        LU-13306
+Summary:    allow clients to accept mgs_nidtbl_entry with IPv6 NIDs
+Link:       https://jira.whamcloud.com/browse/LU-13306
+Type:       Improvement
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   James A Simmons
+Reporter:   Andreas Dilger
+Created:    Fri, 28 Feb 2020 12:35:05 +0000
+Updated:    Wed, 11 Dec 2024 15:55:18 +0000
+Resolved:   Sat, 23 Sep 2023 14:00:55 +0000
+Labels:     IPv6
+Links:      Related: is related to  LU-10360; Related: is related to  LU-19; Related: is related to  LU-10391; Related: is related to LU-17060; Related: is related to LU-18049; Related: is related to LU-17962; Related: is related to LU-16722; Related: is related to LU-16823
+
+--- Description ---
+Currently, if a client receives an mgs_nidtbl_entry with mne_nid_type != 0 or mne_nid_size != sizeof(lnet_nid_t)=8 the client will stop processing all later records, essentially cutting the client off from OST/MDT IR logs that have even one IPv6 addresses configured.
+
+To add IPv6 NID support, but preserve compatibility with older clients, there should be a new connect flag sent to the MGS at connect time:
+
+#define OBD_CONNECT2_MNE_TYPE         0x1000000ULL /* mne_nid_type flags */
+
+that should be saved in the client export on the MGS and used by mgs_nidtbl_read() to decide what type of NIDs should be sent to the client. The client should also send the flags that it understands MNE_NID_SUPPORTED = (MNE_NID_TYPE_* | (MNR_REC_FLAG_*  in struct obd_connect_data.padding0 renamed to ocd_mne_type so that the MGS can also avoid sending future record types to a client that it doesn't understand. The MGS reply should mask out any flags in ocd_mne_type that it doesn't support itself.  If a client export does not have OBD_CONNECT2_MNE_TYPE set, the MGS should only send compatible lnet_nid_t records with mne_nid_type=0 and mne_nid_size=sizeof(lnet_nid_t)=8.
+
+To allow future expansion, the mne_rec_type field should be treated as a bitmask of features present in the mgs_nidtbl_entry instead of a enumerated type. The first bit set in mne_nid_type=MNE_NID_TYPE_RECORD=0x01 would be used for expanding the record size, with the larger per-NID records as follows, with mne_nid_size=24, and a per-record mnr_rec_flags=MNR_REC_FLAG_NIDv6=0x01 to allow positively identifying the record content rather than depending on "all zero" fields to detect the difference:
+
+struct mne_nid_record {         /* when MNE_NID_TYPE_RECORD is set */
+        __u8                    mnr_rec_flags;  /* MNR_REC_FLAG_* flags */
+        __u8                    mnr_padding1;
+        __u16                   mnr_padding2;
+        struct lnet_nid_v6      mnr_nid_v6;
+        /* other fields depending on mne_nid_type, mne_nid_size, mnr_rec_flags */
+};
+
+struct mgs_nidtbl_entry {
+        __u64           mne_version;    /* table version of this entry */
+        __u32           mne_instance;   /* target instance # */
+        __u32           mne_index;      /* target index */
+        __u32           mne_length;     /* length of this entry - by bytes */
+        __u8            mne_type;       /* target type LDD_F_SV_TYPE_OST/MDT */
+        __u8            mne_nid_type;   /* MNE_NID_TYPE_* flags */
+        __u8            mne_nid_size;   /* size of each NID, by bytes */
+        __u8            mne_nid_count;  /* # of NIDs in buffer */
+        union {         /* don't walk the union array directly, use mne_nid_size */
+                lnet_nid_t             mne_nids[];     /* when mne_nid_type == 0 */
+                struct mnr_nid_record mne_records[];  /* if MNE_NID_TYPE_RECORD */
+        };
+};
+
+The 4 extra bytes of fields at the start plus the 20-byte mnr_nid_v6 field keep all records with 64-bit size and alignment. Since lnet_nid_v6 can also encapsulate an IPv4 NID (based on .nid_type) there is no need to handle lnet_nid_t directly within mnr_nid_record. However, MNR_REC_FLAG_NIDv6 should be verified in case there is some other kind of NID in the record.
+
+When processing mne_nids or mne_records, it should be using mne_nid_size to walk the records, rather than having a loop that processes mne_nids[i] as an array, otherwise this will break if mne_nid_size changes in the future (ignoring any potential changes from MDT/OST connections" class="issue-link" data-issue-key="LU-10360">LU-10360):
+
+                void *ptr;
+
+                /* iterate all nids to find one UUID by NID */
+                rc = -ENOENT;
+
+                for (i = 0, ptr = entry->mne_records; i mne_nid_count; i++, ptr += entry->mne_nid_size) {
+                        lnet_nid_v6 nid_v6;
+
+                        if (entry->mne_nid_type & MNE_NID_TYPE_RECORD) {
+                                struct mnr_nid_record *rec = ptr;
+  
+                                if (!(rec->mnr_rec_flags & MNR_REC_FLAG_NIDv6))
+                                        continue;
+                                nid_v6 = rec->mnr_nid_v6;
+                        } else {
+                                lnet_nid2nidv6(*(lnet_nid_t *)ptr, &nid_v6);
+                        }
+            
+                        rc = client_import_find_conn(obd->u.cli.cl_import, nid_v6,
+                                                     (struct obd_uuid *)uuid);
+                        if (rc == 0)
+                                break;
+                }
+
+--- Comment (pjones, Sat, 23 Sep 2023 14:00:55 +0000) ---
+All patches seem to be merged for 2.16
+
+--- Comment (gerrit, Sat, 23 Sep 2023 06:01:37 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/50750/
+
+Subject: LU-13306 mgc: handle large NID formats
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: e4d2d4ff74a103e4288d7581b40020eaff22b139
+
+--- Comment (gerrit, Thu, 31 Aug 2023 01:43:10 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/52053/
+
+Subject: LU-13306 mgs: support large NID for mgs_write_log_osc_to_lov
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 576928b2cd7dcdb6fcb6000ef593ecfb03f66500
+
+--- Comment (gerrit, Wed, 23 Aug 2023 14:56:09 +0000) ---
+"James Simmons " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/52053
+
+Subject: LU-13306 mgs: support large NID for mgs_write_log_osc_to_lov
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: e28695e90051d33bc5129d3512cdd9e01297f4d8
+
+--- Comment (gerrit, Sat, 19 Aug 2023 05:34:36 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/50896/
+
+Subject: LU-13306 mgs: use large NIDS in the nid table on the MGS
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: c0cb747ebe95d3fefa2a70c09c2ae0c4fa873b47
+
+--- Comment (gerrit, Thu, 1 Jun 2023 01:23:00 +0000) ---
+"James Simmons " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/51185
+
+Subject: LU-13306 test: base code
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: ba68cc5f0b71cccc60b3f240cbcacba82796a29c
+
+--- Comment (gerrit, Tue, 9 May 2023 21:16:39 +0000) ---
+"James Simmons " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/50896
+
+Subject: LU-13306 mgs: use large NIDS in the nid table on the MGS
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 6ea3f9538d8ce242f87d96731e2ee4d0900c3983
+
+--- Comment (gerrit, Wed, 26 Apr 2023 00:05:34 +0000) ---
+"James Simmons " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/50750
+
+Subject: LU-13306 mgc: handle large NIDs gracefully
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 86d7f923d7caec756f0354d774e511482c138f50
+
+--- Comment (adilger, Tue, 21 Jul 2020 21:34:57 +0000) ---
+The patch https://review.whamcloud.com/39373 LU-10391 lnet: extended nids introduces struct lnet_nid_x (IMHO, lnet_nid_v6) to encapsulate larger NIDs:
+
+static inline int nidv6_is_legacy(const struct lnet_nid_v6 *nid_v6)
+{
+       return nid_v6->nid_type 
+
+The added mnr_rec_flags and padding fields are used since it only needs 4-byte alignment and is 20 bytes in size.  The nid_is_legacy() check can be used to encapsulate IPv4 addresses without the need for external identification.
+
+--- Comment (adilger, Mon, 20 Jul 2020 22:18:01 +0000) ---
+It would be very useful to get this code fixed to skip "unknown" NIDs in mgs_nidtbl_entry, so that we have some kind of interop with older clients.  Otherwise, as soon as any IPv6 NID is listed in the IR table the client will no longer be able to use the IR list throwing a big wrench into MDT/OST connections" class="issue-link" data-issue-key="LU-10360">LU-10360.
+
+--- Comment (adilger, Fri, 28 Feb 2020 12:38:39 +0000) ---
+The MGS could also check for a new OBD_CONNECT_MNE_TYPE flag at connection time, and drop IPv6 records from the mgs_nidtbl_entry records for those clients.  Since the MGS generates the nidtbl list for every client, this does not increase overhead significantly. Having a simple patch for "old" clients which could be backported to LTS releases to process these records itself would simplify changes to the MGS.  Using the OBD_CONNECT_MNE_TYPE flag avoids the need for "forward compatibility" in the clients, which is problematic given the lack of compatibility with the current implementation.

@@ -1,0 +1,148 @@
+Key:        LU-7368
+Summary:    e2fsck unsafe to interrupt with quota enabled
+Link:       https://jira.whamcloud.com/browse/LU-7368
+Type:       Bug
+Priority:   Critical
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Niu Yawei
+Reporter:   Andreas Dilger
+Created:    Mon, 2 Nov 2015 08:45:42 +0000
+Updated:    Thu, 13 Oct 2016 18:27:35 +0000
+Resolved:   Fri, 11 Dec 2015 21:07:37 +0000
+Links:      Related: is related to  LU-7381; Related: is related to  LU-7428; Related: is related to LU-8706
+
+--- Description ---
+It looks there is a bug in how e2fsck handles being interrupted by CTRL-C.  If CTRL-C is pressed to kill e2fsck rather than e.g. kill -9, then the interrupt handler sets E2F_FLAG_CANCEL in the context but doesn't actually kill the process.  Instead, e2fsck_pass1() checks this flag before processing the next inode.
+
+If a filesystem is running in fix mode (e2fsck -fy) is interrupted, and the quota feature is enabled, then the quota file will still be written to disk even though the inode scan was not complete and the quota information is totally inaccurate.  Even worse, if the Pass 1 inode and block scan was not finished, then the in-memory block bitmaps (which are used for block allocation during e2fsck) are also invalid, so any blocks allocated to the quota files may corrupt other files if those blocks were actually used.
+
+      e2fsck 1.42.13.wc3 (28-Aug-2015)
+      Pass 1: Checking inodes, blocks, and sizes
+      ^C[QUOTA WARNING] Usage inconsistent for ID 0:
+          actual (6455296, 168) != expected (8568832, 231)
+      [QUOTA WARNING] Usage inconsistent for ID 695:
+          actual (614932320256, 63981) != expected (2102405386240, 176432)
+      Update quota info for quota type 0? yes
+    
+      [QUOTA WARNING] Usage inconsistent for ID 0:
+          actual (6455296, 168) != expected (8568832, 231)
+      [QUOTA WARNING] Usage inconsistent for ID 538:
+          actual (614932320256, 63981) != expected (2102405386240, 176432)
+      Update quota info for quota type 1? yes
+    
+      myth-OST0001: e2fsck canceled.
+      myth-OST0001: ***** FILE SYSTEM WAS MODIFIED *****
+
+It also looks like the journal may also be recreated after e2fsck is interrupted, if it was deleted during pass 1 because of corruption.
+
+static void signal_cancel(int sig EXT2FS_ATTR((unused)))
+{
+       e2fsck_t ctx = e2fsck_global_ctx;
+
+       if (!ctx)
+               exit(FSCK_CANCELED);
+
+       ctx->flags |= E2F_FLAG_CANCEL;
+}
+
+int main()
+{
+        :
+	sa.sa_handler = signal_cancel;
+	sigaction(SIGINT, &sa, 0);
+	sigaction(SIGTERM, &sa, 0);
+	:
+	:
+       run_result = e2fsck_run(ctx);
+       e2fsck_clear_progbar(ctx);
+
+       if (!ctx->invalid_bitmaps &&
+           (ctx->flags & E2F_FLAG_JOURNAL_INODE)) {
+		if (fix_problem(ctx, PR_6_RECREATE_JOURNAL, &pctx)) {
+			:
+			:
+			retval = ext2fs_add_journal_inode(fs, journal_size, 0);
+		}
+	}
+
+no_journal:
+	if (ctx->qctx) {
+		for (i = 0; i qctx, i, &needs_writeout);
+		}
+	}
+
+	if (run_result & E2F_FLAG_ABORT)
+		fatal_error(ctx, _("aborted"));
+
+This should have a cancel check right after the return from e2fsck_run() rather than trying to recover the journal and quota files? I can imagine that there is a desire to flush out modified inodes and such that have been repaired, so that restarting an interrupted e2fsck will make progress, but the quota file update is plain wrong unless at least pass1 has finished, and the journal recreation is also dangerous if the block bitmaps have not been fully updated.
+
+The quota problem was hit in on a system, but the journal problem is only a theory at this point.  I'm working on a patch but wanted to solicit input in case there is something that I'm missing.
+
+--- Comment (adilger, Fri, 11 Dec 2015 21:07:37 +0000) ---
+Patch landed for e2fsprogs 1.42.13.wc4 release.
+
+--- Comment (gerrit, Wed, 9 Dec 2015 19:51:20 +0000) ---
+Andreas Dilger (andreas.dilger@intel.com) merged in patch http://review.whamcloud.com/17150/
+
+Subject: LU-7368 e2fsck: skip quota update when interrupted
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 
+
+Commit: 18b6aca349550ca6f2cf65462c575f9b502670cc
+
+--- Comment (niu, Mon, 7 Dec 2015 09:04:01 +0000) ---
+Ok, I was trying to reproduce it locally, but failed. Will continue to investigate it further.
+
+--- Comment (adilger, Fri, 4 Dec 2015 19:44:31 +0000) ---
+Niu, the conf-sanity test_84 subtest is failing 100% with LU-7428 for all new patches pushed to e2fsprogs:
+
+CMD: shadow-21vm12 e2label /dev/lvm-Role_MDS/P1 				2>/dev/null | grep -E ':[a-zA-Z]{3}[0-9]{4}'
+Update not seen after 90s: wanted '' got 'lustre:MDT0000'
+ conf-sanity test_84: @@@@@@ FAIL: /dev/lvm-Role_MDS/P1 failed to initialize!
+
+What this means is that the e2label command run from mount_utils_ldiskfs.c to set the label is being lost.  I don't know if the problem is due to the test itself, or due to e2fsprogs changes, or both, but the patches can't land as-is or they will break all testing.
+
+Could you please investigate.
+
+--- Comment (adilger, Thu, 3 Dec 2015 13:15:22 +0000) ---
+Patch has been accepted into upstream e2fsprogs.  Working on a -wc4 release for this as well.
+
+--- Comment (gerrit, Fri, 13 Nov 2015 11:04:52 +0000) ---
+Andreas Dilger (andreas.dilger@intel.com) uploaded a new patch: http://review.whamcloud.com/17150
+
+Subject: LU-7368 e2fsck: skip quota update when interrupted
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 1
+
+Commit: 5ec2d95a9789cc48af2a439c133f711f1d956349
+
+--- Comment (jgmitter, Tue, 3 Nov 2015 18:23:01 +0000) ---
+Hi Niu,
+
+Can you take a look at the patch?
+
+Thanks.
+
+Joe
+
+--- Comment (gerrit, Mon, 2 Nov 2015 09:01:06 +0000) ---
+Andreas Dilger (andreas.dilger@intel.com) uploaded a new patch: http://review.whamcloud.com/17012
+
+Subject: LU-7368 e2fsck: skip quota update when interrupted
+
+Project: tools/e2fsprogs
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: d0a356e7eb376dcce3b0088ecea40c44987b8d2b

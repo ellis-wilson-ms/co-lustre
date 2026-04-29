@@ -1,0 +1,121 @@
+Key:        LU-3844
+Summary:    Double recovery period in 1.8.9 after OSS failure
+Link:       https://jira.whamcloud.com/browse/LU-3844
+Type:       Bug
+Priority:   Minor
+Status:     Closed
+Resolution: Fixed
+Assignee:   Hongchao Zhang
+Reporter:   Blake Caldwell
+Created:    Tue, 27 Aug 2013 19:39:41 +0000
+Updated:    Wed, 28 Aug 2013 21:46:00 +0000
+Resolved:   Wed, 28 Aug 2013 21:45:59 +0000
+
+--- Environment ---
+kernel 2.6.18-348.3.1.el5, rhel5.9, distribution-provided ofed, gni behind o2iblnd routers
+
+--- Description ---
+We frequently observe that the recovery process repeats itself after reaching the timer expiration.  Often times it reaches the first timer expiration because a client has died, so it is going to go through the whole recovery period again the second time.
+
+In this example, recovery took 60s rather than the better case of 30.  Does this fall under the case implied by the wording 'Will be in recovery for at least 30:00'.  During the failure several OSS had to be rebooted.
+
+[blakec@widow-mgmt3 ~]$ tail -10000 /data/log/apps/lustrekernel|grep oss12a2|grep -i recov|grep widow1-OST00b5:
+
+Aug 27 14:16:46 widow-oss12a2 kernel: [  544.793348] Lustre: widow1-OST00b5: Now serving widow1-OST00b5 on /dev/mpath/widow-ddn12a-l48 with recovery enabled
+
+Aug 27 14:16:46 widow-oss12a2 kernel: [  544.793363] Lustre: widow1-OST00b5: Will be in recovery for at least 30:00, or until 12345 clients reconnect
+
+Aug 27 14:17:13 widow-oss12a2 kernel: [  572.156957] LustreError: 16171:0:(ldlm_lib.c:946:target_handle_connect()) widow1-OST00b5: denying connection for new client 172.30.221.31@o2ib3 (66a3b9fa-4a34-e8cb-c90e-1c98fa38f2e6): 12336 clients in recovery for 1772s
+
+Aug 27 14:19:01 widow-oss12a2 kernel: [  679.468170] LustreError: 15390:0:(ldlm_lib.c:946:target_handle_connect()) widow1-OST00b5: denying connection for new client 172.30.221.25@o2ib3 (e65b92af-bef9-b8b2-5069-d8894f06fb19): 12294 clients in recovery for 1665s
+
+Aug 27 14:55:51 widow-oss12a2 kernel: [ 2885.008362] LustreError: 16132:0:(ldlm_lib.c:946:target_handle_connect()) widow1-OST00b5: denying connection for new client 172.30.221.18@o2ib3 (5ac80ce4-58aa-16fd-8c53-889df4ba3118): 12174 clients in recovery for 1254s
+
+Aug 27 14:59:35 widow-oss12a2 kernel: [ 3108.624936] Lustre: 15386:0:(ldlm_lib.c:1817:target_queue_last_replay_reply()) widow1-OST00b5: 12173 recoverable clients remain
+
+Aug 27 15:16:46 widow-oss12a2 kernel: [ 4137.296402] Lustre: widow1-OST00b5: Recovery period over after 60:00, of 12345 clients 12342 recovered and 2 were evicted.
+
+Aug 27 15:16:46 widow-oss12a2 kernel: [ 4137.296415] Lustre: widow1-OST00b5: sending delayed replies to recovered clients
+
+In an earlier case, only the MSD failed, and recovery finished in less that 30min because all clients reconnected. I'm sure there are cases where recovery just takes 30min, but mostly now when it goes to 30min, it will also go to 60 min
+
+obd_timeout is set to 600
+
+[root@widow-oss10a1 ~]# cat /proc/sys/lustre/timeout  
+
+600
+
+ldlm timeout is set to 200
+
+[root@widow-oss10a1 ~]# cat /proc/sys/lustre/ldlm_timeout 
+
+200
+
+--- Comment (blakecaldwell, Wed, 28 Aug 2013 21:00:41 +0000) ---
+This can be closed.
+
+--- Comment (jamesanunez, Wed, 28 Aug 2013 20:54:07 +0000) ---
+Blake, 
+
+Is there anything else we need to do under this ticket or should we close it?
+
+Thanks, 
+
+James
+
+--- Comment (blakecaldwell, Wed, 28 Aug 2013 17:51:19 +0000) ---
+Thanks much for the explanation!
+
+--- Comment (hongchao.zhang, Wed, 28 Aug 2013 11:24:47 +0000) ---
+Hi Blake,
+
+the extra recovery period is caused by VBR (version based recovery).
+
+in target_recovery_check_and_stop, after the first recovery period (3*obd_timeout = 1800s = 30m) is expired, obd_device->obd_version_recov will be set and
+
+the extra recovery period (30m) is started by calling "reset_recovery_timer".
+
+int target_recovery_check_and_stop(struct obd_device *obd)
+{
+        int abort_recovery = 0;
+                
+        if (obd->obd_stopping || !obd->obd_recovering)
+                return 1;
+                
+        spin_lock_bh(&obd->obd_processing_task_lock);
+        abort_recovery = obd->obd_abort_recovery;
+        obd->obd_abort_recovery = 0;
+        spin_unlock_bh(&obd->obd_processing_task_lock);
+        if (!abort_recovery)
+                return 0;
+        /** check if fs version-capable */
+        if (target_fs_version_capable(obd)) {
+                class_handle_stale_exports(obd);
+        } else {
+                CWARN("Versions are not supported by ldiskfs, VBR is OFF\n");
+                class_disconnect_stale_exports(obd, exp_flags_from_obd(obd));
+        }
+        /* VBR: no clients are remained to replay, stop recovery */
+        spin_lock_bh(&obd->obd_processing_task_lock);
+        if (obd->obd_recovering && obd->obd_recoverable_clients == 0) {
+                spin_unlock_bh(&obd->obd_processing_task_lock);
+                target_stop_recovery(obd, 0);
+                return 1;
+        }
+        /* always check versions now */
+        obd->obd_version_recov = 1;
+        cfs_waitq_signal(&obd->obd_next_transno_waitq);
+        spin_unlock_bh(&obd->obd_processing_task_lock);
+        /* reset timer, recovery will proceed with versions now */
+        reset_recovery_timer(obd, OBD_RECOVERY_TIME_SOFT, 1);
+        return 0;
+}
+
+--- Comment (jamesanunez, Tue, 27 Aug 2013 20:32:25 +0000) ---
+Hongchao, 
+
+Would you please comment on this one?
+
+Thanks,
+
+James

@@ -1,0 +1,79 @@
+Key:        LU-5346
+Summary:    lod_ah_init()) ASSERTION( lc->ldo_stripenr == 0 ) failed
+Link:       https://jira.whamcloud.com/browse/LU-5346
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   John Hammond
+Created:    Mon, 14 Jul 2014 23:36:58 +0000
+Updated:    Tue, 23 Feb 2016 08:08:21 +0000
+Labels:     lod, malloc
+
+--- Description ---
+If mdd_create_data() fails after calling mdd_object_make_hint() then the lod object will have ldo_stripenr set. A second call to mdd_create_data() will then trigger the failed assertion in lod_ah_init().
+
+This was found by memory allocation fault injection.
+
+llmount.sh
+cd /mnt/lustre
+sys_mknod f0
+echo /root/lustre-release/lustre/osd-ldiskfs/osd_handler.c:945 > /proc/fs/lustre/alloc_fail # fail to allocate the transaction in osd_trans_create()
+sys_open f0 w # open("f0", O_WRONLY)
+sys_open f0 w # open("f0", O_WRONLY)
+
+[  338.633638] LustreError: 5233:0:(lod_object.c:2606:lod_ah_init()) ASSERTION( lc->ldo_stripenr == 0 ) failed:
+[  338.635476] LustreError: 5233:0:(lod_object.c:2606:lod_ah_init()) LBUG
+[  338.636652] Pid: 5233, comm: mdt00_005
+[  338.637354]
+[  338.637355] Call Trace:
+[  338.638094]  [] libcfs_debug_dumpstack+0x55/0x80 [libcfs]
+[  338.639359]  [] lbug_with_loc+0x47/0xb0 [libcfs]
+[  338.640490]  [] lod_ah_init+0xadc/0xb40 [lod]
+[  338.641591]  [] mdd_object_make_hint+0x139/0x180 [mdd]
+[  338.642804]  [] mdd_create_data+0x359/0x7f0 [mdd]
+[  338.644047]  [] mdt_mfd_open+0xc1d/0xf40 [mdt]
+[  338.645182]  [] mdt_finish_open+0x200/0xc50 [mdt]
+[  338.646351]  [] ? mdt_object_open_lock+0x345/0x9d0 [mdt]
+[  338.647603]  [] mdt_open_by_fid_lock+0x57e/0x900 [mdt]
+[  338.648821]  [] mdt_reint_open+0x8c8/0x20b0 [mdt]
+[  338.649974]  [] ? _spin_unlock+0x2b/0x40
+[  338.650985]  [] ? upcall_cache_get_entry+0x3dc/0x8a0 [libcfs]
+[  338.652347]  [] ? lu_ucred+0x20/0x30 [obdclass]
+[  338.653490]  [] ? mdt_ucred+0x15/0x20 [mdt]
+[  338.654580]  [] ? mdt_root_squash+0x2c/0x3f0 [mdt]
+[  338.655786]  [] ? __req_capsule_get+0x166/0x6e0 [ptlrpc]
+[  338.657037]  [] mdt_reint_rec+0x41/0xe0 [mdt]
+[  338.658132]  [] mdt_reint_internal+0x4c3/0x7c0 [mdt]
+[  338.659314]  [] mdt_intent_reint+0x1f6/0x520 [mdt]
+[  338.660473]  [] mdt_intent_policy+0x499/0xca0 [mdt]
+[  338.661691]  [] ldlm_lock_enqueue+0x302/0x920 [ptlrpc]
+[  338.662931]  [] ldlm_handle_enqueue0+0x341/0x11e0 [ptlrpc]
+[  338.664249]  [] tgt_enqueue+0x62/0x1d0 [ptlrpc]
+[  338.665403]  [] tgt_request_handle+0x245/0xad0 [ptlrpc]
+[  338.666663]  [] ptlrpc_main+0xcf1/0x1880 [ptlrpc]
+[  338.667841]  [] ? ptlrpc_main+0x0/0x1880 [ptlrpc]
+[  338.668982]  [] kthread+0x96/0xa0
+[  338.669902]  [] child_rip+0xa/0x20
+[  338.670806]  [] ? _spin_unlock_irq+0x30/0x40
+[  338.671868]  [] ? restore_args+0x0/0x30
+[  338.672848]  [] ? kthread+0x0/0xa0
+[  338.673761]  [] ? child_rip+0x0/0x20
+[  338.674690]
+
+--- Comment (bzzz, Tue, 29 Jul 2014 18:57:02 +0000) ---
+iirc, we discussed a related issue in the past - currently locks are supposed to be taken "inside" transaction (still an open question how good is that, but benefits are known). this mean that intermediate state between "declare" and "execute" is exposed to other threads. which isn't good, of course. Ideally "declare" should be working with own copy of data (say, stored somewhere in transaction which is private), while "execute" should use that private data and apply changes atomically. this would solve this issue as well because that private data would be released automatically with ->do_trans_stop().  I'll think of that (again, sorry).
+
+--- Comment (jhammond, Tue, 29 Jul 2014 18:06:37 +0000) ---
+I'm OK with that but it's not enough. If mdd_create_data() fails after lod_ah_init() has returned then we have an object with ldo_stripenr != 0 but ldo_stripe == NULL. Operations on this object will trigger several assertions on lod. If it fails after lod_declare_xattr_set() then we need to call lod_object_free_striping() but the API does not offer us a convenient way to do so.
+
+The first problem is not so hard to fix. I think that lod_ah_init() should not be setting ldo_stripenr. We have some holes in lod_object where lod_ah_init() could put a ldo_stripe_count_hint that we pickup later.
+
+The second problem of failure after declare is trickier.
+
+--- Comment (bzzz, Tue, 29 Jul 2014 03:17:51 +0000) ---
+given all this data created by lod_ah_init() is in-core only, I'd suggest to either: 1) recognize we have it set and return immediately 2) just re-set everything from the beginning? would it be possible?
+
+--- Comment (jhammond, Mon, 28 Jul 2014 23:00:30 +0000) ---
+Alex can you suggest the best way to clean up the partially set striping data (ldo_stripenr, ldo_stripe) that is created by a failure in mdd_create_data()? Should we add a function to the DT API (dt_create_data_fini()) to handle this case?

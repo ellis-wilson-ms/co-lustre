@@ -1,0 +1,136 @@
+Key:        LU-4675
+Summary:    LFSCK should mark files with holes so clients do not access them
+Link:       https://jira.whamcloud.com/browse/LU-4675
+Type:       Technical task
+Priority:   Blocker
+Status:     Resolved
+Resolution: Fixed
+Assignee:   nasf
+Reporter:   Andreas Dilger
+Created:    Wed, 26 Feb 2014 23:45:08 +0000
+Updated:    Thu, 29 May 2014 03:41:59 +0000
+Resolved:   Thu, 29 May 2014 03:41:59 +0000
+Links:      Related: is related to LU-4958
+
+--- Description ---
+If an orphan object with stripe_index != 0 is linked to a recreated MDS inode in http://review.whamcloud.com/7810, but not all of the objects are present (e.g. some of the stripes of that file were lost, but a non-zero stripe_index orphan remained) the client will crash if the file is accessed (e.g. "ls -l"):
+
+LustreError: 19393:0:(ldlm_resource.c:1077:ldlm_resource_get()) ASSERTION( name->name[0] != 0 ) failed: 
+LustreError: 19393:0:(ldlm_resource.c:1077:ldlm_resource_get()) LBUG
+Pid: 19393, comm: ls
+
+Call Trace:
+ [] libcfs_debug_dumpstack+0x55/0x80 [libcfs]
+ [] lbug_with_loc+0x47/0xb0 [libcfs]
+ [] ldlm_resource_get+0x700/0x900 [ptlrpc]
+ [] ldlm_lock_create+0x59/0xcc0 [ptlrpc]
+ [] ldlm_cli_enqueue+0xa4/0x790 [ptlrpc]
+ [] osc_enqueue_base+0x1e4/0x5b0 [osc]
+ [] osc_lock_enqueue+0x1ed/0x8c0 [osc]
+ [] cl_enqueue_try+0xfc/0x300 [obdclass]
+ [] lov_lock_enqueue+0x22a/0x850 [lov]
+ [] cl_enqueue_try+0xfc/0x300 [obdclass]
+ [] cl_enqueue_locked+0x6f/0x1f0 [obdclass]
+ [] cl_lock_request+0x7e/0x270 [obdclass]
+ [] cl_glimpse_lock+0x180/0x490 [lustre]
+ [] cl_glimpse_size0+0x1a5/0x1d0 [lustre]
+ [] ll_inode_revalidate_it+0x1cd/0x660 [lustre]
+ [] ll_getattr_it+0x4a/0x1b0 [lustre]
+ [] ll_getattr+0x37/0x40 [lustre]
+ [] vfs_getattr+0x51/0x80
+ [] vfs_fstatat+0x60/0x80
+ [] vfs_lstat+0x1e/0x20
+ [] sys_newlstat+0x24/0x50
+
+I'm not sure what the right way to handle this is, since this would affect all old clients trying to access files in .lustre/lost+found so fixing just the 2.6 client is not enough.  Either we need to backport the fix to 2.5.2 and 2.4.3 and 2.1.7 clients (not very good, since we aren't sure if the client has the fix), or use some other lmm_magic or lmm_pattern to ensure that unpatched clients will not understand it.
+
+In the second case (using a different lmm_magic or lmm_pattern, maybe LOV_PATTERN_F_SPARSE?) the lfsck_layout_extend_lovea() code would need to decide as stripes are added if the layout is sparse (set the flag, old clients cannot access) or if it is full (clear the flag, old clients can access).
+
+--- Comment (yong.fan, Thu, 29 May 2014 03:41:59 +0000) ---
+The master patch has been landed. The patches for old client will be done under LU-4958
+
+--- Comment (adilger, Fri, 25 Apr 2014 06:47:07 +0000) ---
+To be clear, while http://review.whamcloud.com/10042 is fixing the problem of LFSCK creating layouts with holes in them, there is still the separate bug (LU-4958) for clients crashing because of bad layout data from the network, regardless of whether that was caused by LFSCK or not. It still makes sense for the client to validate the layout (magic, pattern, objects) and return an error of they are bad.
+
+--- Comment (jamesanunez, Tue, 22 Apr 2014 14:38:58 +0000) ---
+I've encountered this client crash while trying to track down what files were causing LFSCK to fail during phase 1 of the scan.
+
+--- Comment (yong.fan, Tue, 22 Apr 2014 04:28:37 +0000) ---
+When the layout LFSCK repairs orphan OST-object, if the parent
+
+MDT-object was lost, then it will re-create the MDT-object and
+
+regenerate the LOV EA and fill the target LOV EA slot with the
+
+orphan information, and fill other slots with zero (LOV hole);
+
+if related LOV EA slot is invalid or hole, then it will refill
+
+the target LOV EA slot; if the target slot exceeds current LOV
+
+EA tail, then extend the LOV EA, and fill the gaps as zero.
+
+Some of the LOV EA holes may cannot be re-filled finally becuase
+
+of lost some OST-objects. And even if they can be re-filled, but
+
+there are still some possible race accessings from client before
+
+the re-filling. If the client access the LOV EA with hole(s), it
+
+may cause some strange behaviour, such as trigger LBUG()/LASSERT()
+
+on the client.
+
+So we will make the client to be aware of the LOV EA is incomplete.
+
+We introduce a new LOV EA pattern flag LOV_PATTERN_F_HOLE for that:
+
+any time when the LFSCK repairs the LOV EA with hole(s), the LOV EA
+
+will be marked as LOV_PATTERN_F_HOLE; when all the holes in the LOV
+
+EA are refilled, the LOV_PATTERN_F_HOLE will be dropped.
+
+For a new client, it recongizes the pattern flag LOV_PATTERN_F_HOLE,
+
+then it can permit/forbid some opertions on the file with LOV holes:
+
+1) getattr/getxattr opertions are permitted, such as stat/ls -l, and
+
+   so on. The file size is the sum on the known stripes. So it gives
+
+   the administrator chance to know how much data has been recovered.
+
+2) Normal read the file with LOV EA hole is not permitted to avoid
+
+   the LOV EA holes cases to be hidden. Instead, the administrator
+
+   can dump the data via new "lfs dump" tool.
+
+3) If the modification only changes MDS-side metadata, such as chmod,
+
+   then it is permitted.
+
+4) unlink/rm the file which has LOV EA holes is permitted.
+
+5) For other modifications, if the modification will change something
+
+   on OST side, such as write/touch/chown, then it will be denied.
+
+For a old client, since it will not recognize the new pattern flag
+
+LOV_PATTERN_F_HOLE. So the LOV EA with holes will be dicarded with
+
+failure, but it will not cause the client to be crashed.
+
+--- Comment (yong.fan, Tue, 22 Apr 2014 04:26:58 +0000) ---
+Here is the patch:
+
+http://review.whamcloud.com/10042
+
+--- Comment (adilger, Wed, 26 Feb 2014 23:51:14 +0000) ---
+To be clear, I don't think that the LASSERT() should be removed, since object 
+
+{0,0}
+ should never be accessed.  Rather, the LOV code should just skip such objects entirely, and return -EIO in such a case.  Please include a test case that creates such a file, and runs a number of different operations on it (stat, read, write, touch, chown, unlink) to make sure the different paths are covered.

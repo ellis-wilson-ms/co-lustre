@@ -1,0 +1,175 @@
+Key:        LU-16671
+Summary:    Fixing unstable pages support in Lustre
+Link:       https://jira.whamcloud.com/browse/LU-16671
+Type:       Improvement
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Patrick Farrell
+Reporter:   Patrick Farrell
+Created:    Mon, 27 Mar 2023 16:52:57 +0000
+Updated:    Thu, 28 Sep 2023 08:48:29 +0000
+Resolved:   Sat, 23 Sep 2023 14:21:34 +0000
+Links:      Related: is related to  LU-15468; Related: is related to LU-16680
+
+--- Description ---
+This ticket is to explore fixing our unstable pages support in Lustre.
+
+We pin write pages until the write transaction is committed on the server, and these pinned pages are not flushable in any way by the kernel.
+
+This is a main driver of the rather high and variable memory requirements to do buffered writes on Lustre - While the pages which are in cache are limited by the kernel and reclaimed on memory pressure, pages which are pinned waiting for commit are tracked in our memory usage stats (for example, by cgroups), but the kernel cannot flush them.  This means the normal memory pressure mechanisms don't work on these pages - they are removed from the page cache on pressure, but not actually freed because they are pinned.
+
+That means there's not really any restriction on how many of these we can create or hold on to - they are flushed from the page cache on memory pressure, but after that, they just sit there unfreeable until they are unpinned.  The only limit to how many of these pages we can have (as long as the client does not run out of memory entirely) is how much data the client can push before the server commits and the client learns about it, so a function of server and client speed.
+
+This means that when we hit memory pressure there can be a large number of unfreeable pages, so we can end up OOM killed because when asked to free up memory, we can't.  This is particularly common with cgroups, because when cgroups are in use, the memory limit is generally much lower than the total system memory limits, so we're more likely to hit it.  On systems not using cgroups, we - in practice - tend to stay below global memory limits and avoid getting OOM killed.  (For various reasons; one is Lustre's default limit of 1/2 of RAM for page caching.)
+
+This was supposed to be solved in part by the unstable pages mechanism, which we put in some years ago, but then disabled because it caused performance issues, primarily because of writeback limiting.  There's also a notable lack of test coverage for them.
+
+So this ticket is to look at what's required to get those working correctly, starting by turning them on and seeing what breaks.  More detail in comments.
+
+--- Comment (pjones, Sat, 23 Sep 2023 14:21:34 +0000) ---
+Landed for 2.16
+
+--- Comment (gerrit, Sat, 23 Sep 2023 06:04:20 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/50451/
+
+Subject: LU-16671 osc: fix unstable pages for short IO
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 4ba4976f525e957ef4c3ca7981bea01f72109ed6
+
+--- Comment (panda, Mon, 3 Apr 2023 18:19:33 +0000) ---
+Hi Patrick,
+
+I've been looking into a related issue lately.
+
+I've uploaded a quick and dirty patch (RHEL 8.4 only) I coded to avoid OOMs when using unified cgroups with Lustre.
+
+The performance isn't great when only stats are fixed.
+
+Hope, this can reduce duplicate work.
+
+--- Comment (gerrit, Mon, 3 Apr 2023 18:07:11 +0000) ---
+"Andrew Perepechko " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/50510
+
+Subject: LU-16671 osc: a fix for unstable pages accounting
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 99afd4772450ce898e72e51dd88a93adb434c867
+
+--- Comment (paf0186, Wed, 29 Mar 2023 17:50:45 +0000) ---
+Moving lowmem_sync patch to a new LU, since it's not using unstable pages:
+
+https://jira.whamcloud.com/browse/LU-16680
+
+--- Comment (gerrit, Tue, 28 Mar 2023 20:24:20 +0000) ---
+"Patrick Farrell " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/50460
+
+Subject: LU-16671 llite: add lowmem_sync feature
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: d9c169ffc6e64e6f188261f3991e641408f92b9a
+
+--- Comment (gerrit, Tue, 28 Mar 2023 15:05:44 +0000) ---
+"Patrick Farrell " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/50451
+
+Subject: LU-16671 osc: fix unstable pages for short IO
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 4e060880fe71fd0409b9e4036a849c0848a477a6
+
+--- Comment (paf0186, Tue, 28 Mar 2023 02:27:43 +0000) ---
+Thanks, Andreas.  One huge problem we face is responsiveness - When cgroups starts looking for memory, it expects to be able to get some.  In my limited testing, generally we can free a little from whatever when it first asks, but shortly after that, we slam into the wall of uncommitted pages, and it thrashes for a bit, then we get OOM-killed.
+
+So, we could try to do something like notice that memory pressure and act differently, but that's not really the intended design with cgroups - they just use the shrinker interfaces, etc, and also walk the active/inactive page lists.  The idea isn't that they tell you what's going on and you change your behavior, the idea is that memory pressure can just free memory.
+
+There's a fairly short (fractions of a second) 'wait for writeout' sleep in the inactive page list flushing code, but that seems to be it - if you can't free memory immediately, you get that much time if you report pages in writeback, and if still no, you get OOM killed.
+
+So that makes me think we need to respond quickly - almost right away - or it won't work.  And cgroups doesn't seem to like giving up information on what the limit is, that's internal information and memory users aren't to worry about it.  So we can't work to avoid it - we just get requests to free memory pressure when we're up against the limit.
+
+--- Comment (adilger, Tue, 28 Mar 2023 01:16:08 +0000) ---
+Some parts of this code may have already been ripped out, on either the client or server.
+
+We also need to determine the workloads that trigger this issue in real life. The single-client data copy seems to be a definite trigger, as well as iozone with slow journal commits. LU-15468 looks like it has a very solid reproducer for this kind of issue. 
+
+Of course, this is only an issue with buffered IO, because the client always forces commits for DIO before reply, so another possibility is the BIO-as-DIO change you are working on.  We may still benefit from the "delayed commit and reply" for many DIO sync writes, but before we introduce added complexity we need to figure out whether that hurts performance or not (both flash and HDD, and with a decent client count).
+
+--- Comment (adilger, Tue, 28 Mar 2023 00:46:56 +0000) ---
+Patrick, my feeling is that transaction commits will have a non-zero cost on the servers, simply because we've seen many times in the past when the journal is too small (and hence commits too frequently) that this hurts performance. 
+
+The second concern with "commit whenever any client has memory pressure" is that this could potentially induce severe "jitter" symptoms where M/N clients have memory pressure at any given time, so the OST will continually be committing the transaction and not being able to aggregate writes across many threads and many RPCs. 
+
+That was why the "soft sync" mechanism was introduced, to allow clients to "suggest" a sync, and if enough clients, or enough RPCs from a single client, are requesting a premature sync that the OST will honor this.
+
+I think one of the main shortcomings with the old implementation is that it started with essentially random numbers for how often a soft sync should become a hard sync, and was then immediately disabled at the first sign of performance loss, and then nobody worked on it again.
+
+If we are going down this road again (which I don't object to, to be clear), then we need to do a few things better than last time:
+
+	have enough stats and knobs to be able to understand what is happening and how to fix it
+
+	have better performance and load testing up front to understand what the performance impact is, and tune it to be minimized. That doesn't mean non-existent, since clients hanging, OOM, or eviction, is zero performance, and we should always be able to do better than that.
+
+	ensure we don't have other bugs in the way of implementing this properly. We've definitely fixed several longstanding issues that may produce similar symptoms, eg.  blocking DLM callbacks not being sent/received under load (eg. LU-15821, LU-16285)
+
+	implement some mechanism to ensure the clients get the updated transno without having to send an additional RPC a long time later.
+
+The tricky part with all of this is that it only is needed in very specific circumstances. If there are many clients writing to an OST (common case), and they all have outstanding RPCs, then the server will commit often enough and any single client will be throttled by max_rpcs_in_flight and the RPC replies will contain a steady stream of last_committed updates.
+
+If there is a single client calling sync frequently or doing sync writes, then doing frequent OST commits is not harmful (nobody else is slowed down except the client waiting on the sync), but the client doesn't know what is happening on the server so it shouldn't just force sync all OSTs whenever it is low on RAM.  Also, we can't block all of the OST threads waiting on sync for client(s) (maybe max_rpcs_in_flight=8 or more threads per client per OST on the OSS), because this would block other clients (or even the same client) from processing RPCs in the queue. 
+
+One option, in addition or instead of some "OSS accumulates soft sync requests and makes a decision when to sync" heuristic, is to "save" the RPC state just before final reply (maybe in a commit callback that pushes the RPC back into an OSS thread queue?) for the "soft-sync" RPC(s) and they will get a reply (with new last_committed) when a commit finishes, either naturally (journal transaction is full), because of a forced commit due to many soft-sync RPCs, or the OSS runs out (or gets low) of RPCs to process. This avoids blocking OSS threads, but allows the client's existing RPC reply to complete with a new last_committed value.  For the client waiting on the RPC with an updated last_committed, this is essentially the most optimal solution (even if the reply is delayed) since it will get the reply ASAP after the commit. 
+
+We might still have some smarts on the OSS to accumulate soft sync, and track the number of RPCs in flight from a single export, so that clients are not starved waiting for the reply. For example, start sync and send reply sooner if export has no other RPCs in flight, but don't hold reply if other RPCs on the same export keep arriving and could be used to reply with new last_transno at some later time.
+
+We might also need to use an "async journal commit" (which already exists, AFAIK), where the transaction commit is started, but threads do not block waiting for it to finish, so that they can continue processing the request/reply and keep a pipeline of RPCs in flight without having stop-and-go traffic.
+
+Clients will also have to be smart about when they send their soft-sync request.  Do they do it early on a fraction of RPCs (eg. at 50% of RAM and just often enough so that there is a journal commit when they reach 90% of RAM), to keep the RPC pipeline full while minimizing performance impact?  Do they do it late and in every RPC when they hit 90% of RAM so that the OSS knows they are getting desperate?  Maybe both?
+
+--- Comment (gerrit, Mon, 27 Mar 2023 17:25:01 +0000) ---
+"Patrick Farrell " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/50437
+
+Subject: LU-16671 llite: Enable unstable pages tracking
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 9775fcaf38e5a246742d1408381e557d1755f3f9
+
+--- Comment (paf0186, Mon, 27 Mar 2023 17:12:57 +0000) ---
+adilger , curious for you thoughts on the above outline.  We might still be thrown off if we can't get the memory pressure mechanism properly linked to our unstable pages handling, or if the kernel just doesn't like us having as many outstanding pages as we want/need, but the above is an outline for how I think we can fix this.
+
+--- Comment (paf0186, Mon, 27 Mar 2023 17:09:53 +0000) ---
+Here's a bit more:
+
+The performance issues seem to have stemmed from the fact that this limits our outstanding write pages.  If we consider unstable pages as dirty and/or in writeback, which is what the kernel does, then they count against some dirty page rate limiting.  That's a huge problem because in effect it limits how many pages we can have outstanding to the server.  And since the server isn't committing transactions immediately and also isn't telling the client immediately when a transaction is committed, we end up with large numbers of uncommitted (unstable) pages.
+
+To get this working correctly, we have to make sure the unstable pages and soft sync mechanism (where the client asks the server to please commit the transaction) are linked properly to the memory pressure mechanisms.  We can then explore what the dirty/writeback/unstable page limits are like and how we can work with them well.  Because it is a high performance network file system, Lustre almost certainly needs more pages outstanding than a local file system in order to get good performance.  But it needs more pages outstanding, does it necessarily need them uncommitted?  Nowadays servers mostly do not use the page cache, so the data is received and written out immediately.  How much more costly is it to do a commit at that time as well so the server can report 'committed' to the client?  Perhaps this is the correct approach, when a client starts saying to the server 'I have a memory problem here', the server should start committing immediately on writes.  Then it could reply immediately to the client that it has done the commit, taking away the issue (noted in the original unstable pages tickets) where the server has no mechanism to proactively tell the client about a commit - it must wait for some other RPC, such as a ping or an I/O (particularly bad when the client may be unable to generate I/O because it's low on memory!).
+
+So, it is a requirement to make sure the unstable page and soft sync mechanism are kicked on by memory pressure, including from cgroups, but we also need to figure out how to make sure the kernel will let us have enough pages outstanding (uncommitted/unstable) to ensure good performance.  (While respecting low memory limits when they are set.)
+
+Assuming the machinery is activated on memory pressure, it's probably essential to fix the lack of immediate notice-on-commit from the OST.  Otherwise the kernel can tell us about memory pressure, but we still won't do anything in a timely manner (it will still take multiple seconds in most cases).  Since we only need this immediate-notice-of-commit when a 'client is low on memory' situation, we may be able to get away with the 'commit before reply' approach I outlined above.  That should be both easier and more responsive than some sort of 'notify once committed'.
+
+The problem is how costly are OST side commits for a busy OST?  Because this will make them happen more often, and we must consider the case where many clients have relatively low cgroups limits which are hit regularly.  This would generate many immediate commit requests to a given OST.

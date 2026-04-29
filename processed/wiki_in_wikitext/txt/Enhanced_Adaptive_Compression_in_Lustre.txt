@@ -1,0 +1,273 @@
+Title:        Enhanced Adaptive Compression in Lustre
+URL:          https://wiki.lustre.org/Enhanced_Adaptive_Compression_in_Lustre
+Page ID:      798
+Last Updated: 2025-09-25T21:41:26Z
+Last Editor:  Adilger
+Edit Comment: /* Project Links */ fix URL
+
+--- Content (MediaWiki markup) ---
+=Introduction=
+
+As the quantity of data continues to increase, while the desire to minimize cost and energy consumption continues to be critical, compressing file data is critical for expanding the use of Lustre to accommodate this functionality.  This document outlines an approach to provide client-side data compression in conjunction with ldiskfs OSTs.
+
+=Requirements=
+==Client-side compression==
+* Compressed data sent over network to servers
+* Multiple compression algorithms and levels available to tune space vs. Performance
+* Reasonable client memory and CPU utilization
+** Tunable to allow users to make this tradeoff based on their needs
+* Uncompressed data kept in client page cache
+* Compression should be a function of the layout of a file
+** Can be tuned per file, directory, or whole filesystem
+** Can be done separately after file is written (e.g. file migration or mirroring)
+** Normal mirror in flash pool for fast IO and compressed mirror on QLC, due to having good read performance, but poor random write performance compared to TLC flash, so prefers larger contiguous writes for best performance.
+* Compression won't be retroactively imposed on existing files
+* Compression before encryption, if both are enabled on a single file
+** Encrypted data is incompressible, so the reverse is not possible
+
+=Functional Specifications=
+==Lustre File Layout and Algorithm Selection==
+The compression algorithm, compression level, and chunk size can be specified in the [[Layout Enhancement Solution Architecture|Lustre File Layout]]. The compression units are independent fixed-size chunks of the file, to allow the file to be efficiently read and written with random offsets. Each compressed chunk corresponds to a contiguous range of pages/blocks, with a minimum chunk size of 64KiB, and could be 1MiB or possibly larger in size. Increasing the chunk size typically improves the efficiency of the compression algorithm, since there is more "similar" data that can be compressed as the compression engine "warms up" and fewer fractional blocks of data will be allocated on disk, but at the expense of having a larger read-modify-write overhead if a file is modified, or read at unaligned offsets, after it has been compressed.
+
+Multiple compression algorithms should be available in order to allow optimizing space vs. CPU usage. Initially, the compression algorithm would be static based on administrator or user tuning of the file layout using new options to the "<code>lfs setstripe</code>" command, for example "<code>-Z gzip:9</code>" or "<code>-Z lz4</code>", as with other Lustre layout attributes such as stripe count, stripe size, and pool. Compression of a data chunk is not useful if the compressed size is not at least one whole data block (4KiB) smaller than the original data, otherwise there will not be any space savings on disk, only added CPU overhead. For a 64KiB chunk size this would mean a minimum compression ratio of 64KiB/60KiB = 1.06, which is very achievable in most cases, unless the data is totally incompressible.
+
+It should also be possible to have some simple "helper" compression types, such as "<code>-Z fast</code>" and "<code>-Z best</code>" that will respectively select the currently fastest and highest compression algorithms available to the client. The "<code>fast</code>" and "<code>best</code>" algorithm choices would initially be statically mapped to an internal table based on algorithm availability but could be dynamically selected at runtime during later implementation tuning.
+
+[[File:csdc-chunk-sparse-file.png]]
+
+This shows a file with multiple compressed and uncompressed chunks. It should be possible to have uncompressed chunks within a single file to handle parts of the file which are incompressible and to avoid increasing the data size in this case. This might also happen if the file is being written directly as compressed (rather than in a post-processing step with Hot Pools), and the client writes are not sized or aligned on a full chunk boundary.
+Chunk structure
+
+When written to disk, a file with packed chunks looks like sparse file, with each chunk of compressed data starting aligned within the file at a chunk-sized offset, and continuing for several filesystem blocks, depending on the amount of compressed data. This allows clients to randomly seek to a chunk-aligned offset within the file to read the compressed data for that chunk, without having to decompress the whole file if it is not being read sequentially. It should be possible to have only a subset of chunks in a file compressed in case parts of the file contain incompressible data (shown below), but normally all chunks of a single mirror would be compressed.
+
+[[File:csdc-chunk-format.png]]
+
+The OST on-disk representation of the compressed data will have a small compression header at the start of every chunk which contains a magic value, the compression type, level, a checksum, and other data for that chunk. The header will be stored inline within the space that is saved by compression, so there would always be enough space for the header if the data can be compressed sufficiently. There would be no header stored for uncompressed data, so it must be possible for the client to positively identify the header chunk independently of the file content using the header contents If there is no valid header found, the raw data would be returned directly to userspace as an uncompressed chunk. The compressed chunks should ideally be allocated contiguously on disk (without holes) so that no seek is needed to read each chunk, and there are not lots of small random chunks of free space left in the filesystem.
+
+==Chunk Size==
+The compression chunk size should be at least the minimum Lustre stripe size of 64KiB, to ensure that the chunks are always aligned on Lustre stripe boundaries, so that a single chunk is not split across OST objects and multiple compression chunks do not occupy a single client page. The maximum compression chunk size should similarly be no larger than the Lustre stripe size, typically 1MiB or 4MiB (though this is a soft limit), so that a single compressed chunk does not span OST objects. Reducing the chunk size also reduces the amount of overhead from reading and writing at random offsets in the file, since the full chunk size would need to be read and decompressed by the client, and then re-compressed and written if it is being modified. However, a larger chunk size allows better opportunity to compress the data.
+
+Each chunk must fit into a single RPC, also typically 1MiB, so that it can be compressed and decompressed as a single unit and does not depend on the completion of multiple RPCs in order to produce usable data.
+
+==Compression Algorithms==
+Initial compression algorithms available for use would be those that are already available in the Linux kernel. Since the compression is handled by the client, the algorithms available need to be widely supported, otherwise clients that do not understand the algorithm will be unable to read the file.
+
+The RHEL8.6 kernel (4.18) supports the following compression algorithms via the kernel CryptoAPI, which include the most common ones:
+* [https://en.wikipedia.org/wiki/DEFLATE GZIP deflate] - best compression ratio, but very slow and high CPU usage
+* [https://en.wikipedia.org/wiki/Lempel%E2%80%93Ziv%E2%80%93Oberhumer LZO] - older "middle of the road" compression ratio and speed
+
+The RHEL8.6 kernel also supports additional algorithms, but they are not enabled by default:
+* [https://en.wikipedia.org/wiki/LZ4_(compression_algorithm) LZ4] - best overall compression speed and good compression ratio
+* LZ4HC - High Compression option for LZ4
+* [https://en.wikipedia.org/wiki/Zstd ZSTD] - best compression ratio, still much faster than GZIP deflate
+
+=== Performance of compression Algorithms ===
+{| class="wikitable" style="margin:auto"
+|+ Compression algorithms and their performance on climate data (2016)
+|- 
+! Algorithm !! Availability !! Compression (MB/s) !! Decompression (MB/s) !! Ratio
+|-
+| GZIP ||  el7/el8 ||     95 ||   610 ||   2.326 
+|-
+| LZO  ||  el7/el8 ||    380 ||  1938 ||   1.887 
+|-
+| LZ4  ||  el8 opt ||   1796 ||  5178 ||   1.923 
+|-
+| LZ4HC||  el8 opt ||    258 ||  4333 ||   2.000
+|-
+| ZSTD ||  el8 opt ||    658 ||  2019 ||   2.326 
+|}
+
+=== Availability of Compression Algorithms ===
+It would be best to use available kernel code for compression to maximize availability of the feature, and minimize development and maintenance overhead.
+
+The lack of optimal compression algorithms enabled in the RHEL8 kernel (or those with custom configurations) should not be a significant obstacle to using a variety of algorithms. This would need to enable, build, and install extra kernel modules for these algorithms (LZ4, LZ4HC, ZSTD) together with the Lustre RPMs (either part of kmod-lustre or as a separate kmod-lustre-compress or similar). The kernel does not natively support the LZ4FAST algorithm, but there are some options for selecting the compression level of the LZ4 algorithm that can provide fast compression with lower CPU use.
+
+It is expected that newer kernels used on clients (Ubuntu, RHEL9, SLES15) would support a superset of these algorithms. The RHEL7 kernel (3.10) supports only the GZIP deflate and LZO algorithms natively, so sites still running these older clients together with newer clients would have to limit the compression algorithms used. It may be possible to backport the LZ4 compression algorithm to RHEL7, but this would be a lower priority after initial development is completed as it has diminishing returns over time as those clients age out of use.
+
+== Unaligned/Partial Chunk Read and Write ==
+In case a client attempts to modify part of a compressed file, the whole compressed file chunk will be read into client RAM, decompressed, modified, compressed, then written again. This would lead to poor performance if there were multiple chunk-unaligned writers on the file, due to both increased lock contention, as well as significant write inflation at the storage side. This could potentially be mitigated by having clients write uncompressed chunks in case of contention, at the expense of not having any compression. The file layout could be flagged as being only partly compressed, to simplify finding such files for later via "<code>lfs find</code>", and then be recompressed in a later step (e.g. "<code>lfs migrate</code>").
+
+== Random IO ==
+Random IO (reads or sync writes) on a compressed file with an IO size smaller than the compression chunk size (e.g. < 64KB) would be bad for performance. For random reads, it would be much better to decompress and read the whole file into memory (e.g. [https://jira.whamcloud.com/browse/LU-11416 LU-11416]). For random writes, it could be handled in a similar manner to the Unaligned/Partial Chunk Read and Write, where the client would write uncompressed into RAM/flash and then compress the whole file in a later step.
+
+== LDISKFS holes ==
+When writing a file with holes (e.g. 32KiB of data at 64KiB offsets), the current ldiskfs mballoc behavior is to preallocate blocks for the unwritten parts of the file (holes), expecting that they will be filled in near future by another client. However, in the compression case, the "holes" in the file will never be filled in so the allocator should skip these blocks. This may require changes to the mballoc allocation heuristics to treat compressed files differently from uncompressed files.
+
+== Client requirements ==
+Compression and decompression are expected to be performed synchronously while holding the DLM extent locks at the time the data is being sent to the OST, so client slowness should not lead to any race conditions and only to a performance drop.
+
+== Server-Side Compressed File Handling ==
+For poorly-formed IO patterns (e.g. unaligned writes, overwrites of files) the OST is best placed to handle the decompression/recompression of partial chunk IO, rather than send the data to the client to perform this operation.  This will place an additional CPU burden on the OSS nodes, but they are typically not CPU constrained (compared to the MDS) so should have available CPU resources as long as this is not the prevalent IO model.  Compared to competing solutions that perform 'all' compression on the servers, the CSDC implementation should be superior under most workloads due to leveraging the available client CPU resources instead of depending wholly on server CPUs.
+
+Implementing compression in the OST IO path would also provide a lesser benefit compared to client-side compression, given that upgrading clients to a supported release is "mostly" free, and there are far more CPU resources on the clients than the servers. Also, server-side compression does not benefit from reductions in network usage.
+
+One benefit of server-side compression is that the server could aggregate multiple unaligned writes in memory and compress them before submitting to storage. However, the in-memory aggregation of writes from multiple clients would require additional code changes on the server (improved QOS ORR/TBF request ordering and writeback server-side cache). This write aggregation would likely also provide some benefit even for uncompressed writes but is not done today.
+
+= Optimizations, Potential Future Improvements =
+== Older Client Access to Compressed Files ==
+Older clients, or those clients that do not understand a particular compression algorithm, will not be able to read or write compressed files. The current design has compression and decompression done only on the client, and this functionality will be missing on older clients. The older clients will be blocked from reading and writing compressed files by virtue of the files having an unknown layout type to that client. In theory, clients that do not understand a compression type could do whole-chunk uncompressed overwrites of a file, which would clobber the compression header, but it isn't clear if there is any real benefit to allow this.
+
+The server-side compression and decompression could potentially be leveraged for older clients to be able to directly access compressed files, by the server decompressing each data chunk before sending it to the client for each read and compressing the data received from the client for each write. This would add significant CPU load to the servers and would require additional development effort beyond the base feature.
+
+However, upgrading the Lustre clients to understand compressed files does not require any development effort and is a lower risk and complexity option to avoid this requirement.
+
+==Dynamic Compression Algorithm Selection==
+After the initial implementation is completed, additional development could investigate whether the compression algorithm selection could be made dynamic based on file content or other heuristics. For example, if the compression algorithm is specified as "any" (or other similar keyword) the client could do a trial compression of a few chunks of file to see which option(s) produced the best compression for that data, within a reasonable timeframe based on the storage bandwidth and available CPU cycles. This would allow dynamically selecting the best compression algorithm for the current system, rather than depending on a static list of compression speeds at compile time to select the "best" and "fast" algorithms.
+
+Some algorithms, such as ZSTD, allow specifying an initial "dictionary" for a file in order to optimize the compression of multiple similar files. Since clients are independently compressing different chunks of the same file, it should be possible to pass on the dictionary from one chunk to the next so that the compression has a "head start". This mechanism can possibly be extended across files compressed by that client (e.g. same filename extension, same parent directory, same JobId, etc.).
+
+==Hardware Assisted Compression==
+Using the [https://docs.kernel.org/crypto/intro.html Linux kernel CryptoAPI] interface to handle the data compression and decompression allows the client to have access to the most efficient implementations of the various algorithms for the current architecture. This could include optimized assembly CPU architecture, or potentially hardware assisted compression in [https://www.anandtech.com/show/17596/intel-demos-sapphire-rapids-accelerators-at-innovation-2022 Intel QAT in Sapphire Rapids CPUs] and https://www.intel.com/content/www/us/en/products/platforms/details/purley.html Intel C620 (Lewisburgh)] chipsets, if such hardware is available on the system.  However, past experience has shown that the memory bandwidth of external compression engines is typically insufficient to handle full-bandwidth data streams, and it is typically faster (and less expensive) to use the client CPU to perform this task.
+
+==Use of Filename Extensions==
+It would also be possible to configure the client to select the best algorithm for each file by its extension or disable compression for file extensions that are known to already be compressed (e.g. <code>.jpg</code>, <code>.mpg</code>, <code>.gz</code>, <code>.tgz</code>, <code>.bz2</code>, etc.). This should be configurable so that other "no compress" file extensions can be added easily. A more generic solution might be to use the "file" utility to identify the content type, and avoid compressing files that report "compressed" in the type, and/or dynamically generate an extension-to-type mapping to avoid calling "file" repeatedly for each file.
+
+== Raw Compressed Data Read/Write ==
+As with fscrypt handling of encrypted data, it should be possible for clients to read and write the raw compressed chunks to and from userspace. This would accelerate file mirroring and migration operations where the source is already partly or fully compressed, rather than decompressing and re-compressing every chunk in the file.
+
+Similarly, it should be possible to directly overwrite uncompressed chunks of a partially-compressed file in-place with compressed data, but the "tail" of each chunk should be overwritten with zeroes or punched out so that it does not cause problems in the future. This is not strictly required, because the compression header will contain the compressed data length, and any old data beyond this size should be ignored during decompression, but this "tail" data would still consume filesystem blocks and be transferred over the network.
+
+==Transient Compression Statistics==
+The client and server can keep transient compression statistics by storing the total compressed and data sizes from the chunk compression headers for both reads and writes (e.g. read_compr and write_compr in osc..stats, and obdfilter..stats), and mdt.*.stats. This would allow calculating a "session compression ratio" statistic:
+    compression ratio = write_bytes / write_compr
+
+These statistics would be reset on unmount or if explicitly reset, like other statistics kept by Lustre clients and servers, but would be representative of current workloads, and accurate over the lifetime of a client or server mount since they will use the actual raw/compressed data size.
+
+==Disk Compression Statistics Report==
+Statistics from the compression methods should be tracked, to be able to report compression ratios acheived, which files have/have not had compression applied and why. A long-term compression statistic reports could be generated in different ways.
+
+It should be relatively straight forward for clients to track the compression ratio of recently read/written files, since they know both the compressed and uncompressed size of the data processed. This data would last only as long as the client had the filesystem mounted. Since the compression happens on the client, and the servers are largely unaware of this, it would be difficult to maintain aggregate statistics over time directly from the client data.
+
+It would be possible to generate a report by aggregating blocks used for each file against the actual file size. This could generate statistics on a per-user, per-group, or per-project basis. This could be done from either the MDT (using Lazy Size on MDT blocks/size values) which may be slightly inaccurate/stale, or on the OSTs (using actual blocks/size values). However, in both cases, using just the blocks and size to determine compression ratios might produce inaccurate results because of sparse files. It would be possible to mostly compensate for the effect of sparse files by determining the "sparseness ratio" for uncompressed files (i.e. blocks / size) and then using this to adjust the compression ratio accordingly (assuming that compressed and uncompressed files are approximately the same). A more complex solution would be to store the file's compression ratio in the inode so that the ratio can be determined without additional overhead.
+
+Alternately, it would be possible to persist the transient compression statistics on the OSTs to disk periodically, so that the OST lifetime compression ratio can be saved (e.g. lifetime total compressed and raw writes). This could be written periodically to a file and read back at restart. Keeping this approximately accurate and uptodate would be relatively straightforward. Keeping this value completely accurate and tracking the current compression ratio would be complex and add overhead to every write.
+
+To be able to report aggregate statistics to users like "this directory has a 2.5:1 compression ratio" and/or "filesystem saved 13TB of space due to data compression" would require scanning the compression statistics for those directories, though they could be cached inside the directory for quick lookup (probably a separate project).  Having a simple (even if slightly inaccurate) way of reporting this to users would be helpful. For example, if the OSTs can track the average "blocks allocated vs. file size since mount" that would be useful to give an estimate of the compression.
+
+= Interaction with Other Features =
+== TLC + QLC Flash ==
+PFL can be configured so that the initial file write is done on a "fast" TLC flash pool, and then the Hot Pools agents will do file compression in the background when the file is no longer being written and is mirrored to the cold pool (HDD or QLC flash), or manually with "<code>lfs migrate</code>". This would allow full-speed/random/poorly-formed writes to be done initially to the TLC flash pool, and reduce the writes on the QLC flash pool to only well-formed sequential writes as much as possible.
+
+It may also be possible to have a hybrid model where "well formed" writes would be compressed by the initial client write (using client-side CPU cycles), and then copied "raw" to the file mirror on the QLC pool without decompressing and recompressing it.
+
+== Compression and Encryption ==
+Data compression must be done strictly before data encryption, otherwise the encrypted data will be incompressible, and no benefit will be had from this feature.  One potential concern is that encrypting the compression header (with embedded magic) is that this provides a "known plaintext" value in every chunk in the file, which might expose it to brute force attacks. so that it is possible to determine if a data chunk is compressed even without decrypting it. However, in this case the compression header should not contain the pre-encryption checksum of the data (if this is implemented and enabled) or it would be a serious data leak. Since encryption/decryption is carried out in the OSC layer, and works on whole pages, it is not going to be possible to exclude the compression header from encryption, unless it is isolated in one or several pages, separated from actual data, and easily identified. 
+
+==Compression and PCC==
+The PCC feature currently only supports read-only access to files in the local cache, so it would not benefit client-side compression. Even if PCC-RW was supported today, this functionality only allows single-client writing to a locally cached file, so this would not provide any advantage over the standard in-RAM aggregation of client writes before an RPC is sent to the OST.
+
+== O_DIRECT on Compressed Files ==
+It may be necessary to ignore <code>O_DIRECT</code> on compressed files if they are not compression-chunk sized or aligned, and instead fall back to buffered IO in that case. As with fscrypt in Lustre, <code>O_DIRECT</code> would always be double-buffered on the client, so that the data compression does not modify the original source data.
+
+== MMAP on Compressed Files== 
+Page cache pages are kept uncompressed (and unencrypted), so MMAP on compressed files should be transparent, just as it is on encrypted files. Since mmap-based file IO is doing page faults at a page-granular level, and often at random offsets, extra care needs to be taken to ensure that reads and writes are handled at a chunk-granular level. It may be that mmap files cannot be compressed initially, and would require a separate post-processing step to do the compression.
+
+== Compression and recovery ==
+There are no additional state-machines, packed data transferred in the same requests as unpacked (except some fields difference). No additional locks are being held, so no locks replay required.
+
+== Compression and DoM ==
+Uncompressed size of data should be taken into account when DoM component size is calculated. It may be that adding compressed data support for DoM files is not implemented in the original release, depending on code complexity. However, reducing DoM space usage on the MDT (or alternately allowing larger files to fit into the same space on the MDT) would provide a significant benefit to this feature.
+
+== Pool spilling==
+The uncompressed size of data should be used to calculate a moment when pool spilling must be enabled in case data will be changed in place and compressed data size will be increased.
+
+== ZFS On-Disk Compression Compatibility ==
+While ZFS integration is not a primary goal of this implementation, it should be possible to integrate the client-side data compression functionality with the on-disk format of ZFS compressed data blocks with a relatively straight-forward protocol change.  Since the compressed chunk data (excluding the compression header) is using standard compression algorithms and formats, it should compatible with the existing ZFS compression algorithms of the same name (i.e. <code>lz4</code>, <code>gzip</code>, <code>lzo</code>).  The client would need to implement the ZFS compression header format for the compressed chunks it is sending (so that they can be written directly to storage without copying/conversion).  This could be done either with a connect flag from each OST that indicates which compression header to use for that OST's data chunks.  Alternately, define different client-side compression algorithms in the future when using a ZFS OST, but this would complicate the implementation (or be impossible) if different OSDs are used for the objects of a single component.
+
+= Logic Specification =
+== Layout Specification ==
+The file compression algorithm and level should be selectable by adding "<code>lfs setstripe … Z|compress <type>[:<level>] [-compress-chunk=<size>]</code>" on a per-component basis. The compression chunk size should default to a reasonable value based on benchmarking once the feature has been implemented but could default to 64KiB initially.
+
+The compression algorithm and level could be stored in the per-component <code>struct lov_comp_md_entry_v1</code> in the 16-bit <code>lcme_padding_1</code> field, but there would not be enough space to directly store a separate chunk size. It seems reasonable to store these fields as:
+
+    __u8 lcme_compr_type;
+    __u8 lcme_compr_level:4;
+    __u8 lcme_chunk_log_bits:4;
+
+While there are some compression algorithms that have more than 16 compression levels, it should be sufficient to map a subset of the actual range to a 16-level range for those algorithms.
+
+The <code>lcme_chunk_log_bits</code> field stores the chunk size in power-of-two multiples of the base 64KiB chunk size, or <code>2^16+log_bits</code>, which allows a range of chunk sizes from 64KiB (<code>log_bits=0</code>) to 2GiB (<code>log_bits=15</code>).
+
+The <code>lcme_flags</code> field may store a flag like <code>LCME_FL_PARTIAL</code> to indicate that some chunks in the component are uncompressed, even though there is a compression type stored in the header, for ease of finding such files in the future for recompression. If the file is entirely uncompressed (e.g. it is determined by the filename extension or initial sample data compression), then the compression type and level could be cleared from the layout.
+
+The LOV layout itself needs to be incompatible with older clients, so that they do not read or write the compressed file data (which would otherwise be returned raw to userspace). The simplest mechanism to do this would be to add a new <code>LOV_PATTERN_COMPRESS</code> flag in the <code>lov_mds_md.lmm_pattern</code> field, which older clients will check and avoid accessing the file in that case. It would be desirable for clients that do not understand the layout of one mirror of a file (whether due to <code>LOV_PATTERN_COMPRESS</code> or an unknown compression type) to still try any other mirror that has a layout that they do understand, so that the file can still be read.
+
+== Compression Header ==
+The compression header should contain the following fields:
+
+    struct ll_compr_hdr {
+        __u64 llch_magic:48;     /* LLCH_MAGIC */
+        __u8  llch_header_size;  /* for future extensions */
+        __u8  llch_extra_flags;
+        __u16 llch_flags;
+        __u8  llch_compr_type;    /* LLCH_COMP_GZIP, LLCH_COMP_LZ4, */
+        __u8  llch_compr_level:4, /* per-algorithm mapped level */
+              llch_chunk_log_bits:4;
+        __u32 llch_compr_size;    /* bytes of compressed data */
+        __u32 llch_uncompr_size;  /* bytes of uncompressed data */
+        __u32 llch_reserved;      /* reserved for future use */
+        __u32 llch_compr_csum;    /* crc32 of compressed data, or 0 */
+        __u32 llch_hdr_csum;      /* crc32 of magic..compr_csum, or 0 */
+    };
+
+The compression type (at least) needs to be stored in the header for 'each chunk' on disk, in addition to the type stored in the LOV layout, because it is needed when decompressing the chunk. At a minimum, some chunks may be uncompressed, and it may be useful to check the compression level to see if it is worthwhile to recompress the chunk during migration/mirroring to save more space (i.e. low/fast compression during write, recompress in background at maximum level). In theory, given enough CPU power on the client, it would be possible to try multiple compression types for each chunk to determine the highest compression ratio.
+
+Additionally, it would be worthwhile to investigate whether storing __u32 pre- and/or post-compression data checksum in each chunk is useful for data verification. Most compressed data streams can detect if the compressed data is invalid and may already have some form of checksum stored at the end, so there may not be a benefit to storing this explicitly in the header. If this is optionally added to the header, a flag could be stored in <code>llch_flags</code> to indicate the presence of the pre- or post- checksum field.
+
+Since the compression header is stored inline with the data, and some chunks may be stored uncompressed without a header, it is possible that there might be false-positive matches of a compression header in uncompressed data. With random data, the presence of the magic, checksum, and compression type+level would mean at most a 1/2^80 chance (or lower once fields like <code>llch_compr_size < chunk</code> size are validated), of a false positive per chunk. That is less than one false positive per 2^144 bytes written, which exceeds the lifetime of the universe. However, it may be possible to maliciously write incompressible data with a valid header to cause an uncompressed chunk to be written with the signature. At worst this should cause the decompression engine to return an error and result in the original data being returned to the application (as it should be). In any case, any errors would only affect the original file (maliciously) written by the user.
+
+== Layout Enforcement ==
+The file layout constraints must be enforced by the user tools (lfs) to provide useful error messages to the user, as well as the client LOV layer to ensure that badly formed layouts are not set on files. The LOV layer already ensures that the file layout is a multiple of 64KiB, so this is not a new requirement. The chunk size should not exceed the RPC size or stripe size.
+
+It isn't required that the MDS or OSS validate the compression algorithm type used, since they are not actually performing the compression and decompression steps. The supported algorithms may differ between clients, so it is only critical that the local client understand the supported algorithm. However, having the client announce the known compression types to the MDS and OSS may facilitate compression algorithm selection and/or server-side decompression, so are useful to add to the protocol during the initial implementation even if they are not strictly required at this stage, since they would be harder to add at a later time.
+
+At a minimum, the MDS must understand the <code>LOV_PATTERN_COMPRESS</code> layout flag, so that it does not consider the layout to be unusable.
+
+There may be a desire to allow the administrator to provide a list of allowed compression algorithms to the client at connect time in order to prevent newer clients from dynamically selecting algorithms that are not supported by all clients in a cluster. Otherwise, files written by one client may not be readable by another client. This could be done by a tunable parameter stored on the MGS (e.g. "osc..compression_type", similar to "osc..checksum_type") and file creation with a compression algorithm not in this list would fail.
+
+== Lustre Client Layering==
+The data compression will be implemented in the OSC layer, adjaceArtem, there isn't much explanation of this. While the splitting of read/write pages happens at the LOV layer, typically page aggregation and RPC generation is done at the OSC layer.
+
+The fscrypt code is handling this with the OSC layer doing the data encryption in <code>osc_brw_prep_request()</code> into the bounce buffer just before the RPC is sent onto the wire, so it makes sense to handle compression in the same place.nt to the data encryption feature. The OSC aggregates pages in the writeback cache and forming RPCs that are aligned to RPC boundaries. The compression needs to be done before encryption in the <code>osc_brw_prep_request()</code> functionDecryption is carried out in <code>osc_brw_fini_request()</code>, so same should be done for decompress, after the decryption step. and after decryption in the <code>osc_brw_fini_request()</code> function.
+
+Since the OSC is below the LOV layer that handles the file layout, it would need to be able to determine the compression algorithm, level, and chunk size from the LOV layout for each page, since this may change on a per-chunk basis based on which component the page is part of. This is a relatively small amount of data (~2 bytes) that could be stored with the pages or passed via the IO request, rather than having to recompute the page location in the layout to determine it each time.
+
+== DLM Lock Alignment ==
+For compressed files, the client will have a DLM extent lock covering the data chunk, as it always does. However, the OST lock granularity needs to be increased to cover the entire compression chunk (e.g. 64KiB) rather than only the PAGE_SIZE (4KiB for x86 clients). The DLM lock granularity is already handled by the client, since ARM and PPC clients can be configured with <code>PAGE_SIZE=64KiB</code>. For writes, the DLM lock would be exclusive so no other clients can interfere with compressed write. For reads, multiple clients can share a read lock, as normal.
+
+On the OST side, the DLM lock expansion should already be able to handle lock alignment at a larger <code>PAGE_SIZE</code> boundary due to different client architectures mounting the same filesystem. This is handled in <code>ldlm_extent_internal_policy_fixup()</code>. If the client(s) are always requesting 64KiB-aligned locks, the OST should never return a lock that is aligned at a smaller granularity.
+
+== Server-Side Compression Awareness ==
+In the original Uni Hamburg implementation, the compression header was passed to the OSS in a separate RPC buffer (similar to <code>struct niobuf</code>) so that the compression chunks were described independently from the data. This was done to allow ZFS to separately process and store the compressed data (in data blocks) and metadata (in block pointers) but means that the OSS needs to be modified to handle compressed files. For ldiskfs this separation is not strictly required in the initial implementation but may be needed later in case of server-side compression handling.
+
+It may at least be necessary (or desirable) to store a flag on the compressed OST objects in order to distinguish them from uncompressed objects. This would be useful for calculating and reporting aggregate data compression ratios, since those should not be computed on uncompressed files.
+
+== Serviceability and debugging ==
+=== e2fsprogs ===
+e2fsprogs tools should not care about the file's content so no difference between compressed and uncompressed data. All required inode flags support should be also added to <code>e2fsck</code> thought.
+=== e2fsck ===
+e2fsck should know about compressed chunk header format and can be ready to fix it in case it is corrupted.
+=== e2image ===
+e2image should not have any issues handling compressed files, since they are regular sparse files.
+=== ext4 ===
+It would be desirable to allow ext4 to create/read/write the compressed files in a similar manner as a Lustre client, but this is a considerable development effort and unclear if there is a desire to include this upstream.
+
+= Unit/integration test plan =
+Lustre FS test should be added that prepare compression/decompression in variety of circumstances.
+= Questions for consideration =
+== Development Parallelism==
+LDISKFS part of QLC optimization can be done independently from client-side compression. An option that forces ldiskfs mballoc to not reserve blocks for holes can be useful for another feature/modes. QLC-related optimizations can be useful themself. It this case these tasks can be separated and done in parallel/by another developer.
+
+== File size handling? ==
+As with encryption, file size needs to be handled specifically for compressed files. As is, file size as seen from client side would be based on data stored on objects on server side. For instance, a "clear text" file of size 64KB, compressed on disk as 60KB, would appear to be 60KB large on clients, which might be problematic when accessed by applications.
+
+The 'real' file size (i_size field for instance) should be passed directly from the client to the OST and saved in the OST object (if it is the last extent being written and extends the file size), rather than being implicitly generated by the OST based on the size of the last write, so that <code>stat()</code> operations return the real data size, even if the last chunk of the file does not extend to the client <code>i_size</code>.
+
+= Project Links =
+
+  * [https://wr.informatik.uni-hamburg.de/research/projects/ipcc-l/start Uni Hamburg Scientific Computing Group]
+  * [https://jira.whamcloud.com/browse/LU-10026 LU-10026 Client-side data compression]
+
+[[Category:Layout]]
+[[Category:Architecture]]

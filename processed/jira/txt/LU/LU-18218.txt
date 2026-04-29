@@ -1,0 +1,528 @@
+Key:        LU-18218
+Summary:    Performance impact on MDT performance with changelogs enabled
+Link:       https://jira.whamcloud.com/browse/LU-18218
+Type:       Improvement
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Alexander Boyko
+Reporter:   Alexander Boyko
+Created:    Thu, 12 Sep 2024 12:23:26 +0000
+Updated:    Wed, 14 May 2025 09:18:46 +0000
+Resolved:   Wed, 7 May 2025 21:37:20 +0000
+Labels:     patch
+Links:      Related: is related to LU-19015
+
+--- Description ---
+We tested MDT performance with and without changelogs enabled and observed a big performance impact with changelogs enabled.
+
+pdsh -g mds 'lctl get_param mdd.*.changelog*' | dshbak -c
+----------------
+lmm1302
+----------------
+mdd.lmm13-MDT0000.changelog_deniednext=60
+mdd.lmm13-MDT0000.changelog_gc=1
+mdd.lmm13-MDT0000.changelog_max_idle_indexes=2097446912
+mdd.lmm13-MDT0000.changelog_max_idle_time=2592000
+mdd.lmm13-MDT0000.changelog_min_free_cat_entries=2
+mdd.lmm13-MDT0000.changelog_min_gc_interval=3600
+mdd.lmm13-MDT0000.changelog_size=1637620216
+mdd.lmm13-MDT0000.changelog_striped_dir_real_pfid=0
+mdd.lmm13-MDT0000.changelog_current_mask=
+MARK CREAT MKDIR HLINK SLINK MKNOD UNLNK RMDIR RENME RNMTO LYOUT TRUNC SATTR XATTR HSM MTIME CTIME MIGRT FLRW RESYNC
+mdd.lmm13-MDT0000.changelog_mask=
+MARK CREAT MKDIR HLINK SLINK MKNOD UNLNK RMDIR RENME RNMTO LYOUT TRUNC SATTR XATTR HSM MTIME CTIME MIGRT FLRW RESYNC
+mdd.lmm13-MDT0000.changelog_users=
+current_index: 227636205
+ID                            index (idle) mask
+cl3                       219246813 (76)
+
+SUMMARY rate: (of 3 iterations)
+   Operation                      Max            Min           Mean        Std Dev
+   ---------                      ---            ---           ----        -------
+   File creation             :      64293.217      61191.096      62598.992       1282.215
+   File stat                 :     697756.541     690173.219     694512.173       3152.598
+   File read                 :     293942.923     292588.428     293054.714        615.889
+   File removal              :      64479.412      57107.824      61776.225       3314.447
+   Tree creation             :        169.033        145.318        154.133         10.595
+   Tree removal              :         82.949         44.846         69.342         17.357
+V-1: Entering PrintTimestamp...
+-- finished at 11/30/2023 12:19:44 --
+ 
+
+When we disable changelog, performance comes back
+
+# cscli lustre changelog disable
+lmm13-MDT0000: Deregistered changelog user #3
+lmm13-MDT0001: Deregistered changelog user #3
+
+SUMMARY rate: (of 3 iterations)
+   Operation                      Max            Min           Mean        Std Dev
+   ---------                      ---            ---           ----        -------
+   File creation             :     158468.362     153578.205     155692.937       2048.523
+   File stat                 :     703378.629     665431.521     689570.511      17093.925
+   File read                 :     290063.030     278902.768     284177.285       4568.720
+   File removal              :     141796.451     136881.639     139915.690       2163.940
+   Tree creation             :        199.212        131.040        173.177         30.070
+   Tree removal              :         95.939         39.770         74.663         24.871
+V-1: Entering PrintTimestamp...
+-- finished at 11/30/2023 12:23:45 --
+
+I'v taken a perf report with changelog enabled, looks like llog_cat_add_rec()->mutex_lock is a bottle neck
+
+   --14.94%--mdt_reint_create                                                     
+ |                                                                               
+  --14.93%--mdt_create                                                           
+            |                                                                    
+            |--14.63%--mdd_create                                                
+            |          |                                                         
+            |          |--12.85%--mdd_changelog_ns_store                         
+            |          |          |                                              
+            |          |           --12.84%--mdd_changelog_store                 
+            |          |                     |                                   
+            |          |                      --12.84%--llog_add                 
+            |          |                                |                        
+            |          |                                 --12.84%--llog_cat_add_rec
+            |          |                                           |             
+            |          |                                           |--12.70%--rwsem_down_write_slowpath        
+            |          |                                           |          |  
+            |          |                                           |          |--11.80%--osq_lock   
+            |          |                                           |          |  
+            |          |                                           |           --0.46%--rwsem_spin_on_owner    
+            |          |                                           |             
+            |          |                                            --0.12%--llog_write_rec         
+            |          |                                                      |  
+            |          |                                                       --0.12%--mdd_changelog_write_rec
+
+Without changelog perf looks like
+
+|--5.90%--mdd_create                                                             
+            |                                                                            
+            |--4.74%--mdd_create_object                                                  
+            |          |                                                                 
+            |          |--3.01%--mdd_create_object_internal                              
+            |          |          |                                                      
+            |          |           --3.01%--lod_create                                   
+            |          |                     |                                           
+            |          |                      --3.01%--lod_sub_create                    
+            |          |                                |                                
+            |          |                                 --3.01%--osd_create             
+            |          |                                           |                     
+            |          |                                           |--2.78%--osd_mkfile.constprop.104                                           
+            |          |                                           |          |          
+            |          |                                           |           --2.78%--ldiskfs_create_inode                                    
+            |          |                                           |                     |          
+            |          |                                           |                      --2.78%--__ldiskfs_new_inode 
+
+From a Lustre llog design/implementation, adding a record to changelog have a synchronization on down_wtrite(plain_llog->lgh_lock). It is a top semaphore.
+
+All locking for a adding record looks next
+
+  down_write((&loghandle->lgh_lock) synchronize writers
+  ----down_write(&loghandle->lgh_last_sem) synchronize write and parallel read
+  --------mutex_lock(&loghandle->lgh_hdr_mutex)  protects llog header/bitmap data from concurrent update/cancel
+  --------dt_write_lock(env, o, 0); for atomic update header and record for a remote readers
+  -----------  write header update
+  --------mutex_unlock(&loghandle->lgh_hdr_mutex);
+  --------write a record
+  --------dt_write_unlock(env, o);
+  ----up_write(&loghandle->lgh_last_sem);
+up_write(&loghandle->lgh_lock);
+
+So there is a real limit for adding record at changelog, and all metadata threads, 512 or so, would sleep at a top semaphore during changelog adding. Only one could be a writer for a moment. Bottleneck.
+
+--- Comment (bzzz, Tue, 13 May 2025 10:57:25 +0000) ---
+. Records B and A belong to the same transaction handle, so there is no possibility of a gap after the transaction is committed.
+
+Multiple threads get into mdd_changelog_write_rec(), they all get their own offsets and now start dt_record_write() in parallel.
+
+Due to scheduling one thread with an offset corresponding to block X+1 starts first and allocates block X+1, few more threads now can write to X+1.
+
+Another thread with block X can't allocate it due to ENOSPC.
+
+--- Comment (aboyko, Tue, 13 May 2025 10:25:06 +0000) ---
+It is simple to skip zero record at llog_process_thread()
+
+diff --git a/lustre/obdclass/llog.c b/lustre/obdclass/llog.c
+index b839e91aff..84c7cb6e0b 100644
+--- a/lustre/obdclass/llog.c
++++ b/lustre/obdclass/llog.c
+@@ -493,6 +493,19 @@ static inline bool llog_is_index_skipable(int idx, struct llog_log_hdr *llh,
+        return !test_bit_le(idx, LLOG_HDR_BITMAP(llh));
+ }
+ 
++static inline int llog_skip_gap(struct llog_rec_hdr *start, char *end)
++{
++       struct llog_rec_hdr *rec = start;
++       /* skipping zero gap */
++       while ((rec->lrh_index == 0 || rec->lrh_len == 0) &&
++              (char *)rec  end ||
++           (rec->lrh_type & LLOG_OP_MASK) != LLOG_OP_MAGIC)
++               return -ENOENT;
++       return (int)((char *)rec - (char *)start);
++}
++
+ static int llog_process_thread(void *arg)
+ {
+        struct llog_process_info *lpi = arg;
+@@ -692,18 +705,29 @@ repeat:
+ 
+                        rc = llog_verify_record(loghandle, rec);
+                        if (rc) {
++                               int gap_size;
++
+                                CDEBUG(D_OTHER, "invalid record at index %d\n",
+                                       index);
+                                /*
+                                 * for fixed-sized llogs we can skip one record
+                                 * by using llh_size from llog header.
+-                                * Otherwise skip the next llog chunk.
+                                 */
+                                rc = 0;
+                                if (llh->llh_flags & LLOG_F_IS_FIXSIZE) {
+                                        rec->lrh_len = llh->llh_size;
+                                        goto next_rec;
+                                }
++                               /*
++                                * for zero gap we can find a next record.
++                                * Otherwise skip the next llog chunk.
++                                */
++                               gap_size = llog_skip_gap(rec, buf + chunk_size -
++                                                        LLOG_MIN_REC_SIZE);
++                               if (gap_size > 0) {
++                                       rec->lrh_len = gap_size;
++                                       goto next_rec;
++                               }
+                                /* make sure that is always next block */
+                                cur_offset = chunk_offset + chunk_size;
+                                /* no goal to find, just next block to read */
+ 
+
+But after thinking about it, the gap situation seems even more ridiculous.
+
+The changelog relates to OSD layer. A dt_write() works on memory objects, but an error can occur when mapping a bh/get journal acces/handle dirty metadata, which leads to a ldiskfs error and panic(error=panic). Records B and A belong to the same transaction handle, so there is no possibility of a gap after the transaction is committed. For a different transactions B could not be committed before A.
+
+--- Comment (bzzz, Fri, 9 May 2025 15:45:10 +0000) ---
+dt_write() fail for a changelog is already problem  without this patch, because operation fails.
+
+it doesn't leave holes AFAIU
+
+--- Comment (aboyko, Fri, 9 May 2025 15:28:41 +0000) ---
+dt_write() fail for a changelog is already problem  without this patch, because operation fails.
+
+--- Comment (bzzz, Fri, 9 May 2025 13:47:58 +0000) ---
+Actually I think that you mean opposite problem when offset A 
+yes, literally I mean a gap.
+
+Currently, when a bad record is encountered, the code proceeds to the next chunk. 
+
+that would be a regression leading to missing records. personally I don't think this is acceptable.
+
+--- Comment (aboyko, Fri, 9 May 2025 13:24:30 +0000) ---
+what would happen if a write to offset A fails while another write to offset B succeed where A > B ? while this is very unlikely, but still possible I think.
+
+ 
+
+A > B  = offset B | offset A = rec B | 0x00 0x00 0x00 0x00
+
+Actually I think that you mean opposite problem when offset A A The index bit would not be set for the record A, and the tail, the bit for B, the B record would be fine. 
+
+In this scenario, the reader (llog_process_thread()) should handle null records appropriately. Currently, when a bad record is encountered, the code proceeds to the next chunk. However, I believe we could improve this by skipping the null record and processing the next valid one, similar to how the patch handles null padding at the end of a block.
+
+--- Comment (bzzz, Fri, 9 May 2025 10:37:28 +0000) ---
+The key enhancement is the ability to perform parallel writes . The mdd_changelog_write_rec() function calculates the file offset and record index and releasing the &loghandle->lgh_lock. A semaphore is used to protect the offset/index calculation only, enabling dt_write() to execute concurrently. This reduces contention and improves efficiency.
+
+what would happen if a write to offset A fails while another write to offset B succeed where A > B ? while this is very unlikely, but still possible I think.
+
+--- Comment (aboyko, Fri, 9 May 2025 09:24:37 +0000) ---
+bzzz
+
+looking at LU-18218 mdd: changelog specific write function patch I still don't quite understand where the improvement comes from. the patch replaces the mutex with a spinlock, but there is outter down_write(&loghandle->lgh_last_sem).
+
+With the patch, the "changelog add record" operation now utilizes its own dedicated function, mdd_changelog_write_rec(), to write a llog record, replacing the previous use of llog_osd_write_rec().
+
+The key enhancement is the ability to perform parallel writes . The mdd_changelog_write_rec() function calculates the file offset and record index and releasing the &loghandle->lgh_lock. A semaphore is used to protect the offset/index calculation only, enabling dt_write() to execute concurrently. This reduces contention and improves efficiency.
+
+--- Comment (bzzz, Fri, 9 May 2025 05:11:57 +0000) ---
+looking at LU-18218 mdd: changelog specific write function patch I still don't quite understand where the improvement comes from. the patch replaces the mutex with a spinlock, but there is outter down_write(&loghandle->lgh_last_sem).
+
+--- Comment (pjones, Wed, 7 May 2025 21:37:20 +0000) ---
+Merged for 2.17
+
+--- Comment (gerrit, Wed, 7 May 2025 21:11:00 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/56342/
+
+Subject: LU-18218 mdd: changelog specific write function
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: cb1290768df9fca6ead194c2812fb0182d85191c
+
+--- Comment (gerrit, Fri, 14 Feb 2025 02:55:06 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/57920/
+
+Subject: LU-18218 llog: repeat declare for remote obj
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 9b2de53f9b39f0e421e97e6a16a2f5998fe8cbfb
+
+--- Comment (gerrit, Wed, 29 Jan 2025 11:52:06 +0000) ---
+"Alexander Boyko " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/57920
+
+Subject: LU-18218 llog: repeat declare for remote obj
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: ead97bde20156f50e9c21b0211170d60f98ae0fd
+
+--- Comment (aboyko, Wed, 29 Jan 2025 10:07:43 +0000) ---
+>not sure what have you reproduced, but I'm hitting this symptom:
+
+the symptoms are ESTALE like you have
+
+--- Comment (bzzz, Wed, 29 Jan 2025 05:08:46 +0000) ---
+not sure what have you reproduced, but I'm hitting this symptom:
+
+rm: cannot remove '/mnt/lustre/d60g.sanity/subdir1': Stale file handle
+rm: cannot remove '/mnt/lustre/d60g.sanity/subdir13': Stale file handle
+rm: cannot remove '/mnt/lustre/d60g.sanity/subdir21': Stale file handle
+ sanity test_60g: @@@@@@ FAIL: rmdir failed 
+
+this is because of llog_declare_write_rec() you call for remote objects in llog_declare_write_rec() -> llog_declare_write_rec().
+
+going to try a small patch..
+
+--- Comment (aboyko, Mon, 27 Jan 2025 20:15:02 +0000) ---
+I've reproduce 60g fail.
+
+looks like transaction abort from test happened for llog osp file creation. And later it leads to ESTALE at llog_osd_declare_write_rec()
+
+00080000:02000000:5.0:1737730681.616524:0:1162613:0:(osd_handler.c:2091:osd_trans_start()) *** cfs_fail_loc=19a, val=0***
+00080000:00000001:5.0:1737730681.616524:0:1162613:0:(osd_handler.c:2092:osd_trans_start()) Process leaving via out (rc=18446744073709551611 : -5 : 0xfffffffffffffffb)
+00080000:00000001:5.0:1737730681.616525:0:1162613:0:(osd_handler.c:2119:osd_trans_start()) Process leaving (rc=18446744073709551611 : -5 : fffffffffffffffb)
+00000020:00000001:5.0:1737730681.616525:0:1162613:0:(out_handler.c:903:out_tx_end()) Process leaving via stop (rc=18446744073709551611 : -5 : 0xfffffffffffffffb)
+00080000:00000001:5.0:1737730681.616525:0:1162613:0:(osd_handler.c:2176:osd_trans_stop()) Process entered
+00040000:00000001:5.0:1737730681.616526:0:1162613:0:(qsd_handler.c:1120:qsd_op_end()) Process entered
+00040000:00000001:5.0:1737730681.616526:0:1162613:0:(qsd_handler.c:1151:qsd_op_end()) Process leaving
+00080000:00000001:5.0:1737730681.616526:0:1162613:0:(osd_handler.c:2271:osd_trans_stop()) Process leaving (rc=0 : 0 : 0)
+00000004:00000001:5.0:1737730681.616527:0:1162613:0:(mdt_handler.c:6840:mdt_object_free()) Process entered
+00000004:00000040:5.0:1737730681.616527:0:1162613:0:(mdt_handler.c:6843:mdt_object_free()) object free, fid = [0x240000401:0x8cb0:0x0]
+00000004:00000001:5.0:1737730681.616527:0:1162613:0:(mdt_handler.c:6854:mdt_object_free()) Process leaving
+00000020:00000002:5.0:1737730681.616527:0:1162613:0:(lu_object.c:224:lu_object_put()) Add ffff98c42af76700/ffff98c42d0e0150 to site lru. bkt: ffff98c4320e5338
+00000020:00000002:5.0:1737730681.616528:0:1162613:0:(lu_object.c:224:lu_object_put()) Add ffff98c42bcd4b00/ffff98c430506a80 to site lru. bkt: ffff98c4320e6670
+00000020:00000001:5.0:1737730681.616528:0:1162613:0:(out_handler.c:944:out_tx_end()) Process leaving (rc=18446744073709551611 : -5 : fffffffffffffffb)
+00000020:00000001:5.0:1737730681.616528:0:1162613:0:(out_handler.c:1275:out_handle()) Process leaving (rc=18446744073709551611 : -5 : fffffffffffffffb)
+00010000:00000040:5.0:1737730681.616528:0:1162613:0:(ldlm_lib.c:3209:target_committed_to_req()) last_committed 4295177667, transno 0, xid 1822138016289024
+00010000:00000001:5.0:1737730681.616529:0:1162613:0:(ldlm_lib.c:3279:target_send_reply()) Process entered
+00010000:00000200:5.0:1737730681.616529:0:1162613:0:(ldlm_lib.c:3267:target_send_reply_msg()) @@@ sending reply  req@ffff98c342d1c450 x1822138016289024/t0(0) o1000->lustre-MDT0000-mdtlov_UUID@0@lo:42/0 lens 1320/4320 e 0 to 0 dl 1737730692 ref 1 fl Interpret:/200/0 rc -5/0 job:'osp_up1-0.0' uid:0 gid:0
+....
+00000100:00000001:5.0:1737730681.616576:0:1163369:0:(niobuf.c:447:ptlrpc_unregister_bulk()) Process entered
+00000100:00000001:5.0:1737730681.616576:0:1163369:0:(niobuf.c:461:ptlrpc_unregister_bulk()) Process leaving (rc=1 : 1 : 1)
+00000004:00000001:5.0:1737730681.616577:0:1163369:0:(osp_trans.c:600:osp_update_interpret()) Process entered
+00000004:00080000:5.0:1737730681.616577:0:1163369:0:(osp_md_object.c:1164:osp_write_interpreter()) error [0x240000401:0x1:0x0]: rc = -5
+00000004:00080000:5.0:1737730681.616577:0:1163369:0:(osp_md_object.c:1164:osp_write_interpreter()) error [0x240000401:0x1:0x0]: rc = -5
+00000004:00080000:5.0:1737730681.616578:0:1163369:0:(osp_md_object.c:1164:osp_write_interpreter()) error [0x240000401:0x1:0x0]: rc = -5
+00000004:00080000:5.0:1737730681.616578:0:1163369:0:(osp_md_object.c:1164:osp_write_interpreter()) error [0x240000401:0x1:0x0]: rc = -5
+00000004:00000001:5.0:1737730681.616578:0:1163369:0:(osp_object.c:1374:osp_invalidate()) Process entered
+00000004:00080000:5.0:1737730681.616578:0:1163369:0:(osp_object.c:1376:osp_invalidate()) Invalidate osp_object [0x240000401:0x1:0x0]
+00000004:00000001:5.0:1737730681.616579:0:1163369:0:(osp_object.c:1396:osp_invalidate()) Process leaving (rc=0 : 0 : 0)
+00000004:00000001:5.0:1737730681.616579:0:1163369:0:(osp_trans.c:689:osp_update_interpret()) Process leaving (rc=18446744073709551611 : -5 : fffffffffffffffb)
+ 
+
+But the real problem for this llog fid [0x240000401:0x8cb0:0x0] happened early
+
+00000020:00000001:5.0:1737730681.616457:0:1163628:0:(out_lib.c:251:out_attr_set_pack()) Process leaving (rc=0 : 0 : 0)
+00000040:00001000:5.0:1737730681.616458:0:1163628:0:(llog_cat.c:186:llog_cat_new_log()) new plain log [0x240000401:0x8cb0:0x0].61 of catalog [0x240000401:0x1:0x0]
+00000004:00000001:5.0:1737730681.616458:0:1163628:0:(osp_dev.c:793:osp_statfs()) Process entered
+00000004:00001000:5.0:1737730681.616458:0:1163628:0:(osp_dev.c:808:osp_statfs()) lustre-MDT0001-osp-MDT0000: blocks=68640, bfree=17648, bavail=11756, bsize=4096, reserved_mb_low=1, reserved_mb_high=3, files=199976, ffree=199442, state=0
+00000004:00000001:5.0:1737730681.616459:0:1163628:0:(osp_dev.c:816:osp_statfs()) Process leaving (rc=0 : 0 : 0)
+00000004:00000001:5.0:1737730681.616459:0:1163628:0:(osp_trans.c:1555:osp_trans_stop()) Process entered
+00000004:00080000:5.0:1737730681.616459:0:1163628:0:(osp_trans.c:1581:osp_trans_stop()) lustre-MDT0001-osp-MDT0000: add oth ffff98c42b331c00 with version 137317
+00000004:00000001:5.0:1737730681.616460:0:1163628:0:(osp_trans.c:1603:osp_trans_stop()) Process leaving (rc=0 : 0 : 0)
+00000040:00000001:5.0:1737730681.616460:0:1163628:0:(llog_cat.c:222:llog_cat_new_log()) Process leaving (rc=0 : 0 : 0)
+00000040:00001000:5.0:1737730681.616460:0:1163628:0:(llog_cat.c:366:llog_cat_prep_log()) lustre-MDT0001-osp-MDT0000: open log [0x240000401:0x8cb0:0x0] for catalog [0x240000401:0x1:0x0] rc=0
+
+this means that next logic is not work, there is no sync llog creation base on Lustre logs, and out request happened later at 1737730681.616525
+
+	if (dt_object_remote(cathandle->lgh_obj)) {
+		/* For remote operation, if we put the llog object
+		 * creation in the current transaction, then the
+		 * llog object will not be created on the remote
+		 * target until the transaction stop, if other
+		 * operations start before the transaction stop,
+		 * and use the same llog object, will be dependent
+		 * on the success of this transaction. So let's
+		 * create the llog object synchronously here to
+		 * remove the dependency.
+		 */
+		rc = llog_cat_new_log(env, cathandle, loghandle, NULL);
+		if (rc == -ESTALE) {
+
+I guess because this check "if (likely(!list_empty(&our->our_list)))" is first, no matter how llog_cat_new_log() tries to do it sync (by handle->th_result to 0).
+
+     CDEBUG(D_HA, "%s: add oth %p with version %llu\n",                              
+               osp->opd_obd->obd_name, oth, our->our_version);                          
+                                                                                        
+        LASSERT(our->our_req_ready == 0);                                               
+        spin_lock(&our->our_list_lock);                                                 
+        if (likely(!list_empty(&our->our_list))) {                                      
+                /* notify sending thread */                                             
+                our->our_req_ready = 1;                                                 
+                wake_up(&osp->opd_update->ou_waitq);                                    
+                spin_unlock(&our->our_list_lock);                                       
+        } else if (th->th_result == 0) {                                                
+                /* if the request does not needs to be serialized,                      
+                 * read-only request etc, let's send it right away */                   
+                spin_unlock(&our->our_list_lock);                                       
+                rc = osp_send_update_req(env, osp, our);                                
+        } else {                                                                        
+                spin_unlock(&our->our_list_lock);                                       
+                osp_trans_callback(env, oth, th->th_result);                            
+        }                                                                               
+out:                                                                                    
+        osp_thandle_put(env, oth);                                                      
+                                                                                        
+        RETURN(rc);                                        
+
+bzzz any thoughts about fixing this?
+
+--- Comment (bzzz, Thu, 23 Jan 2025 07:32:48 +0000) ---
+Subject: LU-18218 llog: catalog lgh_lock refactoring
+
+with this patch applied I hit a failure in sanity/60g:
+
+# ONLY=60g MDSCOUNT=2 ONLY_REPEAT=1000 MDSSIZE=3000000  bash sanity.sh:
+[  795.666375] Lustre: DEBUG MARKER: == sanity test 60g: transaction abort won't cause MDT hung (repeat 233/1000 iter, 12/ min) ========================================================== 07:31:05 (1737617465)
+
+...
+/mnt/lustre/d60g.sanity/subdir97:
+rm: cannot remove '/mnt/lustre/d60g.sanity/subdir22': Stale file handle
+rm: cannot remove '/mnt/lustre/d60g.sanity/subdir14': Stale file handle
+rm: cannot remove '/mnt/lustre/d60g.sanity/subdir6': Stale file handle
+rm: cannot remove '/mnt/lustre/d60g.sanity/subdir32': Stale file handle
+ sanity test_60g: @@@@@@ FAIL: rmdir failed 
+[  799.015419] Lustre: DEBUG MARKER: sanity test_60g: @@@@@@ FAIL: rmdir failed
+
+it takes quite a while, but without the patch I'm unable to reproduce at all.
+
+--- Comment (bzzz, Wed, 8 Jan 2025 12:25:39 +0000) ---
+I don't think that 1/4 threads could provide significant contention, also small amount of llog files would not show any benefit from down_write() to down_read() change. Too see it you need hundreds of open llog files for a single catalog, however this happened with a changelog or osp.
+
+so people write synthetic benchmarks to verify results.. and then 4 threads (with such a benchmark) is enough.
+
+looking at the patch I'd be great to have it splitted into a part fixing real bugs and another optional part, too late I guess.
+
+--- Comment (aboyko, Wed, 8 Jan 2025 10:00:50 +0000) ---
+not sure what was the goal of the refactoring.
+
+The goal was to fix current llog bugs / improve logic without a new code.
+
+you can see the list at Commit msg
+
+-call down_read for list processing, and don't use it for
+ single pointer reading.
+-pass catalog flags to plain log.
+
+llog_osd_prev_block() does not read from the end of file to
+the beggining, and duplicates llog_osd_next_block.
+tail->lrh_len was used without swabbing, it is an error.
+
+Fixes llog_client error processing, according to llog_osd_next_block
+EIO -> EBADR change.
+
+It fixes test_135 race where only one record at llog. A cancel
+happens before ENOSPC, a llog stays empty at catalog and could not be
+deleted. 
+
+An improvement for changelog is here https://review.whamcloud.com/c/fs/lustre-release/+/56342
+
+took 139978 waiting, 2187 / rec in 1 threads
+
+took 110196 waiting, 1721 / rec in 4 threads
+
+I don't think that 1/4 threads could provide significant contention, also small amount of llog files would not show any benefit from down_write() to down_read() change. Too see it you need hundreds of open llog files for a single catalog, however this happened with a changelog or osp.
+
+Also you would not be able to measure with this test a next patch for this LU, LU-18218 mdd: changelog specific write function
+
+because it changes only changelog behaviour.
+
+--- Comment (bzzz, Tue, 7 Jan 2025 18:12:14 +0000) ---
+I wrote a simple benchmark (https://review.whamcloud.com/c/fs/lustre-release/+/57672) and tried to measure the effect of the patch:
+
+before:
+
+took 140133 waiting, 2189 / rec in 1 threads
+took 115719 waiting, 1808 / rec in 4 threads
+took 2805239 waiting, 2805 / rec in 1 threads
+took 1776276 waiting, 1776 / rec in 4 threads
+
+took 139978 waiting, 2187 / rec in 1 threads
+took 110196 waiting, 1721 / rec in 4 threads
+took 2827344 waiting, 2827 / rec in 1 threads
+took 1782573 waiting, 1782 / rec in 4 threads
+
+after:
+
+took 140517 waiting, 2195 / rec in 1 threads
+took 111655 waiting, 1744 / rec in 4 threads
+took 2776056 waiting, 2776 / rec in 1 threads
+took 1765479 waiting, 1765 / rec in 4 threads
+
+took 140849 waiting, 2200 / rec in 1 threads
+took 111845 waiting, 1747 / rec in 4 threads
+took 2724119 waiting, 2724 / rec in 1 threads
+took 1776310 waiting, 1776 / rec in 4 threads
+
+not sure what was the goal  of the refactoring.
+
+--- Comment (gerrit, Thu, 2 Jan 2025 20:41:44 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/56341/
+
+Subject: LU-18218 llog: catalog lgh_lock refactoring
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 8047d75a5b66fbad12255d810ae0a573c52908a7
+
+--- Comment (gerrit, Thu, 12 Sep 2024 12:42:08 +0000) ---
+"Alexander Boyko " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/56342
+
+Subject: LU-18218 mdd: changelog specific write function
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 6097cceff51aa89b6b69ebc774d0efbe008d5adf
+
+--- Comment (gerrit, Thu, 12 Sep 2024 12:42:07 +0000) ---
+"Alexander Boyko " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/56341
+
+Subject: LU-18218 llog: catalog lgh_lock refactoring
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: f21cee08bddda740b080a5dbcb43e1a2f1b357b1

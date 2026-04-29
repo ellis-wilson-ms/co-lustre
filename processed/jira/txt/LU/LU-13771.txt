@@ -1,0 +1,509 @@
+Key:        LU-13771
+Summary:    llite stats is inconsistent with osc stats
+Link:       https://jira.whamcloud.com/browse/LU-13771
+Type:       Bug
+Priority:   Minor
+Status:     Closed
+Resolution: Fixed
+Assignee:   Yang Sheng
+Reporter:   Yang Liping
+Created:    Thu, 9 Jul 2020 09:30:12 +0000
+Updated:    Mon, 10 Aug 2020 06:04:29 +0000
+Resolved:   Mon, 10 Aug 2020 06:04:28 +0000
+Attachments: generic_perform_write.txt.tar.gz, lustre-log.1594746674.tar.gz, lustre-log.1594786368.tar.gz, lustre-log.1594789491.tar.gz, lustre-log_online2.1594310743.tar.gz, lustre-log_online3.1594347137.tar.gz
+
+--- Comment (ys, Mon, 10 Aug 2020 06:04:29 +0000) ---
+Many Thanks, LiPing.
+
+--- Comment (yliping, Mon, 10 Aug 2020 06:01:15 +0000) ---
+This issue can be closed now. Thanks.
+
+--- Comment (yliping, Thu, 16 Jul 2020 03:05:23 +0000) ---
+The comment in the code already provides a possible solution in the filesystem side, not the user side. It's up to Whamcloud to decide Lustre should have this feature or not.
+
+			/* TODO: can be optimized at OSC layer to check if it
+			 * is a lockless IO. In that case, it's not necessary
+			 * to read the data. */
+			result = ll_prepare_partial_page(env, io, page);
+
+I have no more questions on this issue now. Thank you.
+
+--- Comment (ys, Wed, 15 Jul 2020 10:42:41 +0000) ---
+Hi, LiPing,
+
+KMS records max length, So any offset less than it need read first. It is a reasonable case. So in your downloading application, multiple thread are downloading data concurrent. Only need set the start position align with 4k can ensure each write cover [0,4096].  Or enlarge the write buffer(8k is too small). So only first and last page needs read RPC.
+
+YS
+
+--- Comment (yliping, Wed, 15 Jul 2020 09:53:50 +0000) ---
+I think I've found the root cause. The KMS is the key.
+
+static int ll_prepare_partial_page(const struct lu_env *env, struct cl_io *io,
+				   struct cl_page *pg)
+{
+
+		/*
+		 * If are writing to a new page, no need to read old data.
+		 * The extent locking will have updated the KMS, and for our
+		 * purposes here we can treat it like i_size.
+		 */
+		if (attr->cat_kms // this is where the magic happens
+			char *kaddr = ll_kmap_atomic(vpg->vpg_page, KM_USER0);
+
+			memset(kaddr, 0, cl_page_size(obj));
+			ll_kunmap_atomic(kaddr, KM_USER0);
+		} else if (vpg->vpg_defer_uptodate)
+			vpg->vpg_ra_used = 1;
+		else
+			result = ll_page_sync_io(env, io, pg, CRT_READ);   // this code will read data and cause read RPC
+
+}
+
+If you have only one process writing the file, the KMS value will increase gradually. Then next write offset would be larger or equal to KMS.
+
+00000080:00008000:8.0:1594793274.210077:0:23419:0:(rw26.c:629:ll_write_begin()) Writing 173 of 0 to 4096 bytes
+00000080:00008000:8.0:1594793274.210131:0:23419:0:(rw26.c:629:ll_write_begin()) Writing 174 of 0 to 1314 bytes
+00000008:00000002:8.0:1594793274.210243:0:23419:0:(osc_io.c:256:osc_page_touch_at()) stripe KMS increasing 708608->712704 708608
+00000008:00000002:8.0:1594793274.210276:0:23419:0:(osc_io.c:256:osc_page_touch_at()) stripe KMS increasing 712704->714018 712704
+00000080:00008000:8.0:1594793274.210597:0:23419:0:(rw26.c:629:ll_write_begin()) Writing 174 of 1314 to 2782 bytes
+00000008:00000002:8.0:1594793274.210639:0:23419:0:(osc_io.c:256:osc_page_touch_at()) stripe KMS increasing 714018->716800 714018
+
+However, when multiprocess writing to the same file. Only some processes will increase the KMS value. For some processes, the next write offset value is less than KMS. Then for these processes, they will need to read the page first. vvp_page_prep_read() is invoked for this purpose. And then follow by osc_send_read_rpc().
+
+00000080:00008000:15.0:1594347135.807736:0:24096:0:(rw26.c:629:ll_write_begin()) Writing 4066461 of 586 to 3510 bytes
+00000008:00000002:15.0:1594347135.807831:0:24096:0:(osc_io.c:256:osc_page_touch_at()) stripe KMS not increasing 69578154924->16656228352 69578154924
+00020000:00000002:15.0:1594347135.807889:0:24096:0:(lov_merge.c:99:lov_merge_lvb_kms()) MDT ID 0x1dec8:422495 on OST[88]: s=69578154924 m=1594347135 a=1594347
+119 c=1594347135 b=150930907
+00000080:00008000:15.0:1594347135.807905:0:24096:0:(rw26.c:629:ll_write_begin()) Writing 4066462 of 0 to 4096 bytes
+00000080:00008000:15.0:1594347135.807972:0:24096:0:(rw26.c:629:ll_write_begin()) Writing 4066463 of 0 to 586 bytes
+00020000:00000002:15.0:1594347135.808015:0:24096:0:(lov_merge.c:99:lov_merge_lvb_kms()) MDT ID 0x1dec8:422495 on OST[88]: s=69578158080 m=1594347135 a=1594347
+119 c=1594347135 b=150930907
+00000080:00000001:15.0:1594347135.808034:0:24096:0:(vvp_page.c:202:vvp_page_prep_read()) Process entered
+00000008:00000001:15.0:1594347135.808110:0:6424:0:(osc_cache.c:2183:osc_send_read_rpc()) Process entered
+
+If we look at the writes do increasing the KMS value, there will be no read RPC send.
+
+00000080:00008000:10.0:1594347136.342094:0:24098:0:(rw26.c:629:ll_write_begin()) Writing 16987702 of 940 to 3156 bytes
+00000008:00000002:10.0:1594347136.342136:0:24098:0:(osc_io.c:256:osc_page_touch_at()) stripe KMS increasing 69581628332->69581631488 69581628332
+00020000:00000002:10.0:1594347136.342173:0:24098:0:(lov_merge.c:99:lov_merge_lvb_kms()) MDT ID 0x1dec8:422495 on OST[88]: s=69581631488 m=1594347136 a=1594347119 c=1594347136 b=151070931
+00000080:00008000:10.0:1594347136.342185:0:24098:0:(rw26.c:629:ll_write_begin()) Writing 16987703 of 0 to 4096 bytes
+00000080:00008000:10.0:1594347136.342237:0:24098:0:(rw26.c:629:ll_write_begin()) Writing 16987704 of 0 to 940 bytes
+00020000:00000002:10.0:1594347136.342326:0:24098:0:(lov_merge.c:99:lov_merge_lvb_kms()) MDT ID 0x1dec8:422495 on OST[88]: s=69581631488 m=1594347136 a=1594347119 c=1594347136 b=151070931
+00000008:00000002:10.0:1594347136.342617:0:24098:0:(osc_io.c:256:osc_page_touch_at()) stripe KMS increasing 69581631488->69581635584 69581631488
+00020000:00000002:10.0:1594347136.342653:0:24098:0:(lov_merge.c:99:lov_merge_lvb_kms()) MDT ID 0x1dec8:422495 on OST[88]: s=69581635584 m=1594347136 a=1594347119 c=1594347136 b=151070931
+00000008:00000002:10.0:1594347136.342673:0:24098:0:(osc_io.c:256:osc_page_touch_at()) stripe KMS increasing 69581635584->69581636524 69581635584
+00020000:00000002:10.0:1594347136.342709:0:24098:0:(lov_merge.c:99:lov_merge_lvb_kms()) MDT ID 0x1dec8:422495 on OST[88]: s=69581636524 m=1594347136 a=1594347119 c=1594347136 b=151070931
+00000080:00008000:10.0:1594347136.343214:0:24098:0:(rw26.c:629:ll_write_begin()) Writing 16987704 of 940 to 3156 bytes
+00000008:00000002:10.0:1594347136.343257:0:24098:0:(osc_io.c:256:osc_page_touch_at()) stripe KMS increasing 69581636524->69581639680 69581636524
+00020000:00000002:10.0:1594347136.343303:0:24098:0:(lov_merge.c:99:lov_merge_lvb_kms()) MDT ID 0x1dec8:422495 on OST[88]: s=69581639680 m=1594347136 a=1594347119 c=1594347136 b=151070931
+
+A better solution is needed for this scenario. Multiprocess downloading is a common use case.
+
+--- Comment (ys, Wed, 15 Jul 2020 06:22:49 +0000) ---
+Please hold on. I'll back to look into first log.
+
+--- Comment (yliping, Wed, 15 Jul 2020 06:12:45 +0000) ---
+I clear LRU cache, drop all system cache, and redo the test. Still no read RPC. What else I can do to cancel the LDLM lock? Here's the command I used.
+
+lctl set_param ldlm.namespaces.zfsz3*.lru_size=clear
+
+--- Comment (ys, Wed, 15 Jul 2020 05:41:45 +0000) ---
+I forgot mention to cancel the ldlm lock.
+
+--- Comment (yliping, Wed, 15 Jul 2020 05:41:44 +0000) ---
+The latest log uploaded. lustre-log.1594789491.tar.gz
+
+--- Comment (ys, Wed, 15 Jul 2020 05:36:31 +0000) ---
+Could you please upload the latest log?
+
+--- Comment (yliping, Wed, 15 Jul 2020 05:06:45 +0000) ---
+I use the command below to drop all cache
+
+sync; sync; sync; echo 3 > /proc/sys/vm/drop_caches; echo 3 > /proc/sys/vm/drop_caches; echo 3 > /proc/sys/vm/drop_caches
+
+Then rerun the command to overwrite the old file, and still no read RPC.
+
+lctl dk > /tmp/lu-13771/lustre-log.`date +%s`; lctl set_param debug=-1; lctl get_param debug; dd if=/dev/zero of=/zfssz3/test100/ylp_test1111.tmp bs=8k count=2560 seek=1314 oflag=seek_bytes; lctl set_param debug='ioctl neterror warning error emerg ha config console lfsck'; lctl dk > /tmp/lu-13771/lustre-log.`date +%s`
+
+--- Comment (ys, Wed, 15 Jul 2020 04:59:32 +0000) ---
+Please drop the pagecache before test, then you should get read RPC.
+
+--- Comment (yliping, Wed, 15 Jul 2020 04:56:21 +0000) ---
+I still don't get your point. No matter the file exists or not, there is no read RPC now. If you need the log for overwritten an old file. I can upload it. I don't see any difference.
+
+Partial write don't trigger read RPC in my test. I want to know why.
+
+--- Comment (ys, Wed, 15 Jul 2020 04:46:17 +0000) ---
+So the problem is clear enough, Then we can overcome the issue by 3 ways:
+
+1. you can remove old file before write.
+
+2. application write file align with 4K.
+
+3. using mmap instead of write.
+
+--- Comment (ys, Wed, 15 Jul 2020 04:43:02 +0000) ---
+From log, We can see no read RPC even partial write.
+
+Then i think what you found no read RPC since write a new file.
+
+--- Comment (yliping, Wed, 15 Jul 2020 04:26:26 +0000) ---
+I redo the test. Create a new file, and upload a new log. lustre-log.1594786368.tar.gz
+
+Here's the dd command I used. The file is newly created in this test. And I change the block size to 8k to mimic what the program does.
+
+dd if=/dev/zero of=/zfssz3/test100/ylp_test1111.tmp bs=8k count=2560 seek=1314 oflag=seek_bytes
+
+--- Comment (ys, Wed, 15 Jul 2020 04:05:08 +0000) ---
+Hi, Liping,
+
+Does the file is new one or exist one in your test?
+
+YS
+
+--- Comment (yliping, Wed, 15 Jul 2020 03:11:29 +0000) ---
+There aren't any full page write log in lustre-log.1594746674.tar.gz . Which means vmpage is always up to date, and it won't cause ll_prepare_partial_page() be triggered. That's the difference.  Actually, there aren't any full page write for every write in lustre-log.1594746674.tar.gz. It's always partial write. Sorry for my mistake.
+
+static int ll_write_begin(struct file *file, struct address_space *mapping,
+			  loff_t pos, unsigned len, unsigned flags,
+			  struct page **pagep, void **fsdata)
+{
+
+	if (!PageUptodate(vmpage)) {
+		/*
+		 * We're completely overwriting an existing page,
+		 * so _don't_ set it up to date until commit_write
+		 */
+		if (from == 0 && to == PAGE_SIZE) {
+			CL_PAGE_HEADER(D_PAGE, env, page, "full page write\n");
+			POISON_PAGE(vmpage, 0x11);
+		} else {
+			/* TODO: can be optimized at OSC layer to check if it
+			 * is a lockless IO. In that case, it's not necessary
+			 * to read the data. */
+			result = ll_prepare_partial_page(env, io, page);
+			if (result == 0)
+				SetPageUptodate(vmpage);
+		}
+	}
+
+}
+
+--- Comment (yliping, Wed, 15 Jul 2020 01:18:31 +0000) ---
+From the log lustre-log.1594746674.tar.gz, I notice that though ll_write_begin() not write at 4k boundary, there aren't any read RPC. Probably those read RPCs are not from partial write.
+
+--- Comment (yliping, Tue, 14 Jul 2020 17:24:43 +0000) ---
+The test is reproducible. Simple dd with 4k block size is OK. Here's the command I use:
+
+lctl dk > /tmp/lu-13771/lustre-log.`date +%s`; lctl set_param debug=-1; lctl get_param debug; dd if=/dev/zero of=/zfssz3/test100/ylp_test6666.tmp bs=4k count=5120; lctl set_param debug='ioctl neterror warning error emerg ha config console lfsck'; lctl dk > /tmp/lu-13771/lustre-log.`date +%s`
+
+And the relative log below:
+
+00000080:00008000:8.0:1594745597.138945:0:13390:0:(rw26.c:629:ll_write_begin()) Writing 5048 of 0 to 4096 bytes
+00000080:00008000:8.0:1594745597.139374:0:13390:0:(rw26.c:629:ll_write_begin()) Writing 5049 of 0 to 4096 bytes
+00000080:00008000:8.0:1594745597.139769:0:13390:0:(rw26.c:629:ll_write_begin()) Writing 5050 of 0 to 4096 bytes
+00000080:00008000:8.0:1594745597.140190:0:13390:0:(rw26.c:629:ll_write_begin()) Writing 5051 of 0 to 4096 bytes
+00000080:00008000:8.0:1594745597.140592:0:13390:0:(rw26.c:629:ll_write_begin()) Writing 5052 of 0 to 4096 bytes
+00000080:00008000:8.0:1594745597.140984:0:13390:0:(rw26.c:629:ll_write_begin()) Writing 5053 of 0 to 4096 bytes
+00000080:00008000:8.0:1594745597.141406:0:13390:0:(rw26.c:629:ll_write_begin()) Writing 5054 of 0 to 4096 bytes
+00000080:00008000:8.0:1594745597.141814:0:13390:0:(rw26.c:629:ll_write_begin()) Writing 5055 of 0 to 4096 bytes
+00000080:00008000:8.0:1594745597.142237:0:13390:0:(rw26.c:629:ll_write_begin()) Writing 5056 of 0 to 4096 bytes
+00000080:00008000:8.0:1594745597.142639:0:13390:0:(rw26.c:629:ll_write_begin()) Writing 5057 of 0 to 4096 bytes
+00000080:00008000:8.0:1594745597.143040:0:13390:0:(rw26.c:629:ll_write_begin()) Writing 5058 of 0 to 4096 bytes
+00000080:00008000:8.0:1594745597.143452:0:13390:0:(rw26.c:629:ll_write_begin()) Writing 5059 of 0 to 4096 bytes
+00000080:00008000:8.0:1594745597.143847:0:13390:0:(rw26.c:629:ll_write_begin()) Writing 5060 of 0 to 4096 bytes
+00000080:00008000:8.0:1594745597.144268:0:13390:0:(rw26.c:629:ll_write_begin()) Writing 5061 of 0 to 4096 bytes
+00000080:00008000:8.0:1594745597.144670:0:13390:0:(rw26.c:629:ll_write_begin()) Writing 5062 of 0 to 4096 bytes
+00000080:00008000:8.0:1594745597.145090:0:13390:0:(rw26.c:629:ll_write_begin()) Writing 5063 of 0 to 4096 bytes
+00000080:00008000:8.0:1594745597.145510:0:13390:0:(rw26.c:629:ll_write_begin()) Writing 5064 of 0 to 4096 bytes
+00000080:00008000:8.0:1594745597.145903:0:13390:0:(rw26.c:629:ll_write_begin()) Writing 5065 of 0 to 4096 bytes
+00000080:00008000:8.0:1594745597.146370:0:13390:0:(rw26.c:629:ll_write_begin()) Writing 5066 of 0 to 4096 bytes
+
+Just add an option to make dd set the offset to not align with the 4k boundary.
+
+lctl dk > /tmp/lu-13771/lustre-log.`date +%s`; lctl set_param debug=-1; lctl get_param debug; dd if=/dev/zero of=/zfssz3/test100/ylp_test7777.tmp bs=4k count=5120 seek=1024 oflag=seek_bytes; lctl set_param debug='ioctl neterror warning error emerg ha config console lfsck'; lctl dk > /tmp/lu-13771/lustre-log.`date +%s`
+
+And the result would be just as I expected.
+
+00000080:00008000:7.0:1594746674.062656:0:14533:0:(rw26.c:629:ll_write_begin()) Writing 5061 of 1024 to 3072 bytes
+00000080:00008000:7.0:1594746674.062738:0:14533:0:(rw26.c:629:ll_write_begin()) Writing 5062 of 0 to 1024 bytes
+00000080:00008000:7.0:1594746674.063141:0:14533:0:(rw26.c:629:ll_write_begin()) Writing 5062 of 1024 to 3072 bytes
+00000080:00008000:7.0:1594746674.063224:0:14533:0:(rw26.c:629:ll_write_begin()) Writing 5063 of 0 to 1024 bytes
+00000080:00008000:7.0:1594746674.063633:0:14533:0:(rw26.c:629:ll_write_begin()) Writing 5063 of 1024 to 3072 bytes
+00000080:00008000:7.0:1594746674.063716:0:14533:0:(rw26.c:629:ll_write_begin()) Writing 5064 of 0 to 1024 bytes
+00000080:00008000:7.0:1594746674.064126:0:14533:0:(rw26.c:629:ll_write_begin()) Writing 5064 of 1024 to 3072 bytes
+00000080:00008000:7.0:1594746674.064209:0:14533:0:(rw26.c:629:ll_write_begin()) Writing 5065 of 0 to 1024 bytes
+00000080:00008000:7.0:1594746674.064618:0:14533:0:(rw26.c:629:ll_write_begin()) Writing 5065 of 1024 to 3072 bytes
+00000080:00008000:7.0:1594746674.064700:0:14533:0:(rw26.c:629:ll_write_begin()) Writing 5066 of 0 to 1024 bytes
+00000080:00008000:7.0:1594746674.065109:0:14533:0:(rw26.c:629:ll_write_begin()) Writing 5066 of 1024 to 3072 bytes
+00000080:00008000:7.0:1594746674.065191:0:14533:0:(rw26.c:629:ll_write_begin()) Writing 5067 of 0 to 1024 bytes
+00000080:00008000:7.0:1594746674.065595:0:14533:0:(rw26.c:629:ll_write_begin()) Writing 5067 of 1024 to 3072 bytes
+00000080:00008000:7.0:1594746674.065676:0:14533:0:(rw26.c:629:ll_write_begin()) Writing 5068 of 0 to 1024 bytes
+
+Log file attached.  lustre-log.1594746674.tar.gz
+
+--- Comment (ys, Tue, 14 Jul 2020 15:40:19 +0000) ---
+Hi, Liping, 
+
+Could you please test whether no partial write if you write file from position of 4k align?
+
+Thanks,
+
+YangSheng
+
+--- Comment (yliping, Tue, 14 Jul 2020 15:08:59 +0000) ---
+After reading the source code, I believe that how many bytes ll_write_begin() would write, only depends on count value which specified in write() syscall, and offset in the file writing to.
+
+I tried to trace the running program and found out that, the program use multi-thread to write to different parts of the file. Each write's chunk size is 8k. The problem is the start of each part of the file is not strictly aligned with the 4k boundary. The first and the third write to page cache would not be a full page. It will repeat writing 2 partial writes and 1 full-page write for every 8k write. See the trace log attached for more information. generic_perform_write.txt.tar.gz
+
+Ideally, every program's write should align with the 4k boundary perfectly. However, I think it would be better if Lustre could eliminate the unnecessary read RPCs.
+
+--- Comment (ys, Tue, 14 Jul 2020 06:13:07 +0000) ---
+The _generic_file_write_iter part of really helpful. I'll look into it.
+
+--- Comment (yliping, Tue, 14 Jul 2020 05:13:28 +0000) ---
+Here's some debug info that may be helpful to this issue.
+
+kernel.statement("generic_perform_write@mm/filemap.c:2985"), inode: 144116736864585972, page: 0xffffffffc0ba5ecb, offset: 3624, bytes:  472, iov_iter_count: 8192, pos:  51715628584, written: 0
+kernel.statement("generic_perform_write@mm/filemap.c:2985"), inode: 144116736864585972, page: 0xffffe268128d8c40, offset:    0, bytes: 4096, iov_iter_count: 7720, pos:  51715629056, written: 472
+kernel.statement("generic_perform_write@mm/filemap.c:2985"), inode: 144116736864585972, page: 0xffffe268128d8cc0, offset:    0, bytes: 3624, iov_iter_count: 3624, pos:  51715633152, written: 4568
+kernel.statement("generic_perform_write@mm/filemap.c:2985"), inode: 144116736864585972, page: 0xffffffffc0ba5ecb, offset:  262, bytes: 3834, iov_iter_count: 8192, pos:  53041811718, written: 0
+kernel.statement("generic_perform_write@mm/filemap.c:2985"), inode: 144116736864585972, page: 0xffffe26837f93a00, offset:    0, bytes: 4096, iov_iter_count: 4358, pos:  53041815552, written: 3834
+kernel.statement("generic_perform_write@mm/filemap.c:2985"), inode: 144116736864585972, page: 0xffffe26831375ec0, offset:    0, bytes:  262, iov_iter_count: 262, pos:  53041819648, written: 7930
+kernel.statement("generic_perform_write@mm/filemap.c:2985"), inode: 144116736864585972, page: 0xffffffffc0ba5ecb, offset:  570, bytes: 3526, iov_iter_count: 8192, pos:  59417190970, written: 0
+kernel.statement("generic_perform_write@mm/filemap.c:2985"), inode: 144116736864585972, page: 0xffffe26806891140, offset:    0, bytes: 4096, iov_iter_count: 4666, pos:  59417194496, written: 3526
+kernel.statement("generic_perform_write@mm/filemap.c:2985"), inode: 144116736864585972, page: 0xffffe26818533e00, offset:    0, bytes:  570, iov_iter_count: 570, pos:  59417198592, written: 7622
+kernel.statement("generic_perform_write@mm/filemap.c:2985"), inode: 144116736864585972, page: 0xffffffffc0ba5ecb, offset: 3198, bytes:  898, iov_iter_count: 8192, pos:  57102630014, written: 0
+kernel.statement("generic_perform_write@mm/filemap.c:2985"), inode: 144116736864585972, page: 0xffffe26824b6eec0, offset:    0, bytes: 4096, iov_iter_count: 7294, pos:  57102630912, written: 898
+kernel.statement("generic_perform_write@mm/filemap.c:2985"), inode: 144116736864585972, page: 0xffffe268276ef040, offset:    0, bytes: 3198, iov_iter_count: 3198, pos:  57102635008, written: 4994
+kernel.statement("generic_perform_write@mm/filemap.c:2985"), inode: 144116736864585972, page: 0xffffffffc0ba5ecb, offset: 3932, bytes:  164, iov_iter_count: 8192, pos:  58240249692, written: 0
+kernel.statement("generic_perform_write@mm/filemap.c:2985"), inode: 144116736864585972, page: 0xffffe26819046f00, offset:    0, bytes: 4096, iov_iter_count: 8028, pos:  58240249856, written: 164
+kernel.statement("generic_perform_write@mm/filemap.c:2985"), inode: 144116736864585972, page: 0xffffe268177c3380, offset:    0, bytes: 3932, iov_iter_count: 3932, pos:  58240253952, written: 4260
+kernel.statement("generic_perform_write@mm/filemap.c:2985"), inode: 144116736864585972, page: 0xffffffffc0ba5ecb, offset: 1730, bytes: 2366, iov_iter_count: 8192, pos:  54806689474, written: 0
+kernel.statement("generic_perform_write@mm/filemap.c:2985"), inode: 144116736864585972, page: 0xffffe2682c8abe00, offset:    0, bytes: 4096, iov_iter_count: 5826, pos:  54806691840, written: 2366
+kernel.statement("generic_perform_write@mm/filemap.c:2985"), inode: 144116736864585972, page: 0xffffe268106249c0, offset:    0, bytes: 1730, iov_iter_count: 1730, pos:  54806695936, written: 6462
+kernel.statement("generic_perform_write@mm/filemap.c:2985"), inode: 144116736864585972, page: 0xffffffffc0ba5ecb, offset: 2464, bytes: 1632, iov_iter_count: 8192, pos:  55943039392, written: 0
+kernel.statement("generic_perform_write@mm/filemap.c:2985"), inode: 144116736864585972, page: 0xffffe26819766740, offset:    0, bytes: 4096, iov_iter_count: 6560, pos:  55943041024, written: 1632
+
+The code pasted below
+
+2943 static ssize_t generic_perform_write(struct file *file,
+2944                 struct iov_iter *i, loff_t pos)
+
+2958     do {
+2959         struct page *page;
+2960         unsigned long offset;    /* Offset into pagecache page */
+2961         unsigned long bytes;    /* Bytes to write to page */
+2962         size_t copied;      /* Bytes copied from user */
+2963         void *fsdata;
+2964
+2965         offset = (pos & (PAGE_CACHE_SIZE - 1));
+2966         bytes = min_t(unsigned long, PAGE_CACHE_SIZE - offset,
+2967                                 iov_iter_count(i));
+
+2985         status = a_ops->write_begin(file, mapping, pos, bytes, flags,
+2986                                     &page, &fsdata);
+
+--- Comment (yliping, Tue, 14 Jul 2020 01:57:22 +0000) ---
+Here's the call stack for ll_write_begin():
+
+ 0xffffffffc0b17e80 : ll_write_begin+0x0/0x830 [lustre]
+ 0xffffffff83fb8652 : __generic_file_aio_write+0x1e2/0x400 [kernel]
+ 0xffffffffc0b26ffb : __generic_file_write_iter+0xcb/0x340 [lustre]
+ 0xffffffffc0b2aef6 : vvp_io_write_start+0x4a6/0x810 [lustre]
+ 0xffffffffc070eb88 : cl_io_start+0x68/0x130 [obdclass]
+ 0xffffffffc0710f6e : cl_io_loop+0x12e/0xc90 [obdclass]
+ 0xffffffffc0ad53c8 : ll_file_io_generic+0x498/0xc80 [lustre]
+ 0xffffffffc0ad5e8d : ll_file_aio_write+0x12d/0x1f0 [lustre]
+ 0xffffffffc0ad601e : ll_file_write+0xce/0x1e0 [lustre]
+ 0xffffffff840410a0 : vfs_write+0xc0/0x1f0 [kernel]
+ 0xffffffff84041ebf : sys_write+0x7f/0xf0 [kernel]
+ 0xffffffff84574ddb : system_call_fastpath+0x22/0x27 [kernel]
+
+And variables dump for __generic_file_aio_write():
+
+iocb={.ki_users={...}, .ki_filp=0xffff917134065500, .ki_ctx=0x0, .ki_cancel=0x0, .ki_dtor=0x0, .ki_obj={...}, .ki_user_data=0, .ki_pos=285453206744, .private=0x0, .ki_opcode=0, .ki_nbytes=0, .ki_buf=          (null), .ki_left=8192, .ki_inline_vec={...}, .ki_iovec=0x0, .ki_nr_segs=0, .ki_cur_seg=0, .ki_list={...}, .ki_eventfd=0x0} iov={.iov_base=0x7fe118033a84, .iov_len=8192} nr_segs=1 ppos=-121559921193912
+iocb={.ki_users={...}, .ki_filp=0xffff9172b1e3e800, .ki_ctx=0x0, .ki_cancel=0x0, .ki_dtor=0x0, .ki_obj={...}, .ki_user_data=0, .ki_pos=178328534, .private=0x0, .ki_opcode=0, .ki_nbytes=0, .ki_buf=          (null), .ki_left=8192, .ki_inline_vec={...}, .ki_iovec=0x0, .ki_nr_segs=0, .ki_cur_seg=0, .ki_list={...}, .ki_eventfd=0x0} iov={.iov_base=0x7fe670010a44, .iov_len=8192} nr_segs=1 ppos=-121560167639160
+iocb={.ki_users={...}, .ki_filp=0xffff91759ccf0000, .ki_ctx=0x0, .ki_cancel=0x0, .ki_dtor=0x0, .ki_obj={...}, .ki_user_data=0, .ki_pos=1180926976, .private=0x0, .ki_opcode=0, .ki_nbytes=0, .ki_buf=          (null), .ki_left=8192, .ki_inline_vec={...}, .ki_iovec=0x0, .ki_nr_segs=0, .ki_cur_seg=0, .ki_list={...}, .ki_eventfd=0x0} iov={.iov_base=0x7fe66c057944, .iov_len=8192} nr_segs=1 ppos=-121560012130552
+iocb={.ki_users={...}, .ki_filp=0xffff91725e938300, .ki_ctx=0x0, .ki_cancel=0x0, .ki_dtor=0x0, .ki_obj={...}, .ki_user_data=0, .ki_pos=1646606336, .private=0x0, .ki_opcode=0, .ki_nbytes=0, .ki_buf=          (null), .ki_left=8192, .ki_inline_vec={...}, .ki_iovec=0x0, .ki_nr_segs=0, .ki_cur_seg=0, .ki_list={...}, .ki_eventfd=0x0} iov={.iov_base=0x7fe65000c844, .iov_len=8192} nr_segs=1 ppos=-121558346451768
+iocb={.ki_users={...}, .ki_filp=0xffff917227dfdb00, .ki_ctx=0x0, .ki_cancel=0x0, .ki_dtor=0x0, .ki_obj={...}, .ki_user_data=0, .ki_pos=5931597062, .private=0x0, .ki_opcode=0, .ki_nbytes=0, .ki_buf=          (null), .ki_left=8192, .ki_inline_vec={...}, .ki_iovec=0x0, .ki_nr_segs=0, .ki_cur_seg=0, .ki_list={...}, .ki_eventfd=0x0} iov={.iov_base=0x7fe4fc012484, .iov_len=8192} nr_segs=1 ppos=-121559394141880
+iocb={.ki_users={...}, .ki_filp=0xffff917477840200, .ki_ctx=0x0, .ki_cancel=0x0, .ki_dtor=0x0, .ki_obj={...}, .ki_user_data=0, .ki_pos=1804162048, .private=0x0, .ki_opcode=0, .ki_nbytes=0, .ki_buf=          (null), .ki_left=8192, .ki_inline_vec={...}, .ki_iovec=0x0, .ki_nr_segs=0, .ki_cur_seg=0, .ki_list={...}, .ki_eventfd=0x0} iov={.iov_base=0x7fe6909c6000, .iov_len=8192} nr_segs=1 ppos=-121559475956984
+iocb={.ki_users={...}, .ki_filp=0xffff91789589a600, .ki_ctx=0x0, .ki_cancel=0x0, .ki_dtor=0x0, .ki_obj={...}, .ki_user_data=0, .ki_pos=3343207424, .private=0x0, .ki_opcode=0, .ki_nbytes=0, .ki_buf=          (null), .ki_left=8192, .ki_inline_vec={...}, .ki_iovec=0x0, .ki_nr_segs=0, .ki_cur_seg=0, .ki_list={...}, .ki_eventfd=0x0} iov={.iov_base=0x7fe654011594, .iov_len=8192} nr_segs=1 ppos=-121559922230968
+iocb={.ki_users={...}, .ki_filp=0xffff9175e8345600, .ki_ctx=0x0, .ki_cancel=0x0, .ki_dtor=0x0, .ki_obj={...}, .ki_user_data=0, .ki_pos=304232425736, .private=0x0, .ki_opcode=0, .ki_nbytes=0, .ki_buf=          (null), .ki_left=8192, .ki_inline_vec={...}, .ki_iovec=0x0, .ki_nr_segs=0, .ki_cur_seg=0, .ki_list={...}, .ki_eventfd=0x0} iov={.iov_base=0x7fe0ec02d104, .iov_len=8192} nr_segs=1 ppos=-121552870644472
+iocb={.ki_users={...}, .ki_filp=0xffff917109388e00, .ki_ctx=0x0, .ki_cancel=0x0, .ki_dtor=0x0, .ki_obj={...}, .ki_user_data=0, .ki_pos=593866584, .private=0x0, .ki_opcode=0, .ki_nbytes=0, .ki_buf=          (null), .ki_left=8192, .ki_inline_vec={...}, .ki_iovec=0x0, .ki_nr_segs=0, .ki_cur_seg=0, .ki_list={...}, .ki_eventfd=0x0} iov={.iov_base=0x7fe654050fb4, .iov_len=8192} nr_segs=1 ppos=-121559630369848
+iocb={.ki_users={...}, .ki_filp=0xffff9171b84be500, .ki_ctx=0x0, .ki_cancel=0x0, .ki_dtor=0x0, .ki_obj={...}, .ki_user_data=0, .ki_pos=8213792930, .private=0x0, .ki_opcode=0, .ki_nbytes=0, .ki_buf=          (null), .ki_left=8192, .ki_inline_vec={...}, .ki_iovec=0x0, .ki_nr_segs=0, .ki_cur_seg=0, .ki_list={...}, .ki_eventfd=0x0} iov={.iov_base=0x7fe4f00130c4, .iov_len=8192} nr_segs=1 ppos=-121559395743800
+iocb={.ki_users={...}, .ki_filp=0xffff91724177f900, .ki_ctx=0x0, .ki_cancel=0x0, .ki_dtor=0x0, .ki_obj={...}, .ki_user_data=0, .ki_pos=869166080, .private=0x0, .ki_opcode=0, .ki_nbytes=0, .ki_buf=          (null), .ki_left=8192, .ki_inline_vec={...}, .ki_iovec=0x0, .ki_nr_segs=0, .ki_cur_seg=0, .ki_list={...}, .ki_eventfd=0x0} iov={.iov_base=0x7fe6909c0000, .iov_len=8192} nr_segs=1 ppos=-121559394935800
+iocb={.ki_users={...}, .ki_filp=0xffff91749a6c9200, .ki_ctx=0x0, .ki_cancel=0x0, .ki_dtor=0x0, .ki_obj={...}, .ki_user_data=0, .ki_pos=3654809342, .private=0x0, .ki_opcode=0, .ki_nbytes=0, .ki_buf=          (null), .ki_left=8192, .ki_inline_vec={...}, .ki_iovec=0x0, .ki_nr_segs=0, .ki_cur_seg=0, .ki_list={...}, .ki_eventfd=0x0} iov={.iov_base=0x7fd42a70c000, .iov_len=8192} nr_segs=1 ppos=-121559394677688
+iocb={.ki_users={...}, .ki_filp=0xffff917227dfd000, .ki_ctx=0x0, .ki_cancel=0x0, .ki_dtor=0x0, .ki_obj={...}, .ki_user_data=0, .ki_pos=4789573432, .private=0x0, .ki_opcode=0, .ki_nbytes=0, .ki_buf=          (null), .ki_left=8192, .ki_inline_vec={...}, .ki_iovec=0x0, .ki_nr_segs=0, .ki_
+
+--- Comment (yliping, Tue, 14 Jul 2020 01:36:12 +0000) ---
+Thank you for YangSheng's help. It may not be Lustre's issue. I will try to dig deeper into function calls in the kernel. As I know, YangSheng is also working on this too. Thanks.
+
+--- Comment (ys, Sat, 11 Jul 2020 15:36:51 +0000) ---
+From log:
+
+00000080:00008000:7.0:1594347137.845609:0:24101:0:(rw26.c:629:ll_write_begin()) Writing 16138033 of 0 to 4096 bytes
+00000080:00008000:7.0:1594347137.845678:0:24101:0:(rw26.c:629:ll_write_begin()) Writing 16138034 of 0 to 1876 bytes
+00000020:00000001:7.0:1594347137.845715:0:24101:0:(cl_io.c:1225:cl_2queue_init_page()) Process entered
+00000020:00000001:7.0:1594347137.845721:0:24101:0:(cl_io.c:1228:cl_2queue_init_page()) Process leaving
+00000080:00008000:7.0:1594347137.849143:0:24101:0:(rw26.c:629:ll_write_begin()) Writing 16138034 of 1876 to 2220 bytes
+00000080:00008000:7.0:1594347137.849247:0:24101:0:(rw26.c:629:ll_write_begin()) Writing 16138035 of 0 to 4096 bytes
+
+We can figure out the write_begin was invoked with unalign page size. Even it writes full page in fact. This must relate to kernel rather than Lustre.
+
+--- Comment (ys, Sat, 11 Jul 2020 08:55:57 +0000) ---
+Hi, LiPing,
+
+I think the read rpc was caused by partial write, form log:
+
+00000080:00008000:14.0:1594347134.173014:0:24100:0:(rw26.c:629:ll_write_begin()) Writing 15875068 of 2110 to 1986 bytes
+00000080:00008000:14.0:1594347134.176921:0:24100:0:(rw26.c:629:ll_write_begin()) Writing 15875070 of 2110 to 1986 bytes
+00000080:00008000:14.0:1594347134.181230:0:24100:0:(rw26.c:629:ll_write_begin()) Writing 15875072 of 2110 to 1986 bytes
+00000080:00008000:14.0:1594347134.185397:0:24100:0:(rw26.c:629:ll_write_begin()) Writing 15875074 of 2110 to 1986 bytes
+00000080:00008000:14.0:1594347135.702578:0:24097:0:(rw26.c:629:ll_write_begin()) Writing 16771332 of 1174 to 2922 bytes
+00000080:00008000:15.0:1594347135.704168:0:24099:0:(rw26.c:629:ll_write_begin()) Writing 15652186 of 2344 to 1752 bytes
+00000080:00008000:15.0:1594347135.707017:0:24099:0:(rw26.c:629:ll_write_begin()) Writing 15652188 of 2344 to 1752 bytes
+00000080:00008000:14.0:1594347135.707694:0:24093:0:(rw26.c:629:ll_write_begin()) Writing 3161899 of 1288 to 2808 bytes
+00000080:00008000:15.0:1594347135.709961:0:24099:0:(rw26.c:629:ll_write_begin()) Writing 15652190 of 2344 to 1752 bytes
+00000080:00008000:15.0:1594347135.713100:0:24099:0:(rw26.c:629:ll_write_begin()) Writing 15652192 of 2344 to 1752 bytes
+00000080:00008000:15.0:1594347135.715609:0:24099:0:(rw26.c:629:ll_write_begin()) Writing 15652194 of 2344 to 1752 bytes
+00000080:00008000:15.0:1594347135.718384:0:24099:0:(rw26.c:629:ll_write_begin()) Writing 15652196 of 2344 to 1752 bytes
+00000080:00008000:15.0:1594347135.720595:0:24099:0:(rw26.c:629:ll_write_begin()) Writing 15652198 of 2344 to 1752 bytes
+00000080:00008000:15.0:1594347135.723561:0:24099:0:(rw26.c:629:ll_write_begin()) Writing 15652200 of 2344 to 1752 bytes
+00000080:00008000:15.0:1594347135.725620:0:24099:0:(rw26.c:629:ll_write_begin()) Writing 15652202 of 2344 to 1752 bytes
+00000080:00008000:14.0:1594347135.727548:0:24093:0:(rw26.c:629:ll_write_begin()) Writing 3161901 of 1288 to 2808 bytes
+00000080:00008000:15.0:1594347135.728399:0:24099:0:(rw26.c:629:ll_write_begin()) Writing 15652204 of 2344 to 1752 bytes
+00000080:00008000:15.0:1594347135.730721:0:24099:0:(rw26.c:629:ll_write_begin()) Writing 15652206 of 2344 to 1752 bytes
+00000080:00008000:15.0:1594347135.733274:0:24099:0:(rw26.c:629:ll_write_begin()) Writing 15652208 of 2344 to 1752 bytes
+00000080:00008000:15.0:1594347135.735530:0:24099:0:(rw26.c:629:ll_write_begin()) Writing 15652210 of 2344 to 1752 bytes
+00000080:00008000:15.0:1594347135.738171:0:24099:0:(rw26.c:629:ll_write_begin()) Writing 15652212 of 2344 to 1752 bytes
+00000080:00008000:15.0:1594347135.740527:0:24099:0:(rw26.c:629:ll_write_begin()) Writing 15652214 of 2344 to 1752 bytes
+00000080:00008000:15.0:1594347135.743197:0:24099:0:(rw26.c:629:ll_write_begin()) Writing 15652216 of 2344 to 1752 bytes
+00000080:00008000:14.0:1594347135.746249:0:24099:0:(rw26.c:629:ll_write_begin()) Writing 15652218 of 2344 to 1752 bytes
+
+   FORMAT: Writing  of  to  bytes
+
+For partial write, we have to read page first and then write it out.
+
+Thanks,
+
+YangSheng
+
+--- Comment (ys, Sat, 11 Jul 2020 05:56:03 +0000) ---
+Hi, LiPing,
+
+I'll contact you for your question.
+
+Thanks.
+
+YangSheng
+
+--- Comment (yliping, Sat, 11 Jul 2020 05:03:00 +0000) ---
+I've search /proc/[pid]/maps in the client for process mapping files in the Lustre file system. I also tried lsof and pmap tools. However, nothing interesting found. 
+
+What should I do next? How could I know which process triggers those read RPC?
+
+--- Comment (pjones, Fri, 10 Jul 2020 17:09:00 +0000) ---
+Yang Sheng
+
+Could you please investigate?
+
+Peter
+
+--- Comment (jhammond, Fri, 10 Jul 2020 14:43:40 +0000) ---
+Could be memory mapped files or another application.
+
+--- Comment (yliping, Fri, 10 Jul 2020 07:32:03 +0000) ---
+Another client's full debug log uploaded. 
+
+I'm not an expert on Lustre code. However, from the log, I can see lots of write_end() operation. No readpage() operation at all. Then where are those RPC read requests from?
+
+00000008:00000002:11.0:1594347136.965673:0:6419:0:(osc_request.c:1995:osc_build_rpc()) @@@ 1 pages, aa ffffa07d914ab470. now 7r/0w in flight  req@ffffa07d914ab300 x1639854597962928/t0(0) o3->zfsz3-OST0058-osc-ffffa08c68aeb800@10.53.19.56@tcp:6/4 lens 608/432 e 0 to 0 dl 0 ref 2 fl New:/0/ffffffff rc 0/-1
+
+00000100:00100000:11.0:1594347136.992957:0:6420:0:(client.c:2045:ptlrpc_check_set()) Completed RPC pname:cluuid:pid:xid:nid:opc ptlrpcd_05_01:5efc6dcc-0dc7-7bda-9ab4-0c6fe2da4f9e:6420:1639854597962928:10.53.19.56@tcp:3
+
+There are only 5 write RPC. But there are hundreds of read RPC.
+
+# grep 'Sending RPC pname' lustre-log.1594347137 | awk -F ':' '$NF == 4'
+00000100:00100000:10.0:1594347136.938920:0:6420:0:(client.c:1620:ptlrpc_send_new_req()) Sending RPC pname:cluuid:pid:xid:nid:opc ptlrpcd_05_01:5efc6dcc-0dc7-7bda-9ab4-0c6fe2da4f9e:6420:1639854597962240:10.53.19.56@tcp:4 00000100:00100000:13.0:1594347137.176978:0:6421:0:(client.c:1620:ptlrpc_send_new_req()) Sending RPC pname:cluuid:pid:xid:nid:opc ptlrpcd_06_00:5efc6dcc-0dc7-7bda-9ab4-0c6fe2da4f9e:6421:1639854597967232:10.53.19.56@tcp:4 00000100:00100000:0.0:1594347137.796053:0:6400:0:(client.c:1620:ptlrpc_send_new_req()) Sending RPC pname:cluuid:pid:xid:nid:opc ptlrpcd_00_00:5efc6dcc-0dc7-7bda-9ab4-0c6fe2da4f9e:6400:1639854597982576:10.53.19.56@tcp:4 00000100:00100000:7.0:1594347137.849694:0:6406:0:(client.c:1620:ptlrpc_send_new_req()) Sending RPC pname:cluuid:pid:xid:nid:opc ptlrpcd_03_00:5efc6dcc-0dc7-7bda-9ab4-0c6fe2da4f9e:6406:1639854597984144:10.53.19.56@tcp:4 00000100:00100000:3.0:1594347137.868957:0:6403:0:(client.c:1620:ptlrpc_send_new_req()) Sending RPC pname:cluuid:pid:xid:nid:opc ptlrpcd_01_01:5efc6dcc-0dc7-7bda-9ab4-0c6fe2da4f9e:6403:1639854597984544:10.53.19.56@tcp:4
+
+# grep 'Sending RPC pname' lustre-log.1594347137 | awk -F ':' '$NF == 4' | wc -l
+5
+
+# grep 'Sending RPC pname' lustre-log.1594347137 | awk -F ':' '$NF == 3' | wc -l
+314
+
+--- Comment (emoly.liu, Fri, 10 Jul 2020 04:56:29 +0000) ---
+Yang liping requested to reopen this ticket to continue to ask question.
+
+--- Comment (yliping, Thu, 9 Jul 2020 16:14:22 +0000) ---
+Client debug log which with rpctrace and vfstrace enabled uploaded. 
+
+lustre-log_online2.1594310743.tar.gz
+
+--- Comment (yliping, Thu, 9 Jul 2020 14:53:57 +0000) ---
+As you can see in my /tmp/osc_reads.sh script, it counts the number of samples. So is it OK that 2 read() syscall trigger 79,120 OST_READ RPC? It sounds weird to me.
+
+ 
+
+# grep read_bytes /proc/fs/lustre/osc/zfsz3-OST006f-osc-ffff9e86b7e7c000/stats
+read_bytes                32641830 samples [bytes] 0 1048576 732351718180 601737760789691752
+
+# grep read_bytes /proc/fs/lustre/osc/zfsz3-OST006f-osc-ffff9e86b7e7c000/stats | awk '{sum+=$2} END {print sum}'
+32641830
+
+--- Comment (jhammond, Thu, 9 Jul 2020 14:33:22 +0000) ---
+osc read_bytes counts bytes:
+
+read_bytes                45564442648 samples [bytes] 1 4194304 123838172598382
+
+45564442648 is the number of samples (number of RPCs).
+
+1 is the min number of bytes over those samples.
+
+4194304 is the max number of bytes over those samples.
+
+123838172598382 is the sum of bytes over those samples.
+
+--- Comment (yliping, Thu, 9 Jul 2020 14:18:49 +0000) ---
+Does osc read_bytes count bytes transferred by OST_READ RPC? Or does it count numbers of OST_READ RPC? Two read() syscall trigger 79,120 bytes of osc read_bytes is reasonable.  However, two read() syscall trigger 79,120 osc read_bytes is not.
+
+--- Comment (jhammond, Thu, 9 Jul 2020 10:49:11 +0000) ---
+llite read_bytes counts bytes read by read() and related system calls. osc read_bytes counts bytes transferred by OST_READ RPCs. Due to things like caching or read ahead it may be that either exceeds the other.
+
+--- Comment (yliping, Thu, 9 Jul 2020 09:42:24 +0000) ---
+Client: 
+
+   OS: CentOS Linux release 7.6.1810 (Core), 3.10.0-957.el7.x86_64, 
+
+   Lustre: 2.10.6_1_g88b8798
+
+Server: 
+
+   OS: CentOS Linux release 7.3.1611 (Core), 3.10.0-957.el7_lustre.x86_64,
+
+   Lustre: 2.10.6_1_g88b8798
+
+ 
+
+While debugging Lustre server overloaded with 4k read problem. I found that the llite stats is inconsistent with osc stats. Is it a bug? Or something I misunderstand?
+
+From the output below, we can see that there are only 2 samples in llite stats. However, the sum of all osc stats is 79,120.
+
+[root@client ~]# grep read_bytes /proc/fs/lustre/llite/zfsz3-*/stats; /tmp/osc_reads.sh zfsz3; echo; sleep 10; grep read_bytes /proc/fs/lustre/llite/zfsz3-*/stats; /tmp/osc_reads.sh zfsz3
+read_bytes                45564442648 samples [bytes] 1 4194304 123838172598382
+4540200040
+
+read_bytes                45564442650 samples [bytes] 1 4194304 123838172606674
+4540279160
+
+[root@client ~]# cat /tmp/osc_reads.sh
+#!/bin/bash
+
+if [ $# == 1 ]; then
+    grep read_bytes /proc/fs/lustre/osc/$1-OST*-osc-*/stats | awk '{sum+=$2} END {print sum}'
+else
+    echo "Usage: $0 lustre_fs_name"
+fi
+
+The client cause lots of stress in the server. In the obdfilter exports stats, I can see lots of read operation from this client. In the client, I use strace the systemtap to trace the read syscall. But I can't find any evidence showing that the client is reading from Lustre aggressively.

@@ -1,0 +1,186 @@
+Key:        LU-5405
+Summary:    Performance issue while using robinhood in changelog mode
+Link:       https://jira.whamcloud.com/browse/LU-5405
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Bruno Faccini
+Reporter:   Bruno Travouillon
+Created:    Thu, 24 Jul 2014 14:56:22 +0000
+Updated:    Wed, 1 Mar 2017 12:00:07 +0000
+Resolved:   Thu, 4 Sep 2014 17:20:00 +0000
+Attachments: debug.rpctrace.pid20076, robinhood-changelogclear.png, robinhood-readspeed-7days.png, robinhood-readspeed.png, robinhood.log.STATS.gz
+
+--- Environment ---
+Kernel: kernel-2.6.32-431.11.2.el6.x86_64 w/ patch for Lustre
+
+Lustre: lustre-2.4.3-Bull.4.014.el6.20140426.x86_64
+
+Filesystem: 150,000,000+ inodes, 5000+ clients
+
+Robinhood: 2.5
+
+--- Description ---
+We are facing a performance issue when using robinhood in changelog mode on top
+
+of Lustre 2.4.3.
+
+The more the changelog size increase, the more time to clear the records increase.
+
+The production has started on 2014/06/19, after a update from Lustre 2.1 to
+
+Lustre 2.4. The robinhood service has been started on 2014/06/24 09:07:16.
+
+The evolution of the read speed is shown in figure robinhood-readspeed.png. The
+
+read speed is the number of record processed per second by robinhood, kept in
+
+its logfile. (see attached file robinhood.log.STATS)
+
+The performance of the changelog clear is also available in this logfile. This
+
+performance is mesured in ms per operation. The evolution of the changelog
+
+clear performance is shown in figure robinhood-changelogclear.png.
+
+The service has been restarted on 2014/07/16 11:11:50, with no improvments.
+
+As the customer was suspecting the performance of the mysql backend storage to
+
+be the root cause of this issue, the Lustre client running robinhood has been
+
+moved from a bullx S6030 (32 sockets, 64GB memory) to a bullx S6030 (32
+
+sockets, 128GB memory) connected to a faster backend storage for storing the
+
+mysql db on 2014/07/17. The service has been restarted on 2014/07/18 09:41:54
+
+and several times since, until the reboot of the Lustre client on 2014/07/21
+
+12:00:00. We then hit a lot of evictions due to ldlm callbacks timeout. We
+
+stopped the robinhood service on 2014/07/22 10:14:14.
+
+By looking at the changelog, we observed that the MDS was still clearing
+
+records. It cleared records until 2014/07/22 20:00:00.
+
+The MDS was clearing records with a rate of 30 records/sec.
+
+In the meantime, by looking at the MDS, I find out that the kernel thread
+
+mdt03_068 (PID 20076) is in charge of the changelog clear. This thread is
+
+running on CPU 27.
+
+The function llog_cat_id2handle() makes an heavy use of this CPU:
+
+Samples: 27K of event 'cycles', Event count (approx.): 2347474354
+ 46.45% [obdclass] [k] llog_cat_id2handle
+ 37.66% [kernel] [k] _spin_lock_irqsave
+  4.34% [kernel] [k] _spin_lock
+  0.71% [kernel] [k] find_busiest_group
+  0.32% [kernel] [k] _spin_unlock_irqrestore
+  0.26% [ldiskfs] [k] 0x0000000000043778
+  0.24% [lvfs] [k] lprocfs_counter_add
+  0.16% [kernel] [k] schedule
+  0.16% [mlx4_ib] [k] 0x0000000000000c34
+  0.15% [kernel] [k] thread_return
+  0.14% [kernel] [k] apic_timer_interrupt
+  0.14% [obdclass] [k] class_handle2object
+  0.12% [ko2iblnd] [k] kiblnd_find_peer_locked
+  0.12% [kernel] [k] menu_select
+  0.11% [kernel] [k] _spin_lock_irq
+  0.11% [ko2iblnd] [k] kiblnd_scheduler
+  0.11% [kernel] [k] find_next_bit
+  0.10% [kernel] [k] fair_update_curr
+  0.10% [kernel] [k] memcpy
+  0.09% [kernel] [k] kfree
+...
+
+In the context of clearing records, the function seems to be called by
+
+llog_cat_cancel_records(). I enabled the rpctrace debug on the mds. A sample of
+
+the debug log is available in file debug.rpctrace.pid20076.
+
+We still see the same rate of 30 rec/sec.
+
+The bottleneck seems to be in this portion of code (lustre/obdclass/llog_cat.c):
+
+155 int llog_cat_id2handle(const struct lu_env *env, struct llog_handle *cathandle,
+156                struct llog_handle **res, struct llog_logid *logid)
+157 {
+158     struct llog_handle  *loghandle;
+...
+166     down_write(&cathandle->lgh_lock);
+167     cfs_list_for_each_entry(loghandle, &cathandle->u.chd.chd_head,      lgh_id;
+170
+171         if (ostid_id(&cgl->lgl_oi) == ostid_id(&logid->lgl_oi) &&       ==> ostid_id:  /* extract OST objid from a wire ost_id (id/seq) pair */
+172             ostid_seq(&cgl->lgl_oi) == ostid_seq(&logid->lgl_oi)) {     ==> ostid_seq: /* extract OST sequence (group) from a wire ost_id (id/seq) pair */
+                                                                            ==> check if it is the same log object (id/seq)
+173             if (cgl->lgl_ogen != logid->lgl_ogen) {
+...
+179             }
+180             loghandle->u.phd.phd_cat_handle = cathandle;
+181             up_write(&cathandle->lgh_lock);
+182             GOTO(out, rc = 0);
+...
+212 out:
+213     llog_handle_get(loghandle);
+214     *res = loghandle;
+215     return 0;
+216 }
+
+Finally, the robinhood has been restarted on 2014/07/22 16:46:19, but in scan
+
+mode.
+
+The changelog has not been deregistered yet, we are keeping it for testing
+
+purposes. We plan to register a new changelog in order to restart robinhood in
+
+changelog mode and see if we observe the same behavior.
+
+--- Comment (adegremont, Sun, 21 Sep 2014 13:18:55 +0000) ---
+I think this fix should also be considered for 2.5.4
+
+--- Comment (pjones, Thu, 4 Sep 2014 17:20:00 +0000) ---
+Landed for 2.7
+
+--- Comment (lixi, Mon, 25 Aug 2014 08:57:51 +0000) ---
+Patch for master:
+
+http://review.whamcloud.com/11575
+
+--- Comment (laisiyao, Wed, 13 Aug 2014 09:19:38 +0000) ---
+Each llog contains 60k records, so for your changelogs(400m records), it has almost 6k opened logs, I've verified http://review.whamcloud.com/#/c/11338/ works on my local test system with 2m records, which can always find the log from the head of the opened log handle list.
+
+--- Comment (laisiyao, Wed, 6 Aug 2014 08:22:11 +0000) ---
+Patch is on http://review.whamcloud.com/#/c/11338/, could you test with it? Sorry for the late update because I just get back from vacation.
+
+--- Comment (laisiyao, Mon, 28 Jul 2014 08:12:16 +0000) ---
+Debug log doesn't show any errors, and as you said the change log is quite large, IMO this catalog contains too many llogs, and all of them are opened, and it took quite some time to iterate the open handle list to find the right handle for each record, and to increase this iteration, it should be done backward since the latest opened handle  is at the end. I'll commit a patch soon.
+
+--- Comment (pjones, Fri, 25 Jul 2014 16:49:30 +0000) ---
+Lai
+
+Could you please advise on this issue?
+
+Thanks
+
+Peter
+
+--- Comment (bruno.travouillon, Thu, 24 Jul 2014 15:43:02 +0000) ---
+I forgot to notice that I read the content of the changelog.
+
+# lfs changelog scratch3-MDT0000 > scratch3-MDT0000.changelog.2
+# ls -l scratch3-MDT0000.changelog.2
+-rw-r--r-- 1 root root 46577682272 Jul 18 18:47 scratch3-MDT0000.changelog.2
+
+First entries were from 19:46:00.582365844 2014.07.04
+
+Last entries were from 14:09:43.370430939 2014.07.18
+
+There are 436,211,167 records in the file.

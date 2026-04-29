@@ -1,0 +1,114 @@
+Key:        LU-16789
+Summary:    "lfs migrate" to use AIO/DIO or io_uring (kernel 5.1+)
+Link:       https://jira.whamcloud.com/browse/LU-16789
+Type:       Improvement
+Priority:   Minor
+Status:     In Progress
+Resolution: Unresolved
+Assignee:   Feng Lei
+Reporter:   Andreas Dilger
+Created:    Mon, 1 May 2023 17:49:24 +0000
+Updated:    Fri, 7 Feb 2025 00:44:55 +0000
+Labels:     lug23dd, lug24dd, medium, utils
+Links:      Related: is related to  LU-12649; Related: is related to  LU-18032; Related: is related to LU-18647; Related: is related to LU-17143; Related: is related to LU-18455; Related: is related to LU-16587; Related: is related to LU-18454
+
+--- Description ---
+It would be useful to speed up "lfs migrate",  "lfs mirror extend", and "lfs mirror resync" to use asynchronous Direct IO (AIO/DIO via libaio) to do the data copying
+
+This should use the same mechanism as lustre/tests/aiocp.c to have a producer/consumer queue and submits some number of AIO read requests, and then submit  the write requests when the reads finish.
+
+--- Comment (gerrit, Fri, 22 Nov 2024 01:41:26 +0000) ---
+Mistake.
+
+--- Comment (flei, Mon, 18 Nov 2024 06:25:19 +0000) ---
+Create LU-18454 to enable 'lfs migrate' read file list from stdin/file.
+
+Create LU-18455 to make 'lfs migrate' multi-threading.
+
+--- Comment (adilger, Sat, 12 Oct 2024 19:12:37 +0000) ---
+flei, I think "-0" should be an option for "lfs migrate" (and "lfs mirror extend") to read NUL-terminated filenames from stdin, and --files-from=FILELIST should read from a list of files, with "FILELIST=-" should indicate stdin (one file per line). This matches the option name from tar and rsync, and allows reading from both an existing file as well as a pipe. 
+
+It isn't clear whether there is a need to have many threads if there can be multiple AIO requests active at one time. It would be enough to have two or three threads active at once - one to create one file in advance, and the others to issue AIO read/write requests for the its file until it hits the AIO limit.  If enough AIO requests have been submitted to read (and in turn write) the whole file size, then the remaining AIO requests would go to a new file/thread, while the current thread waits for the pending AIO completions and closing the file before taking the next file from the input to process. 
+
+That way, only as many threads are started as needed to fill the AIO queue. It makes sense to have at least 2 or 3 threads actively reading/writing to different files (OSTs) so that they do not get blocked waiting for one OST that is slow or has hit max_rpcs_in_flight, but it also doesn't help to have thousands of in-flight IO requests to avoid clogging the network and OSTs.  The --threads parameter would be the maximum number of threads started, if that is necessary (eg. for files Ideally this can be self-balancing in some way, so that only as many AIO requests are submitted on a single file as needed to keep it busy, and the others are used for other files.  Similarly, the number of AIO requests are balanced to hit peak performance (or the specified bandwidth limit), and not thousands of requests that are all running slowly.
+
+--- Comment (flei, Tue, 8 Oct 2024 04:53:33 +0000) ---
+"lfs migrate" command can take multiple filenames and migrate them one by one. So just now such a command "lfs find ... -0 | xargs -0 -P 8 -n 32 lfs migrate ..." can work as expected.
+
+Currently "lfs migrate" will process these 32 files one by one. For each file, multiple aio tasks will be created to copy data then be destroyed.
+
+It's not so hard to start multiple threads for multiple files and multiple aio tasks for each file.  But not so easy to share all these aio tasks across files.
+
+What about such a model:
+
+	"lfs migrate" read unlimited filenames from stdin one by one (with --stdin or --input-file param)
+
+	prepare a thread pool to process files with --threads param
+
+So that we can run such a command: "lfs find ... | lfs migrate --stdin --threads=32 ..."
+
+--- Comment (adilger, Thu, 3 Oct 2024 03:32:12 +0000) ---
+flei, I don't know if you've looked into this at all, but how hard would it be for "lfs migrate" to use AIO to migrate multiple files in parallel (possibly in multiple threads with "--threads")?  If "lfs migrate" can take a list of files from the command-line or from stdin (e.g. using a "-0" option to read NUL-separated pathnames from "lfs find -0" or similar tool), would it be possible to keep multiple AIO requests in flight across files to improve small-file migration performance?
+
+Or is it enough to run something like "lfs find ... -0 | xargs -0 -P 8 -N 32 lfs migrate" to generate parallelism across multiple separate executables (8 tasks with 32 files per task).  The one drawback I see of using "xargs -P" to generate parallelism is that this may fail badly if one process gets a series of very large files, while other processes get small files.  That might be OK when migrating many thousands or millions of files, but if migrating only 32 files there would be no parallelism at all.  On the flip side, if using "-N 1" then there is potentially a lot of overhead from fork/exec of lfs to migrate only a single file with a few KB of data.
+
+--- Comment (gerrit, Tue, 13 Aug 2024 03:55:11 +0000) ---
+"Feng Lei " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/56016
+
+Subject: LU-16789 utils: improve performance of 'lfs migrate'
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: bfe5b988d78c2fb8069dd805bb11fac9e042819e
+
+--- Comment (flei, Mon, 12 Aug 2024 06:10:26 +0000) ---
+Will only repalce migrate_copy_data() with an AIO version of migrate_copy_data_aio() in this ticket. For "lfs_mirror_resync_file", the work will be moved to LU-17143.
+
+--- Comment (adilger, Thu, 8 Aug 2024 16:21:53 +0000) ---
+I think it should be possible to have two fd's open on the file pointing to different mirrors.  One requirement of this mirror resync code is that the IO be done with DIO, since it cannot have cached pages from different mirrors on the same file at the same time.
+
+--- Comment (flei, Thu, 8 Aug 2024 00:57:58 +0000) ---
+"lfs_mirror_resync_file" function is a little different. It has only one fd. When it needs to read file, it sets the mirror id to the src replica; when it needs to write file, it sets the mirror id to the dst replica.
+
+So my questions is:
+
+	Is it possible to open 2 fds, one is always set to the src replica and the other is always set to the dst replia.
+
+	If not, how do I optimize this function?
+
+--- Comment (adilger, Wed, 7 Aug 2024 17:39:28 +0000) ---
+Instead of using AIO it would also be possible to use io_uring for newer kernels (5.1+) .  Partly this is a performance improvement, but it also has the benefit of regularly testing the async DIO path in the kernel instead of only using them only in a few sanity tests.  So my strong preference would be to use libaio or io_uring rather than implementing multithreading in userspace.
+
+--- Comment (flei, Wed, 7 Aug 2024 08:29:45 +0000) ---
+Both "lfs migrate" and "lfs mirror extend" invoke migrate_data_copy() function to copy data. DIO is already used by default.
+
+I suggest to:
+
+	Prepare a lock protecting task control block which has src_fd, dst_fd and offset.
+
+	Start several threads.
+
+	Each thread gets a task based on the offset and set it to the next task with lock, then free lock and copy data.
+
+	All threads exit when file ends or error
+
+Personally I think it is easier than AIO.
+
+--- Comment (pjones, Thu, 9 Nov 2023 19:35:47 +0000) ---
+As per James, this work has not been tackled at ORNL yet so this task is still available for someone else to work on
+
+--- Comment (pjones, Fri, 20 Oct 2023 19:05:29 +0000) ---
+simmonsja any word from Chris B?
+
+--- Comment (simmonsja, Wed, 4 Oct 2023 14:53:32 +0000) ---
+Just to leave a note, at ORNL we implemented a replacement for lfs mirgate using a library that uses IO ring under the hood. Need to ask Chris Brumgard.
+
+--- Comment (paf0186, Wed, 4 Oct 2023 14:52:39 +0000) ---
+Note for anyone doing this - These changes should be made to migrate_copy_data(), which can then be shared out.  See LU-17143.
+
+--- Comment (paf0186, Wed, 4 Oct 2023 14:51:50 +0000) ---
+I think we should actually aim this at io_uring.  simmonsja says there is a library which allows you to write against io_uring and have it use AIO for backwards compatibility with older kernels (eg, RHEL 8 which is still a major target).

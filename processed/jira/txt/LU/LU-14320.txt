@@ -1,0 +1,204 @@
+Key:        LU-14320
+Summary:    Poor zfs performance (particularly reads) with ZFS 0.8.5 on RHEL 7.9
+Link:       https://jira.whamcloud.com/browse/LU-14320
+Type:       Bug
+Priority:   Major
+Status:     Closed
+Resolution: Done
+Assignee:   Nathaniel Clark
+Reporter:   Jeff Niles
+Created:    Mon, 11 Jan 2021 14:59:36 +0000
+Updated:    Wed, 28 Feb 2024 14:47:34 +0000
+Resolved:   Wed, 28 Feb 2024 14:42:18 +0000
+Labels:     ORNL, ornl
+Links:      Related: is related to  LU-14293
+Attachments: Screen Shot 2021-01-10 at 1.12.20 PM.png, Screen Shot 2021-01-10 at 12.58.44 PM.png
+
+--- Description ---
+Creating a new issue as a follow on for LU-14293.
+
+This issue is affecting one production file system and one that's currently in acceptance.
+
+When we stood up the system in acceptance, we ran some benchmarks on the raw block storage, so we're confident that the block storage can provide ~7GB/s read per LUN, with ~65GB/s read across the 12 LUNs in aggregate. What we did not do, however, was run any benchmarks on ZFS after the zpools were created on top of the LUN. Since LNET was no longer our bottleneck, we figured it would make sense to verify the stack from the bottom up, starting with the zpools. We set the zpools to `canmount=on` and changed the mountpoints, then mounted them and ran fio on them. Performance is terrible.
+
+Given that we have another file system running with the exact same tunings and general layout, we also checked that file system in the same manner to much the same results. Since we have past benchmarking results from that file system, we're fairly confident that at some point in the past ZFS was functioning correctly. With that knowledge (and after looking at various zfs github issues) we decided to roll back from zfs 0.8.5 to 0.7.13 to test the performance there. It seems that 0.7.13 is also providing the same results.
+
+I think that there may be potential value in rolling back our kernel to match what it was when we initialized the other file system, as there might be some odd interaction occurring with the kernel version we're running, but I'm not sure.
+
+Here's the results of our testing on a single LUN with ZFS. Keep in mind this LUN can do ~7GB/s at the block level.
+
+	files | read | write
+
+1 file - 396 MB/s | 4.2 GB/s
+
+4 files - 751 MB/s | 4.7 GB/s
+
+12 files - 1.6 GB/s | 4.7 GB/s
+
+And here's the really simple fio we're running to get these numbers:
+
+fio --rw=read --size 20G --bs=1M --name=something --ioengine=libaio --runtime=60s --numjobs=12
+
+We're also noticing some issues where Lustre is eating into those numbers significantly when layered on top. We're going to hold off on debugging that at all until zfs is stable though, as it may just be due to the same zfs issues.
+
+Here's our current zfs module tunings:
+
+  - 'metaslab_debug_unload=1'
+  - 'zfs_arc_max=150000000000'
+  - 'zfs_prefetch_disable=1'
+  - 'zfs_dirty_data_max_percent=30'
+  - 'zfs_arc_average_blocksize=1048576'
+  - 'zfs_max_recordsize=1048576'
+  - 'zfs_vdev_aggregation_limit=1048576'
+  - 'zfs_multihost_interval=10000'
+  - 'zfs_multihost_fail_intervals=0'
+  - 'zfs_vdev_async_write_active_min_dirty_percent=20'
+  - 'zfs_vdev_scheduler=deadline'
+  - 'zfs_vdev_async_write_max_active=10'
+  - 'zfs_vdev_async_write_min_active=5'
+  - 'zfs_vdev_async_read_max_active=16'
+  - 'zfs_vdev_async_read_min_active=16'
+  - 'zfetch_max_distance=67108864'
+  - 'dbuf_cache_max_bytes=10485760000'
+  - 'dbuf_cache_shift=3'
+  - 'zfs_txg_timeout=60'
+
+I've tried with zfs checksums on and off with no real change in speed. Screen grabs of the flame graphs from those runs are attached.
+
+--- Comment (lflis, Wed, 28 Feb 2024 14:47:34 +0000) ---
+James, can you share version combination which work for you?
+
+--- Comment (simmonsja, Wed, 28 Feb 2024 14:42:18 +0000) ---
+Newer ZFS + Lustre version resolved this
+
+--- Comment (lflis, Sat, 17 Sep 2022 19:41:07 +0000) ---
+@nilesj Out of curiosity - have you succedded with getting expected performance out of this setup?
+
+--- Comment (nilesj, Fri, 22 Jan 2021 18:23:59 +0000) ---
+Agree that a single VDEV zpool probably isn't the best way to organize these. I think we'll try to explore some different options there in the future. On the raid controller, yes. The backend system is a DDN 14KX with DCR pools (hence the huge LUN).
+
+With that being said, we've recently moved to testing on a development system that has a direct attached disk enclosure and we can reproduce the problem on a scale as low as 16 disks. We tried giving ZFS full control over the disks, where we put them into a zpool with each drive as a vdev (more traditional setup) with no RAID and the results were pretty bad. We then tried to replicate the production DDN case by creating a RAID0 MD device for the exact same disks, then laid ZFS on top of that. Those results were also fairly poor. Raw mdraid device performance was as expected.
+
+Raw mdraid device - 16 disks - 2375 MB/s write, 2850 read
+
+mdraid with zfs on top - 16 disks - 1700 write, 950 read
+
+zfs managing drives - 16 disks - 1500 write, 1100 read
+
+--- Comment (adilger, Fri, 22 Jan 2021 06:32:07 +0000) ---
+As I mentioned on the call today, but I'll record here as well, I don't think creating the zpool on a single large VDEV is very good for ZFS performance.  Preferably you should have 3 leaf VDEVs so that ditto blocks can be written to different devices.  Also, a single large zpool causes contention at commit time, and in the past we saw better performance with multiple smaller zpools (e.g. 2x 8+2 RAID-Z2 VDEVs per OST) to allow better parallelism.
+
+It sounds like you have a RAID controller in front of the disks?  Is it possible that the controller is interfering with the IO from ZFS?
+
+You don't need dnodesize=auto for the OSTs.  Also, depending on what ZFS version you have, there were previously problems with this feature on the MDT.
+
+--- Comment (nilesj, Tue, 19 Jan 2021 15:58:11 +0000) ---
+Andreas,
+
+The image that has 1:12 in the title shows a later run with checksumming disabled entirely, which made no meaningful change to the outcome. I am curious about your thoughts on the checksum type though, as EDONR is set on this system and our other system in the creation script. I think the reason that we're using it has been lost to time. Should we consider changing to Fletcher4, regardless of performance impact? Would be pretty low effort.
+
+For the zpool config: Each OSS controls two zpools, each with a single VDEV created from a single ~550TB block device that's presented over IB via SRP. I believe zfs sets this up as RAID0 internally, but I'm not sure.
+
+Unfortunately, I don't have the drives on hand to test, but I think that would make a fantastic test. Might be useful to see if it's a good idea to include SSD/NVMe in future OSS purchases to offload that VDEV onto.
+
+Robin,
+
+No worries on stopping by, we'll take all the help we can get. Yes, we currently set ashift to 12; recordsize on our systems is 1M to align with the block device, and dnodesize is set to auto.
+
+I assume your enclosures are direct attached and you let ZFS handle all the disks? I think this may be part of our problem; we're trying to offload as much of this onto the block storage as possible, and ZFS just doesn't like it.
+
+Thanks!
+
+	Jeff
+
+--- Comment (scadmin, Tue, 19 Jan 2021 09:04:11 +0000) ---
+Hi,
+
+I found this ticket by mistake, so please forgive the intrusion. but I had a thought - is your ashift=12? we tend to create zpools by hand, so I'm not sure what the lustre tools set.
+
+	zpool get ashift
+
+NAME                   PROPERTY  VALUE   SOURCE
+
+arkle1-dagg-OST0-pool  ashift    12      local
+
+also I'm not sure I've ever seen a great zfs read speed, but we did tweak these a bit on our system
+
+	zfs get recordsize,dnodesize
+
+NAME                        PROPERTY    VALUE    SOURCE
+
+arkle1-dagg-OST0-pool       recordsize  2M       local
+
+arkle1-dagg-OST0-pool       dnodesize   auto     local
+
+with zfs module option
+
+options zfs zfs_max_recordsize=2097152
+
+also, FWIW we use 12+3 z3 vdevs with 4 vdevs per pool (ie. pool is 60 disks). no doubt z2 is faster, but we use z3 'cos speed isn't really our main goal.
+
+cheers,
+
+robin
+
+--- Comment (adilger, Mon, 18 Jan 2021 09:59:50 +0000) ---
+A few comments here - the EDONR checksum that shows in the flame graphs seems to be consuming a lot of CPU.  This checksum is new to me, so I'm not sure of its performance or overhead.  Have you tried a more standard checksum (e.g. Fletcher4) which also has Intel CPU assembly optimizations that we added a few years ago?
+
+The other question of interest is what the zpool config is like (how many disks, how many VDEVs, RAID type, etc)?  Definitely ZFS gets better performance driving separate zpools than having a large single zpool, since there is otherwise contention at commit time when there are many disks in the pool.  On the one hand, several 8+2 RAID-Z2 as separate OSTs will probably give better performance, but on the other hand, there is convenience and some amount of additional robustness when having at least 3 VDEVs in the pool (it allows mirror metadata copies to br written to different disks).
+
+Finally, if you have some SSDs available and you are running ZFS 0.8+, it might be worthwhile to test with an SSD Metadata Allocation Class VDEV that is all-flash.  Then ZFS could put all of the internal metadtata (dnodes, indirect blocks, Merkle tree) on the  SSDs and only use the HDDs for data.
+
+--- Comment (nilesj, Wed, 13 Jan 2021 18:02:10 +0000) ---
+Sorry for the delayed response, we've been working on testing and migrating over to a test system.
+
+Our zfs_vdev_scheduler is currently getting tuned to deadline. We tried setting it to noop, and then tried setting both it and the scheduler for the disks/mpaths to noop as well. No noticeable change in performance.
+
+We played with the max_sectors_kb and 32M doesn't seem to provide a tangible benefit either. We also tried setting nr_requests higher, same thing.
+
+We do get about a 2x speed increase (~1.3GB/s -> ~2.5GB/s) when enabling prefetching. While better, won't this impact smaller file workloads in a negative way? Also, ~2.5GB/s is still way short of the mark. It does prove that zfs can push more bandwidth than it currently is.
+
+We also tried tuning the zfs_vdev_[async/sync]read[max/min]_active parameters with values ranging from 1 - 256, particularly focused on zfs_vdev_async_read_max_active. These also seemingly provided no change. It seems like we're bottlenecked somewhere else.
+
+We're also nearly set up for a test where we're going to break a LUN up into 8 smaller LUNs and then feed those into ZFS to see if it's choking on the single large block device. I don't think we really expect much out of it, but will at least give us a datapoint. I'll let you know how that goes, but in the mean time do you have any more suggestions?
+
+Thanks!
+
+	Jeff
+
+--- Comment (utopiabound, Mon, 11 Jan 2021 20:30:24 +0000) ---
+The block scheduler for the disks and mpaths is "mq-deadline". This is the system default, since zfs_vdev_scheduler is disabled (at least in 2.0/master). I'm wondering if setting the scheduler to none might help.
+
+The other oddity I found was multipath has max_sectors_kb set to 8196 for the SFA14KX (but the current versions of the multipath.conf file I've found do not have such a setting, and I believe the default is 32M instead of 8M). I'm not sure this is affecting you, given the test blocksize is 1M.
+
+Does FIO perform better with zfs_prefetch_disable=0?
+
+There's also a small ARC fix in ZFS 0.8.6.
+
+--- Comment (nilesj, Mon, 11 Jan 2021 18:08:02 +0000) ---
+I sent the sosreport to your whamcloud email.
+
+--- Comment (utopiabound, Mon, 11 Jan 2021 17:25:05 +0000) ---
+would it be possible to attach an sosreport the OSS?
+
+--- Comment (bzzz, Mon, 11 Jan 2021 17:22:10 +0000) ---
+memcpy seem to contribute a lot. Lustre doesn't need extra copy and can send data from ARC directly
+
+--- Comment (nilesj, Mon, 11 Jan 2021 16:42:09 +0000) ---
+Correct, we're running fio directly on the vdev and the results are the same for 0.8.5 and 0.7.13 (at least on this kernel version).
+
+As far as zpool layout, each OSS is primary for two zpools, each constructed from a single block device (LUN) provided by an external storage device that handles RAID (DDN). Any other info you need, let me know.
+
+--- Comment (utopiabound, Mon, 11 Jan 2021 15:44:30 +0000) ---
+Okay, to be clear.
+
+You are running fio directly on a ZFS vdev and getting these result for both 0.8.5 and 0.7.13?
+
+Can you dump info on the format of the zpool?  Is it just a single logical unit on the a storage array?
+
+--- Comment (pjones, Mon, 11 Jan 2021 15:16:17 +0000) ---
+Nathaniel
+
+What do you advise here?
+
+Peter

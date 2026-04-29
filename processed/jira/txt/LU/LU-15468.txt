@@ -1,0 +1,423 @@
+Key:        LU-15468
+Summary:    Lustre Client Lockup/OOM Conditions Under Buffered I/O
+Link:       https://jira.whamcloud.com/browse/LU-15468
+Type:       Bug
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Ellis Wilson
+Created:    Thu, 20 Jan 2022 19:23:58 +0000
+Updated:    Wed, 29 Mar 2023 16:38:24 +0000
+Links:      Related: is related to LU-16671
+Attachments: mem.tar.bz2, net.tar.bz2, off-cpu.svg, on-cpu.svg, syslog
+
+--- Environment ---
+5.4.0-1065-azure #68~18.04.1-Ubuntu SMP x86_64 x86_64 x86_64 GNU/Linux
+
+--- Description ---
+Recently we've switched from using ZFS to ldiskfs as the backing filesystem to work around some performance issues and I'm finding that when I put the cluster under load (with as little as a single client) I can almost completely lockup the client.  SSH (even existing sessions) stall, iostat, top, etc all freeze for 20 to 200 seconds.  This alleviates for small windows and recurs as long as I leave the io-generating process in existence.  It reports extremely high CPU and RAM usage, and appears to be consumed exclusively doing 'system'-tagged work.  This is on 2.14.0, but I've reproduced on more or less HOL for master-next.  If I do direct-IO, performance is fantastic and I have no such issues regarding CPU/memory pressure.
+
+The test cluster I've been using is a single client with 16GB of RAM, one MDS/MGS with 64GB of RAM, and two OSSes with 64GB of RAM each.  This issue occurs but without the complete stall out with 32GB clients, and doesn't appear to occur with 64GB clients.  At the last size it maxes out at about 40GB RAM consumed and enough free all the time that it never OOM-kills any userspace processes, hangs, or shows perf degradation).
+
+I dmesg I see consistent spew on the client about:
+
+[19548.601651] LustreError: 30918:0:(events.c:208:client_bulk_callback()) event type 1, status 5, desc 00000000b69b83b0 [19548.662647] LustreError: 30917:0:(events.c:208:client_bulk_callback()) event type 1, status -5, desc 000000009ef2fc22 [19549.153590] Lustre: lustrefs-OST0000-osc-ffff8d52a9c52800: Connection to lustrefs-OST0000 (at 10.1.98.7@tcp) was lost; in progress operations using this service will wait for recovery to complete [19549.153621] Lustre: 30927:0:(client.c:2282:ptlrpc_expire_one_request()) @@@ Request sent has failed due to network error: [sent 1642535831/real 1642535833]  req@0000000002361e2d x1722317313374336/t0(0) o4>lustrefs-OST0001-osc-ffff8d52a9c52800@10.1.98.10@tcp:6/4 lens 488/448 e 0 to 1 dl 1642535883 ref 2 fl Rpc:eXQr/0/ffffffff rc 0/-1 job:''
+
+[19549.153623] Lustre: 30927:0:(client.c:2282:ptlrpc_expire_one_request()) Skipped 4 previous similar messages
+
+But I actually think this is a symptom of extreme memory pressure causing the client to timeout things, not a cause.
+
+Testing with obdfilter-survey (local) on the OSS side shows expected performance of the disk subsystem.  Testing with lnet_selftest from client to OSS shows expected performance.  In neither case do I see the high cpu or memory pressure issues.
+
+Reducing a variety of lctl tunables that appear to govern memory allowances for Lustre clients does not improve the situation.  In almost all cases I'm using defaults for 2.14.0, but I've further reduced the following without any observed improvement:
+
+~# lctl set_param llite.*.max_cached_mb=1024
+
+~# lctl set_param osc.*.max_dirty_mb=512
+
+~# lctl set_param osc.*.max_pages_per_rpc=128
+
+~# lctl set_param osc.*.max_rpcs_in_flight=2
+
+I've also tried reducing client and server-side sysctls to force things to flush out (since ODIRECT seems to DTRT) more frequently, but that doesn't help me either:
+
+sudo sysctl -w vm.dirty_ratio=5; sudo sysctl -w vm.dirty_background_ratio=2; sudo sysctl -w vm.dirty_writeback_centisecs=50; sudo sysctl -w vm.dirty_expire_centisecs=100
+
+Even running "sync" in a bash loop doesn't improve the situation - something apparently really thinks it needs all of the memory on the machine until some magic event unplugs things and suddenly I get 8-10GB of memory back at once.
+
+By all appearances, the running iozone or even simple dd processes gradually (i.e., over a span of just 10 seconds or so) consumes all 16GB of RAM on the client I'm using.  I've generated bcc profile graphs for both on- and off-cpu analysis, and they are utterly boring – they basically just reflect rampant calls to shrink_inactive_list resulting from page_cache_alloc in the presence of extreme memory pressure.
+
+I have collected and attached output from issuing a sysrq during the "hang" point when there is no memory available, as well as a set of logs with memory-oriented logs enabled, and a set of logs with network-oriented logs enabled.  Both sets of logs overran my 1GB in-memory buffer, so the start MARK for iozone is not present, but you can find the end MARK.  At the time of the end MARK the used memory is still reported as extremely high - that doesn't tend to resolve until a while after iozone is complete.  I cannot determine with any accuracy what causes memory to free up suddenly, so that part may or may not be covered in the logs.
+
+I have also attached two SVG files with flamegraphs - one is on-cpu from start of iozone through the recurring hangs, and ditto that for an off-cpu graph.  It is notable that these are all from separate runs (5 in total: one for sysrq, two sets of logs, and two bcc runs), so I would avoid trying to exactingly correlate them, though they all overlap the same phenomenon.
+
+This is a major blocker for us, so any other information I can provide, experiments I can run, or further logs I can collect you need only ask.
+
+--- Comment (paf0186, Wed, 29 Mar 2023 16:38:24 +0000) ---
+Ellis,
+
+Just a note here:
+
+"This directly explains DIO performing well while buffered I/O ran up to OOM.  However, most bafflingly, while the default for the struct in ofd_internal.h is set to enabled:
+
+111 struct ofd_device {
+
+…snip…
+
+140                  /* sync journal on writes */
+
+141                  ofd_sync_journal:1,"
+
+That's a bit field element one bit wide, not an initialization.  It'll just be whatever's in that memory until it's set. 
+
+Thanks for the detailed description.  This is sort of a known issue, I'm looking at a general fix here - where we force a sync to the OST on memory pressure.  Your journal commit change is still likely a good idea for you, but the change I'm working on should let things work smoothly regardless.
+
+It's here:
+
+https://review.whamcloud.com/c/fs/lustre-release/+/50460
+
+I'd be curious if you wanted to test it on your workload, if it's not too big of an ask.  It's working well on simple stuff, but I haven't yet put it on real hardware.
+
+--- Comment (JIRAUSER17317, Fri, 25 Feb 2022 14:42:06 +0000) ---
+There are two reasonable dispositions for this bug:
+
+	Since it's rich with content describing the rather easy-to-reproduce situation Lustre might run it's client OOM, revise the title and description to reflect it as an enhancement bug to build memory limitations into PTLRPC for referenced pages as there already are for many other layers of Lustre.  I'm not quite experienced enough in the PTLRPC code to begin hacking away at a sane fix, otherwise I'd take this on myself.
+
+	Close it with a resolution akin to fixed no code change, worked around, or similar.  The 5 second commit time appears to avoid OOM so far on our cluster, but it doesn't give me the warm and fuzzies about robustness in the face of the wide array of cloud-based client memory sizes we have to support.  I still think it would be worthwhile to open and link an enhancement bug describing #1 to this, but I recognize that's a beggar's ask.
+
+--- Comment (JIRAUSER17317, Tue, 15 Feb 2022 03:16:22 +0000) ---
+I've discovered that the real reason it's been so much easier for me to reproduce this problem compared with the rest of the world is that I'm building ldiskfs against a Canonical Ubuntu repo for Azure, which has modified the following:
+
+-#define JBD2_DEFAULT_MAX_COMMIT_AGE 5
+
++#define JBD2_DEFAULT_MAX_COMMIT_AGE 30
+
+This governs the commit option if it is not specified, and makes it a heck of a lot easier to run your client OOM.
+
+--- Comment (JIRAUSER17317, Mon, 14 Feb 2022 22:07:26 +0000) ---
+I know how this is happening now, and it’s as simple to work-around as a one-line configuration change.
+
+Here’s what happens:
+
+1. The Lustre client  performs a ton of async/buffered I/O.  This results in lots of ptlrpc requests going through the motions to move data as a bulkrw to the target OST.  On the client side, looking at a single request (in this instance, it’s the very last bulk RPC for my dd of 1GB) this looks like:
+
+00000100:00000010:2.0:1644855026.009472:0:3528:0:(client.c:539:ptlrpc_request_cache_alloc()) slab-alloced 'req': 1112 at 000000009849dfa0.
+
+00000008:00100000:2.0:1644855026.010003:0:3528:0:(osc_request.c:1763:osc_brw_prep_request()) brw rpc 000000009849dfa0 - object 0x0:527 offset 1044381696<>1048576000
+
+00000008:00000002:2.0:1644855026.010011:0:3528:0:(osc_request.c:2618:osc_build_rpc()) @@@ 1024 pages, aa 00000000fb3e4fe8, now 0r/1w in flight  req@000000009849dfa0 x1724409356180480/t0(0) o4->lustrefs-OST0001-osc-ffff9f3c2acc5000@10.1.98.9@tcp:6/4 lens 488/448 e 0 to 0 dl 0 ref 2 fl New:QU/0/ffffffff rc 0/-1 job:''
+
+00000100:00000040:2.0:1644855026.010020:0:3528:0:(ptlrpcd.c:304:ptlrpcd_add_req()) @@@ add req [000000009849dfa0] to pc [ptlrpcd_00_02+2]  req@000000009849dfa0 x1724409356180480/t0(0) o4->lustrefs-OST0001-osc-ffff9f3c2acc5000@10.1.98.9@tcp:6/4 lens 488/448 e 0 to 0 dl 0 ref 2 fl New:QU/0/ffffffff rc 0/-1 job:''
+
+00000100:00000040:0.0:1644855026.010043:0:3529:0:(lustre_net.h:2470:ptlrpc_rqphase_move()) @@@ move request phase from New to Rpc  req@000000009849dfa0 x1724409356180480/t0(0) o4->lustrefs-OST0001-osc-ffff9f3c2acc5000@10.1.98.9@tcp:6/4 lens 488/448 e 0 to 0 dl 0 ref 2 fl New:QU/0/ffffffff rc 0/-1 job:''
+
+00000100:00100000:0.0:1644855026.010051:0:3529:0:(client.c:1728:ptlrpc_send_new_req()) Sending RPC req@000000009849dfa0 pname:cluuid:pid:xid:nid:opc:job ptlrpcd_00_02:de03a898-364e-4d98-8b57-f40bdf7e7ac5:3529:1724409356180480:10.1.98.9@tcp:4:
+
+00000100:00000040:0.0:1644855026.010083:0:3529:0:(niobuf.c:923:ptl_send_rpc()) @@@ send flags=0  req@000000009849dfa0 x1724409356180480/t0(0) o4->lustrefs-OST0001-osc-ffff9f3c2acc5000@10.1.98.9@tcp:6/4 lens 488/448 e 0 to 0 dl 1644855593 ref 3 fl Rpc:r/0/ffffffff rc 0/-1 job:''
+
+00000100:00000200:7.0:1644855026.010183:0:3490:0:(events.c:59:request_out_callback()) @@@ type 5, status 0  req@000000009849dfa0 x1724409356180480/t0(0) o4->lustrefs-OST0001-osc-ffff9f3c2acc5000@10.1.98.9@tcp:6/4 lens 488/448 e 0 to 0 dl 1644855593 ref 3 fl Rpc:r/0/ffffffff rc 0/-1 job:''
+
+00000100:00000040:7.0:1644855026.010189:0:3490:0:(client.c:2698:__ptlrpc_req_finished()) @@@ refcount now 2  req@000000009849dfa0 x1724409356180480/t0(0) o4->lustrefs-OST0001-osc-ffff9f3c2acc5000@10.1.98.9@tcp:6/4 lens 488/448 e 0 to 0 dl 1644855593 ref 3 fl Rpc:Qr/0/ffffffff rc 0/-1 job:''
+
+00000100:00000200:7.0:1644855026.026290:0:3490:0:(events.c:100:reply_in_callback()) @@@ type 2, status 0  req@000000009849dfa0 x1724409356180480/t0(0) o4->lustrefs-OST0001-osc-ffff9f3c2acc5000@10.1.98.9@tcp:6/4 lens 488/448 e 0 to 0 dl 1644855593 ref 2 fl Rpc:Qr/0/ffffffff rc 0/-1 job:''
+
+00000100:00000040:7.0:1644855026.026295:0:3490:0:(events.c:169:reply_in_callback()) @@@ reply in flags=0 mlen=448 offset=224 replen=448  req@000000009849dfa0 x1724409356180480/t0(0) o4->lustrefs-OST0001-osc-ffff9f3c2acc5000@10.1.98.9@tcp:6/4 lens 488/448 e 0 to 0 dl 1644855593 ref 2 fl Rpc:RQ/0/ffffffff rc 0/-1 job:''
+
+00000100:00000200:0.0:1644855026.026427:0:3529:0:(events.c:100:reply_in_callback()) @@@ type 6, status 0  req@000000009849dfa0 x1724409356180480/t0(0) o4->lustrefs-OST0001-osc-ffff9f3c2acc5000@10.1.98.9@tcp:6/4 lens 488/448 e 0 to 0 dl 1644855593 ref 2 fl Rpc:RQ/0/ffffffff rc 0/-1 job:''
+
+00000100:00000200:0.0:1644855026.026430:0:3529:0:(events.c:122:reply_in_callback()) @@@ unlink  req@000000009849dfa0 x1724409356180480/t0(0) o4->lustrefs-OST0001-osc-ffff9f3c2acc5000@10.1.98.9@tcp:6/4 lens 488/448 e 0 to 0 dl 1644855593 ref 2 fl Rpc:RQU/0/ffffffff rc 0/-1 job:''
+
+00000100:00000040:0.0:1644855026.026450:0:3529:0:(lustre_net.h:2470:ptlrpc_rqphase_move()) @@@ move request phase from Rpc to Bulk  req@000000009849dfa0 x1724409356180480/t8590048423(8590048423) o4->lustrefs-OST0001-osc-ffff9f3c2acc5000@10.1.98.9@tcp:6/4 lens 488/448 e 0 to 0 dl 1644855593 ref 3 fl Rpc:RQU/4/0 rc 0/0 job:''
+
+00000100:00000040:0.0:1644855026.026453:0:3529:0:(lustre_net.h:2470:ptlrpc_rqphase_move()) @@@ move request phase from Bulk to Interpret  req@000000009849dfa0 x1724409356180480/t8590048423(8590048423) o4->lustrefs-OST0001-osc-ffff9f3c2acc5000@10.1.98.9@tcp:6/4 lens 488/448 e 0 to 0 dl 1644855593 ref 3 fl Bulk:RQU/4/0 rc 0/0 job:''
+
+00000008:00000002:0.0:1644855026.026469:0:3529:0:(osc_request.c:2321:brw_interpret()) request 000000009849dfa0 aa 00000000fb3e4fe8 rc 0
+
+00000100:00000040:0.0:1644855026.026530:0:3529:0:(client.c:2698:__ptlrpc_req_finished()) @@@ refcount now 2  req@000000009849dfa0 x1724409356180480/t8590048423(8590048423) o4->lustrefs-OST0001-osc-ffff9f3c2acc5000@10.1.98.9@tcp:6/4 lens 488/448 e 0 to 0 dl 1644855593 ref 3 fl Interpret:RQU/4/0 rc 0/0 job:''
+
+00000100:00000040:0.0:1644855026.036072:0:3529:0:(lustre_net.h:2470:ptlrpc_rqphase_move()) @@@ move request phase from Interpret to Complete  req@000000009849dfa0 x1724409356180480/t8590048423(8590048423) o4->lustrefs-OST0001-osc-ffff9f3c2acc5000@10.1.98.9@tcp:6/4 lens 488/448 e 0 to 0 dl 1644855593 ref 2 fl Interpret:RQU/4/0 rc 0/0 job:''
+
+00000100:00100000:0.0:1644855026.036075:0:3529:0:(client.c:2202:ptlrpc_check_set()) Completed RPC req@000000009849dfa0 pname:cluuid:pid:xid:nid:opc:job ptlrpcd_00_02:de03a898-364e-4d98-8b57-f40bdf7e7ac5:3529:1724409356180480:10.1.98.9@tcp:4:
+
+00000100:00000040:0.0:1644855026.036079:0:3529:0:(client.c:2698:__ptlrpc_req_finished()) @@@ refcount now 1  req@000000009849dfa0 x1724409356180480/t8590048423(8590048423) o4->lustrefs-OST0001-osc-ffff9f3c2acc5000@10.1.98.9@tcp:6/4 lens 488/448 e 0 to 0 dl 1644855593 ref 2 fl Complete:RQU/4/0 rc 0/0 job:''
+
+Notes:
+
+a) 8590048423 is the transaction number for this request.  This is visible on both the OST side as well as the client.
+
+b) You will see even though the request is “finished,” there is a refcount of 1.  That’s because it has not yet been committed on the OST side.  That’s pretty reasonable, since from start to end of the request it’s only 0.02s and this is an async/buffered I/O.
+
+c) Because this has a refcount of >0, all pages associated with the I/O will also retain their references within ptlrpc since bulkrw is a replayable RPC and the target is a replay-enabled target (being ldiskfs).
+
+2. On the OST-side, we can see the target code acknowledge the last received update to the transaction.  I’m eliding the request details here regarding writes to ldiskfs because they are numerous and have little value.  This is what happens after all of the writes go out the door to the disk:
+
+00000001:00000002:5.0:1644855026.014352:0:21200:0:(tgt_lastrcvd.c:1397:tgt_last_rcvd_update()) transno = 8590048423, last_committed = 8590048173
+
+00000001:00000010:5.0:1644855026.014353:0:21200:0:(tgt_lastrcvd.c:919:tgt_last_commit_cb_add()) kmalloced '(ccb)': 96 at 000000001f8e869e.
+
+00000001:00000040:5.0:1644855026.014354:0:21200:0:(tgt_lastrcvd.c:924:tgt_last_commit_cb_add()) callback GETting export 00000000ca841ef5 : new cb_count 500
+
+00000020:00000040:5.0:1644855026.014355:0:21200:0:(genops.c:968:class_export_get()) GET export 00000000ca841ef5 refcount=507
+
+00010000:00000040:5.0:1644855026.025162:0:21200:0:(ldlm_lib.c:3156:target_committed_to_req()) last_committed 8590048173, transno 8590048423, xid 1724409356180480
+
+00010000:00000200:5.0:1644855026.025166:0:21200:0:(ldlm_lib.c:3213:target_send_reply_msg()) @@@ sending reply  req@0000000002ad48f5 x1724409356180480/t8590048423(0) o4->de03a898-364e-4d98-8b57-f40bdf7e7ac5@10.1.99.6@tcp:263/0 lens 488/448 e 0 to 0 dl 1644855343 ref 1 fl Interpret:/0/0 rc 0/0 job:''
+
+00000100:00000040:5.0:1644855026.025211:0:21200:0:(lustre_net.h:2470:ptlrpc_rqphase_move()) @@@ move request phase from Interpret to Complete  req@0000000002ad48f5 x1724409356180480/t8590048423(0) o4->de03a898-364e-4d98-8b57-f40bdf7e7ac5@10.1.99.6@tcp:263/0 lens 488/448 e 0 to 0 dl 1644855343 ref 1 fl Interpret:/0/0 rc 0/0 job:''
+
+00000100:00100000:5.0:1644855026.025216:0:21200:0:(service.c:2348:ptlrpc_server_handle_request()) Handled RPC req@0000000002ad48f5 pname:cluuid+ref:pid:xid:nid:opc:job ll_ost_io01_027:de03a898-364e-4d98-8b57-f40bdf7e7ac5+506:3529:x1724409356180480:12345-10.1.99.6@tcp:4: Request processed in 15302us (15614us total) trans 8590048423 rc 0/0
+
+00002000:00100000:5.0:1644855026.025224:0:21200:0:(ofd_dev.c:2583:ofd_rw_hpreq_check()) @@@ lustrefs-OST0001 ll_ost_io01_027: refresh rw locks for [0x100010000:0x20f:0x0] (1044381696->1048575999)  req@0000000002ad48f5 x1724409356180480/t8590048423(0) o4->de03a898-364e-4d98-8b57-f40bdf7e7ac5@10.1.99.6@tcp:263/0 lens 488/448 e 0 to 0 dl 1644855343 ref 1 fl Complete:/0/0 rc 0/0 job:''
+
+Notes:
+
+a) last_committed indicates the transaction number we just received is well ahead of last_committed, but as the target subsystem hasn’t committed this to disk yet, it can’t be moved forward yet.
+
+b) The export mentioned here is 00000000ca841ef5.  That’s our client.  There being around 500 outstanding references to the client makes sense, as the client is issuing 4MB RPCs to create the 1GB file I asked it to.  None of these have been committed as of the times above (they all started within ten seconds prior to the timestamp above).
+
+c) All 500 or so bulk RPC transactions are added to a single journal transaction.
+
+3. The OST now sits waiting for the commits.   Since this is a tiny cluster, there is some sanity checking code that runs (that won’t run once you have more than 100 exports/mounts), and that sheds some light on the state of the commit status:
+
+00000020:00000020:4.0:1644855030.025668:0:28986:0:(tgt_grant.c:145:tgt_check_export_grants()) lustrefs-OST0001: cli de03a898-364e-4d98-8b57-f40bdf7e7ac5/00000000ca841ef5 dirty 0 pend 1054720000 grant 138485760
+
+00000020:00000020:4.0:1644855035.145721:0:28986:0:(tgt_grant.c:145:tgt_check_export_grants()) lustrefs-OST0001: cli de03a898-364e-4d98-8b57-f40bdf7e7ac5/00000000ca841ef5 dirty 0 pend 1054720000 grant 138485760
+
+00000020:00000020:14.0:1644855038.264326:0:31164:0:(tgt_grant.c:145:tgt_check_export_grants()) lustrefs-OST0001: cli de03a898-364e-4d98-8b57-f40bdf7e7ac5/00000000ca841ef5 dirty 0 pend 1054720000 grant 138485760
+
+00000020:00000020:4.0:1644855040.265751:0:28986:0:(tgt_grant.c:145:tgt_check_export_grants()) lustrefs-OST0001: cli de03a898-364e-4d98-8b57-f40bdf7e7ac5/00000000ca841ef5 dirty 0 pend 1054720000 grant 138485760
+
+Notes:
+
+a) Highly curiously, there is 1GB of not dirty but pending data outstanding associated with the export.  Pending took me some time to figure out.  Dirty == “there’s stuff in RAM that’s totally un-written-to-disk.”  Pending == “there’s stuff in my ldiskfs journal that’s not yet been sync’d into the ldiskfs filesystem”.
+
+b) Examining code, depending on whether LDISKFS_HT_MISC is enabled, Lustre is supposed to permit up to the journal size or up to one half the journal size in pending.  Looking at the inode for the Lustre journal, that should mean up to 1GB in pending ever in the worst-case.  Nevertheless, going well beyond my toy dd 1GB example, I can see output like the following, quite beyond the journal capacity, which is weird:
+
+00000020:00000020:0.0:1644868720.905530:0:5291:0:(tgt_grant.c:145:tgt_check_export_grants()) lustrefs-OST0001: cli de03a898-364e-4d98-8b57-f40bdf7e7ac5/00000000f3ffcf62 dirty 131055616 pend 1656487936 grant 146923520
+
+4. Shortly after that last check export grants output above, ldiskfs must have flushed the journal, as all the callbacks begin being executed, commits made, and export references decremented:
+
+00000100:00000001:15.0F:1644855041.523456:0:5156:0:(service.c:411:ptlrpc_commit_replies()) Process entered
+
+00000100:00000001:15.0:1644855041.523462:0:5156:0:(service.c:433:ptlrpc_commit_replies()) Process leaving
+
+00000001:00080000:15.0:1644855041.523464:0:5156:0:(tgt_lastrcvd.c:901:tgt_cb_last_committed()) lustrefs-OST0001: transno 8590048423 is committed
+
+00000001:00000040:15.0:1644855041.523467:0:5156:0:(tgt_lastrcvd.c:904:tgt_cb_last_committed()) callback PUTting export 00000000ca841ef5 : new cb_count 499
+
+00000020:00000040:15.0:1644855041.523471:0:5156:0:(genops.c:979:class_export_put()) PUTting export 00000000ca841ef5 : new refcount 504
+
+00000001:00000010:15.0:1644855041.523474:0:5156:0:(tgt_lastrcvd.c:905:tgt_cb_last_committed()) kfreed 'ccb': 96 at 000000001f8e869e.
+
+00000020:00000001:15.0:1644855041.523477:0:5156:0:(tgt_grant.c:1420:tgt_grant_commit()) Process entered
+
+00000020:00000001:15.0:1644855041.523479:0:5156:0:(tgt_grant.c:1474:tgt_grant_commit()) Process leaving
+
+… 500 loops later…
+
+00000020:00000001:15.0:1644855041.525179:0:5156:0:(tgt_grant.c:1420:tgt_grant_commit()) Process entered
+
+00000020:00000001:15.0:1644855041.525179:0:5156:0:(tgt_grant.c:1474:tgt_grant_commit()) Process leaving
+
+00000020:00000040:15.0:1644855041.525179:0:5156:0:(tgt_grant.c:1505:tgt_grant_commit_cb()) callback PUTting export 00000000ca841ef5 : new cb_count 0
+
+00000020:00000040:15.0:1644855041.525180:0:5156:0:(genops.c:979:class_export_put()) PUTting export 00000000ca841ef5 : new refcount 5
+
+00000020:00000010:15.0:1644855041.525180:0:5156:0:(tgt_grant.c:1506:tgt_grant_commit_cb()) kfreed 'tgc': 88 at 000000007b152ac9.
+
+00080000:00000010:15.0:1644855041.525181:0:5156:0:(osd_handler.c:1797:osd_trans_commit_cb()) kfreed 'oh': 224 at 00000000fa6a3b18.
+
+00080000:00000010:15.0:1644855041.525182:0:5156:0:(osd_handler.c:1797:osd_trans_commit_cb()) kfreed 'oh': 224 at 00000000d941ce2a.
+
+Notes:
+
+a) Now, you’d think at this point the OST would be in charge of letting the client know, “hey, your async commit is done, go ahead and drop those refs you were keeping for recovery/replay purposes.”  Not how it’s implemented in Lustre.  One of two things occurs
+
+a.1) The client does another meaningful RPC to that OST, which , at which point the reply will include the updated last_commit, which has been moved along to 8590048423 now.  This is precluded in our failure cases because the client is OOMing trying to formulate more requests against the OST.
+
+a.2) The OST pings the MGS, letting the MGS know it’s latest transaction number, and the client pings the MGS thereafter.  It will get back that transaction number (or something later) from the MGS, and can then drop refs.  I admit to not understanding the inner-workings of what appears to be a monotonically increasing cluster-wide transaction number.
+
+5. We see on the client side that ping (just showing the conclusion of it here for brevity) to the MGS, in this example 4 seconds after the OST sync’d its journal and moved the last_commit along:
+
+00000100:00100000:7.0:1644855045.418715:0:3532:0:(client.c:2202:ptlrpc_check_set()) Completed RPC req@000000006c785edf pname:cluuid:pid:xid:nid:opc:job ptlrpcd_01_00:de03a898-364e-4d98-8b57-f40bdf7e7ac5:3532:1724409356180608:10.1.98.8@tcp:400:
+
+00000100:00001000:4.0:1644855045.418715:0:3533:0:(import.c:1918:at_measured()) add 250 to 00000000ce0e42dc time=90 v=250 (250 0 0 0)
+
+00000100:00000001:7.0:1644855045.418716:0:3532:0:(client.c:2253:ptlrpc_check_set()) Process leaving (rc=1 : 1 : 1)
+
+00000100:00001000:4.0:1644855045.418716:0:3533:0:(import.c:1918:at_measured()) add 1 to 00000000df0f836b time=35 v=250 (1 0 0 0)
+
+00000100:00000001:7.0:1644855045.418717:0:3532:0:(client.c:2690:__ptlrpc_req_finished()) Process entered
+
+00000100:00000001:4.0:1644855045.418717:0:3533:0:(client.c:1359:ptlrpc_check_status()) Process entered
+
+00000100:00000001:4.0:1644855045.418717:0:3533:0:(client.c:1378:ptlrpc_check_status()) Process leaving (rc=0 : 0 : 0)
+
+00000100:00000040:7.0:1644855045.418718:0:3532:0:(client.c:2698:__ptlrpc_req_finished()) @@@ refcount now 0  req@000000006c785edf x1724409356180608/t0(0) o400->lustrefs-MDT0000-mdc-ffff9f3c2acc5000@10.1.98.8@tcp:12/10 lens 224/224 e 0 to 0 dl 1644855612 ref 1 fl Complete:RNQU/0/0 rc 0/0 job:''
+
+00010000:00000001:4.0:1644855045.418718:0:3533:0:(ldlm_request.c:1425:ldlm_cli_update_pool()) Process entered
+
+00010000:00000001:4.0:1644855045.418718:0:3533:0:(ldlm_request.c:1455:ldlm_cli_update_pool()) Process leaving (rc=0 : 0 : 0)
+
+00000100:00000001:4.0:1644855045.418719:0:3533:0:(client.c:2883:ptlrpc_free_committed()) Process entered
+
+00000100:00000001:7.0:1644855045.418720:0:3532:0:(client.c:2605:__ptlrpc_free_req()) Process entered
+
+00000100:00100000:4.0:1644855045.418720:0:3533:0:(client.c:2895:ptlrpc_free_committed()) lustrefs-OST0001-osc-ffff9f3c2acc5000: committing for last_committed 8590048423 gen 15
+
+02000000:00000001:7.0:1644855045.418721:0:3532:0:(sec.c:1741:sptlrpc_cli_free_repbuf()) Process entered
+
+02000000:00000010:7.0:1644855045.418721:0:3532:0:(sec_null.c:213:null_free_repbuf()) kfreed 'req->rq_repbuf': 512 at 00000000124c284c.
+
+02000000:00000010:4.0:1644855045.425922:0:3533:0:(sec_null.c:213:null_free_repbuf()) kfreed 'req->rq_repbuf': 1024 at 000000004d3f5b01.
+
+02000000:00000001:4.0:1644855045.425923:0:3533:0:(sec.c:1755:sptlrpc_cli_free_repbuf()) Process leaving
+
+00000020:00000001:4.0:1644855045.425923:0:3533:0:(genops.c:1199:class_import_put()) Process entered
+
+00000020:00000040:4.0:1644855045.425923:0:3533:0:(genops.c:1205:class_import_put()) import 00000000f3282859 refcount=6 obd=lustrefs-OST0001-osc-ffff9f3c2acc5000
+
+00000020:00000001:4.0:1644855045.425924:0:3533:0:(genops.c:1212:class_import_put()) Process leaving
+
+00000100:00000001:4.0:1644855045.425924:0:3533:0:(client.c:287:ptlrpc_free_bulk()) Process entered
+
+00000020:00000001:4.0:1644855045.425924:0:3533:0:(genops.c:1199:class_import_put()) Process entered
+
+00000020:00000040:4.0:1644855045.425925:0:3533:0:(genops.c:1205:class_import_put()) import 00000000f3282859 refcount=5 obd=lustrefs-OST0001-osc-ffff9f3c2acc5000
+
+00000020:00000001:4.0:1644855045.425925:0:3533:0:(genops.c:1212:class_import_put()) Process leaving
+
+00000100:00000010:4.0:1644855045.425939:0:3533:0:(client.c:306:ptlrpc_free_bulk()) kfreed 'desc->bd_vec': 16384 at 0000000016c64e17.
+
+00000100:00000010:4.0:1644855045.425939:0:3533:0:(client.c:307:ptlrpc_free_bulk()) kfreed 'desc': 928 at 00000000b8c6f9b7.
+
+00000100:00000001:4.0:1644855045.425940:0:3533:0:(client.c:308:ptlrpc_free_bulk()) Process leaving
+
+02000000:00000010:4.0:1644855045.425940:0:3533:0:(sec_null.c:183:null_free_reqbuf()) kfreed 'req->rq_reqbuf': 512 at 0000000008362de7.
+
+02000000:00000001:4.0:1644855045.425941:0:3533:0:(sec.c:470:sptlrpc_req_put_ctx()) Process entered
+
+02000000:00000001:4.0:1644855045.425941:0:3533:0:(sec.c:487:sptlrpc_req_put_ctx()) Process leaving
+
+00000100:00000010:4.0:1644855045.425941:0:3533:0:(client.c:545:ptlrpc_request_cache_free()) slab-freed '(req)': 1112 at 000000009849dfa0.
+
+00000100:00000001:4.0:1644855045.425942:0:3533:0:(client.c:2663:__ptlrpc_free_req()) Process leaving
+
+00000100:00000001:4.0:1644855045.425942:0:3533:0:(client.c:2731:__ptlrpc_req_finished()) Process leaving (rc=1 : 1 : 1)
+
+00000100:00000001:4.0:1644855045.425944:0:3533:0:(client.c:2939:ptlrpc_free_committed()) Process leaving via out (rc=0 : 0 : 0x0)
+
+00000100:00000001:4.0:1644855045.425944:0:3533:0:(client.c:2958:ptlrpc_free_committed()) Process leaving
+
+00000100:00000001:4.0:1644855045.425945:0:3533:0:(client.c:1624:after_reply()) Process leaving (rc=0 : 0 : 0)
+
+00000100:00000040:4.0:1644855045.425946:0:3533:0:(lustre_net.h:2470:ptlrpc_rqphase_move()) @@@ move request phase from Rpc to Interpret  req@00000000a0bc99fa x1724409356180672/t0(0) o400->lustrefs-OST0001-osc-ffff9f3c2acc5000@10.1.98.9@tcp:28/4 lens 224/224 e 0 to 0 dl 1644855612 ref 1 fl Rpc:RNQU/0/0 rc 0/0 job:''
+
+00000100:00000001:4.0:1644855045.425948:0:3533:0:(client.c:2140:ptlrpc_check_set()) Process leaving via interpret (rc=0 : 0 : 0x0)
+
+00000100:00000001:4.0:1644855045.425949:0:3533:0:(niobuf.c:446:ptlrpc_unregister_bulk()) Process entered
+
+00000100:00000001:4.0:1644855045.425949:0:3533:0:(niobuf.c:460:ptlrpc_unregister_bulk()) Process leaving (rc=1 : 1 : 1)
+
+00000100:00000040:4.0:1644855045.425950:0:3533:0:(lustre_net.h:2470:ptlrpc_rqphase_move()) @@@ move request phase from Interpret to Complete  req@00000000a0bc99fa x1724409356180672/t0(0) o400->lustrefs-OST0001-osc-ffff9f3c2acc5000@10.1.98.9@tcp:28/4 lens 224/224 e 0 to 0 dl 1644855612 ref 1 fl Interpret:RNQU/0/0 rc 0/0 job:''
+
+00000100:00100000:4.0:1644855045.425952:0:3533:0:(client.c:2202:ptlrpc_check_set()) Completed RPC req@00000000a0bc99fa pname:cluuid:pid:xid:nid:opc:job ptlrpcd_01_01:de03a898-364e-4d98-8b57-f40bdf7e7ac5:3533:1724409356180672:10.1.98.9@tcp:400:
+
+00000100:00000001:4.0:1644855045.425954:0:3533:0:(client.c:2253:ptlrpc_check_set()) Process leaving (rc=1 : 1 : 1)
+
+… this will continue to loop over ALL of the 500 outstanding bulkrw rpcs that still had a refcount of 1, in turn allowing vmscan in the Linux kernel to suddenly be able to free up some ~15GB of RAM …
+
+Notes:
+
+a) In the above, ptlrpc_free_bulk is a key function for us, as it is the one that calls release_frags, which is a function pointer to ptlrpc_release_bulk_page_pin, which does a put_page on every page in the iovec, allowing vmscan to free them from the inactive file page cache LRU.
+
+Analysis:
+
+Looking through the code and Lustre manual for hints as to how to control how much could be left async in the ldiskfs journal, I came across some very worrying language.  Please see “39.4.4. Enabling OSS Asynchronous Journal Commit”:
+
+“The OSS asynchronous journal commit feature asynchronously writes data to disk without forcing a journal
+
+flush. This reduces the number of seeks and significantly improves performance on some hardware.
+
+Note
+
+Asynchronous journal commit cannot work with direct I/O-originated writes (O_DIRECT flag
+
+set). In this case, a journal flush is forced.”
+
+This directly explains DIO performing well while buffered I/O ran up to OOM.  However, most bafflingly, while the default for the struct in ofd_internal.h is set to enabled:
+
+111 struct ofd_device {
+
+…snip…
+
+140                  /* sync journal on writes */
+
+141                  ofd_sync_journal:1,
+
+In ofd_init0, which is “the main starting point of OFD initialization” it is statically overwritten to 0:
+
+2991     m->ofd_sync_journal = 0;
+
+And indeed on our OSTs it is disabled:
+
+root@dccafc60-1b3c-43b2-ad21-4dade5251757-oss-a0-g0-vm:/mnt/resource# sudo lctl get_param obdfilter.lustrefs-OST0000.sync_*
+
+obdfilter.lustrefs-OST0000.sync_journal=0
+
+obdfilter.lustrefs-OST0000.sync_lock_cancel=never
+
+obdfilter.lustrefs-OST0000.sync_on_lock_cancel=never
+
+sync_lock_cancel is a synonym for sync_on_lock_cancel, covered in the aforementioned chapter in the Lustre manual, and oddly should be set to always if sync_journal is set to 0 and the inverse if set to 1.
+
+There is more good context on the nature of this tunable above sync_journal_show in lproc_ofd.c:
+
+	Show journal handling mode: synchronous or asynchronous.
+
+*
+
+	When running in asynchronous mode the journal transactions are not
+
+	committed to disk before the RPC is replied back to the client.
+
+	This will typically improve client performance when only a small number
+
+	of clients are writing, since the client(s) can have more write RPCs
+
+	in flight. However, it also means that the client has to handle recovery
+
+	on bulk RPCs, and will have to keep more dirty pages in cache before they
+
+	are committed on the OST.
+
+This exactly explains our issue, except why it appears an OST is accepting (way) more data as pending into the journal before blocking.
+
+Short-term solution:
+
+Setting sync_lock_cancel=always does not solve the OOM problem.  It may be that setting this while adjusting some LDLM setting may alleviate the issue, but I can’t figure that out presently.
+
+Setting sync_journal to the manual-described ‘1’ does completely solve the problem.  Used memory on a client never exceeds around 2GB, and the performance is excellent:
+
+$ /lustre# iozone -i 0 -r 4M -s 8G -t 8
+
+                Parent sees throughput for  8 initial writers          = 1426228.62 kB/sec
+
+                Parent sees throughput for  8 rewriters = 1448949.64 kB/sec
+
+It’s somewhat less aggressive, and more in-line with bog standard ext4, you can similarly revise the commit interval for ldiskfs to be the default for ext4 by adding “commit=5” to the mount options for ldiskfs:
+
+                Parent sees throughput for  8 initial writers          = 1430542.53 kB/sec
+
+                Parent sees throughput for  8 rewriters = 1435312.76 kB/sec
+
+Memory consumption on the client is slightly higher under this however (3-4GB used), and there’s no guarantee a low-RAM client won’t go OOM in the face of sufficient OSTs when using PFL or a wide static striping.  Advisement from upstream between these two short-term solutions would be really useful.  I cannot figure out what commit is presently set to, but it’s definitely not the default 5 seconds expected by ext4.
+
+Open issues:
+
+1. Is sync_journal being defaulted to 0 known by upstream?  The name was revised from syncjournal to sync_journal in 2018 and the manual updated accordingly, but it still claims the default is enabled.  I’ve confirmed this is set to 0 in ofd_init0 in 2.14.0, master, and master-next.  This appears to have been the default since 2010, arriving with change “f10a4cfd1146989e3947fc8061f2769002b3f044”.
+
+2. Is the missed setting of sync_lock_cancel to always with this default known by upstream?  That occurs appropriately if I manually set sync_journal to 0 or 1 manually, but isn’t occurring (or at least reflected appropriately via lprocfs) on OFD standup.
+
+3. Why isn’t target code appropriately limiting pending bytes?  Documentation online suggests that this shouldn’t outrun the journal – perhaps pending isn’t mapped to journal bytes as strictly as I’m thinking?

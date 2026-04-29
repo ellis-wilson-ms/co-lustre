@@ -1,0 +1,144 @@
+Key:        LU-19855
+Summary:    e2fsck incorrectly links EA inodes to lost+found
+Link:       https://jira.whamcloud.com/browse/LU-19855
+Type:       Bug
+Priority:   Critical
+Status:     Open
+Resolution: Unresolved
+Assignee:   Etienne Aujames
+Reporter:   Etienne Aujames
+Created:    Thu, 5 Feb 2026 09:23:38 +0000
+Updated:    Sat, 28 Feb 2026 15:06:32 +0000
+Labels:     CEA
+
+--- Description ---
+e2fsck complains about "Unattached inodes" after running it on a MDT at the CEA:
+
+Shine.Lustre.Actions.Fsck INFO xxxx-MDT0001 b'Pass 4: Checking reference counts'
+Shine.Lustre.Actions.Fsck INFO xxxx-MDT0001 b'Unattached inode 238467314'
+Shine.Lustre.Actions.Fsck INFO xxxx-MDT0001 b'Connect to /lost+found? yes'
+....
+
+These are EA inodes (ea_inode feature, contained trusted.link data):
+
+debugfs> stat 
+Inode: 238467339   Type: regular    Mode:  0600   Flags: 0x200000     
+
+But the EA inodes are connected to parents inodes (found via trusted.link data contained in the EA inode):
+
+Inode: 238467186   Type: regular    Mode:  0644   Flags: 0x0
+Generation: 642869650    Version: xxxxx
+User: 13639   Group: 32063   Project:     0   Size: 0
+File ACL: 0
+Links: 104   Blockcount: 8
+[...]
+
+inode  linkea: idx=0 ....
+....
+
+--- Comment (gerrit, Sat, 28 Feb 2026 15:06:32 +0000) ---
+"Li Dongyang " merged in patch https://review.whamcloud.com/c/tools/e2fsprogs/+/63815/
+
+Subject: LU-19855 e2fsck: fix merging ea_inode_refs count
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 
+
+Commit: b1e429e88c3c162e78c4c55af33b3ffd4e02c1e3
+
+--- Comment (gerrit, Thu, 5 Feb 2026 13:09:28 +0000) ---
+"Etienne AUJAMES " uploaded a new patch: https://review.whamcloud.com/c/tools/e2fsprogs/+/63815
+
+Subject: LU-19855 e2fsck: fix merging ea_inode_refs count
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 1
+
+Commit: 520904eda4f5039b6586f20d34fff0ef84e497b5
+
+--- Comment (eaujames, Thu, 5 Feb 2026 11:19:46 +0000) ---
+Here the full analysis (gdb e2fsck on the e2image MDT backup before the e2fsck):
+
+One thread scan the parent inode and set the ref to 1 in its local context:
+
+Thread 1 "e2fsck" hit Breakpoint 3, e2fsck_pass1_merge_ea_inode_refs (global_ctx=xxxx, thread_ctx=xxxx) at pass1.c:3107
+3107                    retval = ea_refcount_store(global_ctx->ea_inode_refs,
+(gdb) p ino
+$52 = 238467339
+(gdb) p global_count
+$53 = 0
+(gdb) p thread_cout
+No symbol "thread_cout" in current context.
+(gdb) p thread_count
+$54 = 1
+
+ 
+
+Another thread scan the EA inode and set the ref to EA_INODE_FL (via track_ea_inode()) and then e2fsck_pass1_merge_ea_inode_refs() sum the refs:
+
+Thread 1 "e2fsck" hit Breakpoint 3, e2fsck_pass1_merge_ea_inode_refs (global_ctx=xxxx, thread_ctx=xxxx) at pass1.c:3107
+3107                    retval = ea_refcount_store(global_ctx->ea_inode_refs,
+(gdb) p ino
+$56 = 238467339
+(gdb) p global_count
+$57 = 1
+(gdb) p thread_count
+$58 = 18446744073709551615
+(gdb) p 18446744073709551615 + 1
+$59 = 0
+
+Then ea_refcount_store() remove the ref for the ea_inode from rb_tree:
+
+errcode_t ea_refcount_store(ext2_refcount_t refcount, ea_key_t ea_key,
+                            ea_value_t ea_value)
+{
+        struct ea_refcount_el   *el;
+
+        /*                         
+         * Get the refcount element
+         */                            
+        el = get_refcount_el(refcount, ea_key, ea_value ? 1 : 0);
+        if (!el)                       
+                return ea_value ? EXT2_ET_NO_MEMORY : 0;
+        el->ea_value = ea_value;   
+        if (el->ea_value == 0) {
+                ext2fs_rb_erase(&el->node, &refcount->root);
+                ext2fs_free_mem(&el); 
+        }
+        return 0;
+}
+
+In pass4 no ref is found so the inode is attached in lost+found:
+
+void e2fsck_pass4(e2fsck_t ctx)
+{
+....
+                if (ctx->ea_inode_refs) {
+                        ea_refcount_fetch(ctx->ea_inode_refs, i, &ea_refs);
+                        if (ea_refs) {
+                                /*
+                                 * Final consolidation of EA inodes. We either
+                                 * decide the inode is fine and set link_counted
+                                 * to one, or we decide this is actually a
+                                 * normal file and clear EA_INODE flag, or
+                                 * decide the inode should just be deleted.
+                                 */
+                                check_ea_inode(ctx, i, &last_ino, inode,
+                                               &link_counted, ea_refs);
+                        }
+                }
+
+                if (link_counted == 0) {
+                        if (!buf)
+                                buf = e2fsck_allocate_memory(ctx,
+                                     fs->blocksize, "bad_inode buffer");
+                        if (e2fsck_process_bad_inode(ctx, 0, i, buf))
+                                continue;
+                        if (disconnect_inode(ctx, i, &last_ino, inode))
+...

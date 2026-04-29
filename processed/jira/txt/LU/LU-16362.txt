@@ -1,0 +1,134 @@
+Key:        LU-16362
+Summary:    landing async readhead caused a "uncovered page" panic during sanityN runs
+Link:       https://jira.whamcloud.com/browse/LU-16362
+Type:       Bug
+Priority:   Critical
+Status:     Open
+Resolution: Unresolved
+Assignee:   Alexey Lyashkov
+Reporter:   Alexey Lyashkov
+Created:    Fri, 2 Dec 2022 09:35:57 +0000
+Updated:    Sat, 24 Feb 2024 08:17:16 +0000
+Links:      Related: is related to  LU-16332; Related: is related to LU-16401
+
+--- Description ---
+Async readhead have skip a "locking" phase
+
+c2791674260 (Wang Shilong           2019-01-21 20:23:47 +0800  658)     io->ci_state = CIS_LOCKED;
+
+But separate cl io created, this caused pages sends outside of original page lock and parallel blocking AST caused an "uncovered page" panic hit.
+
+--- Comment (shadow, Sat, 24 Feb 2024 08:16:07 +0000) ---
+Qian,
+
+Thanks for pointing it. This patch useless except on note. It takes extra reference to lock in normal case. but for redhead case - we can take a pages outside of original lock, a specially in switch to the different stripe. In this case, this patch will be take a reference for lock in extent creating time, but we needs to be sure lock isn't released before submit. This is actual change for this bug, other parts is cleanups/refactoring needs to have a single codepath.
+
+diff --git a/lustre/llite/rw.c b/lustre/llite/rw.c
+index 1fac09f18e..b43cd72f8a 100644
+--- a/lustre/llite/rw.c
++++ b/lustre/llite/rw.c
+@@ -462,7 +462,12 @@ ll_read_ahead_pages(const struct lu_env *env, struct cl_io *io,
+                                        break;
+                                }
+ 
+-                               cl_read_ahead_release(env, &ra);
++                               if (ra.cra_release != NULL)
++                                       rc = ll_submit_read(env, io, queue);
++
++                               cl_read_ahead_release(env, &ra);
++                               if (rc break;
+ 
+                                rc = cl_io_read_ahead(env, io, page_idx, &ra);
+                                if (rc 
+
+If it needs to better understanding - I might submits a patch as series - with refactoring as separate part.
+
+--- Comment (qian_wc, Fri, 23 Feb 2024 03:14:00 +0000) ---
+Hi Alexey,
+
+Please note the patch  LU-16160 osc: take ldlm lock when queue sync pages (https://review.whamcloud.com/#/c/fs/lustre-release/+/48557/) is a useless patch.
+
+Please note that for read, reading pages (or redhead pages) do not unlocked until the completion of the read RPCs.
+
+Please see the patch https://jira.whamcloud.com/browse/LU-17190.
+
+The patch: https://review.whamcloud.com/#/c/ex/lustre-release/+/52682/4/lustre/llite/rw.c
+
+it will release all matched read-ahead DLM locks when the current read I/O is done.
+
+Best regards,
+
+Qian
+
+--- Comment (gerrit, Wed, 10 Jan 2024 13:56:33 +0000) ---
+"Alexey Lyashkov " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/53635
+
+Subject: LU-16362 readahead: simplification
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: b41d1363be6ee45e2b19ec708be43954dde69e86
+
+--- Comment (shadow, Thu, 30 Nov 2023 08:16:39 +0000) ---
+It might be artifact of PG_writeback change. page don't unlocked until IO done before it and panic don't hit.
+
+--- Comment (shadow, Wed, 29 Nov 2023 13:49:45 +0000) ---
+I looks I understand an issue finally.
+
+readahead loop collects a locked pages during loop, but ldlm lock released after each iteration. So just PG_lock prevents a lock canceling during submit, bit osc_make_rpc had release a page lock after rpc created but don't send. it open window when lock might be canceled and osc_req_attr_set complains lock don't exist.
+
+Lock might be canceled due aging or conlfict on the different node.
+
+Right code should create an special cl_io to collect a lock and cl_io_submit_sync should be called during lock held. osc extent will hold a ldlm lock (after Bobi Jam patch     LU-16160 osc: take ldlm lock when queue sync pages) it will prevent to cancel a lock until it will don't needs.
+
+--- Comment (shadow, Thu, 26 Oct 2023 15:02:54 +0000) ---
+once first patch version found an issues, I spent more time to investing it.
+
+Current picture is:
+
+application started to read a data from a file. It's multi stripe file, but read want to read just first stripe only, and cl io had created to offset range assigned to first stripe.
+
+once stripe size is 4M now - RA started to full rpc with this size and finished at end of stripe offset.
+
+On next read, RA window moved outside of IO region requested by cl_io and outside of active locks pined by this IO.
+
+In the current code, it caused a situation osc will search an old lock for the second stripe. lock might exist from past, it's OK. but RA had pined this lock just to send a prepare read for one page - and release it after it via cl_read_ahead_release().
+
+It caused a situation when some pages prepared to send read before lock cancel, but some not and error returned from cl_io_read_ahead(), but previous pages still in osc extents and ready to send rpc. It caused a panic in the osc_req_attr_set when osc have a time to send.
+
+This is easy reproduce with simple assertion and sanity 44A+44a (START_AT=44A).
+
+@@ -1195,22 +1198,27 @@ static int lov_io_read_ahead(const struct lu_env *env,
+        if (unlikely(!r0->lo_sub[stripe]))
+                RETURN(-EIO);
+
+        sub = lov_sub_get(env, lio, lov_comp_index(index, stripe));
+        if (IS_ERR(sub))
+                RETURN(PTR_ERR(sub));
+
+        /* no RA outside of active stripe */
++       if (sub->sub_io.ci_state != CIS_IO_GOING &&
++           sub->sub_io.ci_state != CIS_LOCKED)
++               LBUG();
+
+I'm not sure what is best in this situation - just disable an RA outside of active region. or make lock pinning better to avoid situation with submitting without lock held.
+
+--- Comment (gerrit, Fri, 14 Jul 2023 13:21:59 +0000) ---
+"Alexey Lyashkov " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/51677
+
+Subject: LU-16362 lov: dont't allow RA outside of active stripe
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 01966622f7b4f1c7626bc5980f9adc0d01338e1c
+
+--- Comment (zam, Mon, 9 Jan 2023 10:33:40 +0000) ---
+LU-16332 is a similar issue.

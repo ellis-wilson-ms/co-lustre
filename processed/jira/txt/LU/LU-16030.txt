@@ -1,0 +1,435 @@
+Key:        LU-16030
+Summary:    sanity-pcc test_45: attach more than 2 time: 0
+Link:       https://jira.whamcloud.com/browse/LU-16030
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Qian Yingjin
+Reporter:   Maloo
+Created:    Wed, 20 Jul 2022 09:39:37 +0000
+Updated:    Wed, 12 Mar 2025 00:49:40 +0000
+Links:      Related: is related to LU-16651
+
+--- Description ---
+This issue was created by maloo for Qian Yingjin 
+
+This issue relates to the following test suite run: https://testing.whamcloud.com/test_sets/5cddefde-7d18-45d2-9fe6-496bfef626d4
+
+test_45 failed with the following error:
+
+attach more than 2 time: 0
+
+VVVVVVV DO NOT REMOVE LINES BELOW, Added by Maloo for auto-association VVVVVVV
+
+sanity-pcc test_45 - attach more than 2 time: 0
+
+--- Comment (paf0186, Sun, 23 Apr 2023 23:10:59 +0000) ---
+"We could also examine why the client is requesting (or is granted) overlapping DLM extent locks, since that would also avoid the issue."
+
+So, just an additional note:
+
+We can't really do this.  Read locks can always overlap, particularly if there's also a write lock covering part of the file.  (This assumes a single stripe file for simplicity; everything I'm saying applies at the level of a single stripe, even in multi-stripe files.)
+
+Consider this case:
+
+Client 1 has a write lock from 1-3 MiB on a file
+
+Client 2 requests to read 0 - 1 MiB
+
+Server grants a read lock from 0-1 MiB on client 2 (server does not extend client 2 request due to write lock)
+
+Client 2 requests to read 1-2 MiB
+
+Server cancels write lock from client 1
+
+Server processes client 2 lock request, no conflicts
+
+Server grants read lock from 0 MiB to infinity for client 2
+
+Client 2 now has overlapping read locks.
+
+Also consider that server lock expansion isn't needed either, if the second read request is for 0.5 MiB to 1.5 MiB.  We don't split read/write requests across dlm locks (within an OSC), for various good reasons, so this also results in a second overlapping read lock.
+
+To be fair, we also don't really protect against racing lock requests from different processes on the same client.  We do a little bit of it - the OSC locking code can catch it - but it's racy, so sometimes we can get multiple identical read locks from parallel read requests (we can also get overlapping write lock requests from the same client when there are overlapping writes from userspace, resulting in a self-conflict, which is resolved safely with the usual lock callback mechanisms, just with the slightly odd sight of a client requesting two write locks on the same area of a file).
+
+I looked at fixing these overlaps and self-conflicts back when I was first working on lockahead (it's very noticeable with lockahead, particularly if you screw up in userspace and request the same lock over and over), but concluded the way it is is basically fine and not worth the trouble to fix.  It happens only occasionally during parallel reads and writes and because it's rare and transient, I couldn't see a meaningful cost.
+
+(OK, I think this is really my final edit...)
+
+And because overlapping read locks are always possible, fixing the race that allows them with parallel reads doesn't get us much.  We still have to handle that case.
+
+--- Comment (paf0186, Sun, 23 Apr 2023 22:55:04 +0000) ---
+So, I'm about 95% sure the bug here is fixed - on all kernels - by:
+
+LU-16649 llite: EIO is possible on a race with page reclaim https://review.whamcloud.com/c/fs/lustre-release/+/50344/ 
+
+The described situation is identical.
+
+But that fix is a bit of a hack, and the 'right' way to do it is to use the invalidate lock as Yingjin describes here.  It just doesn't exist on older kernels.
+
+Yingjin made patches using the invalidate lock.  See the series here:
+
+LU-16651 llite: hold invalidate_lock when invalidate cache pages / https://review.whamcloud.com/c/fs/lustre-release/+/50423/
+
+That series ends by removing the hack from LU-16649 (and Panda's LU-16160 llite: SIGBUS is possible on a race with page reclaim / https://review.whamcloud.com/c/fs/lustre-release/+/49647) , but of course only on newer kernels.
+
+But to be clear:
+
+Yingjin's patches are an improvement, but as far as I know, we get correct operation with LU-16649, including for this bug.
+
+Yingjin, please confirm and correct if I have anything badly wrong
+
+--- Comment (paf0186, Sun, 23 Apr 2023 22:44:30 +0000) ---
+"I recall that when a lock was being cancelled that the client would check for an overlapping read lock and attach the page to the second lock rather than invalidating it. I believe that was stopped because it added overhead for cancelling locks and the thought was that the page would be refreshed if it was accessed again."
+
+No, I believe we still do that, though I think we played with not doing so.  We actually don't attach pages to locks in any way - they just live 'under' the DLM lock.  We just keep page if there's a still lock covering them - check_and_discard_cb.  There's no linkage from a page to a lock (and so also pages don't hold references on locks.  It would be quite expensive to do so.)
+
+So, about the bug here, just a moment...
+
+--- Comment (adilger, Sun, 23 Apr 2023 22:16:12 +0000) ---
+fter investigate the bug, the problem should be that:
+
+The client has two overlapped PR DLM extent locks:
+
+L1 = 
+L2 = 
+
+A reader process holds L1 and read data in range [3M, 4M -1].
+
+L2 is being revoking due to the conflict access.
+
+Then in the ->readpage() call:
+
+It will unlock the page after the page is in Uptodate state.
+
+And lock blocking callback for L2 will clear the Uptodate state and delete the page from cache.
+
+I recall that when a lock was being cancelled that the client would check for an overlapping read lock and attach the page to the second lock rather than invalidating it. I believe that was stopped because it added overhead for cancelling locks and the thought was that the page would be refreshed if it was accessed again. 
+
+In addition to patching the kernel to fix this retry issue there, another option would be to do an interval tree lookup on the other DLM locks on this resource to see if there is an overlapping lock extent, and then bulk transfer all of the pages from the old lock to the new lock, rather than doing this one page at a time. This lock could also be cached in case other pages need to be evicted. 
+
+In the common case, the client resource will only have a single lock on it, so the lookup would be fast.
+
+We could also examine why the client is requesting (or is granted) overlapping DLM extent locks, since that would also avoid the issue.
+
+--- Comment (adilger, Sun, 23 Apr 2023 22:05:48 +0000) ---
+Yingjin, what is the path forward for this bug?  Is there a fix in Lustre that can be made, possibly one already in flight for the other read cache issues, or is the only fix to submit a patch to Ubuntu to backport a fix from upstream to their kernel?
+
+--- Comment (qian_wc, Tue, 21 Mar 2023 03:01:52 +0000) ---
+Verifed that after acquired invalidate_lock during the lock blocking AST (extent lock), the test passed without -EIO.
+
+As this is a exclusive lock on the inode, it may reduce the concurrency for multiple lock blocking ASTs (from multiple stripes)...
+
+--- Comment (qian_wc, Mon, 20 Mar 2023 15:47:37 +0000) ---
+I will cook a patch to verify it later.
+
+--- Comment (qian_wc, Mon, 20 Mar 2023 15:41:12 +0000) ---
+According to the Linux Documents: Documentations/filkesystems/locking.rst:
+
+ 
+
+ 
+
+ocking rules:
+	All except set_page_dirty and freepage may block
+
+======================	======================== =========	===============
+ops			PageLocked(page)	 i_rwsem	invalidate_lock
+======================	======================== =========	===============
+writepage:		yes, unlocks (see below)
+readpage:		yes, unlocks				shared
+writepages:
+set_page_dirty		no
+readahead:		yes, unlocks				shared
+readpages:		no					shared
+write_begin:		locks the page		 exclusive
+write_end:		yes, unlocks		 exclusive
+bmap:
+invalidatepage:		yes					exclusive
+releasepage:		yes
+freepage:		yes
+direct_IO:
+isolate_page:		yes
+migratepage:		yes (both)
+putback_page:		yes
+launder_page:		yes
+is_partially_uptodate:	yes
+error_remove_page:	yes
+swap_activate:		no
+swap_deactivate:	no
+======================	======================== =========	===============
+The filesystem must exclusively acquire invalidate_lock before invalidating page cache in truncate / hole punch path (and thus calling into ->invalidatepage) to block races between page cache invalidation and page cache filling functions (fault, read, ...).
+
+ 
+
+ 
+
+The solution  should be that:
+
+we must hold exclusive invalidate_lock (mapping->invalidate_lock) (in the newer kernel) when remove pages from page cache caused by the revoking of the DLM extent lock protecting them.
+
+--- Comment (qian_wc, Mon, 20 Mar 2023 15:24:18 +0000) ---
+After investigate the bug, the problem should be that:
+
+The client has two overlapped PR DLM extent locks:
+
+	L1 = [1M, 4M - 1]>
+
+	L2 = [3M, 5M - 1]>
+
+A reader process holds L1 and read data in range [3M, 4M -1].
+
+L2 is being revoking due to the conflict access.
+
+Then in the ->readpage() call:
+
+It will unlock the page after the page is in Uptodate state.
+
+And lock blocking callback for L2 will clear the Uptodate state and delete the page from cache.
+
+Then in the old kernel, it will:
+
+ 
+
+/* Start the actual read. The read will unlock the page. */
+		error = mapping->a_ops->readpage(filp, page);
+
+		if (unlikely(error)) {
+			if (error == AOP_TRUNCATED_PAGE) {
+				put_page(page);
+				error = 0;
+				goto find_page;
+			}
+			goto readpage_error;
+		}
+
+		if (!PageUptodate(page)) {
+			error = lock_page_killable(page);
+			if (unlikely(error))
+				goto readpage_error;
+			if (!PageUptodate(page)) {
+				if (page->mapping == NULL) { =====>
+					/*
+					 * invalidate_mapping_pages got it
+					 */
+					unlock_page(page);
+					put_page(page);
+					goto find_page;
+				}
+				unlock_page(page);
+				shrink_readahead_size_eio(filp, ra);
+				error = -EIO;
+				goto readpage_error;
+			}
+			unlock_page(page);
+		}
+
+		goto page_ok;
+
+It will check whether the page was truncated and deleted from page cache via page->mapping, if so, it will retry the page read.
+
+ 
+
+But in the newer kernel, it deletes this check and retry.
+
+It seems there is no any simple solution for this bug.
+
+static int filemap_read_page(struct file *file, struct address_space *mapping,
+		struct page *page)
+{
+	int error;
+
+	/*
+	 * A previous I/O error may have been due to temporary failures,
+	 * eg. multipath errors.  PG_error will be set again if readpage
+	 * fails.
+	 */
+	ClearPageError(page);
+	/* Start the actual read. The read will unlock the page. */
+	error = mapping->a_ops->readpage(file, page);
+	if (error)
+		return error;
+
+	error = wait_on_page_locked_killable(page);
+	if (error)
+		return error;
+	if (PageUptodate(page))
+		return 0;
+
+	shrink_readahead_size_eio(&file->f_ra);
+	return -EIO;
+}
+ 
+
+ 
+
+And I also found that it may cause short read (partial read) during the test...
+
+Which may be related to DDN-3569.
+
+--- Comment (qian_wc, Fri, 17 Mar 2023 08:15:10 +0000) ---
+After investigate the problem, the problem is narrowed down to a generic Lustre bug even without PCC on the newer kernel (Ubuntu 2204).
+
+The bug can be easily reproduced by the following scripts (without PCC setup on the client):
+
+ 
+
+#!/bin/bash
+
+error() {
+        echo "$@"
+        exit 1
+}
+
+HSMTOOL_ARCHIVE_FORMAT=v2
+LCTL=$(which lctl)
+LFS=$(which lfs)
+MMAP_CAT="/usr/lib/lustre/tests/mmap_cat"
+
+DIR="/mnt/lustre"
+tdir="sanity-pcc.d99"
+tfile="sanity-pcc.f99"
+hsm_root="/mnt/pcc"
+mntpt="/mnt/pcc"
+dir=$DIR/$tdir
+file=$dir/$tfile
+id=2
+cnt=30
+
+DEBUGFS=/sys/kernel/debug/tracing
+CURRENT_TRACER="function_graph"
+SET_FUNCTION_GRAPH="*:mod:lustre"
+
+lctl set_param debug=cache+inode+iotrace+vfstrace+info+dlmtrace+trace+reada
+lctl set_param subsystem_debug=llite+ldlm+osc
+lctl set_param debug_mb=40000
+lctl get_param debug_mb
+rm -rf $mntpt/*
+rm -rf $DIR/*
+rm logC
+
+rm mytrace.dat
+echo "$CURRENT_TRACER" > $DEBUGFS/current_tracer
+echo 12 > $DEBUGFS/max_graph_depth
+#echo "$SET_FUNCTION_GRAPH" > $DEBUG_FS/set_ftrace_filter
+echo '' > $DEBUG_FS/set_ftrace_filter
+mkdir -p $dir
+lctl clear
+
+dd if=/dev/zero of=$file bs=1M count=$cnt || error "Write $file failed"
+lctl clear
+(
+        while [ ! -e $DIR/sanity-pcc.99.lck ]; do
+                dd if=/dev/zero of=$file bs=1M count=$cnt conv=notrunc ||
+                        error "failed to write $file"
+                sleep 0.$((RANDOM % 4 + 1))
+        done
+)&
+wpid=$!
+
+(
+        while [ ! -e $DIR/sanity-pcc.99.lck ]; do
+                #lctl clear
+                echo > $DEBUGFS/trace
+                echo 1 > $DEBUGFS/tracing_on
+                dd if=$file of=/dev/null bs=1M count=$cnt &
+                pid=$!
+                echo "$pid" > $DEBUGFS/set_ftrace_pid
+                wait $pid ||
+                {
+                        rc=$?
+                        cp $DEBUGFS/trace mytrace.dat
+                        echo 0 > $DEBUGFS/tracing_on
+                        echo 'nop' > $DEBUGFS/current_tracer
+                        echo "failed to read $file: rc = $rc pid = $pid"
+                        lctl dk > logA
+                        error "failed to read $file: rc = $?"
+                }
+                sleep 0.$((RANDOM % 4 + 1))
+                echo 0 > $DEBUGFS/tracing_on
+        done
+)&
+rpid=$!
+
+(
+        while [ ! -e $DIR/sanity-pcc.99.lck ]; do
+                dd if=$file of=/dev/null bs=1M count=$cnt iflag=direct ||
+                        error "failed to mmap_cat $file"
+                sleep 0.$((RANDOM % 4 + 1))
+        done
+        true
+)&
+rpid2=$!
+
+sleep 5
+touch $DIR/sanity-pcc.99.lck
+wait $wpid || error "$?: write failed"
+wait $rpid || error "$?: read failed: pid=$rpid"
+wait $rpid2 || error "$?: read2 failed" 
+
+The output:
+
+ 
+
+ 
+
+30+0 records in
+30+0 records out
+31457280 bytes (31 MB, 30 MiB) copied, 0.353618 s, 89.0 MB/s
+dd: error reading '/mnt/lustre/sanity-pcc.d99/sanity-pcc.f99': Input/output error
+4+0 records in
+4+0 records out
+4194304 bytes (4.2 MB, 4.0 MiB) copied, 0.459942 s, 9.1 MB/s
+30+0 records in 
+
+ 
+
+ 
+
+Three process keeping buffered read/direct I/O read from a file and write to the same file will return -EIO .
+
+The EIO code is returned from:
+
+ 
+
+static int filemap_read_page(struct file *file, struct address_space *mapping,
+		struct page *page)
+{
+	int error;
+
+	/*
+	 * A previous I/O error may have been due to temporary failures,
+	 * eg. multipath errors.  PG_error will be set again if readpage
+	 * fails.
+	 */
+	ClearPageError(page);
+	/* Start the actual read. The read will unlock the page. */
+	error = mapping->a_ops->readpage(file, page);
+	if (error)
+		return error;
+
+	error = wait_on_page_locked_killable(page);
+	if (error)
+		return error;
+	if (PageUptodate(page))
+		return 0;
+	shrink_readahead_size_eio(&file->f_ra);
+	return -EIO; return code!!
+}
+
+ 
+
+Still need more time to investigate the bug....
+
+--- Comment (adilger, Wed, 25 Jan 2023 00:39:49 +0000) ---
++3 in past week:
+
+https://testing.whamcloud.com/sub_tests/1049c17f-fba7-4d78-9620-3e5e5c3f6b17
+
+https://testing.whamcloud.com/sub_tests/3fe48ac1-c27c-488e-b95a-37e6abd93d9d
+
+https://testing.whamcloud.com/sub_tests/6a045690-d7a6-476c-8cf2-47d070a62de0
+
+--- Comment (qian_wc, Wed, 7 Dec 2022 01:38:03 +0000) ---
+It seems that this failure occurred on the newer kernel SLES 15.3 and Unubtu2004.

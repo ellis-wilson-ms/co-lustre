@@ -1,0 +1,65 @@
+Key:        LU-18844
+Summary:    mark Lustre volatile files with I_LINKABLE to allow linkat()
+Link:       https://jira.whamcloud.com/browse/LU-18844
+Type:       Improvement
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Andreas Dilger
+Created:    Thu, 20 Mar 2025 22:14:58 +0000
+Updated:    Mon, 14 Jul 2025 09:16:11 +0000
+Labels:     medium, performance, usability
+Links:      Related: is related to  LU-9512; Related: is related to  LU-17776; Related: is related to  LU-18843; Related: is related to LU-16374
+
+--- Description ---
+Tools doing data migration/restore often create a temporary "dot file" (with a leading ".", the "actual filename", and 6 or 10 random trailing alphanumeric characters for uniqueness) as a holding space while writing the file, then change file ownership, permissions, and timestamps before renaming it to the final "actual filename".  The leading "dot" by convention partially hides the filename from tools like "ls" (without the -a option), but does not actually prevent it from being seen or accessed by users and applications.  In addition to being visible and accessible, the "dot file" is a proper file in the filesystem may be left behind if the process that created it crashes.
+
+A newer kernel API open(O_TMPFILE) allows creating an "invisible" file that is only accessible by the returned "open-unliked" file descriptor, and allows the file to be created and modified while actually hidden from the world.  One of the important features of O_TMPFILE is that it still allows hard-linking file descriptor into the filesystem namespace by using linkat(fd, "actual filename") so the file can spring fully-formed into the namespace. 
+
+The vfs_tmpfile() function that open(O_TMPFILE) uses internally will mark these open-unlinked inodes with inode->i_state |= I_LINKABLE. A security restriction in the Linux VFS is that linkat()->vfs_link()->inc_count() prevents hard linking to an open-unlinked file (inode->i_nlink == 0) unless its inode  is marked with inode->i_state & I_LINKABLE.  This prevents malicious users from "reviving" a file that was deleted by the owner, but is held open by another process (possibly via file descriptor passing to another security domain).
+
+It would be very useful if the Lustre Volatile File creation mechanism (llapi_create_volatile*() would also mark inodes with I_LINKABLE when they are created, so that they can also be linked into the namespace via linkat().  This would allow the flexibility of the volatile file creation together with the "normal/new" linkat() behavior for use by applications.  This can be done independently of the Lustre O_TMPFILE implementation (LU-9512).
+
+--- Comment (gerrit, Wed, 21 May 2025 10:02:30 +0000) ---
+"Aryan Gupta " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/59346
+
+Subject: LU-18844 mdt:  restrict hard linking of zero-link count files.
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 6c7dd18ac64cf7621a991c13ea834e1616ac08c5
+
+--- Comment (adilger, Mon, 5 May 2025 18:15:20 +0000) ---
+On the client, the inode flag should be in ll_lookup_it_finish() at the end where it is checking if the file was just created, something like:
+
+        if (it_disposition(it, DISP_OPEN_CREATE)) {
+                if (op_data->op_bias |= MDS_CREATE_VOLATILE) {
+                        spin_lock(&inode->i_lock);
+                        inode->i_state |= I_LINKABLE;
+                        spin_unlock(&inode->i_lock);
+                }
+                ll_stats_ops_tally(ll_i2sbi(parent), LPROC_LL_MKNOD,
+                                 ktime_us_delta(ktime_get(), kstart));
+        }
+
+While I initially thought the MDS handling would also be a relatively simple matter of modifying code in the mdt_reint_link() path to save a VOLATILE or LINKABLE flag in the dt_object and then check this when increasing the link count (maybe osd_ref_add()), it turns out not to be so straight forward.
+
+There are some more complex issues on the MDS that I discovered while going through this code:
+
+	MDS_OPEN_VOLATILE files are immediately put into the PENDING directory by mdd_create()->mdd_orphan_insert(), so just hard-linking them into the namespace may not be enough to revive them.
+
+	mdt_reint_link() may need to do more complex operations to move an inode out of PENDING in the linkat() case if the inode is marked VOLATILE
+
+	the inode->i_nlink count is handled down in the OSD layer, so osd_ref_add() would need to see the MDS_OPEN_VOLATILE flag, or some equivalent flag set on dt_object or similar that is set when the file is created
+
+	osd_ref_add() is always allowing hard linking to a file with i_nlink == 0, which is probably not right.  It should only be allowed in specific cases - parent is PENDING (or soon a TRASH directory), or now VOLATILE/LINKABLE flag set
+
+--- Comment (adilger, Tue, 8 Apr 2025 17:09:10 +0000) ---
+The Volatile (and O_TMPFILE implementation, when complete) should mark the inode with I_LINKABLE on both the client as well as the MDS where it is created (when MDS_OPEN_VOLATILE is seen), so that both sides are aware of the status.  Without this flag on the client, the client VFS will block the linkat() call.
+
+It may be desirable to allow the linkat() call to be done on a different client node from where the file was created (e.g. if a copytool or migration agent is running on multiple client nodes).  It is possible to create a new open file handle to the temporary file on another client via llapi_open_by_fid() or open_by_handle_at().  In this case, the MDS also needs to sanity check that the link cal on an inode with i_nlink == 0 is only being done on a new temporary file created with MDS_OPEN_VOLATILE and not one that was previously unlinked from the namespace.

@@ -1,0 +1,321 @@
+Key:        LU-16690
+Summary:    kernel: obd_memory max: 1854996506, obd_memory current: 1854996506
+Link:       https://jira.whamcloud.com/browse/LU-16690
+Type:       Bug
+Priority:   Critical
+Status:     Resolved
+Resolution: Duplicate
+Assignee:   Dongyang Li
+Reporter:   Mahmoud Hanafi
+Created:    Thu, 30 Mar 2023 21:33:10 +0000
+Updated:    Sat, 13 May 2023 14:42:18 +0000
+Resolved:   Sat, 13 May 2023 14:42:11 +0000
+Links:      Related: is related to  LU-16413
+Attachments: nbp13_hung, stack.out, stack.out2, stack.out3
+
+--- Description ---
+After upgrade to 2.15.2 server hung with errors
+
+kernel: obd_memory max: 1854996506, obd_memory current: 1854996506
+
+see attached logs for full set of longs.
+
+--- Comment (pjones, Sat, 13 May 2023 14:42:11 +0000) ---
+Ok so in that case let's assume that this is fixed unless future evidence comes to light that this is not the case
+
+--- Comment (mhanafi, Wed, 26 Apr 2023 17:32:24 +0000) ---
+Peter,
+
+I haven't been able to reproduce it on our test filesystem, I think it is too small. We may need to wait on a production filesystem during an extended dedicated.
+
+--- Comment (pjones, Fri, 21 Apr 2023 15:35:59 +0000) ---
+Mahmoud
+
+The LU-16413 fix has been merged to b2_15 and will be in the upcoming 2.15.3 release. Have you tested the effectiveness of this release?
+
+Peter
+
+--- Comment (dongyang, Tue, 4 Apr 2023 01:42:43 +0000) ---
+Andreas,
+
+From the logs the kernel is 4.18.0-425.3.1.el8_lustre.x86_64.
+
+I think we are seeing memory allocation issue is because of LU-16413, the patch was landed in master but not in 2.15.2.
+
+Before the patch the bio-integrity kernel patch is broken for 4.18 kernels, it removed check in bio_integrity_prep() if the integrity payload is already allocated or not, and from osd we are calling bio_integrity_prep() twice, so we are leaking the integrity payload. Both are fixed in LU-16413.
+
+I will port LU-16413 to b2_15.
+
+--- Comment (adilger, Mon, 3 Apr 2023 22:26:51 +0000) ---
+Mahmoud, which kernel is running on the servers for this system?
+
+--- Comment (mhanafi, Mon, 3 Apr 2023 20:23:46 +0000) ---
+Lower the number threads help but eventualy the service hit the issue. But host that had ib_iser t10pi disable was find. So for now we have disabled t10pi and lowered the number of threads.
+
+ 
+
+I will try to see if I can get a reproducer to help debug the issue.
+
+--- Comment (pjones, Sat, 1 Apr 2023 02:35:20 +0000) ---
+Dongyang
+
+What is your advise here?
+
+Peter
+
+--- Comment (mhanafi, Fri, 31 Mar 2023 21:51:34 +0000) ---
+All the servers have 192GB of memory. Memory has never been an issue before the upgrade.
+
+Filesystem crashing all have small files with hight number of IOPs. We changed thread count on one filesystem and turned off ib_iser T10pi checking. I saw threads waiting in bio_integrity_prep.
+
+--- Comment (green, Fri, 31 Mar 2023 20:33:11 +0000) ---
+to me this looks like something is wrong on the disk backend, the system is super slow (all the traces trying to get data from storage) and then eventually clients start to reconnect and I imagine whatever dirty data there is is not being flushed super fast either.
+
+And then the system thinks it's running out of memory and frantically asks everybody around to free some (and this is the memory message you see is), the lustre only allocated 1.8G of RAM though which is not all that much (how much RAM is there?)
+
+--- Comment (adilger, Fri, 31 Mar 2023 20:14:46 +0000) ---
+From the stack traces, it looks like a lot of OSS threads are handling clients connecting to the OST, while at the same time a lot are disconnecting, and all of them are stuck starting journal transactions:
+
+295816 ll_ost03_057
+[] wait_transaction_locked+0x89/0xd0 [jbd2]
+[] add_transaction_credits+0xd4/0x290 [jbd2]
+[] start_this_handle+0x10a/0x520 [jbd2]
+[] jbd2__journal_start+0xee/0x1f0 [jbd2]
+[] __ldiskfs_journal_start_sb+0x6e/0x140 [ldiskfs]
+[] osd_trans_start+0x13b/0x500 [osd_ldiskfs]
+[] tgt_client_data_update+0x468/0x6c0 [ptlrpc]
+[] tgt_client_new+0x5c2/0x880 [ptlrpc]
+[] ofd_obd_connect+0x385/0x4f0 [ofd]
+[] target_handle_connect+0x611/0x29a0 [ptlrpc]
+[] tgt_request_handle+0x569/0x1a40 [ptlrpc]
+[] ptlrpc_server_handle_request+0x323/0xbe0 [ptlrpc]
+[] ptlrpc_main+0xc0f/0x1570 [ptlrpc]
+[] kthread+0x10a/0x120
+[] ret_from_fork+0x1f/0x40
+
+295822 ll_ost03_063
+[] wait_transaction_locked+0x89/0xd0 [jbd2]
+[] add_transaction_credits+0xd4/0x290 [jbd2]
+[] start_this_handle+0x10a/0x520 [jbd2]
+[] jbd2__journal_start+0xee/0x1f0 [jbd2]
+[] __ldiskfs_journal_start_sb+0x6e/0x140 [ldiskfs]
+[] osd_trans_start+0x13b/0x500 [osd_ldiskfs]
+[] tgt_server_data_update+0x3db/0x5a0 [ptlrpc]
+[] tgt_client_del+0x368/0x710 [ptlrpc]
+[] ofd_obd_disconnect+0x1f8/0x210 [ofd]
+[] target_handle_disconnect+0x22f/0x500 [ptlrpc]
+[] tgt_disconnect+0x4a/0x1a0 [ptlrpc]
+[] tgt_request_handle+0xc97/0x1a40 [ptlrpc]
+[] ptlrpc_server_handle_request+0x323/0xbe0 [ptlrpc]
+[] ptlrpc_main+0xc0f/0x1570 [ptlrpc]
+
+When clients disconnect they need to force a synchronous journal commit, because otherwise if the OSS crashes shortly thereafter same time the clients will not be around to participate in recovery and recovery will take the maximum time.  This might be significantly impacting the filesystem IO rate.  Is this for an HDD or NVMe filesystem?
+
+There are also a handful of OSS threads are handling file unlinks:
+
+295743 ll_ost06_061
+[] wait_transaction_locked+0x89/0xd0 [jbd2]
+[] add_transaction_credits+0xd4/0x290 [jbd2]
+[] start_this_handle+0x10a/0x520 [jbd2]
+[] jbd2__journal_start+0xee/0x1f0 [jbd2]
+[] __ldiskfs_journal_start_sb+0x6e/0x140 [ldiskfs]
+[] osd_trans_start+0x13b/0x500 [osd_ldiskfs]
+[] ofd_destroy+0x247/0xb20 [ofd]
+[] ofd_destroy_by_fid+0x25e/0x4a0 [ofd]
+[] ofd_destroy_hdl+0x263/0xa10 [ofd]
+[] tgt_request_handle+0xc97/0x1a40 [ptlrpc]
+[] ptlrpc_server_handle_request+0x323/0xbe0 [ptlrpc]
+[] ptlrpc_main+0xc0f/0x1570 [ptlrpc]
+
+and
+
+295763 ll_ost06_063
+[] wait_transaction_locked+0x89/0xd0 [jbd2]
+[] add_transaction_credits+0xd4/0x290 [jbd2]
+[] start_this_handle+0x10a/0x520 [jbd2]
+[] jbd2__journal_start+0xee/0x1f0 [jbd2]
+[] __ldiskfs_journal_start_sb+0x6e/0x140 [ldiskfs]
+[] ldiskfs_evict_inode+0x273/0x6b0 [ldiskfs]
+[] evict+0xd2/0x1a0
+[] osd_object_delete+0x21a/0x320 [osd_ldiskfs]
+[] lu_object_free.isra.37+0x90/0x1e0 [obdclass]
+[] ofd_destroy_by_fid+0x2d6/0x4a0 [ofd]
+[] ofd_destroy_hdl+0x263/0xa10 [ofd]
+[] tgt_request_handle+0xc97/0x1a40 [ptlrpc]
+[] ptlrpc_server_handle_request+0x323/0xbe0 [ptlrpc]
+[] ptlrpc_main+0xc0f/0x1570 [ptlrpc]
+
+some threads are doing writes:
+
+293423 ll_ost_io02_061
+[] wait_transaction_locked+0x89/0xd0 [jbd2]
+[] add_transaction_credits+0xd4/0x290 [jbd2]
+[] start_this_handle+0x10a/0x520 [jbd2]
+[] jbd2__journal_start+0xee/0x1f0 [jbd2]
+[] __ldiskfs_journal_start_sb+0x6e/0x140 [ldiskfs]
+[] osd_trans_start+0x13b/0x500 [osd_ldiskfs]
+[] ofd_write_attr_set+0x11d/0x1070 [ofd]
+[] ofd_commitrw_write+0x226/0x1ad0 [ofd]
+[] ofd_commitrw+0x5b4/0xd20 [ofd]
+[] obd_commitrw+0x1b0/0x380 [ptlrpc]
+[] tgt_brw_write+0x139f/0x1ce0 [ptlrpc]
+[] tgt_request_handle+0xc97/0x1a40 [ptlrpc]
+[] ptlrpc_server_handle_request+0x323/0xbe0 [ptlrpc]
+[] ptlrpc_main+0xc0f/0x1570 [ptlrpc]
+
+A bunch of threads are doing reads (and shouldn't have journal handles), but appear to be stuck in memory allocations:
+
+293418 ll_ost_io02_056
+[] shrink_lruvec+0x2f1/0x6c0
+[] shrink_node+0x22e/0x700
+[] do_try_to_free_pages+0xc9/0x3e0
+[] try_to_free_pages+0xf3/0x1c0
+[] __alloc_pages_slowpath+0x372/0xd10
+[] __alloc_pages_nodemask+0x2e2/0x320
+[] kmalloc_order+0x28/0x90
+[] kmalloc_order_trace+0x1d/0xb0
+[] __kmalloc+0x203/0x250
+[] bio_integrity_prep+0xee/0x2b0
+[] blk_mq_make_request+0xad/0x5b0
+[] generic_make_request_no_check+0xe1/0x330
+[] submit_bio+0x3c/0x160
+[] osd_do_bio.constprop.51+0x510/0xc40 [osd_ldiskfs]
+[] osd_read_prep+0x456/0x540 [osd_ldiskfs]
+[] ofd_preprw_read.isra.27+0x4a0/0x13b0 [ofd]
+[] ofd_preprw+0x6ef/0x900 [ofd]
+[] tgt_brw_read+0x6e0/0x1fc0 [ptlrpc]
+[] tgt_request_handle+0xc97/0x1a40 [ptlrpc]
+[] ptlrpc_server_handle_request+0x323/0xbe0 [ptlrpc]
+[] ptlrpc_main+0xc0f/0x1570 [ptlrpc]
+
+and
+
+293127 ll_ost_io01_057
+[] __lock_page+0x12d/0x230
+[] pagecache_get_page+0x1e5/0x310
+[] osd_bufs_get+0x56a/0xb20 [osd_ldiskfs]
+[] ofd_preprw_read.isra.27+0x3dc/0x13b0 [ofd]
+[] ofd_preprw+0x6ef/0x900 [ofd]
+[] tgt_brw_read+0x6e0/0x1fc0 [ptlrpc]
+[] tgt_request_handle+0xc97/0x1a40 [ptlrpc]
+[] ptlrpc_server_handle_request+0x323/0xbe0 [ptlrpc]
+[] ptlrpc_main+0xc0f/0x1570 [ptlrpc]
+
+All of the above threads are blocked waiting to access the journal or for memory, so they shouldn't actually be doing anything to modify the filesystem yet.  There are a handful of threads that are actually holding a transaction open:
+
+293304 ll_ost_io05_051
+[] jbd2_log_wait_commit+0xac/0x120 [jbd2]
+[] jbd2_journal_stop+0x2d5/0x330 [jbd2]
+[] __ldiskfs_journal_stop+0x36/0xb0 [ldiskfs]
+[] osd_trans_stop+0x235/0xa60 [osd_ldiskfs]
+[] ofd_object_punch+0xdbf/0x1330 [ofd]
+[] ofd_punch_hdl+0x4b0/0x710 [ofd]
+[] tgt_request_handle+0xc97/0x1a40 [ptlrpc]
+[] ptlrpc_server_handle_request+0x323/0xbe0 [ptlrpc]
+[] ptlrpc_main+0xc0f/0x1570 [ptlrpc]
+
+and
+
+293411 ll_ost_io04_061
+[] range_lock+0x148/0x270 [obdclass]
+[] ofd_preprw_write.isra.28+0x720/0x1240 [ofd]
+[] ofd_preprw+0x7b2/0x900 [ofd]
+[] obd_preprw+0x1a1/0x360 [ptlrpc]
+[] tgt_brw_write+0x11cf/0x1ce0 [ptlrpc]
+[] tgt_request_handle+0xc97/0x1a40 [ptlrpc]
+[] ptlrpc_server_handle_request+0x323/0xbe0 [ptlrpc]
+[] ptlrpc_main+0xc0f/0x1570 [ptlrpc]
+
+One possible cause of this blockage is a handful of threads that are holding an open transaction, but are blocked on memory allocation:
+
+227209 ll_ost_io06_004
+292970 ll_ost_io00_021
+292989 ll_ost_io06_054
+227821 ll_ost_io06_006
+271578 ll_ost_io03_023
+293355 ll_ost_io00_059
+[] shrink_lruvec+0x2f1/0x6c0
+[] shrink_node+0x22e/0x700
+[] do_try_to_free_pages+0xc9/0x3e0
+[] try_to_free_pages+0xf3/0x1c0
+[] __alloc_pages_slowpath+0x372/0xd10
+[] __alloc_pages_nodemask+0x2e2/0x320
+[] kmalloc_order+0x28/0x90
+[] kmalloc_order_trace+0x1d/0xb0
+[] __kmalloc+0x203/0x250
+[] bio_integrity_prep+0xee/0x2b0
+[] blk_mq_make_request+0xad/0x5b0
+[] generic_make_request_no_check+0xe1/0x330
+[] submit_bio+0x3c/0x160
+[] osd_do_bio.constprop.51+0xb63/0xc40 [osd_ldiskfs]
+[] osd_ldiskfs_map_inode_pages+0x873/0x8f0 [osd_ldiskfs]
+[] osd_write_commit+0x5e2/0x990 [osd_ldiskfs]
+[] ofd_commitrw_write+0x77e/0x1ad0 [ofd]
+[] ofd_commitrw+0x5b4/0xd20 [ofd]
+[] obd_commitrw+0x1b0/0x380 [ptlrpc]
+[] tgt_brw_write+0x139f/0x1ce0 [ptlrpc]
+[] tgt_request_handle+0xc97/0x1a40 [ptlrpc]
+[] ptlrpc_server_handle_request+0x323/0xbe0 [ptlrpc]
+[] ptlrpc_main+0xc0f/0x1570 [ptlrpc]
+
+It looks like the underlying storage is using T10-PI at the block level, which is doing an allocation late in the IO submission process, which is bad.  The kmalloc() itself looks like it is using GFP_NOIO, which is good, so it doesn't recurse into the filesystem again, but it doesn't appear that there is much memory available for the number of running threads, and this is causing it to block.
+
+That may also be problematic because kswapd is blocked in the filesystem when trying to free an inode, so it is unable to do any memory reclaim:
+
+349 kswapd0
+[] wait_transaction_locked+0x89/0xd0 [jbd2]
+[] add_transaction_credits+0xd4/0x290 [jbd2]
+[] start_this_handle+0x10a/0x520 [jbd2]
+[] jbd2__journal_start+0xee/0x1f0 [jbd2]
+[] __ldiskfs_journal_start_sb+0x6e/0x140 [ldiskfs]
+[] ldiskfs_release_dquot+0x60/0xb0 [ldiskfs]
+[] dqput.part.19+0x82/0x1e0
+[] __dquot_drop+0x69/0x90
+[] ldiskfs_clear_inode+0x1e/0x80 [ldiskfs]
+[] ldiskfs_evict_inode+0x58/0x6b0 [ldiskfs]
+[] evict+0xd2/0x1a0
+[] dispose_list+0x48/0x70
+[] prune_icache_sb+0x52/0x80
+[] super_cache_scan+0x123/0x1b0
+[] do_shrink_slab+0x11d/0x330
+[] shrink_slab+0xbe/0x2f0
+[] shrink_node+0x246/0x700
+[] balance_pgdat+0x2d7/0x550
+[] kswapd+0x201/0x3c0
+
+I see the same kswapd0 process stuck in nbp13_hung so that seems significant.
+
+I don't have the configuration, system, and storage details, but it may just be that there are too many threads running on this system for the amount of RAM that it has?  You could try tuning oss_max_threads=256 or similar to reduce the concurrent thread count so the OSS memory isn't running out.  If large RPCs are in use (e.g. obdfilter.*.brw_size=16 or =32) then this could be reduced so the OST threads are not preallocating so much memory for large RPCs.
+
+--- Comment (mhanafi, Fri, 31 Mar 2023 19:45:12 +0000) ---
+Not sure if this is related or not but after the upgrade module load takes a long time. Stack trace shows module load is in lnet_wait_router_start for several minutes.
+
+7611 modprobe
+
+[] lnet_wait_router_start+0xb6/0x100 [lnet]
+
+[] LNetNIInit+0x873/0xcf0 [lnet]
+
+[] ptlrpc_ni_init+0x22/0x1a0 [ptlrpc]
+
+[] ptlrpc_init_portals+0xb/0xe0 [ptlrpc]
+
+[] ptlrpc_init+0x1e0/0x1000 [ptlrpc]
+
+[] do_one_initcall+0x46/0x1d0
+
+[] do_init_module+0x5a/0x230
+
+[] load_module+0x14be/0x17f0
+
+[] __do_sys_finit_module+0xb1/0x110
+
+[] do_syscall_64+0x5b/0x1b0
+
+[] entry_SYSCALL_64_after_hwframe+0x61/0xc6
+
+--- Comment (mhanafi, Fri, 31 Mar 2023 19:04:40 +0000) ---
+I am attaching stack output during which the load on system was +1000.
+
+--- Comment (mhanafi, Fri, 31 Mar 2023 01:30:06 +0000) ---
+we now have two servers on two different filesystem hit the same issue.

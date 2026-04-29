@@ -1,0 +1,114 @@
+Key:        LU-12429
+Summary:    Single client buffered SSF write is slower than O_DIRECT
+Link:       https://jira.whamcloud.com/browse/LU-12429
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Dongyang Li
+Reporter:   Shuichi Ihara
+Created:    Wed, 12 Jun 2019 08:10:23 +0000
+Updated:    Tue, 21 Jan 2020 09:29:44 +0000
+Links:      Related: is related to  LU-9920; Related: is related to LU-247
+Attachments: lustre-ssf.svg, single-thread.svg
+
+--- Description ---
+Single client's SSF doesn't scale by nubmer of process
+
+# mpirun --allow-run-as-root -np X /work/tools/bin/ior -w -t 16m -b $((32/X))g -e -o file
+
+NP     Write(MB/s)
+  1     1594
+  2     2525
+  4     1892
+  8     2032
+ 16     1812
+
+A framegraph output at ior with NP=16 pointed out huge amount cost of spin_lock in add_to_page_cache_lru() and set_page_dirty(). At the resutls, Buffered SSF write on single client is slower than SSF with O_DIRECT. Here is my quick test resutls of single client SSF with/without O_DIRECT.
+
+# mpirun -np 16 --allow-run-as-root /work/tools/bin/ior -w -t 16m -b 4g -e -o /scratch0/stripe/file 
+Max Write: 1806.31 MiB/sec (1894.06 MB/sec)
+
+# mpirun -np 16 --allow-run-as-root /work/tools/bin/ior -w -t 16m -b 4g -e -o /scratch0/stripe/file -B
+Max Write: 5547.13 MiB/sec (5816.58 MB/sec)
+
+--- Comment (adilger, Tue, 21 Jan 2020 09:29:44 +0000) ---
+Does it make sense to just automatically bypass the page cache on the client for read() and/or write() calls that are large enough and aligned (essentially use O_DIRECT automatically)?  For example, read/write over 16MB if single-threaded, or over 4MB if multi-threaded?  That would totally avoid the overhead of the page cache for those syscalls.
+
+--- Comment (dongyang, Fri, 25 Oct 2019 00:03:55 +0000) ---
+I agree, this ticket is more about the page cache overhead for multi-thread buffered write.
+
+--- Comment (sihara, Thu, 24 Oct 2019 23:11:15 +0000) ---
+DY, attached is an framegraph of Lustre client when single thread IOR write on it. it might be related, but differnt workload (e.g. buffered IO vs O_DIRECT, single thread vs single client). I wonder if I should open new ticket for it?
+
+--- Comment (sihara, Fri, 14 Jun 2019 23:09:01 +0000) ---
+https://review.whamcloud.com/#/c/28711/ (latest patchset 8) doesn't help very much either.
+
+# mpirun -np 16 --allow-run-as-root /work/tools/bin/ior -w -t 16m -b 4g -e -o /cache1/stripe/file 
+Max Write: 2109.99 MiB/sec (2212.49 MB/sec)
+
+--- Comment (pfarrell, Thu, 13 Jun 2019 16:28:24 +0000) ---
+I'm glad the patch improves things by 25%.  I'm pretty sure a new flame graph would basically show more time shifting to the contention on page allocation rather than page dirtying, but still those two hot spots.  It would be interesting to see, though.
+
+Backing up:
+
+Packed node direct i/o with reasonable sizes is always going to be better than buffered i/o.  We're not going to be able to fix that unless we were to convert direct to buffered in that scenario.
+
+I also don't have any other good ideas for improvements - That contention we're facing is in the page cache itself, and Lustre isn't contributing to it.  Unless we want to do something radical like try to convert from buffered to direct when we run in to trouble, there will always be a gap.  (I don't like that idea of switching when the node is busy for a variety of reasons, FYI)
+
+So I think we have to decide what the goal is for this ticket, as the implied goal of making them the same is, unfortunately, not realistic.
+
+--- Comment (pfarrell, Thu, 13 Jun 2019 16:24:54 +0000) ---
+That patch probably doesn't work with newer kernels - The mapping->tree_lock has been renamed.  I need to fix that, and will do shortly...  But you shouldn't expect much benefit, there have not been many changes in that area.  Just some reshuffling.
+
+--- Comment (sihara, Wed, 12 Jun 2019 23:33:38 +0000) ---
+https://review.whamcloud.com/35206 improved SSF write by 25%, but still big gap against non-buffered IO. 
+
+Max Write: 2278.23 MiB/sec (2388.90 MB/sec)
+
+Will check with newer linux kernel to compare.
+
+--- Comment (pfarrell, Wed, 12 Jun 2019 15:04:38 +0000) ---
+By the way, the contention here is two sided - It's adding pages to the mapping tree/lru, and it's marking them dirty.  (For some reason, removing them from the radix tree doesn't show up in here.  Possibly because it's already optimized with pagevecs or possibly because the test didn't run long enough?)
+
+Anyway, naturally we would like to optimize the adding side as well.  Unfortunately, the way Linux does writing makes that quite hard.  Adding a page to the cache happens in ll_write_begin, which is called on each page as part of generic_file_buffered_write in the kernel.  It is required that after that call the page be inserted in to the radix tree for the file being written.
+
+This means that there's not really any way to batch this at this step.
+
+If we wanted, we could potentially try adding the requisite pages in batch before we got there - I would think in vvp_io_write_start - but that would still require open-coding batch functionality for adding pages to the cache.
+
+Specifically, we'd have to open code:
+
+__add_to_page_cache_locked
+add_to_page_cache_lru
+grab_cache_page_nowait 
+
+This would let us just find already added pages in ll_write_begin, which requires no locking and is quite fast.
+
+Which is a fair bit of kernel internal functionality.  Yuck.  It's something you'd want to upstream first, ideally...  (As is LU-9920 to be honest...)
+
+--- Comment (pfarrell, Wed, 12 Jun 2019 14:03:26 +0000) ---
+Please see
+
+https://review.whamcloud.com/35206
+
+For rebased copy.  Rebase was trivial (one line of comment was the only diff), but had to push to a new Gerrit because the old patch was abandoned.
+
+Let's see how much benefit this gets you and we can consider reviving it.
+
+FWIW, full node shared file direct i/o is probably always going to be faster than buffered...
+
+--- Comment (pfarrell, Wed, 12 Jun 2019 13:54:20 +0000) ---
+Ihara,
+
+So we abandoned this patch because it's not useful for FPP loads, but given where you're reporting contention, it should be worth a try for SSF loads - which was the original goal.
+
+https://review.whamcloud.com/#/c/28711/
+
+The lock you're contending on here is the mapping->tree_lock, which is exactly what this patch helps address contention on.
+
+Back in the past, I reported a 25% improvement with 8 writers in the SSF case.  You would probably see as much or more with more writers.
+
+I'll see if I can rebase it right now...
+
+Note that we rejected it because it requires re-implementing a certain amount of kernel functionality in a way that is not very pleasing...  But if there's a big benefit, it's not necessarily off the table.

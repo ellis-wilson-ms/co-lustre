@@ -1,0 +1,134 @@
+<?xml version='1.0' encoding='utf-8'?>
+<mediawiki xmlns:ns1="http://www.mediawiki.org/xml/export-0.11/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.mediawiki.org/xml/export-0.11/ http://www.mediawiki.org/xml/export-0.11.xsd" version="0.11" xml:lang="en">
+  <ns1:siteinfo>
+    <ns1:sitename>Lustre Wiki</ns1:sitename>
+    <ns1:dbname>wiki_lustre_org</ns1:dbname>
+    <ns1:base>http://wiki.lustre.org/Main_Page</ns1:base>
+    <ns1:generator>MediaWiki 1.39.7</ns1:generator>
+    <ns1:case>first-letter</ns1:case>
+    <ns1:namespaces>
+      <ns1:namespace key="-2" case="first-letter">Media</ns1:namespace>
+      <ns1:namespace key="-1" case="first-letter">Special</ns1:namespace>
+      <ns1:namespace key="0" case="first-letter" />
+      <ns1:namespace key="1" case="first-letter">Talk</ns1:namespace>
+      <ns1:namespace key="2" case="first-letter">User</ns1:namespace>
+      <ns1:namespace key="3" case="first-letter">User talk</ns1:namespace>
+      <ns1:namespace key="4" case="first-letter">Lustre Wiki</ns1:namespace>
+      <ns1:namespace key="5" case="first-letter">Lustre Wiki talk</ns1:namespace>
+      <ns1:namespace key="6" case="first-letter">File</ns1:namespace>
+      <ns1:namespace key="7" case="first-letter">File talk</ns1:namespace>
+      <ns1:namespace key="8" case="first-letter">MediaWiki</ns1:namespace>
+      <ns1:namespace key="9" case="first-letter">MediaWiki talk</ns1:namespace>
+      <ns1:namespace key="10" case="first-letter">Template</ns1:namespace>
+      <ns1:namespace key="11" case="first-letter">Template talk</ns1:namespace>
+      <ns1:namespace key="12" case="first-letter">Help</ns1:namespace>
+      <ns1:namespace key="13" case="first-letter">Help talk</ns1:namespace>
+      <ns1:namespace key="14" case="first-letter">Category</ns1:namespace>
+      <ns1:namespace key="15" case="first-letter">Category talk</ns1:namespace>
+    </ns1:namespaces>
+  </ns1:siteinfo>
+  <ns1:page>
+    <ns1:title>RAID5 Patches</ns1:title>
+    <ns1:ns>0</ns1:ns>
+    <ns1:id>892</ns1:id>
+    <ns1:revision>
+      <ns1:id>1957</ns1:id>
+      <ns1:parentid>1954</ns1:parentid>
+      <ns1:timestamp>2016-10-13T14:18:53Z</ns1:timestamp>
+      <ns1:contributor>
+        <ns1:username>KenRawlings</ns1:username>
+        <ns1:id>43</ns1:id>
+      </ns1:contributor>
+      <ns1:comment>adding needs-review category</ns1:comment>
+      <ns1:origin>1957</ns1:origin>
+      <ns1:model>wikitext</ns1:model>
+      <ns1:format>text/x-wiki</ns1:format>
+      <ns1:text bytes="5799" sha1="0msyp75quulxdxbuws2aazmv0xmo12p" xml:space="preserve">{| class='wikitable'
+|- 
+!Note: This page originated on the old Lustre wiki. It was identified as likely having value and was migrated to the new wiki. It is in the process of being reviewed/updated and may currently have content that is out of date.
+|}
+
+&lt;small&gt;''(Updated: Dec 2009)''&lt;/small&gt;
+__TOC__
+This page contents some notes about RAID internals.
+
+== Structures ==
+
+In Linux, RAID5 handles all incoming requests by small units called '''stripes'''.
+A stripe is a set of '''blocks''' taken from all disks at the same position.
+A block is defined as a unit of PAGE_SIZE bytes. 
+
+For example, suppose you have 3 disks and have specified 8K chunksize. Internally, RAID5 will look like this:
+{|border=1 cellspacing=0
+|-
+|       || S0  || S8  || S32 || S40 
+|-
+| Disk1 || #0  || #8  || #32 || #40 
+|-
+| Disk2 || #16 || #24 || #48 || #56 
+|-
+| Disk3 || P0  || P8  || P32 || P40 
+|}
+
+where:
+
+* Sn -- Number of internal stripe
+* #n -- An offset in sectors (512 bytes)
+* Pn -- Parity for other blocks in the stripe (actually, it floats among disks)
+
+As you can see, an 8K chunksize means 2 contiguous blocks.
+
+== Logic ==
+
+''make_request()'' goes through an incoming request, breaking it into '''blocks''' (PAGE_SIZE) and handling them separately. Given bio with bi_sector = 0 bi_size = 24K and the array described above, ''make_request()'' would handle #0, #8 and #16.
+
+For every block, ''add_stripe_bio()'' and ''handle_stripe()'' are called.
+
+''add_stripe_bio()'' adds bio to a given stripe. Later, in ''handle_stripe()'', we can use bio and its data to serve requests.
+
+''handle_stripe()'' is a core of RAID5 (as discussed in the next section).
+
+== handle_stripe() ==
+
+The routine works with a stripe. It checks what should be done, learns the current state of a stripe in the internal cache, decides what I/O is needed to satisfy user requests, and does recovery.
+
+For example, if a user wants to write block #0 (8 sectors starting from sector 0), RAID5's responsibility is to store new data and update parity P0. There are a few possibilities here:
+
+* Delay serving until the data for block #16 is ready -- probably the user will want to write #16 very soon?
+* Read #16, make a new parity P0; write #0 and P0.
+* Read P0, roll back the old #0 from P0 (so it looks like we did parity with #0) and re-compute parity with the new #0.
+
+The first possibility looks like the best option because it does not require a very expensive read, but the problem is that user may need to write only #0 and not #16 in near future.
+
+Also, the queue can get unplugged, meaning that the user wants all requests to
+complete. (Unfortunately, in the current block layer, there is no way to specify the exact request that the user is interested in, so any completion interest requires that the entire queue be immediately served).
+
+== Problems ==
+
+This is a short list of RAID5 problems we encountered in the Thumper project:
+
+* Order of handling is not good for large requests
+: As ''handle_stripe()'' goes in logical block order, it handles S0, then S8, and then again S0 and S8. After the first touch, S0 is left with block #0 up-to-date, while #16 and P0 are not. If the stripe is forced to completion, we would need to read block #16 or P0 to get a fully up-to-date stripe. Such reads hurt throughput, almost to death. If a single process writes, things are okay because no one unplugs the queue, and there are no requests to force completion of a pending request. If there are more writers and a queue unplug occurs often, then pending requests are often forced to completion. Consider that we use a large chunk size (128K, 256K, and even larger). In the end, there are many out-of-date stripes in the cache and many reads.
+
+* memcpy() is a top consumer
+:  All requests are handled via internal cache, on dual-core, two-way Opteron. This takes up to 30-33% of CPU doing 1 GB/s writes.
+
+* Small requests
+:  To fill I/O pipes and reach good throughput, we need very large I/O requests. Lustre™ does this by using a bio subsystem on 2.6. As described above, RAID5 handles all blocks separately, and issues separate I/O (bio) for each block. This is partially solved by an I/O scheduler that merges small requests into bigger ones. But, due to the nature of the block subsystem, any process that wants I/O to be completed ''unplugs'' the queue, causing many small requests in the pipe.
+
+We have developed patches that address the described problems. You can find
+them at [http://downloads.lustre.org/people/alex/raid5/ http://downloads.lustre.org/people/alex/raid5/] .
+
+== Zero-copy Patch ==
+
+In the current RAID5 implementation, there is a cache for each device. For each I/O instance, the RAID5 driver first updates the device cache, and then submits the read/write request to the real block device. The cache update operation consumes lots of CPU time to copy data to/from the device cache. For Lustre's bulk write, it is meaningless to update this cache space. This is the basis of the zero-copy patch for RAID5.
+
+To avoid data copy, pages from bio are used directly to calculate the parity page and feed the I/O source to disks. These pages (bio pages from the file system layer) should not be modified when calculating the parity page. Otherwise, the wrong parity will be written to storage, which causes garbage data to be generated if the administrator tries to rebuild the array in the future.
+
+If pages are being mapped, our solution is to lock the pages and then unmap them (to keep the pages from being modified). For this purpose, an additional page flag (PG_constant) has been introduced. Set this bit to let the RAID5 driver know that the page will not be modified during I/O. After I/O completes against this page, the bit will be cleared, so the page can be written again.
+
+[[Category: NeedsReview]]</ns1:text>
+      <ns1:sha1>0msyp75quulxdxbuws2aazmv0xmo12p</ns1:sha1>
+    </ns1:revision>
+  </ns1:page>
+</mediawiki>

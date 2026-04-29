@@ -1,0 +1,124 @@
+Key:        LU-18308
+Summary:    big DIRECT_IO reads zeroes
+Link:       https://jira.whamcloud.com/browse/LU-18308
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Duplicate
+Assignee:   WC Triage
+Reporter:   Mikhail Pershin
+Created:    Thu, 3 Oct 2024 13:32:57 +0000
+Updated:    Thu, 31 Oct 2024 14:48:34 +0000
+Resolved:   Thu, 31 Oct 2024 14:47:50 +0000
+Links:      Related: is related to  LU-17524
+
+--- Description ---
+if read() is called with a large enough O_DIRECT then it returns zeroes instead of data. It happens on some kernels, when read size is more than ~680Mb.
+
+Going to read: 536870912(0x20000000) bytes
+Read: 402653184 bytes. Total bytes read: 402653184
+Read: 134217728 bytes. Total bytes read: 536870912
+read[0x18000000] == ef
+Going to read: 805306368(0x30000000) bytes
+Read: 402653184 bytes. Total bytes read: 402653184
+Read: 402653184 bytes. Total bytes read: 805306368
+read[0x18000000] == ef
+Going to read: 1073741824(0x40000000) bytes
+Read: 671088640 bytes. Total bytes read: 671088640
+read[0x18000000] == 0
+
+each time it splits incoming read size by 400Mb, but when size is more than 800Mb, IO first split size becomes 670Mb but it reads still only 400Mb of data.
+
+Bug was seen in exa6+el9.4 client so far, master is being tested
+
+--- Comment (adilger, Thu, 31 Oct 2024 14:48:34 +0000) ---
+Duplicate of LU-17524
+
+--- Comment (adilger, Thu, 31 Oct 2024 14:47:35 +0000) ---
+Reopen to change resolution.
+
+--- Comment (tappro, Fri, 4 Oct 2024 07:38:05 +0000) ---
+issue doesn't exists in master
+
+--- Comment (tappro, Fri, 4 Oct 2024 07:37:28 +0000) ---
+master works with the same tests because it uses iov_iter_revert() to negate extra advance it seems.
+
+--- Comment (tappro, Thu, 3 Oct 2024 23:53:14 +0000) ---
+it seems master consider that properly:
+
+#if !defined HAVE_IOV_ITER_GET_PAGES_ALLOC2 && defined HAVE_DIO_ITER
+static inline ssize_t iov_iter_get_pages_alloc2(struct iov_iter *i,
+                           struct page ***pages,
+                           size_t maxsize,
+                           size_t *start)
+{
+    ssize_t result = 0;    /* iov_iter_get_pages_alloc is non advancing version of alloc2 */
+    result = iov_iter_get_pages_alloc(i, pages, maxsize, start);
+    if (result > 0 && user_backed_iter(i))
+        iov_iter_advance(i, result);    return result;
+}
+#endif
+
+and makes it really advanced in compat code, but I wonder why we still have iov_iter_advance() in ll_direct_IO_impl() code:
+
+        iov_iter_advance(iter, count);
+
+        tot_bytes += count;
+        file_offset += count;
+
+ 
+
+I can't say how test performs yet, but looks  suspicios
+
+--- Comment (tappro, Thu, 3 Oct 2024 23:47:22 +0000) ---
+Just add here my comment in original ticket:
+
+I think I've found the reason. Here is result of internal Lustre operations during DIO:
+
+(rw26.c:495:ll_direct_IO_impl()) VFS Op:inode=[0x200000404:0x3:0x0](00000000fc9e2699), size=939524096 (max 402653184), offset=0=0, pages 229376 (max 98304)
+--- OK, full size asked to read and enter internal cycle over 'iov_iter' iterator:
+(rw26.c:543:ll_direct_IO_impl()) count: 402653184(0x18000000), offset: 0
+(rw26.c:573:ll_direct_IO_impl()) result: 402653184, pages: 98304 
+
+all looks like iov_iter was advanced twice instead of once. And that is actually so:
+
+static ssize_t ll_get_user_pages(int rw, struct iov_iter *iter,
+                struct page ***pages, ssize_t *npages,
+                size_t maxsize)
+{
+#if defined(HAVE_DIO_ITER)
+    size_t start;
+    size_t result;    result = iov_iter_get_pages_alloc2(iter, pages, maxsize, &start);
+    if (result > 0)
+        *npages = DIV_ROUND_UP(result + start, PAGE_SIZE);    return result;
+#else
+
+we are using iov_iter_get_pages_alloc2() which does advance internally and then we call iov_iter_advance() once more. 
+
+All worked fine because of our compat code which is wrong:
+
+#ifndef HAVE_IOV_ITER_GET_PAGES_ALLOC2
+#define iov_iter_get_pages_alloc2(i, p, m, s) \
+    iov_iter_get_pages_alloc((i), (p), (m), (s))
+#endif
+
+it replaces advanced function with non-advaced one. And all worked because there were no HAVE_IOV_ITER_GET_PAGES_ALLOC2 defined
+
+in newer kernel it is defined and exists in kernel, so it is called and done iterator advance, so our code advances it twice.
+
+That causes all effect we saw including split read and zeroed region. 
+
+So out ll_direct_IO_impl() should be reworked to handle that properly
+
+--- Comment (gerrit, Thu, 3 Oct 2024 13:36:10 +0000) ---
+"Mikhail Pershin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/56574
+
+Subject: LU-18308 test: big DIO read test
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: cf5ae587919d69353a188ad7dfa2c319f9465eec

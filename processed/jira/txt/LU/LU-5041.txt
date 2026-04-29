@@ -1,0 +1,247 @@
+Key:        LU-5041
+Summary:    FID Prefetching
+Link:       https://jira.whamcloud.com/browse/LU-5041
+Type:       Improvement
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Alex Zhuravlev
+Reporter:   Brian Behlendorf
+Created:    Fri, 9 May 2014 23:12:22 +0000
+Updated:    Tue, 25 Feb 2020 19:12:25 +0000
+Labels:     performance, zfs
+Links:      Blocker: is blocking LU-2600
+
+--- Description ---
+When our ZFS OSTs are heavily loaded we still can see the following console warning.  Long ago we improved things such that this doesn't cause failures but it can limit create performance when there are a small number of OSTs in the filesystem.
+
+2014-05-09 14:05:48 Lustre: lcz-OST0000: Slow creates, 4736/5120 objects created at a rate of 94/s
+2014-05-09 14:05:48 Lustre: Skipped 5 previous similar messages
+
+Recently I had a idea on how we might be able to fairly easily improve performance for precreate RPCs.  One of the major reasons the creates can take a long time is because ofd_precreate_objects() calls ofd_object_find() serially to create the objects.  The ofd_object_find() will result in at least one ZAP lookup and there's a decent chance that means performing a synchronous IO to disk.  That alone will be slow but if the disk is already 100% utilized it can be very slow.
+
+What occurred to me is that for the precreate case prefetching the objects we're about to do ofd_object_find()'s on should be very effective.  A prefetch pass which called ofd_object_prefetch() prior to ofd_object_find() would allow us to effectively read all the needed ZAP blocks as quickly as possible.  The subsequent ofd_object_find() calls would then have a good chance of being cache hits.
+
+I'm proposing adding the following zap_prefetch() interface to ZFS to do what we need.  Presumably this is something the ldiskfs OSD could optionally take advantage of as well.  Obviously we'd still need to add a reasonable interface on the Lustre side.
+
+https://github.com/zfsonlinux/zfs/pull/2318
+
+Anyway, I wanted to file this to get your guys feedback and so I don't forget.  It should be a pretty a straight forward improvement.  It's also something I could see us making use of elsewhere in the code.  As soon as we're aware of a FID we many need to lookup we could issue the prefetch which is entirely asynchronous.
+
+--- Comment (ofaaland, Tue, 25 Feb 2020 19:12:25 +0000) ---
+zap_prefetch() is in zfs-0.7.0.  I haven't looked at our systems to see if there are still cases this would improve.
+
+--- Comment (bzzz, Wed, 14 Oct 2015 20:57:32 +0000) ---
+Brian, any plans to add zap_prefetch() ?
+
+--- Comment (gerrit, Wed, 14 Oct 2015 17:53:03 +0000) ---
+Alex Zhuravlev (alexey.zhuravlev@intel.com) uploaded a new patch: http://review.whamcloud.com/16825
+
+Subject: LU-5041 ofd: precreate to use LOC_F_NEW
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 921c54173352acc017663b3dfe31d627d3f8171e
+
+--- Comment (adilger, Fri, 14 Aug 2015 23:35:44 +0000) ---
+Alex, any chance to look at this since last year?  It seems like a relatively straight forward optimization.
+
+--- Comment (pjones, Mon, 20 Jul 2015 21:43:18 +0000) ---
+A change tracked under this ticket landed for 2.6. Are there plans for further work? If so, does it make sense to track it under a new ticket and mark this one as resolved in 2.6?
+
+--- Comment (behlendorf, Tue, 22 Jul 2014 22:35:10 +0000) ---
+My expectation is this would significantly improve performance.  I'd love to see numbers.
+
+--- Comment (bzzz, Tue, 22 Jul 2014 04:48:01 +0000) ---
+The rough plan would be:
+
+	osd-zfs:
+	
+		osd_object_init() to recognize  LOC_F_NEW, skip OI lookup and call zap_prefetch() instead
+
+		osd_object_create() to recognize -EEXIST when trying to add FID to OI and properly cleanup (remove just created object, etc)
+
+	
+	
+
+	osd-ldiskfs:
+	
+		osd_object_create() and osd_object_ea_create() to recognize -EEXIST when trying to add FID to OI and properly cleanup
+
+	
+	
+
+	OFD:
+	
+		ofd_precreate_objects() to lookup objects with LOC_F_NEW
+
+		ofd_precreate_objects() to ignore -EEXIST returned by dt_create()
+
+	
+	
+
+I think Fan Yong should review the idea, especially possible interaction with LFSCK.
+
+--- Comment (bzzz, Mon, 7 Jul 2014 10:34:38 +0000) ---
+> The ZAP interfaces don't allow duplicates so you're guaranteed that zap_add() will return EEXIST for keys which already exist.
+
+great to have this in place. thanks Brian.
+
+--- Comment (behlendorf, Wed, 2 Jul 2014 23:34:19 +0000) ---
+That sounds like a promising idea.  The function zap_prefetch_uint64() can be used in osd_object_init() to pull in the needed ZAP leaf blocks in to the ARC.  Then a subsequent zap_lookup() in osd_object_create() would have a much highly likelyhood of being all cache hits.  The ZAP interfaces don't allow duplicates so you're guaranteed that zap_add() will return EEXIST for keys which already exist.
+
+--- Comment (bzzz, Mon, 23 Jun 2014 04:56:29 +0000) ---
+sorry, I'm still thinking of an alternative.. there is LOC_F_NEW, which is to tell OSD we'll be creating a new object which is not supposed to be a part of OI. probably we could re-use that in OFD. the logic would be: osd_object_init() to recognize LOC_F_NEW and schedule prefetching, then in osd_object_create() ensure there is no entry for this FID (iirc, ZAP does not check for dups internally) and in case of an existing record, return -EEXIST. then we would have to change OFD slightly.
+
+--- Comment (behlendorf, Wed, 21 May 2014 18:16:11 +0000) ---
+> btw, can you tell how many objects that 8GB OI contains?
+
+Sure, I finally got a chance to grab this data.  Each OI on these OSTs is around 300M and since there are 32 of them by default they're taking up roughly 9.6G of space.  According to zdb the FatZAP I spot checked is 99.68% full.  That means in practice our hash function is distributing entries reasonably evenly and creating leaves for all the hash buckets.
+
+$ zdb zwicky-lcz-oss1/ost0 176
+Dataset zwicky-lcz-oss1/ost0 [ZPL], ID 42, cr_txg 203358, 5.68T, 90119750 objects
+
+    Object  lvl   iblk   dblk  dsize  lsize   %full  type
+       176    5     4K     4K   293M   308M   99.68  ZFS directory (K=inherit) (Z=inherit)
+                                        144   bonus  System attributes
+        dnode flags: USED_BYTES USERUSED_ACCOUNTED
+        dnode maxblkid: 78894
+        path    /O/0/d28
+        uid     0
+        gid     0
+        atime   Wed Dec 31 16:00:00 1969
+        mtime   Wed Dec 31 16:00:00 1969
+        ctime   Wed Dec 31 16:00:00 1969
+        crtime  Wed Jan 29 11:07:49 2014
+        gen     203409
+        mode    40755
+        size    2
+        parent  147
+        links   1
+        pflags  0
+        rdev    0x0000000000000000
+        Fat ZAP stats:
+                Pointer table:
+                        131072 elements
+                        zt_blk: 41321
+                        zt_numblks: 256
+                        zt_shift: 17
+                        zt_blks_copied: 0
+                        zt_nextblk: 0
+                ZAP entries: 2816619
+                Leaf blocks: 78383
+                Total blocks: 78895
+                zap_block_type: 0x8000000000000001
+                zap_magic: 0x2f52ab2ab
+                zap_salt: 0x53e3110e1
+                Leafs with 2^n pointers:
+                        0:  25712 ********************
+                        1:  52662 ****************************************
+                        2:      9 *
+                Blocks with n*5 entries:
+                        3:     85 *
+                        4:   3770 *********
+                        5:  17189 ****************************************
+                        6:  16997 ****************************************
+                        7:  13789 *********************************
+                        8:  11017 **************************
+                        9:  15536 *************************************
+                Blocks n/10 full:
+                        4:    523 *
+                        5:  12502 ********************
+                        6:  25016 ****************************************
+                        7:  16113 **************************
+                        8:  12995 *********************
+                        9:  11234 ******************
+                Entries with n chunks:
+                        3: 2816619 ****************************************
+                Buckets with n entries:
+                        0: 7509739 ****************************************
+                        1: 2246872 ************
+                        2: 260020 **
+                        3:  15873 *
+                        4:    512 *
+                        5:      8 *
+
+What this doesn't show is how many of those leaves still have entries.  You can get this information with zdb but for large FatZAPs it can take a long time to run.  But since there are 90,151,035 objects on this OST and 32 OIs it's probably fair to say each OI has roughly 2,817,219 entries.
+
+One thing worth mentioning is tgat FatZAPs in ZFS currently don't contain any code to allow them to be collapsed as entries are removed.  They'll expand to accommodate the worse case usage ever observed.  This could  and should be done but thus far we haven't gotten to it, see http://open-zfs.org/wiki/Projects#Lustre_feature_ideas.
+
+So because 1) entries are hashed evenly and 2)  the FatZAPs only expand and 3) the OIs are pushed out of the ARC we've observed that every FID lookup is likely to result in an IO to fetch the ZAP block.  This seems to be perhaps the biggest drag on performance.  If lu_obejct_find() could be made IO-less I'd expect that to help considerably.
+
+--- Comment (behlendorf, Wed, 21 May 2014 00:01:51 +0000) ---
+>  concurrent threads.. why is this serialized now?
+
+It seems like we've found a few cases recently where certain things are serialized during the server mount operation.  For example, the lock replay in LU-5042 is done serially in the target_recv thread.  We also have an open issue where llog handling is done serially in the mount.  In both cases performance is pretty clearly being limited by the fact that all the read operations are being done sequentially from a single thread and the disk IOPs are being under utilized.  I'd expect prefetching would significantly improve performance because we'd be able to saturate the disk and get an excellent cache hit rate.
+
+Potentially another way to take advantage of an ofd_fid_prefetch() function would be immediately start the prefetch when an RPC arrives in the pending queue.  This way once a service thread is available to handle it there's a very good chance the needed blocks are already cached.
+
+I suspect that if we did have such an interface available we'd find plenty of ways to make use of it.
+
+Related to all of this I've proposed a trivial patch which prefetchs the dnode as part of a FID lookup on ZFS.  This is exactly analogous to what ZFS currently does in zfs_readdir() when filling in a directory page.  Unfortunately, I haven't had a chance to get a performance results yet.
+
+http://review.whamcloud.com/10395
+
+>  and the bigger OI the less changes to the same block within a txg..
+
+Yes, exactly.  What we've seen in practice is that the hashing is very uniform.  Your almost guaranteed to be modifying a different block for every entry you want to to add to the ZAP.  And if those OI blocks aren't already cached your going to have to read each of them in which is very expensive.
+
+--- Comment (bzzz, Mon, 19 May 2014 18:54:21 +0000) ---
+yet another option we were discussing for DNE2 is to make lu_obejct_find() "I/O-less" - so that it does instantiate all the slices, but doesn't lookup in OI and doesn't set LOHA_EXISTS, then ->do_attr_get() and similar methods would do OI lookup (only once), fetch attributes and set EXISTS, if needed. this would allow to batch remote accesses and save RPC(s). but also it could be used to implement your schema with ZAP prefetching.
+
+--- Comment (bzzz, Mon, 12 May 2014 19:40:36 +0000) ---
+btw, can you tell how many objects that 8GB OI contains?
+
+--- Comment (bzzz, Mon, 12 May 2014 19:38:54 +0000) ---
+IMHO, the issue with prefetch interface is that its applicability is very limited. at the moment I don't see many example at least, except this very specific batched precreation.
+
+not sure I got your thought on the concurrent threads.. why is this serialized now?
+
+yet another option I was considering in the past is to use ZAP_FLAG_UINT64_KEY on specific OIs. given id (the key) is growing monotonically (at least in the current precreation schema) we'd have to modify the same block many times and then switch to another one? with current hashing we have to modify many blocks because the keys tend to distribute evenly? and the bigger OI the less changes to the same block within a txg..
+
+in the long term, I'd think the good (and complex) solution is to modify as less block as possible (using proper hash) and on read access use a cookie, which is an opaque for every layer except OSD, but it's returned to the client and the client supplies it back along with FID. optimistically OSD tries to use that cookie (which is dnode#) and check with LMA it matches the FID. in case FID->dnode# has changed for a reason we'd go through OI.
+
+--- Comment (behlendorf, Mon, 12 May 2014 19:24:33 +0000) ---
+> well, for precreate we were considering slightly different approach where a thread on OST is doing precreation on its own before precreate request.
+
+This would probably work too.  Although I doesn't seem as flexible or powerful as a generic prefetch interface.
+
+> now let's consider the idea where we do not precreate objects ahead, but instead create them on demand (e.g. at write).
+
+Prefetching of course won't help the on demand case.  But at least here there could be a large number of concurrent threads so not everything will end up serialized.  That should mitigate things somewhat.
+
+> why can't we have the most of OI cached? or at least amortize reads by I/O size?
+
+Ideally we do want to have most (or all) of the OI cached.  That's a happy place for performance, but we can't count on that.  For example, the on-disk OI size for one of our existing ZFS OSTs is around 8G.  That's an awful lot to keep cached all the time, so if there is memory pressure the ZFS ARC is only going to keep around those ZAP blocks which are most frequently accessed.  And even if you assume the full OI can be cached there's still going to be a warm up time to read it all in.  I thought about making a little patch to read in all the OIs as part of initialization but that's just at best a workaround and not a great long term solution.
+
+--- Comment (bzzz, Mon, 12 May 2014 19:05:46 +0000) ---
+well, for precreate we were considering slightly different approach where a thread on OST is doing precreation on its own before precreate request. so that by the time precreate request comes we have the objects ready.
+
+now let's consider the idea where we do not precreate objects ahead, but instead create them on demand (e.g. at write). osd_fid_prefetch() won't help much in this case, I guess.
+
+why can't we have the most of OI cached? or at least amortize reads by I/O size?
+
+--- Comment (behlendorf, Mon, 12 May 2014 18:45:35 +0000) ---
+For example, in the precreate case we know in advance exactly what all the FIDs are going to be.  I suspect it would be hugely beneficial if prior to doing the first osd_fid_lookup() we called an osd_fid_prefetch() for all of those FIDs.  This would allow ZFS to schedule the required IO in the most effecient way for the disk.  This might also be useful to generically speed up RPC handling.  If early in the RPC handling process the relevant FIDs were known they could be prefetched to make cache hits much more likely.
+
+--- Comment (bzzz, Mon, 12 May 2014 18:28:05 +0000) ---
+much earlier? can you explain more please?
+
+--- Comment (behlendorf, Mon, 12 May 2014 18:24:27 +0000) ---
+Alex I'll give that a try.  It doesn't provide us that much advance warning but it may still be helpful.  What do you think about provide a more generic asynchronous interface which could be called much earlier.
+
+--- Comment (bzzz, Mon, 12 May 2014 06:10:24 +0000) ---
+Brian, this should be relatively easy to try and no big changes to Lustre are required - something like osd_get_idx_for_ost_obj() could call zap_prefetch(). readdir() in ldiskfs actually schedules few subsequent reads ahead. probably ZAP could do something internally as well. though again, I'm not against calling zap_prefetch() from OSD - it's just not very clear do we need to call it on every lookup or skip on some..
+
+--- Comment (pjones, Sat, 10 May 2014 14:24:12 +0000) ---
+Alex
+
+Could you please comment?
+
+Thanks
+
+Peter

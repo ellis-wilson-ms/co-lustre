@@ -1,0 +1,121 @@
+Key:        LU-3020
+Summary:    Lustre returns EINTR during writes when SA_RESTART is set
+Link:       https://jira.whamcloud.com/browse/LU-3020
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Keith Mannthey
+Reporter:   Patrick Farrell
+Created:    Fri, 22 Mar 2013 20:53:24 +0000
+Updated:    Sun, 14 Aug 2016 09:59:40 +0000
+Resolved:   Tue, 23 Apr 2013 13:11:17 +0000
+Labels:     patch
+Links:      Related: is related to  LU-8494; Related: is related to LU-3433; Related: is related to LU-3581
+Attachments: iotest.c
+
+--- Description ---
+Lustre is returning EINTR when it should probably be returning ERESTARTSYS.
+
+The POSIX spec specifies that write system calls must react as follows to signals:
+
+If a signal arrives before any data is written, the return is -1 and ERRNO is -EINTR.
+
+If a signal arrives when some data has been written, the return is the amount of data written.
+
+When SA_RESTART is set, the write call should retry until it completes, and should not return EINTR.
+
+As I understand it, this is usually handled by returning ERESTARTSYS instead of EINTR - When this is returned, the kernel checks for SA_RESTART on the handler, if any.  If SA_RESTART is set, ERESTARTSYS is left alone and the system call is restarted.  If SA_RESTART is not set, ERESTARTSYS is changed to EINTR.  (See handle_signal in /arch/x86/kernel/signal.c)
+
+When using the attached reproducer, we consistently see -EINTR returned from cl_lock_state_wait in lustre/obdclass/cl_lock.c.  (In brief, the reproducer spawns a child, then starts a series of looped writes in the parent while the child sends SIGALRMS to the parent.  Once a write fails with EINTR, the parent and child print out and exit.)
+
+Turning on full tracing will let you see this return value (-4) coming from cl_lock_state_wait in the logs.  (I can attach logs if requested.)
+
+Moving on to implications and possible fixes:
+
+The norm in most file system code appears to be to return ERESTARTSYS, except where a system call specifically cannot be restarted.  This snippet is from /fs/aio.c in the kernel:
+
+—
+
+/*
+
+	There's no easy way to restart the syscall since other AIO's
+
+	may be already running. Just fail this IO with EINTR.
+
+*/
+
+if (unlikely(ret == -ERESTARTSYS || ret == -ERESTARTNOINTR ||
+
+                             ret == -ERESTARTNOHAND || ret == -ERESTART_RESTARTBLOCK))
+
+                        ret = -EINTR;
+
+—
+
+However, a quick search through the Lustre code shows Lustre returns EINTR far more often than ERESTARTSYS.  This is presumably because Lustre is more complex and therefore less restartable than most file systems.
+
+I've made a patch I'll be submitting shortly which changes this specific instance of EINTR to ERESTARTSYS.  Some simple testing shows it fixes the problem described above and does not appear to cause other issues.
+
+I'll add a link to that patch here once it's submitted.
+
+One other note.  This problem occurs at exactly the same location during read system calls.  The same patch appears to resolve it.
+
+Two questions:
+
+1) Is it most likely OK to return ERESTARTSYS at this particular location (cl_lock_state_wait)?  IE, can sys calls be safely restarted from here?
+
+2) The reproducer is a contrived test case, but the actual application that revealed this issue sends SIGALRM periodically during its normal operation.  We're concerned about the general reaction of Lustre to SIGALRM when a handler is set and whether or not we'll fix this spot, but see the problem return from another location.
+
+--- Comment (pjones, Tue, 23 Apr 2013 13:11:17 +0000) ---
+Landed for 2.4
+
+--- Comment (spitzcor, Fri, 19 Apr 2013 20:45:42 +0000) ---
+Can this land now?  Or must we wait until after b2_4 is branched?
+
+--- Comment (paf, Mon, 25 Mar 2013 14:34:29 +0000) ---
+Updates from the patch review:
+
+Failed test54c.  I'm not sure if that's related to my patch or not, but I noticed a problem with the patch in any case.
+
+This is my review comment.  I've pushed a patch with the new code below as of a few minutes ago.
+
+—
+
+Upon further reflection, I'm wondering about something in the block of code I modified: If the if statement is not entered, then ERESTARTSYS will be returned.
+
+Here's the current (modified) code:
+
+—
+
+result = -ERESTARTSYS;
+if (likely(!OBD_FAIL_CHECK(OBD_FAIL_LOCK_STATE_WAIT_INTR))) {
+    cfs_waitq_wait(&waiter, CFS_TASK_INTERRUPTIBLE);
+    if (!cfs_signal_pending())
+        result = 0;
+}
+
+—
+
+I'm wondering if this might not be better, since we only want to return ERESTARTSYS when a signal is involved.. (Since ERESTARTSYS should never be returned to user space, and is processed by the signal handling code in the kernel [whether or not a user handler is set]):
+
+—
+
+result = -EINTR;
+if (likely(!OBD_FAIL_CHECK(OBD_FAIL_LOCK_STATE_WAIT_INTR))) {
+    cfs_waitq_wait(&waiter, CFS_TASK_INTERRUPTIBLE);
+    if (!cfs_signal_pending()) {
+        result = 0;
+    }
+    else {
+        /* Returning ERESTARTSYS if a signal is found so
+        * system calls can be restarted if the signal handler
+        * calls for it. */
+        result = -ERESTARTSYS;
+    }
+}
+
+—
+
+--- Comment (paf, Fri, 22 Mar 2013 21:06:31 +0000) ---
+http://review.whamcloud.com/#change,5814

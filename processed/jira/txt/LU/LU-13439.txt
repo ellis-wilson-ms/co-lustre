@@ -1,0 +1,139 @@
+Key:        LU-13439
+Summary:    DNE3: MDT QOS tuning to avoid full MDTs completely
+Link:       https://jira.whamcloud.com/browse/LU-13439
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Lai Siyao
+Reporter:   Andreas Dilger
+Created:    Wed, 8 Apr 2020 21:29:17 +0000
+Updated:    Sun, 29 May 2022 14:30:25 +0000
+Resolved:   Wed, 5 May 2021 12:58:40 +0000
+Labels:     dne3
+Links:      Related: is related to  LU-13417; Related: is related to  LU-15850; Related: is related to LU-14762; Related: is related to LU-13440
+
+--- Description ---
+Testing for LU-13417 showed that "lfs setdirstripe -D -c 1 -i -1 /mnt/testfs" now caused subdirectories to be created on different MDTs when the qos_threshold_rr was reduced.  However, there were still errors hit when one MDT ran out of space, when there are free inodes (and also reported multiple kernel errors).  For mkdir this is a real problem because each directory needs at least one block, so the QOS code should completely avoid selection of MDTs with little free space (e.g. below 5% of the average MDT free space).
+
+# lfs df
+UUID                   1K-blocks        Used   Available Use% Mounted on
+testfs-MDT0000_UUID       125368        9508      104624   9% /mnt/testfs[MDT:0]
+testfs-MDT0001_UUID       125368       93560       20572  82% /mnt/testfs[MDT:1]
+
+# lfs df -i
+UUID                      Inodes       IUsed       IFree IUse% Mounted on
+testfs-MDT0000_UUID       100000       20295       79705  21% /mnt/testfs[MDT:0]
+testfs-MDT0001_UUID       100000       40580       59420  41% /mnt/testfs[MDT:1]
+
+# ./createmany -d /mnt/testfs/dir 1000
+total: 1000 mkdir in 0.57 seconds: 1768.49 ops/second
+[root@centos7 tests]# lfs getdirstripe -m /mnt/testfs/dir* | sort | uniq -c
+    871 0
+    129 1
+
+# ./createmany -d /mnt/testfs/dsub/d 1000
+total: 1000 mkdir in 1.64 seconds: 608.97 ops/second
+# lfs getdirstripe -m /mnt/testfs/dsub/d[0-9]* | sort | uniq -c
+    860 0
+    140 1
+
+These showed a reasonable distribution of directories, over 85% of directories going to MDT0000.
+
+However, when creating more directories the space balance doesn't change very much:
+
+# ./createmany -d /mnt/testfs/dsub/d 1000 9000
+ - mkdir 5742 (time 1586376135.48 total 10.00 last 574.16)
+mkdir(/mnt/testfs/dsub/d9621) error: No space left on device
+total: 8621 mkdir in 15.30 seconds: 563.46 ops/second
+# lfs df
+UUID                   1K-blocks        Used   Available Use% Mounted on
+testfs-MDT0000_UUID       125368       48572       65560  43% /mnt/testfs[MDT:0]
+testfs-MDT0001_UUID       125368      125368           0 100% /mnt/testfs[MDT:1]
+
+# lfs df -i
+UUID                      Inodes       IUsed       IFree IUse% Mounted on
+testfs-MDT0000_UUID       100000       29764       70236  30% /mnt/testfs[MDT:0]
+testfs-MDT0001_UUID       100000       50330       49670  51% /mnt/testfs[MDT:1]
+
+This shows that the mkdir is failing with -ENOSPC in the "-i -1" directory even though MDT0000 is still having a lot of free blocks and space.  Checking the distribution of files that were created show that the distribution didn't change very much:
+
+# lfs getdirstripe -m /mnt/testfs/dsub/d1[0-9][0-9][0-9] | sort | uniq -c
+    891 0
+    109 1
+# lfs getdirstripe -m /mnt/testfs/dsub/d2[0-9][0-9][0-9] | sort | uniq -c
+    882 0
+    118 1
+# lfs getdirstripe -m /mnt/testfs/dsub/d3[0-9][0-9][0-9] | sort | uniq -c
+    887 0
+    113 1
+# lfs getdirstripe -m /mnt/testfs/dsub/d4[0-9][0-9][0-9] | sort | uniq -c
+    881 0
+    119 1
+# lfs getdirstripe -m /mnt/testfs/dsub/d5[0-9][0-9][0-9] | sort | uniq -c
+    884 0
+    116 1
+# lfs getdirstripe -m /mnt/testfs/dsub/d6[0-9][0-9][0-9] | sort | uniq -c
+    862 0
+    138 1
+# lfs getdirstripe -m /mnt/testfs/dsub/d7[0-9][0-9][0-9] | sort | uniq -c
+    884 0
+    116 1
+# lfs getdirstripe -m /mnt/testfs/dsub/d8[0-9][0-9][0-9] | sort | uniq -c
+    886 0
+    114 1
+# lfs getdirstripe -m /mnt/testfs/dsub/d9[0-9][0-9][0-9] | sort | uniq -c
+    554 0
+     67 1
+
+I figure that this may be related to the "qos_maxage=60" on the client causing it not to get a new space update while "createmany -d" is running, and the relatively small amount of space on the MDTs.  However, even if I waited a long time it is not allowing files to create on the empty MDT:
+
+# ./createmany -d /mnt/testfs/dsub/d 10000 1000
+mkdir(/mnt/testfs/dsub/d10001) error: No space left on device
+total: 1 mkdir in 0.01 seconds: 104.60 ops/second
+
+I think two improvements are needed:
+
+	the QOS code should avoid allocating on an MDT before it becomes too full.  We should limit the space/inode used to minimum ~10% of the average free space across all MDTs.  This will avoid hitting -ENOSPC during creation, either from the directory or the llogs.  Since directories take space, we should consider either free blocks or inodes much lower than average as a reason not to use the MDT.
+
+	the default "qos_threshold_rr=17%" is too high to start balancing directory creation across MDTs. This might mean that a large MDT0000 is used for many millions of files and top-level directories before any balancing is even started. At that point it will be harder to return the balance of the MDTs because so many top-level directories and subdirectories have been created on MDT0000. I think it would be better to have a smaller "qos_threshold_rr=5%" or "=10%" by default, to avoid the MDTs becoming too imbalanced before starting QOS.
+
+--- Comment (pjones, Wed, 5 May 2021 12:58:40 +0000) ---
+Landed for 2.15
+
+--- Comment (gerrit, Wed, 5 May 2021 02:52:22 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/43445/
+
+Subject: LU-13439 lmv: qos stay on current MDT if less full
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 3f6fc483013da443b1494d81efe2d271ac67f901
+
+--- Comment (gerrit, Sun, 25 Apr 2021 11:03:16 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/43445
+
+Subject: LU-13439 lmv: qos stay on current MDT if less full
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: d656423a0b640d9427693efa7c16c26ed6d9ea9a
+
+--- Comment (adilger, Thu, 22 Apr 2021 03:02:52 +0000) ---
+Lai, I had an idea about this that I think will help a lot. For the DNE auto-remote directory creation (-i -1 -c 1) it should only create a remote subdirectory if the MDT of the parent directory is more full than other MDTs (e.g. parent MDT has less than the average free space/inodes of other MDTs). It doesn't make sense to "space balance" a subdirectory if the parent is already on an MDT that is less full than other MDTs. 
+
+This will also help reduce the number of remote subdirectories that are created.
+
+--- Comment (adilger, Sat, 9 May 2020 10:51:14 +0000) ---
+The patch in LU-13417 should address the "qos_threshold_rr" issue.  It should be noted that setting "-D -c 1 -i -1" on 2.13 and later will round-robin subdirectories across all MDTs if they are evenly balanced (e.g. at format time) and will use QOS to balance across MDTs if their free space threshold exceeds qos_threshold_rr.
+
+--- Comment (adilger, Wed, 8 Apr 2020 21:44:10 +0000) ---
+I think the other change needed to make the MDT balancing work better is to make remote directory creation much more aggressive in the "ROOT/" directory than the default "qos_threshold_rr".  That would allow the MDT space balancing to work better for high-level directories and new filesystems, and having a spread across MDTs at the top level reduces the need for a lot more lower-level remote directories.

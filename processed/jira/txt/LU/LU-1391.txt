@@ -1,0 +1,283 @@
+Key:        LU-1391
+Summary:    lov device is released while some osc devices are still remaining on a Client node
+Link:       https://jira.whamcloud.com/browse/LU-1391
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Duplicate
+Assignee:   Keith Mannthey
+Reporter:   Hiroya Nozaki
+Created:    Wed, 9 May 2012 08:56:30 +0000
+Updated:    Wed, 23 Jan 2013 14:17:50 +0000
+Resolved:   Wed, 23 Jan 2013 14:17:50 +0000
+Labels:     patch
+Links:      Duplicate: duplicates LU-1291
+Attachments: proto_lustre-1.8.7-wc1_LU1391.diff
+
+--- Environment ---
+Fujitsu customized Lustre base on Lustre-1.8.5 
+
+MDSx1, OSSx1 (OSTx3), Clientx1
+
+--- Description ---
+The problem happened with Fujitsu customized Lustre, named FEFS. But after reading the source code of Lustre-1.8.7-wc1, I found that the same problem can happen in Lustre-1.8.7-wc1 environment. Then, I reported it in wc-discuss and I was recommended by Oreg to report it. So I created the ticket here... anyway, below is the problem.
+
+After mount.lustre command is executed on a client node, ptlrpcd-recov thread activate the import objects of OSC. Then, in the middle of this way, osc_import_event() is called and it calls obd_notify_observer() like below.
+
+static int osc_import_event(struct obd_device *obd,
+                            struct obd_import *imp,
+                            enum obd_import_event event)
+{
+        ...
+        case IMP_EVENT_ACTIVE: {
+                /* Only do this on the MDS OSC's */
+                if (imp->imp_server_timeout) {
+                        struct osc_creator *oscc = &obd->u.cli.cl_oscc;
+
+                        spin_lock(&oscc->oscc_lock);
+                        oscc->oscc_flags &= ~OSCC_FLAG_NOSPC;
+                        spin_unlock(&oscc->oscc_lock);
+                }
+                CDEBUG(D_INFO, "notify server \n");
+                rc = obd_notify_observer(obd, obd, OBD_NOTIFY_ACTIVE,NULL);
+                break;
+        }
+        ...
+
+}
+
+static inline int obd_notify_observer(struct obd_device *observer,
+                                      struct obd_device *observed,
+                                      enum obd_notify_event ev, void *data)
+{
+        int rc1;
+        int rc2;
+
+        struct obd_notify_upcall *onu;
+
+        if (observer->obd_observer)
+                rc1 = obd_notify(observer->obd_observer, observed, ev,data);
+        else
+                rc1 = 0;
+        /*
+         * Also, call non-obd listener, if any
+         */
+        onu = &observer->obd_upcall;
+        if (onu->onu_upcall != NULL)
+                rc2 = onu->onu_upcall(observer, observed, ev, onu->onu_owner);
+
+        else
+                rc2 = 0;
+        return rc1 ?: rc2;
+ } 
+
+obd_notify_observer() calls obd_notify() with "observer->obd_observer", this must be a LOV object when the argument of "observer" is a OSC object. And then, lov_notify() works with the "observer->obd_observer". But, as you can see, obd_putref(), class_incref() and something like these have never been called to pin the "observer->obd_observer", lov object. and it's the same even when obd_observer is registered.
+
+As a result, the "observer->obd_observer" can be released in the middile of its execution, for example, when umount is executed in just the execution. Then, it will cause OS panic. Actually, I've already succeeded to cause the same problem in purpose with the example, althought it's so rare case in real user operations.
+
+Here is the call stack of 
+
+PID: 17084  TASK: ffff81063fb770c0  CPU: 10  COMMAND: "umount"
+ #0 [ffff810594801640] crash_kexec at ffffffff800aeb6b
+ #1 [ffff810594801700] __die at ffffffff80066157
+ #2 [ffff810594801740] die at ffffffff8006cce5
+ #3 [ffff810594801770] do_general_protection at ffffffff8006659f
+ #4 [ffff8105948017b0] error_exit at ffffffff8005ede9
+    [exception RIP: osc_import_event+635]
+    RIP: ffffffff8889a37b  RSP: ffff810594801868  RFLAGS: 00010202
+    RAX: 0000000000000001  RBX: ffff8105974b23b8  RCX: 0000000000000000
+    RDX: 5a5a5a5a5a5a5a5a  RSI: ffff81061222a800  RDI: ffff810593930338
+    RBP: ffff810593930338   R8: ffff8105f4ab5000   R9: 00000000000000d8
+    R10: 00000000ffffffff  R11: 0000000000000000  R12: ffff81061222a800
+    R13: 0000000000000000  R14: ffff810c3e8f3200  R15: ffff8105939303b8
+    ORIG_RAX: ffffffffffffffff  CS: 0010  SS: 0018
+ #5 [ffff8105948018c0] ptlrpc_deactivate_and_unlock_import at ffffffff887bdd06
+ #6 [ffff810594801900] ptlrpc_invalidate_import at ffffffff887be31a
+ #7 [ffff8105948019b0] client_disconnect_export at ffffffff8875b811
+ #8 [ffff810594801a20] osc_disconnect at ffffffff88892588
+ #9 [ffff810594801a70] class_disconnect_export_list at ffffffff886a1c51
+#10 [ffff810594801ad0] class_disconnect_exports at ffffffff886a47bf
+#11 [ffff810594801b30] class_cleanup at ffffffff886ba1fc
+#12 [ffff810594801c20] class_process_config at ffffffff886be77c
+#13 [ffff810594801ca0] class_manual_cleanup at ffffffff886c0544
+#14 [ffff810594801d90] ll_put_super at ffffffff88a6271c
+#15 [ffff810594801e60] generic_shutdown_super at ffffffff800e4bc0
+#16 [ffff810594801e80] kill_anon_super at ffffffff800e4c90
+#17 [ffff810594801e90] deactivate_super at ffffffff800e4d41
+#18 [ffff810594801eb0] sys_umount at ffffffff800ee830
+#19 [ffff810594801f80] system_call at ffffffff8005e116
+    RIP: 000000394bad3dd7  RSP: 00007fffef2dfc28  RFLAGS: 00010246
+    RAX: 00000000000000a6  RBX: ffffffff8005e116  RCX: 00000000004068df
+    RDX: 0000000000000000  RSI: 0000000000000000  RDI: 0000000016df0060
+    RBP: 0000000016df0030   R8: 0000000000000000   R9: 0000000000000000
+    R10: 0000000000000000  R11: 0000000000000246  R12: 00007fffef2e0138
+    R13: 0000000016df0060  R14: 0000000016df00c0  R15: 0000000016def530
+    ORIG_RAX: 00000000000000a6  CS: 0033  SS: 002b
+
+PID: 16786  TASK: ffff810c34d207a0  CPU: 4   COMMAND: "ptlrpcd-recov"
+ #0 [ffff81065522ef20] crash_nmi_callback at ffffffff8007bf44
+ #1 [ffff81065522ef40] do_nmi at ffffffff8006688a
+ #2 [ffff81065522ef50] nmi at ffffffff80065eef
+    [exception RIP: lov_notify+1102]
+    RIP: ffffffff889d08ee  RSP: ffff81059beddbb0  RFLAGS: 00000216
+    RAX: 00000000095202b9  RBX: 0017c04c001be959  RCX: 00000005490682ff
+    RDX: 0017c04e00000000  RSI: 0000000000000206  RDI: ffff810592268200
+    RBP: ffff810598eb22b8   R8: 0000000000000032   R9: 0000000000000020
+    R10: 000000000000001a  R11: 0000000000000000  R12: ffff8105974b2820
+    R13: ffff8105974b23b8  R14: ffff810c3fecd800  R15: ffff810598eb2738
+    ORIG_RAX: ffffffffffffffff  CS: 0010  SS: 0018
+---  ---
+ #3 [ffff81059beddbb0] lov_notify at ffffffff889d08ee
+ #4 [ffff81059beddc48] osc_import_event at ffffffff8889a83c
+ #5 [ffff81059beddca8] ptlrpc_activate_import at ffffffff887bcb25
+ #6 [ffff81059beddce8] ptlrpc_connect_interpret at ffffffff887bf30f
+ #7 [ffff81059bedddb8] ptlrpc_check_set at ffffffff88786ab6
+ #8 [ffff81059bedde68] ptlrpcd_check at ffffffff887c1add
+ #9 [ffff81059beddeb8] ptlrpcd at ffffffff887c2421
+#10 [ffff81059beddf48] kernel_thread at ffffffff8005efb1
+
+As you can see. The RDX's of the umounts shown above refers to bad memory, 0x5a5a5a5a5a5a5a5a. And looking to "obd_devs" shown below indicates that MDS and LOV have been already wiped out at that time. These remaining are MGC and three OSCs, by the way. 
+
+obd_devs = $2 =
+ {0xffff810c348d40b8, 0x0, 0x0, 0xffff810593930338, 0xffff810598eb22b8, 0xffff8105df0b43f8, 0x0, 0x0, 0x0, ... }
+
+I've tried to fix the problem with some ideas like below. But all of them could n't work. 
+
+1) Add obd_gutref() in obd_register_obserever(), and create a new func, obd_unregister_observer() which calls obd_putref() and substitutes NULL to obd_observer.- This is invalid to the problem of releasing LOV obd_device prior to OSCs. Because obd_refcount reaches zero before lov_refcount reaches zero 
+
+2) Add class_incref()/class_decref() just before/after obd_getref()/obd_putref() in obd_register_observer()
+
+	This works to the problem of LOV releasing, but it causes a weird phenomenon, LOV remains but MDS is released.
+
+	And, then, I realized that obd_unregister_observer(), or obd_register_observer() with the second argument NULL in Lustre-1.8.7-wc1, is never called until lov_refcount reaches zero. and it's the same in the No1 case.
+
+3) managing MDS's and LOV's obd_refcounts in the kernel side of mount/umount causes a releasing MGC prior to MDS and LOV. then, I gave up today.
+
+I'm really seeking the idea to fix the problem. So could someone help me with it ??
+
+thank you.
+
+--- Comment (keith, Wed, 23 Jan 2013 14:17:50 +0000) ---
+This is a dup of LU-2591
+
+--- Comment (nozaki, Mon, 14 Jan 2013 19:54:26 +0000) ---
+Nice to meet you, Keith.
+
+Now I realized that I had misunderstood the root ot this problem, I mean this is a bad way to fix the problem. 
+
+I'm sorry but could you please visit LU-2591 and review the patch? I believe that the patch of LU-2591 can fix this problem in a right way.
+
+And, I'm sorry again, please close this ticket as a duplicate of LU-2591.
+
+Thank you.
+
+--- Comment (keith, Thu, 29 Nov 2012 19:04:44 +0000) ---
+Hiroya Nozaki, 
+
+  Sorry this patch and lu were overlooked for some time.  I have re-submitted it for testing.  As you know 1.8 is in more of a maintenance mode at this time.
+
+--- Comment (nozaki, Fri, 22 Jun 2012 02:46:14 +0000) ---
+I'm afraid to say that, but could someone review the patch ?
+
+This patch have been applied to K-computer a month ago, so I think it works well.
+
+--- Comment (nozaki, Thu, 17 May 2012 04:45:18 +0000) ---
+I created and uploaded the patch here 
+
+http://review.whamcloud.com/#change,2822
+
+Now what I have to do is to wait for auto-test result and getting the patch reviewed?
+
+Or Should I choose reviewer almost randomly in the Gerrit page??
+
+--- Comment (nozaki, Fri, 11 May 2012 11:12:30 +0000) ---
+Wow, that's kind of you.
+
+OK, then, I'll try it next Monday because I'm already home and don't have the code and any way to access my company's WAN ...
+
+anyway, thanks indeed.
+
+--- Comment (pjones, Fri, 11 May 2012 09:39:22 +0000) ---
+Hi there
+
+If you would like your patch to be reviewed, please upload it into gerrit rather than attach it to a ticket. Details are here http://wiki.whamcloud.com/display/PUB/Submitting+Changes
+
+Thanks
+
+Peter
+
+--- Comment (nozaki, Fri, 11 May 2012 08:51:44 +0000) ---
+the patch might not be so difficult for you all. so I think it's enough only to explain the below part.
+
+diff -rup lustre-1.8.7/lustre/ldlm/ldlm_lib.c lustre-1.8.7_custom/lustre/ldlm/ldlm_lib.c
+--- lustre-1.8.7/lustre/ldlm/ldlm_lib.c	2012-05-11 21:05:58.245037954 +0900
++++ lustre-1.8.7_custom/lustre/ldlm/ldlm_lib.c	2012-05-11 20:57:26.378944431 +0900
+@@ -464,6 +464,9 @@ int client_disconnect_export(struct obd_
+         cli = &obd->u.cli;
+         imp = cli->cl_import;
+ 
++        if (obd->obd_observer) {
++                obd_getref(obd->obd_observer);
++        }
+         down_write(&cli->cl_sem);
+         CDEBUG(D_INFO, "disconnect %s - %d\n", obd->obd_name,
+                cli->cl_conn_count);
+@@ -519,6 +522,9 @@ int client_disconnect_export(struct obd_
+         if (!rc && err)
+                 rc = err;
+         up_write(&cli->cl_sem);
++        if (obd->obd_observer) {
++                obd_putref(obd->obd_observer);
++        }
+ 
+         RETURN(rc);
+ }
+
+the reason is to prevent the below case, I mean, double-calling osc_disconnect(). it's end in the deadlock of cli->cl_sem.
+
+PID: 9525   TASK: ffff8105e2170100  CPU: 3   COMMAND: "umount"
+ #0 [ffff810613013518] schedule at ffffffff80063f96
+ #1 [ffff8106130135f0] __down_write_nested at ffffffff80065613
+ #2 [ffff810613013630] client_disconnect_export at ffffffff8875b5a4
+ #3 [ffff8106130136a0] osc_disconnect at ffffffff88874588
+ #4 [ffff8106130136f0] lov_putref at ffffffff889c2ab4
+ #5 [ffff8106130137b0] lov_notify at ffffffff889b2f20
+ #6 [ffff810613013850] osc_import_event at ffffffff8887c479
+ #7 [ffff8106130138b0] ptlrpc_deactivate_and_unlock_import at ffffffff887bdd06
+ #8 [ffff8106130138f0] ptlrpc_invalidate_import at ffffffff887be31a
+ #9 [ffff8106130139a0] client_disconnect_export at ffffffff8875b811
+#10 [ffff810613013a10] osc_disconnect at ffffffff88874588
+#11 [ffff810613013a60] class_disconnect_export_list at ffffffff886a1c51
+#12 [ffff810613013ac0] class_disconnect_exports at ffffffff886a47bf
+#13 [ffff810613013b20] class_cleanup at ffffffff886ba1fc
+#14 [ffff810613013c10] class_process_config at ffffffff886be77c
+#15 [ffff810613013c90] class_manual_cleanup at ffffffff886c0544
+#16 [ffff810613013d80] ll_put_super at ffffffff88a4475c
+#17 [ffff810613013e60] generic_shutdown_super at ffffffff800e4bc0
+#18 [ffff810613013e80] kill_anon_super at ffffffff800e4c90
+#19 [ffff810613013e90] deactivate_super at ffffffff800e4d41
+#20 [ffff810613013eb0] sys_umount at ffffffff800ee830
+#21 [ffff810613013f80] system_call at ffffffff8005e116
+    RIP: 000000394bad3dd7  RSP: 00007fffc3c4b208  RFLAGS: 00010246
+    RAX: 00000000000000a6  RBX: ffffffff8005e116  RCX: 00000000004068df
+    RDX: 0000000000000000  RSI: 0000000000000000  RDI: 000000000ce17060
+    RBP: 000000000ce17030   R8: 0000000000000000   R9: 0000000000000000
+    R10: 0000000000000000  R11: 0000000000000246  R12: 00007fffc3c4b718
+    R13: 000000000ce17060  R14: 000000000ce170c0  R15: 000000000ce16530
+    ORIG_RAX: 00000000000000a6  CS: 0033  SS: 002b
+
+--- Comment (nozaki, Fri, 11 May 2012 08:37:49 +0000) ---
+I've probably fixed this problem in FEFS. Actually, so far, I haven't encountered the same problem since I applied the above patch of FEFS version. Then, I created the same patch of Lustre-1.8.7-wc1 version and attached it into this ticket.
+
+So, could someone check the patch?
+
+by the way, I think this patch won't work to the LU-1291 MDS case, Because, I'm afraid that, I don't know the detail and I haven't considered the MDS case yet. but I think the same or some similar direction could be valid to the MDS case.
+
+--- Comment (nozaki, Fri, 11 May 2012 08:21:02 +0000) ---
+a prototype patch for lustre-1.8.7-wc1 to fix the problem.
+
+--- Comment (nozaki, Wed, 9 May 2012 20:00:45 +0000) ---
+oh, I got it. Then, I'll track the ticket. anyway, thank you for your informing me with it
+
+--- Comment (ys, Wed, 9 May 2012 13:07:38 +0000) ---
+The issue looks like same as LU-1291.

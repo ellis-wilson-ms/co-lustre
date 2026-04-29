@@ -1,0 +1,240 @@
+Key:        LU-12450
+Summary:    MDT ZFS deadlock (task z_wr_iss blocked for more than 120 seconds)
+Link:       https://jira.whamcloud.com/browse/LU-12450
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Aurelien Degremont
+Created:    Tue, 18 Jun 2019 10:48:30 +0000
+Updated:    Mon, 16 Sep 2019 21:35:33 +0000
+
+--- Description ---
+We are able to consistently reproduce a deadlock on a ZFS MDT with a read-mostly heavy workload.
+
+Error could be spotted in the log with this kind of logs:
+
+ 
+
+[41567.393252] INFO: task z_wr_iss:9190 blocked for more than 120 seconds.
+[41567.402043] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[41567.408225] z_wr_iss D 0 9190 2 0x80000080
+[41567.412000] Call Trace:
+[41567.414576] ? __schedule+0x28e/0x890
+[41567.417696] schedule+0x28/0x80
+[41567.420528] rwsem_down_write_failed+0x19a/0x3c0
+[41567.423927] ? call_rwsem_down_write_failed+0x13/0x20
+[41567.427577] call_rwsem_down_write_failed+0x13/0x20
+[41567.431161] ? metaslab_alloc+0x639/0x1120 [zfs]
+[41567.434635] down_write+0x20/0x30
+[41567.437621] dbuf_write_ready+0x1ba/0x2b0 [zfs]
+[41567.441034] arc_write_ready+0x9b/0x2f0 [zfs]
+[41567.444351] zio_ready+0x42/0x420 [zfs]
+[41567.447507] ? tsd_get_by_thread+0x2a/0x40 [spl]
+[41567.450959] zio_execute+0x90/0xe0 [zfs]
+[41567.454134] taskq_thread+0x2d1/0x530 [spl]
+[41567.457463] ? wake_up_q+0x70/0x70
+[41567.460411] ? zio_reexecute+0x360/0x360 [zfs]
+[41567.463760] ? taskq_thread_spawn+0x50/0x50 [spl]
+[41567.467264] kthread+0x11a/0x130
+[41567.470156] ? kthread_create_on_node+0x70/0x70
+[41567.473569] ret_from_fork+0x35/0x40
+
+ 
+
+ 
+
+The deadlock was detected several times but we are able to reproduce with this heavy workload:
+
+	With a filesystem with 1 MDS, 30 OSS, using 50 clients, each running 50 threads.
+
+	Each thread creates 20K files, total of 1M files per client, 50M files altogether. Each client uses a unique directory, so there are 50 directories with 1M files each. And each file is 1MB in size.
+
+	Then each thread randomly chooses a file within the 20K that thread previous created, opens it for RW access, chooses a random location on a 4KB byte boundary, and reads a random number of 4KB blocks from that location, and subsequently closes the file.
+
+	The deadlock occurs in the process of reading the files. It is perhaps significant that even though the threads only read the file, they open it with both READ and WRITE access.
+
+ Deadlock does not occur when volumes are mounted noatime, so updating atime appears to be required.
+
+The reproducer needs several hours to hit the bug, but it will eventually hit it.
+
+Problem is reproduced with Lustre 2.10, 2.12, ZFS 0.7.9 and 0.7.13 
+
+ 
+
+ 
+
+We identify 6 group of processes with specific strack traces. They are all waiting for a dn_struct_rwlock for a DNODE or META_DNODE.
+
+ 
+
+ rw_enter(&mdn->dn_struct_rwlock, RW_...);
+
+ 
+
+Group 1 (mdt_rdpgxx_xxx  *52)
+
+[] call_rwsem_down_read_failed+0x14/0x30
+[] dbuf_dirty+0x303/0x8a0 [zfs]
+[] dnode_setdirty+0x8a/0xe0 [zfs]
+[] dbuf_dirty+0x3fc/0x8a0 [zfs]
+[] sa_attr_op+0x28d/0x3d0 [zfs]
+[] sa_bulk_update_impl+0x67/0x100 [zfs]
+[] sa_bulk_update+0x50/0x90 [zfs]
+[] osd_attr_set+0x52a/0xa90 [osd_zfs]
+[] lod_sub_attr_set+0x1f3/0x470 [lod]
+[] lod_attr_set+0x109/0x850 [lod]
+[] mdd_attr_set_internal+0x9f/0x2b0 [mdd]
+[] mdd_attr_set+0xb42/0xec0 [mdd]
+[] mdt_mfd_close+0x23e/0x620 [mdt]
+[] mdt_close_internal+0x1e0/0x250 [mdt]
+[] mdt_close+0x3e5/0x840 [mdt]
+[] tgt_request_handle+0x814/0x14b0 [ptlrpc]
+[] ptlrpc_server_handle_request+0x2c7/0xb70 [ptlrpc]
+[] ptlrpc_main+0xb20/0x1f00 [ptlrpc]
+[] kthread+0x11a/0x130
+[] ret_from_fork+0x35/0x40
+[] 0xffffffffffffffff
+
+Group 2 (z_wr_iss *48)
+
+[] call_rwsem_down_write_failed+0x13/0x20
+ [] dbuf_write_ready+0x1ba/0x2b0 [zfs]
+ [] arc_write_ready+0x9b/0x2f0 [zfs]
+ [] zio_ready+0x42/0x420 [zfs]
+ [] zio_execute+0x90/0xe0 [zfs]
+ [] taskq_thread+0x2d1/0x530 [spl]
+ [] kthread+0x11a/0x130:
+ [] ret_from_fork+0x35/0x40
+ [] 0xffffffffffffffff
+
+Group 3 (mdt_rdpg01_003)
+
+ 
+
+[] call_rwsem_down_read_failed+0x14/0x30
+[] dbuf_read+0x371/0x920 [zfs]
+[] dnode_hold_impl+0xe9/0xbf0 [zfs]
+[] dmu_tx_hold_object_impl+0x50/0xc0 [zfs]
+[] dmu_tx_hold_bonus+0x1c/0x30 [zfs]
+[] osd_declare_attr_set+0x223/0x7b0 [osd_zfs]
+[] lod_sub_declare_attr_set+0xcc/0x310 [lod]
+[] lod_declare_attr_set+0x104/0x550 [lod]
+[] mdd_attr_set+0x48c/0xec0 [mdd]
+[] mdt_mfd_close+0x23e/0x620 [mdt]
+[] mdt_close_internal+0x1e0/0x250 [mdt]
+[] mdt_close+0x3e5/0x840 [mdt]
+[] tgt_request_handle+0x814/0x14b0 [ptlrpc]
+[] ptlrpc_server_handle_request+0x2c7/0xb70 [ptlrpc]
+[] ptlrpc_main+0xb20/0x1f00 [ptlrpc]
+[] kthread+0x11a/0x130
+[] ret_from_fork+0x35/0x40
+[] 0xffffffffffffffff
+
+ 
+
+Group 4 (mdt_rdpgxx_xxx *65)
+
+ 
+
+[] call_rwsem_down_read_failed+0x14/0x30
+[] dnode_hold_impl+0x71/0xbf0 [zfs]
+[] dmu_tx_hold_object_impl+0x50/0xc0 [zfs]
+[] dmu_tx_hold_bonus+0x1c/0x30 [zfs]
+[] osd_declare_attr_set+0x223/0x7b0 [osd_zfs]
+[] lod_sub_declare_attr_set+0xcc/0x310 [lod]
+[] lod_declare_attr_set+0x104/0x550 [lod]
+[] mdd_attr_set+0x48c/0xec0 [mdd]
+[] mdt_mfd_close+0x23e/0x620 [mdt]
+[] mdt_close_internal+0x1e0/0x250 [mdt]
+[] mdt_close+0x3e5/0x840 [mdt]
+[] tgt_request_handle+0x814/0x14b0 [ptlrpc]
+[] ptlrpc_server_handle_request+0x2c7/0xb70 [ptlrpc]
+[] ptlrpc_main+0xb20/0x1f00 [ptlrpc]
+[] kthread+0x11a/0x130
+[] ret_from_fork+0x35/0x40
+[] 0xffffffffffffffff
+
+ 
+
+Group 5 (mdtxx_xxx *71, 2 similar traces)
+
+ 
+
+[] call_rwsem_down_read_failed+0x14/0x30
+[] dmu_prefetch+0x75/0x1d0 [zfs]
+[] osd_fid_lookup+0x105/0x350 [osd_zfs]
+[] osd_object_init+0xcf/0x10a0 [osd_zfs]
+[] lu_object_alloc+0xc8/0x2e0 [obdclass]
+[] lu_object_find_at+0x17a/0x2a0 [obdclass]
+[] mdt_object_find+0x39/0x150 [mdt]
+[] mdt_reint_open+0x1d83/0x3020 [mdt]
+[] mdt_reint_rec+0x7f/0x250 [mdt]
+[] mdt_reint_internal+0x5ee/0x680 [mdt]
+[] mdt_intent_reint+0x173/0x3e0 [mdt]
+[] mdt_intent_opc+0x385/0xa00 [mdt]
+[] mdt_intent_policy+0x1c5/0x370 [mdt]
+[] ldlm_lock_enqueue+0x234/0x950 [ptlrpc]
+[] ldlm_handle_enqueue0+0xa0b/0x1750 [ptlrpc]
+[] tgt_enqueue+0x5b/0x200 [ptlrpc]
+[] tgt_request_handle+0x814/0x14b0 [ptlrpc]
+[] ptlrpc_server_handle_request+0x2c7/0xb70 [ptlrpc]
+[] ptlrpc_main+0xb20/0x1f00 [ptlrpc]
+[] kthread+0x11a/0x130
+[] ret_from_fork+0x35/0x40
+[] 0xffffffffffffffff
+
+ 
+
+and
+
+ 
+
+[] call_rwsem_down_read_failed+0x14/0x30
+[] dmu_prefetch+0x75/0x1d0 [zfs]
+[] osd_fid_lookup+0x105/0x350 [osd_zfs]
+[] osd_object_init+0xcf/0x10a0 [osd_zfs]
+[] lu_object_alloc+0xc8/0x2e0 [obdclass]
+[] lu_object_find_at+0x17a/0x2a0 [obdclass]
+[] mdt_object_find+0x39/0x150 [mdt]
+[] mdt_reint_open+0x1022/0x3020 [mdt]
+[] mdt_reint_rec+0x7f/0x250 [mdt]
+[] mdt_reint_internal+0x5ee/0x680 [mdt]
+[] mdt_intent_reint+0x173/0x3e0 [mdt]
+[] mdt_intent_opc+0x385/0xa00 [mdt]
+[] mdt_intent_policy+0x1c5/0x370 [mdt]
+[] ldlm_lock_enqueue+0x234/0x950 [ptlrpc]
+[] ldlm_handle_enqueue0+0xa0b/0x1750 [ptlrpc]
+[] tgt_enqueue+0x5b/0x200 [ptlrpc]
+[] tgt_request_handle+0x814/0x14b0 [ptlrpc]
+[] ptlrpc_server_handle_request+0x2c7/0xb70 [ptlrpc]
+[] ptlrpc_main+0xb20/0x1f00 [ptlrpc]
+[] kthread+0x11a/0x130
+[] ret_from_fork+0x35/0x40
+[] 0xffffffffffffffff
+
+ 
+
+Not the same call path from mdt_reint_open()
+
+--- Comment (degremoa, Mon, 16 Sep 2019 21:35:33 +0000) ---
+For the records, this was related to a kernel bug in 4.14 kernel branch that was fixed by this ticket:
+
+commit 8a5e7aeffc81ed2f1f5371eee7a0b019b37fb13a
+Author: Waiman Long longman@redhat.com
+Date: Sun Apr 28 17:25:38 2019 -0400
+locking/rwsem: Prevent decrement of reader count before increment [ Upstream commit a9e9bcb45b1525ba7aea26ed9441e8632aeeda58 ]
+
+{}
+
+--- Comment (simmonsja, Mon, 22 Jul 2019 17:15:20 +0000) ---
+Can you try patch https://review.whamcloud.com/#/c/35524/
+
+--- Comment (degremoa, Tue, 18 Jun 2019 11:55:34 +0000) ---
+I was curious to know what's your point of view on that. I've seen issues in the past which were coming from the way OSD was using LDISKFS or ZFS and not the underlying filesystem itself.
+
+But indeed, It looks like a ZFS issue.
+
+--- Comment (adilger, Tue, 18 Jun 2019 10:54:45 +0000) ---
+I can't say for sure, but this looks like the bug is purely in the ZFS code?  As such, it is probably better suited to be an issue in github/zfsonlinux.

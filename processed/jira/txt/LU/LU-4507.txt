@@ -1,0 +1,81 @@
+Key:        LU-4507
+Summary:    Server hangs and terrible performance - ZFS IOR
+Link:       https://jira.whamcloud.com/browse/LU-4507
+Type:       Bug
+Priority:   Blocker
+Status:     Resolved
+Resolution: Cannot Reproduce
+Assignee:   Isaac Huang
+Reporter:   Cliff White
+Created:    Fri, 17 Jan 2014 19:09:56 +0000
+Updated:    Sat, 9 Oct 2021 05:55:58 +0000
+Resolved:   Sat, 9 Oct 2021 05:55:58 +0000
+Links:      Related: is related to LU-4716
+Attachments: MDTEST performance.xlsx, h-agb15.errors.txt, h-agb15.log.dump.txt, h-agb21.zfs.read.txt
+
+--- Environment ---
+Hyperion/LLNL
+
+--- Description ---
+For sometime now we have been observing terrible read performance when running ZFS IOR file-per-proccess. The system will see ~7 GB/s reading with ldiskfs, at higher client counts the ZFS read performance on this test will drop to ~400 MB/s which is roughly a single client level. 
+
+Observing the OSTs we typically see one or two of the 12 OSTs with a very high load, the rest idle. The busy OST with then timeout, frequently evict several clients, and move forward. Stack dumps and errors from two servers are attached. These tests are ongoing, please advise what further data needs to be collected.
+
+--- Comment (behlendorf, Thu, 23 Jan 2014 17:49:02 +0000) ---
+My suggestion would be to start with the latest source from Github if you're doing any sort of performance work.  We've made some major performance improvements in the last 6 months you'll definitely benefit from.  We try very hard to keep what's on the master branch stable so I would track it for performance testing.
+
+  https://github.com/zfsonlinux/zfs/
+
+One of the major improvements made post 0.6.2 was the ZFS write throttle code has been completely reworked.  The previous design was causing considerable I/O starvation/contention just like you've described above.  The updated code smooths things out considerably we're see more consistent I/O times and improved throughput.  Here are some additional links describing this work.
+
+  http://open-zfs.org/wiki/Features#Smoother_Write_Throttle
+
+  http://dtrace.org/blogs/ahl/2013/12/27/zfs-fundamentals-the-write-throttle/
+
+Another thing we've been working on is improving the ARC hit rate.  We've observed that particularly with meta data heavy workloads (which is all the MDS does) the ARC performance degrades over time and we end up needing to read from disk more.  You can see this behavior pretty easily by running the arcstat.py script which among other things can show you the the current cache hit rate.  Prakash has been investigating this and has proposed some promising patches which help a lot.  But we're still reviewing and testing them to ensure they work as expected and don't introduce regressions for other workloads.  We'd love for you to give them a spin and see how much they help your testing.
+
+  https://github.com/zfsonlinux/zfs/pull/1967
+
+It's also worth running the master branch because it adds some useful tools and more entries to proc to improve visibility.  My favorite new tool is dbufstat.py.  It allows you to dump all the cached dbufs and show which pool, dataset, object they belong too.  You can also see extended information about each buffer which allows you to often infer why it's being kept in the cache.  For example, for Lustre it clearly shows all the spill blocks we're forced to use because of the 512 byte dnode size.  That makes it quite clear than increasing the dnode size to 1k could halve the number of I/Os we need to do for lookups.  It's nice to be able to easily see that.
+
+There are also some new entries in /proc/spl/kstat/zfs/.  They let you get a handle of how long it's taking to assign a TXG or exactly what I/O are we issuing to disk when we get a cache miss.
+
+	dbufs                - Stats for all dbufs in the dbuf_hash
+
+	/txgs          - Stats for the last N txgs synced to disk
+
+	/reads         - Stats for the last N reads issues by the ARC
+
+	/dmu_tx_assign - Histogram of tx assign times
+
+	/io            - Total I/O issued for the pool
+
+Basically, we've been thinking about performance with ZFS too.  And now that things are running well we've been getting the tools in place so we can clearly understand exactly what needs to be improved.  I'd hoped to get an 0.6.3 tag out with all these improvements in January but that's slipped.  One of the two major blockers in convincing ourselves that Prakash's ARC changes work as designed and help the expected workloads.  Once again if you guys could help test them that would be very helpful!
+
+--- Comment (adilger, Thu, 23 Jan 2014 04:53:52 +0000) ---
+Brian, Isaac is starting to dig into ZFS debugging and development.  The stack traces that Cliff attached here look pretty clearly like a lockup (or at least heavy contention) in ZFS:
+
+ll_ost_io02_0 D 0000000000000008     0 10402      2 0x00000000
+Call Trace:
+ [] rwsem_down_failed_common+0x95/0x1d0
+ [] rwsem_down_write_failed+0x23/0x30
+ [] call_rwsem_down_write_failed+0x13/0x20
+ [] ? down_write+0x32/0x40
+ [] dmu_zfetch+0x6fa/0xd70 [zfs]
+ [] dbuf_read+0x6a1/0x750 [zfs]
+ [] dmu_buf_hold_array_by_dnode+0x162/0x560 [zfs]
+ [] dmu_read+0x97/0x180 [zfs]
+ [] osd_read+0x18f/0x240 [osd_zfs]
+ [] osd_read_prep+0x183/0x240 [osd_zfs]
+ [] ofd_preprw_read+0x253/0x7f0 [ofd]
+ [] ofd_preprw+0x77a/0x1480 [ofd]
+ [] obd_preprw+0x121/0x390 [ost]
+ [] ost_brw_read+0xd29/0x1350 [ost]
+ [] ost_handle+0x24a8/0x44d0 [ost]
+ [] ptlrpc_server_handle_request+0x385/0xc00 [ptlrpc]
+ [] ptlrpc_main+0xaed/0x1740 [ptlrpc]
+
+Any pointers for how to proceed on this?  Looks like the threads are blocked for a long time reading a dnode from disk, or there is some sort of lock deadlock.
+
+--- Comment (cliffw, Tue, 21 Jan 2014 17:01:07 +0000) ---
+ZFS also is demonstrating terrible mdtest performance. I compared ZFS and ldiskfs, increasing the number of files. Increasing file count on ZFS from 500k to 750k increased the test run time 4-6x. No such impact was observed on the ldiskfs side. Spreadsheet attached.

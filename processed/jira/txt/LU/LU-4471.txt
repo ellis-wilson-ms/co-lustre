@@ -1,0 +1,147 @@
+Key:        LU-4471
+Summary:    Failed 'rmdir' on remote directories still removes directory on MDT0
+Link:       https://jira.whamcloud.com/browse/LU-4471
+Type:       Bug
+Priority:   Blocker
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Cliff White
+Reporter:   Patrick Farrell
+Created:    Fri, 10 Jan 2014 17:48:00 +0000
+Updated:    Sat, 1 Mar 2014 00:10:34 +0000
+Resolved:   Tue, 25 Feb 2014 21:15:18 +0000
+Labels:     MB, mn4, patch
+Links:      Related: is related to LU-4690
+Attachments: lu-4471.tar.gz
+
+--- Description ---
+When doing an rmdir on a 'first level' remote directory, IE, a directory on MDT1 which is in a directory on MDT0, the directory entry on MDT0 is removed before the sanity checking is done.
+
+To reproduce (/lus/TEMP is a directory on MDT0):
+
+/lus/TEMP # mkdir mdt0
+/lus/TEMP # lfs mkdir -i 1 mdt1
+/lus/TEMP # touch mdt1/file
+/lus/TEMP # ls
+mdt0  mdt1
+/lus/TEMP # ls mdt1
+1
+/lus/TEMP # rmdir mdt1
+rmdir: failed to remove `mdt1': Directory not empty
+/lus/TEMP #  ls
+mdt0
+
+As you can see, rmdir returns with an error saying it failed to remove the directory mdt1, but the director no longer exists on MDT0.
+
+Looking at mdt_reint_unlink (which is executing on MDT1), it's easy to see why.
+
+When a first level remote directory is found, the delete RPC is sent to MDT0 before the sanity checking on MDT1 is done.
+
+if (mdt_object_remote(mc)) {
+                struct mdt_body  *repbody;
+
+                if (!fid_is_zero(rr->rr_fid2)) {
+                        CDEBUG(D_INFO, "%s: name "DNAME" cannot find "DFID"\n",
+                               mdt_obd_name(info->mti_mdt),
+                               PNAME(&rr->rr_name), PFID(mdt_object_fid(mc)));
+                        GOTO(put_child, rc = -ENOENT);
+                }
+                CDEBUG(D_INFO, "%s: name "DNAME": "DFID" is on another MDT\n",
+                       mdt_obd_name(info->mti_mdt),
+                       PNAME(&rr->rr_name), PFID(mdt_object_fid(mc)));
+
+                if (!mdt_is_dne_client(req->rq_export))
+                        /* Return -EIO for old client */
+                        GOTO(put_child, rc = -EIO);
+
+                if (info->mti_spec.sp_rm_entry) {
+                        struct lu_ucred *uc  = mdt_ucred(info);
+
+                        if (!md_capable(uc, CFS_CAP_SYS_ADMIN)) {
+                                CERROR("%s: unlink remote entry is only "
+                                       "permitted for administrator: rc = %d\n",
+                                        mdt_obd_name(info->mti_mdt),
+                                        -EPERM);
+                                GOTO(put_child, rc = -EPERM);
+                        }
+
+                        ma->ma_need = MA_INODE;
+                        ma->ma_valid = 0;
+                        mdt_set_capainfo(info, 1, child_fid, BYPASS_CAPA);
+                        rc = mdo_unlink(info->mti_env, mdt_object_child(mp),
+                                        NULL, &rr->rr_name, ma, no_name);
+                        GOTO(put_child, rc);
+                }
+
+Followed shortly after by this:
+
+        mutex_lock(&mc->mot_lov_mutex);
+
+        rc = mdo_unlink(info->mti_env, mdt_object_child(mp),
+                        mdt_object_child(mc), &rr->rr_name, ma, no_name);
+
+        mutex_unlock(&mc->mot_lov_mutex);
+
+It is mdo_unlink that returns the -39 (ENOTEMPTY) back to the client, because it calls mdd_unlink_sanity_check (which calls mdd_dir_is_empty).
+
+I have logs from both MDTs and the client of an rmdir on MDT0 failing as expected, and an rmdir on MDT1 showing the unusual behavior described.  I'll attach those shortly.
+
+--- Comment (pjones, Tue, 25 Feb 2014 21:15:18 +0000) ---
+Landed for 2.6
+
+--- Comment (bogl, Tue, 25 Feb 2014 15:18:06 +0000) ---
+backport to b2_5:
+
+http://review.whamcloud.com/9379
+
+--- Comment (cliffw, Mon, 10 Feb 2014 20:00:22 +0000) ---
+I have restarted testing, sorry about that. Will monitor.
+
+--- Comment (paf, Thu, 6 Feb 2014 17:06:26 +0000) ---
+Cliff - Not really.  This one's in Intel's hands now.  My patch, I think, satisfies Andreas and Fan Yong, and Cray has been using it internally for a bit now with great success.  The Maloo tests failed for a reason unrelated to my patch, and need to be re-run.
+
+I can't really do anything more, as the patch is good - Someone at Intel can restart the Maloo testing, and hopefully it won't hit any other issues.
+
+--- Comment (cliffw, Thu, 6 Feb 2014 16:54:20 +0000) ---
+Patrick, any updates on this issue?
+
+--- Comment (paf, Mon, 20 Jan 2014 17:48:55 +0000) ---
+Cliff - Most definitely.  Barring the unexpected, I'll get to fixing it up this afternoon.
+
+--- Comment (cliffw, Mon, 20 Jan 2014 17:39:49 +0000) ---
+Patrick, it appears that you patch has failed some reviews, are you able to address the comments?
+
+--- Comment (jlevi, Mon, 20 Jan 2014 16:47:14 +0000) ---
+Cliff,
+
+Are you able to comment on your monitoring of this ticket yet?
+
+Thank you!
+
+--- Comment (cliffw, Tue, 14 Jan 2014 21:31:10 +0000) ---
+Thanks, will monitor.
+
+--- Comment (paf, Mon, 13 Jan 2014 22:44:38 +0000) ---
+Patch here:
+
+http://review.whamcloud.com/8827
+
+Confirmed it fixes the issue in question.
+
+--- Comment (paf, Mon, 13 Jan 2014 21:05:05 +0000) ---
+Ugh, my mistake here.  The logs are still valid, but my analysis above was mistaken.
+
+The problem seems to be specifically in mdd_unlink.
+
+mdd_declare_unlink is called from mdd_unlink, and then when mdd_trans_start is called, the remote_sync it does causes the remote MDT to delete the directory.
+
+Further down, mdd_unlink_sanity_check is called on the non-remote MDT, and it errors because the directory is non-empty.
+
+--- Comment (paf, Fri, 10 Jan 2014 19:36:17 +0000) ---
+Logs of the client, MDS0, and MDS1 for:
+
+The 'normal' rmdir in these logs is the attempted removal of a directory on MDT0 with files in it, which fails as expected.
+
+The 'broken' rmdir in these logs is the attempted removal of a directory on MDT1, which returns a failure but also removes the directory entry for the directory on MDT0.
+
+Logs are from CentOS, Lustre is master from early January 2014.

@@ -1,0 +1,327 @@
+Key:        LU-4382
+Summary:    kernel BUG at fs/jbd2/transaction.c:1033
+Link:       https://jira.whamcloud.com/browse/LU-4382
+Type:       Bug
+Priority:   Blocker
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Zhenyu Xu
+Reporter:   Christopher Morrone
+Created:    Fri, 13 Dec 2013 02:33:44 +0000
+Updated:    Wed, 27 Aug 2014 17:27:42 +0000
+Resolved:   Mon, 24 Feb 2014 22:05:00 +0000
+Labels:     mn4
+Links:      Related: is related to LU-5392
+
+--- Description ---
+Running lustre 2.4.0-19chaos we recently had several OSS nodes crass on the following BUG:
+
+kernel BUG at fs/jbd2/transaction.c:1033
+
+They were all in an ll_ost_00_0?? thread with the same backtrace:
+
+__ldiskfs_handle_dirty_metadata
+ldiskfs_free_inode
+ldiskfs_delete_inode
+generic_delete_inode
+generic_drop_inode
+iput
+osd_object_delete
+lu_object_free
+lu_object_put
+ofd_object_put
+ofd_destroy_by_fid
+ofd_destroy
+ofd_destroy
+ost_handle
+ptlrpc_server_handle_request
+ptlrpc_main
+
+The failures were on the secure network, so I can't upload logs.
+
+--- Comment (pjones, Mon, 24 Feb 2014 22:05:01 +0000) ---
+Landed for 2.6
+
+--- Comment (bogl, Thu, 20 Feb 2014 23:12:10 +0000) ---
+backport to b2_5:
+
+http://review.whamcloud.com/9334
+
+--- Comment (bobijam, Wed, 19 Feb 2014 01:18:30 +0000) ---
+Since OST does not use xattr inode, I've created another ticket for it (LU-4648).
+
+--- Comment (bzzz, Mon, 10 Feb 2014 10:10:55 +0000) ---
+> And also, if the 1st reservation has been almost precise with this evaluation but more credits are required in 
+
+ext4_delete_inode(), why do we need to extend with the same number ?
+
+because in some cases truncate can't fit a single transaction (this is true for other filesystems like ZFS as well), then it's hard to compute credits for truncate as it involves tree traversal (so we'd have to traverse twice).
+
+one way to "compute" is to extend handle_t with another counter and increment it in __ldiskfs_handle_dirty_metadata() or maintain some history. this way you can learn what code is involved, at least.
+
+--- Comment (bfaccini, Mon, 10 Feb 2014 10:00:56 +0000) ---
+I find this global credits need evaluation very difficult to compute, regarding the number of nested handles/needs in underlying
+routines called and also depending on the current operation to be processed …
+So, I can understand why the 2*EXT4_QUOTA_INIT_BLOCK() credits need in vfs_dq_init()>ext4_dquot_initialize()->dquot_initialize()
+could be ignored since it will not be used during a truncate, but then why do we also ignore the
+MAXQUOTAS*EXT4_QUOTA_TRANS_BLOCKS() (2*2 ?) for 
+vfs_dq_free_inode()->mark_dquot_dirty()->ext4_write_dquot()->dquot_commit() ?
+
+And also, if the 1st reservation has been almost precise with this evaluation but more credits are required in 
+ext4_delete_inode(), why do we need to extend with the same number ?
+
+--- Comment (bobijam, Sun, 9 Feb 2014 02:55:28 +0000) ---
+yes, I think you are right about the unnecessariness of the dquot initial credit counting.
+
+And further more, I checked dquot_drop()->dqput(), if the dquot drop need to release the quota structure, its operations also involves writing the dquot back to disk, so probably 2*EXT4_QUOTA_DEL_BLOCKS is enough for the whole quota operations.
+
+--- Comment (adilger, Sun, 9 Feb 2014 02:36:25 +0000) ---
+I don't think ext4_free_inode() needs to account for EXT4_QUOTA_INIT_BLOCK() because the user and group should already have quota allocated at wrote or chown time. I don't think it is possible to delete a file that has not already accounted in the quota.
+
+--- Comment (bobijam, Sat, 8 Feb 2014 07:29:49 +0000) ---
+the patch to verify the quota missed credit theory http://review.whamcloud.com/9187
+
+--- Comment (bobijam, Sat, 8 Feb 2014 04:50:54 +0000) ---
+ext4_delete_inode()-> ext4_free_inode(handle, inode)
+
+        vfs_dq_init(inode);
+        ext4_xattr_delete_inode(handle, inode);
+        vfs_dq_free_inode(inode);
+        vfs_dq_drop(inode);
+
+in vfs_dq_init()->ext4_dquot_initialize() (which is added in ldiskfs ext4-back-dquot-to patch)
+
+ext4_dquot_initialize
+
+static int ext4_dquot_initialize(struct inode *inode, int type)
+{       
+        handle_t *handle;
+        int ret, err;
+        
+        /* We may create quota structure so we need to reserve enough blocks */
+        handle = ext4_journal_start(inode, 2*EXT4_QUOTA_INIT_BLOCKS(inode->i_sb));                     
+        if (IS_ERR(handle))
+                return PTR_ERR(handle);
+        ret = dquot_initialize(inode, type);
+        err = ext4_journal_stop(handle);
+        if (!ret)      
+                ret = err;
+        return ret;     
+}       
+
+in vfs_dq_free_inode()
+
+        /* Dirtify all the dquots - this can block when journalling */
+        for (cnt = 0; cnt if (dquot[cnt])
+                        mark_dquot_dirty(dquot[cnt]);
+
+and mark_dquot_dirty()->ext4_write_dquot()
+
+ext4_write_dquot
+
+static int ext4_write_dquot(struct dquot *dquot)
+{
+        int ret, err;
+        handle_t *handle;
+        struct inode *inode;
+
+        inode = dquot_to_inode(dquot);
+        handle = ext4_journal_start(inode,
+                                    EXT4_QUOTA_TRANS_BLOCKS(dquot->dq_sb));
+        if (IS_ERR(handle))
+                return PTR_ERR(handle);
+        ret = dquot_commit(dquot);
+        err = ext4_journal_stop(handle);
+        if (!ret)
+                ret = err;
+        return ret;
+}
+
+and vfs_dq_drop()->ext4_dquot_drop()
+
+ext4_dquot_drop
+
+        handle_t *handle;
+        int ret, err;
+        
+        /* We may delete quota structure so we need to reserve enough blocks */
+        handle = ext4_journal_start(inode, 2*EXT4_QUOTA_DEL_BLOCKS(inode->i_sb));       
+        if (IS_ERR(handle)) {
+                /*
+                 * We call dquot_drop() anyway to at least release references
+                 * to quota structures so that umount does not hang.
+                 */
+                dquot_drop(inode);
+                return PTR_ERR(handle);
+        }
+        ret = dquot_drop(inode);
+        err = ext4_journal_stop(handle);
+        if (!ret)
+                ret = err;
+        return ret;
+
+so for quota part, ext4_free_inode may misses 2*EXT4_QUOTA_INIT_BLOCKS(inode->i_sb) + 2*2 + 2*EXT4_QUOTA_DEL_BLOCKS(inode->i_sb) credits.
+
+--- Comment (green, Sat, 8 Feb 2014 00:38:02 +0000) ---
+It would be a great exercise for somebody other than Alex to go through this callpath and count all possible blocks being journaled, list them all here for double verification and thus arrive to the updated reservation number.
+
+--- Comment (bfaccini, Thu, 6 Feb 2014 17:34:23 +0000) ---
+Ok Alex, thanks to insist … I had to better read the full ticket's story. Talking with Johann it is also more clear for me what could be the specific scenario leading to this issue. Will try to post a patch proposal to ensure better computation of required credits, that will take care of quota-accounting if used and all the other blocks you mentionned.
+
+Chris, forget about my earlier requests of debugfs infos to determine xattr credits need, that do not apply (actually?) on OSSs.
+
+--- Comment (bzzz, Wed, 5 Feb 2014 17:03:33 +0000) ---
+I'm not sure why xattr is mentioned while 3 doesn't look enough with no xattrs even.
+
+--- Comment (bfaccini, Wed, 5 Feb 2014 17:00:17 +0000) ---
+Chris,
+
+Since it ends in a BUG(), is it possible that before to restart Lustre on the crashed OSS node you do some crash analysis to find concerned inode number and then extract its content using debugfs ?
+
+I would like to ensure that the issue is realy the xattr need for additional credits.
+
+--- Comment (bzzz, Mon, 27 Jan 2014 14:36:19 +0000) ---
+iirc, to free an inode, we have to modify the following blocks: inode itself (dtime), orphan list header (sb), inode bitmap, group descriptor, then user accounting and group accounting = 6 blocks? and, iirc, we changed quota accounting to be atomic (so a part of transaction).
+
+--- Comment (bobijam, Wed, 22 Jan 2014 02:51:43 +0000) ---
+about truncate part, since truncate has happened before calculating remaining credit for inode free, so I'd think that truncate credit is contained safely.
+
+        if (inode->i_blocks)
+                ext4_truncate(inode);
+
+        /*
+         * ext4_ext_truncate() doesn't reserve any slop when it
+         * restarts journal transactions; therefore there may not be
+         * enough credits left in the handle to remove the inode from
+         * the orphan list and set the dtime field.
+         */
+        if (!ext4_handle_has_enough_credits(handle, 3)) {
+                err = ext4_journal_extend(handle, 3);
+                if (err > 0)
+                        err = ext4_journal_restart(handle, 3);
+                if (err != 0) {
+                        ext4_warning(inode->i_sb,
+                                     "couldn't extend journal (err %d)", err);
+                stop_handle:
+                        ext4_journal_stop(handle);
+                        sb_end_intwrite(inode->i_sb);
+                        goto no_delete;
+                }
+        }
+
+--- Comment (bobijam, Wed, 22 Jan 2014 02:46:20 +0000) ---
+Alex,
+
+in ext4_free_inode()
+
+        /*
+         * Note: we must free any quota before locking the superblock,
+         * as writing the quota to disk may need the lock as well.
+         */
+        vfs_dq_init(inode);
+        ext4_xattr_delete_inode(handle, inode);
+        vfs_dq_free_inode(inode);
+        vfs_dq_drop(inode);
+
+and vfs_dp_init() comment states
+
+/* It is better to call this function outside of any transaction as it might
+ * need a lot of space in journal for dquot structure allocation. */
+static inline void vfs_dq_init(struct inode *inode)
+
+Is it possible that kernel code has not counted in the quota credit to be included in the 3 block credit?
+
+--- Comment (morrone, Tue, 21 Jan 2014 18:37:26 +0000) ---
+Yes quota accounting is enabled.  It is always enabled in 2.4+, correct?
+
+I have no idea how large the objects might be.  Some may certainly be large, for some definition of large.
+
+--- Comment (adilger, Sat, 18 Jan 2014 18:45:09 +0000) ---
+The xattr_inode (large_xattr) feature shouldn't ever be used on an OST, so I don't think this can be the problem. That should only be used if there is an xattr larger than 4KB on the OST object, but we never store user xattrs or large layouts on the OST objects. The only xattrs we store there are the LMA (struct lov_mds_md) and fid (struct filter_fid) which should both fit in under 128 bytes. 
+
+I would be more inclined to blame the truncate code, since this has traditionally been a source of problems because the size of a truncate transaction is potentially very large.
+
+Are quotas enabled on your filesystem (even just space accounting without enforcement)?  Are the objects being unlinked particularly large?
+
+--- Comment (morrone, Fri, 17 Jan 2014 22:16:06 +0000) ---
+OSTs are dropping like flies around here lately.
+
+Since you have a theory now, is there perhaps a systemtap script or debugging patch that could be used to verify your theory?  It would be reassuring to know that we are making progress on the right bug.
+
+--- Comment (bobijam, Thu, 16 Jan 2014 15:51:21 +0000) ---
+master patch tracking at http://review.whamcloud.com/8881
+
+--- Comment (bobijam, Wed, 15 Jan 2014 03:25:37 +0000) ---
+Hi Alex,
+
+I checked the difference of ldiskfs code and vanilla code, in ldiskfs_free_inode()->ldiskfs_xattr_delete_inode(), we added delete_external_ea part which vanilla code does not contain, is it possible that we omitted count in the external EA inode unlink credit?
+
+--- Comment (bzzz, Mon, 23 Dec 2013 03:36:09 +0000) ---
+I think Lustre isn't involved in this case - our transaction was closed in ofd_object_destroy() and later iput() was called on the inode.
+
+in ldiskfs_delete_inode():
+
+...
+
+	if (!ldiskfs_handle_has_enough_credits(handle, 3)) {
+
+		err = ldiskfs_journal_extend(handle, 3);
+
+3 doesn't seem to be enough to remove inode from orphan list, free inode and adjust quota accounting ?
+
+--- Comment (bobijam, Mon, 23 Dec 2013 01:32:06 +0000) ---
+Hi bzzz,
+
+Can you enlighten me how to debug this transaction credit deficiency issue?
+
+--- Comment (morrone, Thu, 19 Dec 2013 18:53:39 +0000) ---
+OSS crashes are pretty frequent (every couple of days).  We definitely need a plan to get this debugged.
+
+--- Comment (morrone, Tue, 17 Dec 2013 19:20:53 +0000) ---
+what condition is this hit? Client deleting files or OSS in recovery process.
+
+I don't see any signs of recovery in the console logs.  The assertion trips with nothing else in the log for more than an hour preceding it.
+
+Is it possible that the OSS nodes do not have big enough journal devices for the bursting data change?
+
+We are not using external journal devices.  The OSS nodes have 15 OSTs, each device is aroun 3.3TB in size and around 80% full.
+
+--- Comment (bobijam, Tue, 17 Dec 2013 11:59:16 +0000) ---
+Is it possible that the OSS nodes do not have big enough journal devices for the bursting data change?
+
+--- Comment (bobijam, Tue, 17 Dec 2013 11:38:27 +0000) ---
+what condition is this hit? Client deleting files or OSS in recovery process.
+
+From the backtrace, it's in the ext4(ldiskfs) context which does not preserve enough credit for the inode delete operation.
+
+--- Comment (bobijam, Tue, 17 Dec 2013 01:28:13 +0000) ---
+sorry, I meant journal credit deficiency.
+
+--- Comment (morrone, Tue, 17 Dec 2013 00:57:20 +0000) ---
+Could you elaborate on why you suspect a stack overflow?  Just to make sure that we are on the same page, we are hitting the following J_ASSERT_JH in jbd2_journal_dirty_metadata():
+
+  1026          if (jh->b_modified == 0) {
+  1027                  /*
+  1028                   * This buffer's got modified and becoming part
+  1029                   * of the transaction. This needs to be done
+  1030                   * once a transaction -bzzz
+  1031                   */
+  1032                  jh->b_modified = 1;
+  1033                  J_ASSERT_JH(jh, handle->h_buffer_credits > 0);
+  1034                  handle->h_buffer_credits--;
+  1035          }
+
+--- Comment (bobijam, Mon, 16 Dec 2013 23:43:10 +0000) ---
+it looks like the kernel stack is overflow but w/o further logs I could not know what code path took so much stack space.
+
+--- Comment (morrone, Mon, 16 Dec 2013 18:24:21 +0000) ---
+We had several more OSS nodes crash on this bug.
+
+--- Comment (pjones, Fri, 13 Dec 2013 04:00:35 +0000) ---
+Bobijam
+
+Could you please help with this one?
+
+Thanks
+
+Peter

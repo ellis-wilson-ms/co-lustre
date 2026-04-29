@@ -1,0 +1,192 @@
+Key:        LU-15083
+Summary:    osp_last_used_init() returns -28
+Link:       https://jira.whamcloud.com/browse/LU-15083
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Dongyang Li
+Reporter:   Hyunwoo Jung
+Created:    Tue, 12 Oct 2021 13:10:22 +0000
+Updated:    Thu, 16 Feb 2023 10:49:20 +0000
+Resolved:   Tue, 30 Nov 2021 13:47:11 +0000
+Links:      Related: is related to  LU-12652; Related: is related to LU-15208; Related: is related to LU-15231
+
+--- Environment ---
+Ubuntu 20.04 5.4.0-89, LDISK
+
+--- Description ---
+I got the following error on MDT after mounting OST.
+
+[ 408.221734] LustreError: 17651:0:(osp_dev.c:374:osp_last_used_init()) temp-OST0000-osc-MDT0000: Can not get ids -28 from old objid!
+[ 408.222498] LustreError: 17651:0:(obd_config.c:774:class_setup()) setup temp-OST0000-osc-MDT0000 failed (-28)
+[ 408.222533] LustreError: 17651:0:(obd_config.c:2001:class_config_llog_handler()) MGC123.123.123.123@tcp: cfg command failed: rc = -28
+[ 408.223280] Lustre: cmd=cf003 0:temp-OST0000-osc-MDT0000 1:temp-OST0000_UUID 2:123.123.123.123@tcp
+[ 408.223300] LustreError: 13754:0:(mgc_request.c:612:do_requeue()) failed processing log: -28
+
+ 
+
+ 
+
+It always occurs.
+
+Lustre version: 2.14.55 (09e2e43241, git://git.whamcloud.com/fs/lustre-release.git)
+
+Linux version: Ubuntu 20.04 5.4.0-89 (49208326b3, git://git.launchpad.net/~ubuntu-kernel/ubuntu/+source/linux/+git/focal)
+
+I built both linux and lustre from source.
+
+Lustre was configured as:
+
+ 
+
+./configure --with-linux=$KERNEL_SRC_PATH --with-o2ib=no
+
+What I have found from debugging is the following:
+
+- osp_last_used_init() calls osp_find_or_create_local_file(), which calls ldiskfs_xattr_set() internally.
+
+ ldiskfs_xattr_set() retries ldiskfs_xattr_set_handle() (line 2511) many times but ended up failing because ldiskfs_handle_has_enough_credits() (line 2344) returns 0 (handle>h_buffer_credits  
+
+/* ldiskfs/xattr.c */
+
+...
+
+2300 int
+2301 ldiskfs_xattr_set_handle(handle_t *handle, struct inode *inode, int name_index,
+2302                       const char *name, const void *value, size_t value_len,
+2303                       int flags)
+2304 {
+2305         struct ldiskfs_xattr_info i = {
+2306                 .name_index = name_index,
+2307                 .name = name,
+2308                 .value = value,
+2309                 .value_len = value_len,
+2310                 .in_inode = 0,
+2311         };
+2312         struct ldiskfs_xattr_ibody_find is = {
+2313                 .s = { .not_found = -ENODATA, },
+2314         };
+2315         struct ldiskfs_xattr_block_find bs = {
+2316                 .s = { .not_found = -ENODATA, },
+2317         };
+2318         int no_expand;
+2319         int error;
+2320
+2321         if (!name)
+2322                 return -EINVAL;
+2323         if (strlen(name) > 255)
+2324                 return -ERANGE;
+2325
+2326         ldiskfs_write_lock_xattr(inode, &no_expand);
+2327
+2328         /* Check journal credits under write lock. */
+2329         if (ldiskfs_handle_valid(handle)) {
+2330                 struct buffer_head *bh;
+2331                 int credits;
+2332
+2333                 bh = ldiskfs_xattr_get_block(inode);
+2334                 if (IS_ERR(bh)) {
+2335                         error = PTR_ERR(bh);
+2336                         goto cleanup;
+2337                 }
+2338
+2339                 credits = __ldiskfs_xattr_set_credits(inode->i_sb, inode, bh,
+2340                                                    value_len,
+2341                                                    flags & XATTR_CREATE);
+2342                 brelse(bh);
+2343
+2344                 if (!ldiskfs_handle_has_enough_credits(handle, credits)) {
+2345                         error = -ENOSPC;
+2346                         goto cleanup;
+2347                 }
+2348                 WARN_ON_ONCE(!(current->flags & PF_MEMALLOC_NOFS));
+2349         }
+
+...
+
+2486 int
+2487 ldiskfs_xattr_set(struct inode *inode, int name_index, const char *name,
+2488                const void *value, size_t value_len, int flags)
+2489 {
+2490         handle_t *handle;
+2491         struct super_block *sb = inode->i_sb;
+2492         int error, retries = 0;
+2493         int credits;
+2494
+2495         error = dquot_initialize(inode);
+2496         if (error)
+2497                 return error;
+2498
+2499 retry:
+2500         error = ldiskfs_xattr_set_credits(inode, value_len, flags & XATTR_CREATE,
+2501                                        &credits);
+2502         if (error)
+2503                 return error;
+2504
+2505         handle = ldiskfs_journal_start(inode, LDISKFS_HT_XATTR, credits);
+2506         if (IS_ERR(handle)) {
+2507                 error = PTR_ERR(handle);
+2508         } else {
+2509                 int error2;
+2510
+2511                 error = ldiskfs_xattr_set_handle(handle, inode, name_index, name,
+2512                                               value, value_len, flags);
+2513                 error2 = ldiskfs_journal_stop(handle);
+2514                 if (error == -ENOSPC &&
+2515                     ldiskfs_should_retry_alloc(sb, &retries))
+2516                         goto retry;
+2517                 if (error == 0)
+2518                         error = error2;
+2519         }
+2520
+2521         return error;
+2522 }
+
+--- Comment (yujian, Mon, 31 Jan 2022 18:08:00 +0000) ---
+With the fix in this ticket, mounting a filesystem hit obd_lu_dev->ld_site == lod->lod_dt_dev.dd_lu_dev.ld_site ) failed on mounting half-initilized MDS" class="issue-link" data-issue-key="LU-15231">LU-15231.
+
+--- Comment (pjones, Tue, 30 Nov 2021 13:47:11 +0000) ---
+Landed for 2.15
+
+--- Comment (gerrit, Tue, 30 Nov 2021 03:46:25 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/45546/
+
+Subject: LU-15083 ldiskfs: disable xattr credits check
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 580a22145ec16b548f5bdafa3a066686a95799b3
+
+--- Comment (gerrit, Fri, 12 Nov 2021 12:37:12 +0000) ---
+"Li Dongyang " uploaded a new patch: https://review.whamcloud.com/45546
+
+Subject: LU-15083 ldiskfs: disable xattr credits check
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 63afe25a2140b9cb001167671054fe2018e36ef1
+
+--- Comment (JIRAUSER16927, Fri, 15 Oct 2021 06:08:49 +0000) ---
+I am using ldiskfs on Ubuntu20 server. Clients are also on Ubuntu20.
+
+It is a newly-formatted test filesystem. This is my first time to setup Lustre.
+
+I rebuilt Lustre of older version (2.14.0) and found it works.
+
+Thanks.
+
+--- Comment (adilger, Thu, 14 Oct 2021 18:04:04 +0000) ---
+Thank you for filing the bug.
+
+Are you using ldiskfs on the Ubuntu20 server, or only Ubuntu client?  Is this a newly-formatted test filesystem, or has it been used and only hits this problem after some time/crash/other?
+
+If this always happens on a new filesystem, it is possible that there is some bug in the ldiskfs patches for this Ubuntu kernel (not enough credits reserved for this filesystem transaction handle).  It should be noted that Ubuntu servers are not really being tested regularly, and the 2.14.55 tag is a development release so this should only be used for testing.

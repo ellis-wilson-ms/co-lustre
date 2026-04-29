@@ -1,0 +1,114 @@
+Key:        LU-16935
+Summary:    deadlock between ll_filemap_fault and ll_imp_inval
+Link:       https://jira.whamcloud.com/browse/LU-16935
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Vladimir Saveliev
+Reporter:   Vladimir Saveliev
+Created:    Thu, 29 Jun 2023 16:25:52 +0000
+Updated:    Fri, 19 Dec 2025 03:13:34 +0000
+Resolved:   Sat, 23 Mar 2024 15:19:35 +0000
+Links:      Related: is related to LU-17712
+
+--- Description ---
+Thee following loop in ll_filemap_fault
+
+int ll_filemap_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
+..
+        do {
+                seq = read_seqbegin(&ll_i2info(inode)->lli_page_inv_lock);
+                ret = __ll_filemap_fault(vma, vmf);
+        } while (read_seqretry(&ll_i2info(inode)->lli_page_inv_lock, seq) &&
+                 (ret & VM_FAULT_SIGBUS));
+
+may become endless:
+
+ll_filemap_fault()
+  filemap_fault()
+  ...
+    ll_readpage()
+      ll_io_read_page()
+        rc = cl_sync_io_wait(env, anchor, 0);
+        if (!PageUptodate(cl_page_vmpage(page)))
+          cl_page_discard()
+            vvp_page_discard()
+              generic_error_remove_page()
+                truncate_complete_page()
+                  ...
+                    vvp_page_delete()
+                      write_seqlock(&ll_i2info(inode)->lli_page_inv_lock);
+                      ClearPageUptodate(vmpage);
+                      write_sequnlock(&ll_i2info(inode)->lli_page_inv_lock);
+
+If page is not uptodate after cl_sync_io_wait() - vvp_page_delete() called deep inside cl_page_discard() increases lli_page_inv_lock seqlock.
+
+filemap_fault() (true for 4.12.14_122.147 and probably few other kernels of SLES12 SP5) returns VM_FAULT_SIGBUS if readpage fails:
+
+int filemap_fault(struct vm_fault *vmf)
+..
+        error = mapping->a_ops->readpage(file, page);
+        if (!error) {
+                wait_on_page_locked(page);
+                if (!PageUptodate(page))
+                        error = -EIO;
+        }
+        put_page(page);
+
+        if (!error || error == AOP_TRUNCATED_PAGE)
+                goto retry_find;
+
+        /* Things didn't work out. Return zero to tell the mm layer so. */
+        shrink_readahead_size_eio(file, ra);
+        return VM_FAULT_SIGBUS;
+
+When readpage fails as result of eviction from server side the following deadlock gets formed:
+
+ll_imp_inval stucks in
+
+ptlrpc_invalidate_import_thread
+  obd_import_event(IMP_EVENT_INVALIDATE)
+    ..
+      osc_object_invalidate
+        l_wait_event(osc->oo_io_waitq, atomic_read(&osc->oo_nr_ios) == 0, &lwi);
+
+and can not proceed to recovery.
+
+ll_filemap_fault() spins and keeps osc->oo_nr_ios != 0, as readpage()'s read rpc fails with -108 because import is invalid:
+
+static int ptlrpc_import_delay_req(struct obd_import *imp,
+..
+        } else if (imp->imp_invalid || imp->imp_obd->obd_no_recov) {
+                if (!imp->imp_deactive)
+                        DEBUG_REQ(D_NET, req, "IMP_INVALID");
+                *status = -ESHUTDOWN; /* b=12940 */
+
+--- Comment (pjones, Sat, 23 Mar 2024 15:19:35 +0000) ---
+Landed for 2.16
+
+--- Comment (gerrit, Sat, 23 Mar 2024 05:51:54 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/51505/
+
+Subject: LU-16935 llite: avoid hopeless i/o repeats
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: f5564c35ede12659acedd14845cb36e70563233a
+
+--- Comment (gerrit, Thu, 29 Jun 2023 16:27:16 +0000) ---
+"Vladimir Saveliev " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/51505
+
+Subject: LU-16935 llite: do not discard page after readpage failure
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: ad4208e16bd537bdc93dc52b4e381b5148e6f880

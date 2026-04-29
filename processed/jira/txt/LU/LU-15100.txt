@@ -1,0 +1,102 @@
+Key:        LU-15100
+Summary:    Add ability to tune definition of loose sequential read
+Link:       https://jira.whamcloud.com/browse/LU-15100
+Type:       Improvement
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Patrick Farrell
+Reporter:   Patrick Farrell
+Created:    Wed, 13 Oct 2021 20:53:33 +0000
+Updated:    Fri, 11 Aug 2023 16:03:09 +0000
+Labels:     readahead
+Links:      Related: is related to  LU-11416; Related: is related to  LU-14917; Related: is related to  LU-15155
+
+--- Description ---
+Loose sequential read is the Lustre term for reads which do not read all pages and are not strided, but do proceed in a semi-random fashion forward or backward through the file.  Basically, they jump forward or backward a small random amount between each read.  This is a fairly common pattern in database queries, for example, which have a certain hit rate on a large table and so pull a certain % of pages, mostly randomly.
+
+The definition of this in Lustre has been limited to "within 8 pages of previous access" for a very long time.  This is a tiny range, and it should be larger - and it should be tunable.  This tiny range means that an application which reads page 5, then page 18, then page 27, then page 50, etc, is considered entirely random, which is very bad for performance.  Making the limit on 'loose forward read' larger will allow readahead to recognize these cases, and perform readahead.  (The cost of reading 1 MiB is only slightly higher than the cost of reading 1 page, so if we get even a few hits per MiB, it's worth reading in the data.  So it makes sense to pull in all the data for these "loose sequential" reads.)
+
+Patch forthcoming.
+
+--- Comment (paf0186, Tue, 26 Oct 2021 17:04:26 +0000) ---
+"The requirement that max_readahead_per_file >= max_readahead_whole makes sense to me. If the user specifies "don't do more than 256MB of readahead for a single file" it doesn't really make sense to speculatively readahead all of a 1GB file on the first or second access. That can cause a lot of data to be read for some workloads that are only accessing a tiny amount of data in each file."
+
+Sure, but these are separate tunables.  If the user doesn't want whole files read in above a certain size, then that's what max_readahead_whole is for.  The existing requirement means if they want to turn up max readahead whole, they have to increase the window size for ongoing reads.  And with the patch to link the tunables, when they turn up max readahead whole, the window size will go up automatically if they turn up max readahead whole.
+
+I think LU-11416 is a good idea, there's a lot of detail to be sorted out about when to do that vs do other things - that seems like it's often the hardest part of readahead.  When to do one thing vs another.
+
+--- Comment (adilger, Mon, 25 Oct 2021 23:47:14 +0000) ---
+The requirement that max_readahead_per_file >= max_readahead_whole makes sense to me.  If the user specifies "don't do more than 256MB of readahead for a single file" it doesn't really make sense to speculatively readahead all of a 1GB file on the first or second access.  That can cause a lot of data to be read for some workloads that are only accessing a tiny amount of data in each file.
+
+That said, the proposal in LU-11416 is intended to avoid the bi-polar behavior of "read whole small file on second access" vs. "only readahead for strictly sequential access".  That tries to balance number of IOs (anywhere in the file) vs. the total file size vs. total RAM size to best decide the behavior.  Essentially, the concept of "loose readahead" is a subset of this, but the patch comments indicate that reading 2-6 pages per MB is enough for sequential reads to win over "loose" reads that send less data but have more round trips (and also more server IOPS because it is fetching more data but not sending it over the wire).  The only difference between "loose readahead" and LU-11416 is that the latter is counting reads anywhere in the file, and not just within a sequentially increasing window forward/backward.  If there are enough reads for the file, and there is an expectation that the whole file can fit into memory, it just drops any pretense of doing random reads and fetches the whole file.   
+
+Essentially, the current "max_readahead_whole_mb=2 prefetches whole file on second read" could be considered "prefetch whole file when 1/256 pages read" (only for very small files), while LU-11416 proposes "prefetch whole file when 1/4096 pages read" which is probably too aggressive, and your patch is essentially "prefetch file when 5/256 pages read" (only for loose sequential).   The exact ratio of reads-to-whole-file-prefetch likely depends on the performance penalty for sequential vs. random reads (ideally determined at runtime, ala LU-7880, but with some reasonable defaults for rotational/nonrotational storage).  You don't want to wait too long before switching over or you will have already lost much of the benefit to be gained by doing the whole-file readahead.
+
+--- Comment (paf0186, Mon, 25 Oct 2021 21:11:34 +0000) ---
+I agree with you about active vs growing.  Still chewing on it.
+
+I have a related thought - Currently, max_readahead_per_file sets the maximum readahead window size, but it also has to be larger than the desired limit for whole file readahead.  After thinking about this, I don't think it makes any sense - there's no strong link between the file size we should pull in all of and the maximum window size.
+
+With another customer workload, they read some files in a pattern readahead couldn't handle - backwards, but it could have just been purely random instead - and so we turned up whole_file read to catch the entire file.  But that meant I had to turn up the per_file_mb limit to 1 GiB, which means the max readahead window size is now 1 GiB, which is crazy.  They have a very constrained set of workloads and it didn't cause any regressions, so it's fine in that instance.  But it could be a problem elsewhere.
+
+So I'm thinking of disconnecting those two tunables, so we can raise whole file mb to large values without also increasing the maximum readahead window size.
+
+--- Comment (paf0186, Mon, 25 Oct 2021 21:05:53 +0000) ---
+One note before I engage with the full comment:
+
+There is no 'clustered' or 'jump' component here - I haven't seen that in any workloads that have been shown to me.  The distribution is even through the file.  In discussions with a database expert friend of mine, it's hard to see why there would be clusters, rather than just random.
+
+ie, you are doing some form of 'SELECT' and you hit on a certain % of the data in the database.  Generally speaking that would just be random throughout, at a particular hit density - which is what we see in the customer workloads I looked at for this.  It's not impossible you could have clusters of data where you'd hit a lot and sections that would be mostly barren, but it would require an unusual combination of input data and query.  (And even then, for those clusters then to have something like a regular spacing... etc.)
+
+I know the clustered mmap reads work was done to match a specific workload - sihara indicated he still had access to that workload, so I'm hoping to get a closer look at it, and see if it really is clustered as described.  Even if it is, I wonder if we didn't get hyper-optimization to a particular workload?  I'm trying to keep an open mind though and look at a variety of workloads.
+
+--- Comment (adilger, Mon, 25 Oct 2021 20:43:16 +0000) ---
+I've though for a while that it makes sense to separate "grow RA window" from "RA active".  For workloads like this, it doesn't necessarily make sense to grow the RA window, if there are not enough userspace reads to go beyond the current RA window.  However, that could be considered independent of whether RA is active (i.e. do we want to keep doing any prefetch of sequentia/clustered pages on this fd or not)?
+
+In other words, if the current readahead window is meeting the needs of the user then we should consider limiting the size of the readahead to what is actually needed, rather than always increasing to the maximum.  So if RA is far enough ahead of a sequential reader to have pages in cache by the time they are accessed by userspace (i.e. all read latency is hidden), the window should stop growing to avoid fetching pages that might not be needed.
+
+In the case of the "random jump then clustered read" workload being examined here, the window size should only be large enough to cover the "M pages before first read, N pages after first read" cluster, but not necessarily grow larger, since that is just wasting RAM/bandwidth/IOPS if the client is prefetching pages that it never uses.
+
+Not necessarily something to fix in this patch, but something to keep in mind as you rework these heuristics.
+
+Another consideration is whether it makes sense for clients to be more aggressive in readahead when the server is relatively idle, and less aggressive when the server is busy?  For an idle server, the cost of readahead for pages that are never used by the client is relatively low, since it wasn't doing anything anyway.  For a busy server, readahead of pages that are never used has directly slowed down other processes that could have used the IOPS/bandwidth to perform more useful work.  That isn't to say that no readahead should be done, because a busy server also has high RPC processing latency and prefetching pages that are used may help the application avoid some of that latency (if there is some client processing between read() calls, and not all processes are read bound where the "readahead" just degrades to "read" because the application is always waiting for the read RPCs to finish).
+
+--- Comment (gerrit, Tue, 19 Oct 2021 16:30:49 +0000) ---
+"Patrick Farrell " uploaded a new patch: https://review.whamcloud.com/45294
+
+Subject: LU-15100 tests: Add dump of readahead parameters
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 3718a0866de60c79154b0eaf2a2114a846e6455f
+
+--- Comment (gerrit, Mon, 18 Oct 2021 19:51:40 +0000) ---
+"Patrick Farrell " uploaded a new patch: https://review.whamcloud.com/45283
+
+Subject: LU-15100 tests: Test fix
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 530fbd0a541154c275e613710f16b5ba2323d470
+
+--- Comment (gerrit, Wed, 13 Oct 2021 21:16:45 +0000) ---
+"Patrick Farrell " uploaded a new patch: https://review.whamcloud.com/45234
+
+Subject: LU-15100 llite: Add loose read pages tunables
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 4737eddb5f70a9f895489e3f62c33dfa73be41d0

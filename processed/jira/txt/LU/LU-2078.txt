@@ -1,0 +1,111 @@
+Key:        LU-2078
+Summary:    sync_on_lock_cancel too aggressive
+Link:       https://jira.whamcloud.com/browse/LU-2078
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Alex Zhuravlev
+Reporter:   Brian Behlendorf
+Created:    Thu, 19 Apr 2012 14:09:03 +0000
+Updated:    Thu, 26 Dec 2013 17:21:00 +0000
+Resolved:   Mon, 8 Oct 2012 01:21:25 +0000
+Labels:     server, topsequoia
+Links:      Related: is related to LU-2085
+Attachments: 57chaos-always.tar.bz2, 58chaos-always.tar.bz2, 58chaos-never.tar.bz2, ori642.tar.bz2
+
+--- Description ---
+While running some single shared file IOR tests I noticed, with 'zpool iostat', that there were a lots write going on during the read phase.  This was absolutely destroying performance and it wasn't at all clear to me why there should be any reads at all.  IOR is just reading during this phase, no writes.
+
+On a hunch I set 'sync_on_lock_cancel=never' and the writes stopped entirely and performance improved at least 6x.  I haven't looked at the code yet but I think there might be a few issues here.
+
+1) Why were so many lock revocations occurring during the read phase.  I would have thought that each client would end up with a single concurrent read lock rather quickly.  However, this behavior persistent for the 30 minutes it took to read all the data back.
+
+2) When revoking a read lock, or even a write lock which isn't actually covering any dirty data, there's no reason to issue the sync.  I suspect this was never noticed because under ldiskfs if there's no dirty data to sync performing the sync is basically free.  Under ZFS however if you call sync you will force the current txg to be written out.  That will result in at a minimum the vdev labels at the beginning and end of each disk to be written.  Lots of syncs will result each disk head basically seeking from the being to end of the disk repeatedly.  Very very bad.
+
+--- Comment (ian, Mon, 8 Oct 2012 01:21:25 +0000) ---
+Patch landed.
+
+--- Comment (morrone, Fri, 5 Oct 2012 17:43:11 +0000) ---
+Patch landed on master: http://review.whamcloud.com/4117
+
+--- Comment (prakash, Wed, 25 Jul 2012 16:52:56 +0000) ---
+I went ahead and ran the same test with `sync_on_lock_cancel=never` as well. Here's the logs and performance numbers.
+
+Single Shared File Read Performance (MiB/s)
+
+        |  always |  never  |
+      --+---------+---------+
+58chaos | 1311.51 | 1265.46 |
+      --+---------+---------+
+
+--- Comment (prakash, Wed, 25 Jul 2012 16:35:34 +0000) ---
+Same logs as before, except with our 58chaos tag (reverted debug patch-set 1 and applied debug patch-set 2 as requested).
+
+With this tag, I saw the best performance numbers of all my tests run so far (roughly equal to the sync_on_lock_cancel=never tests):
+
+Single Shared File Read Performance (MiB/s)
+
+        |  always |   never  |
+      --+---------+----------+
+58chaos | 1311.51 | untested |
+      --+---------+----------+
+
+So my question is, can we safely drop the write lock as is done in the debug patch? Or is this just a proof of concept?
+
+Also, What exactly is that lock protecting, and why?
+
+--- Comment (bzzz, Wed, 25 Jul 2012 00:58:12 +0000) ---
+thanks.. here is another patch: http://review.whamcloud.com/#change,3456  hope this time we'll get some improvement. again, a log with +dlmtrace +rpctrace is very welcome. thanks in advance.
+
+--- Comment (prakash, Tue, 24 Jul 2012 20:10:45 +0000) ---
+This has the IOR output from the read and write phase of the test. Along with Lustre Logs from the OSS with +dlmtrace and +rpctrace.
+
+--- Comment (bzzz, Tue, 24 Jul 2012 12:14:48 +0000) ---
+thanks for the data Prakash. I'm still looking at dlmtrace.. it's still not clear why we don't reach
+
+the peak performance: the very first PR lock should commit the whole object and all subsequent reads
+
+should skip osd_sync().. so here is a debug patch: http://review.whamcloud.com/#change,3456
+
+please try, just current orion + this patch with sync_on_cancel=always should be enough. a log with
+
++dlmtrace +rpctrace would be very useful. thanks in advance.
+
+--- Comment (prakash, Thu, 19 Jul 2012 21:59:10 +0000) ---
+IOR output for the read and write phase of each test. And MDS and OSS server logs for the read phase of each test with '+dlmtrace' enabled.
+
+--- Comment (prakash, Thu, 19 Jul 2012 21:54:56 +0000) ---
+Alex, I was able to run a few single shared file tests today. Here's a summary of my results.
+
+I ran 4 separate tests. Two tests with our 55chaos tag (without http://review.whamcloud.com/3355), one with sync_on_lock_cancel=always and another with sync_on_lock_cancel=never. Also, two tests were run with our 56chaos tag (with http://review.whamcloud.com/3355), again one with "always" and another with "never".
+
+Also, each test was run using 64 client nodes, 1 task per node, striped over a single OST, using these IOR options "-a POSIX -CegkY".
+
+Single Shared File Read Performance (MiB/s)
+
+         |  always |   never |
+       --+---------+---------+
+ 55chaos |  469.19 | 1304.03 |
+       --+---------+---------+
+ 56chaos |  988.26 | 1275.59 |
+       --+---------+---------+
+
+So just from the above data, your patch seems to provide a 2x improvement for reads!
+
+Also, I'll attach a tarball with the IOR output and and logs from MDS and OSS with '+dlmtrace' enabled during each test's read phase.
+
+--- Comment (bzzz, Thu, 19 Jul 2012 04:05:40 +0000) ---
+Brian, do you remember any details of the test? how many stripes? arguments to IOR, etc? thanks in advance.
+
+--- Comment (adilger, Thu, 12 Jul 2012 18:19:56 +0000) ---
+Per comments in Skype, it might make sense to remove the sync from the DLM level entirely, and implement a "commit on share" style handling of write data.  That means the writes should not be committed to disk when the lock is cancelled, but rather only if the data is being read again.  This should allow the initial writes will go faster because a larger number of writes can be aggregated into a single commit.  If the data is not immediately being read back from the object, it may not even need a transaction commit.
+
+There is no data consistency problem from doing this, because until the data is read by another client it is in a Schrödinger's box, and whether it was committed to disk or not is irrelevant.  Using the same "commit on share" mechanism also brings the OST data handling more in line with COS on the MDS.
+
+The most simplistic mechanism for this is to move the "inode version > last_committed" conditional sync from change 3355 from the DLM cancel into the OST read code.  This will improve the common case of many page-aligned writers on the same file that do not need to do read-modify-write of the file data.  A more sophisticated mechanism would be to track the dirty extents of the file (via ZIL?), and only sync the inode and data if reading dirty pages.
+
+--- Comment (bzzz, Mon, 9 Jul 2012 04:55:01 +0000) ---
+please, give this trivial patch a run?
+
+http://review.whamcloud.com/#change,3355

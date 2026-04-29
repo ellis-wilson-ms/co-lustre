@@ -1,0 +1,113 @@
+Key:        LU-10413
+Summary:    Side-effect of 'stat' on data writeback
+Link:       https://jira.whamcloud.com/browse/LU-10413
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Mikhail Pershin
+Reporter:   Mikhail Pershin
+Created:    Wed, 20 Dec 2017 10:28:55 +0000
+Updated:    Sun, 6 May 2018 04:31:07 +0000
+Resolved:   Sun, 6 May 2018 04:31:07 +0000
+Links:      Related: is related to LU-10279
+
+--- Description ---
+There is quote old code in ldlm_handle_gl_callback() which flushes data on glimpse:
+
+static void ldlm_handle_gl_callback()
+{
+...
+        if (lock->l_granted_mode == LCK_PW &&
+            !lock->l_readers && !lock->l_writers &&
+	    ktime_after(ktime_get(),
+			ktime_add(lock->l_last_used,
+				  ktime_set(10, 0)))) {
+                unlock_res_and_lock(lock);
+                if (ldlm_bl_to_thread_lock(ns, NULL, lock))
+                        ldlm_handle_bl_callback(ns, NULL, lock);
+
+                EXIT;
+                return;
+        }
+...
+}
+
+It flushes lock data if lock stays on client more than 10 seconds. That means we have sort of additional and non-controlled flusher for a client dirty data. For example, regular 'stat' operation (stat-ahead?) on some client may work as 'flusher' for all other clients with dirty data. I see two problems with that:
+
+1. client usually has own flush policy and timings but they doesn't work as expected. E.g. client flusher time is 30 seconds but data will be still flushed often (on 10 second basis)
+
+2. Even if this feature is useful the value used for timeout is hardcoded as 10 seconds.
+
+Solutions:
+
+1. Remove this code. The kernel flusher works with Lustre and its default is 30 seconds, each Lustre client may be tuned by its administrator for any needed value, including 10 seconds if needed. We don't need another level of control on this.
+
+2. Keep the code but exclude glimpses from stat-ahead and similar things. The original idea of that code was to flush dirty data because there is a sign (glimpse) that somebody is going to use this file. With stat-ahead it is not true anymore. 
+
+3. Keep the code but introduce parameter for it instead of hardcoded 10 seconds. Zero means this feature is disabled.
+
+--- Comment (pjones, Sun, 6 May 2018 04:31:07 +0000) ---
+Landed for 2.12
+
+--- Comment (gerrit, Sun, 6 May 2018 03:43:06 +0000) ---
+Oleg Drokin (oleg.drokin@intel.com) merged in patch https://review.whamcloud.com/32113/
+
+Subject: LU-10413 ldlm: expose dirty age limit for flush-on-glimpse
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 69727e45b4c0194f97c74df65b45fbf6a23235c4
+
+--- Comment (gerrit, Mon, 23 Apr 2018 08:23:10 +0000) ---
+Mike Pershin (mike.pershin@intel.com) uploaded a new patch: https://review.whamcloud.com/32113
+
+Subject: LU-10413 ldlm: expose dirty age limit for flush-on-glimpse
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: deea36344bce23db938fa04f428da26283706886
+
+--- Comment (adilger, Thu, 19 Apr 2018 07:20:40 +0000) ---
+Patrick, the / 100 is because that parameter is stored in centisecond units, not seconds (AFAIK).
+
+--- Comment (paf, Tue, 17 Apr 2018 16:25:11 +0000) ---
+A further thought:
+
+Given the 10 second delay, it's actually going to be pretty rare there's any dirty data to flush here.  You'd have to have a situation where dirty data was still present 10 seconds after use.  The OSC writeback policies already guarantee that's a small amount of data, unless the system is extremely busy and unable to get the data written out quickly.  It's just hard to imagine a real workload where this would significantly change the effective writeback behavior.  At most it flushes some small files or trailing bits of data a bit faster.
+
+This seems like a good optimization.  Quite good, in fact.  I like Andreas' suggestion to hook it to the dirty_writeback_interval - 10 seconds vs 30 seconds doesn't seem like a huge change (both seem like fairly large numbers for jobs that are doing "create one place, open/stat in another" as sequential operations).  Not sure about the /100 part...?
+
+--- Comment (tappro, Sat, 6 Jan 2018 08:25:37 +0000) ---
+So this is the question of balance between the ability to cache file's attributes on clients and the flushing of dirty data on other clients. The best strategy depends on the way cluster is being used and I think the only thing we can do here is to expose this parameter via procfs and describe this feature better somewhere, so administrators may use it as needed.
+
+--- Comment (adilger, Wed, 3 Jan 2018 09:47:33 +0000) ---
+The reason this is needed is that if another client starts accessing this file (e.g. ls -l in some directory), we want that client to be able to cache the lock without having to refetch the lock every time that the file is accessed.  Otherwise, the glimpse will never cause the cancellation of a PW DLM lock on the client, even if the client is using stat() on the file repeatedly.  On the first access by another client, the initial client would flush the dirty pages from cache and cancel the lock, and on the second glimpse access the client would be able to get the DLM lock on the file and cache the file attributes locally.
+
+I think it is reasonable to expose this tunable via a /proc parameter.  It might also make sense to increase this by default to be the same as the client dirty_writeback_interval / 100 so that the glimpse itself doesn't cause dirty data to be flushed from the client, but if the file is idle longer than what the VM is using to flush dirty pages then it will still cancel the lock. This could have some larger performance implications, since it means a client listing a directory wouldn't cache a file's attributes until it is at least 30s old.
+
+--- Comment (tappro, Thu, 28 Dec 2017 19:08:18 +0000) ---
+Andreas, I observed that this code cause flushes when they are no expected and when file is not used by other client, e.g. there is no open/read/write, etc. In my case that was just 'stat' request before unlink and it flushes data that must be discarded actually on unlink, but that 'stat' do flush prior that, so it breaks 'discard-on-unlink' mechanism at least. But I am afraid that with that code and stat-ahead we have sort of 'lustre-wide' flusher which flushes dirty data each 10sec despite local client vm settings and no matter if this file is going to be used or not. 
+
+Or this is expected and needed for that fstat data caching you've mentioned?
+
+--- Comment (adilger, Mon, 25 Dec 2017 07:48:40 +0000) ---
+The reason this code was added is so that if one client was writing to a file, but is now idle, and a second client starts accessing that file, the first client does not hold on to idle locks until it is canceled due to LRU aging, which prevents the second client getting a lock on that object/extent.
+
+With the current code, if the first client's lock is idle for 10s (i.e. no longer actively being written) then the glimpse callback will notify the client that there is another client interested in the lock, and cause the lock to be cancelled.  Otherwise, a DLM lock can live in the LRU for up to max_lru_age (3900s by default) if there is not much DLM activity on the client's OSC.  That means other clients cannot cache fstat() data for ls -l until the lock drops from the first client's LRU.
+
+If you think there is a problem with the 10s "idle glimpse cancel" time limit, this could be exposed via a tunable /proc or /sys file.
+
+--- Comment (tappro, Wed, 20 Dec 2017 10:52:14 +0000) ---
+Another bad effect from this is related to unlink. There is mechanism in Lustre to notify client to discard data instead of writing it back, but this become broken if data stays for more than 10 seconds on client, there will be glimpse from client doing unlink and data will be flushed prior unlink itself.
+
+--- Comment (tappro, Wed, 20 Dec 2017 10:43:55 +0000) ---
+I have found this while investigating false-negative results in tests 101[a,b,c] in sanityn. Tests uses vm kernel settings to disable flushes but they are still happening due to such glimpses. This code is very old, from 2007 at least and there is no details why it was introduced, was that just an optimization or fix or anything else.

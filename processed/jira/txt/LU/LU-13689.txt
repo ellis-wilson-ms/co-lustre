@@ -1,0 +1,100 @@
+Key:        LU-13689
+Summary:    Replace cdt_state_lock with cdt_llog_lock
+Link:       https://jira.whamcloud.com/browse/LU-13689
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Nikitas Angelinas
+Reporter:   Nikitas Angelinas
+Created:    Wed, 17 Jun 2020 11:47:57 +0000
+Updated:    Wed, 12 Oct 2022 19:25:42 +0000
+Links:      Duplicate: is duplicated by LU-16235; Related: is related to  LU-11675; Related: is related to LU-14793
+
+--- Description ---
+Merge cdt_llog_lock and cdt_state_lock and check cdt_state against CDT_STOPPED and CDT_INIT in mdt_agent_record_add(); this should allow for race-free checking of cdt_state with respect to cdt_state transitions and ensure that cdt_last_cookie has been properly set at CDT startup time, before it is used for new requests.
+
+--- Comment (nangelinas, Wed, 12 Aug 2020 13:56:43 +0000) ---
+The following shows a reproducer and that the fix addresses the issue:
+
+Reproducer:
+
+The reproducer depends on artificially-inserted delays in the relevant code paths to simulate the race condition between the threads. A 10 second delay is inserted in mdt_hsm_cdt_start() after the HSM coordinator is set to CDT_INIT and cdt_last_cookie is reset using ktime_get_real_seconds(), but before mdt_hsm_pending_restore() is called; this allows us to enlarge the race window artificially when restarting the HSM coordinator. A 5 second delay is added in mdt_hsm_add_actions(), after cdt_state is checked against CDT_STOPPED and CDT_INIT, but only after 1000 HSM requests have been handled; this allows the reproducer to enter the race window where cdt_state is checked and gives a small delay during which we can restart the HSM coordinator. Because the request-adding delay is smaller than the coordinator-restarting delay, the request-adding thread in mdt_hsm_add_actions() will check cdt_state and proceed since it is set to CDT_RUNNING. Once 1000 HSM requests have been handled by the HSM coordinator, we try to archive the 1001th request. The 5-second delay allows us to restart the coordinator quickly; this resets cdt_last_cookie. The request-adding thread wakes up quicker than the coordinator-restarting thread since it has a smaller delay and since cdt_last_cookie has not yet been incremented to an unused value by the coordinator-starting thread, it proceeds to add the HSM request to the llog using an already-used cookie value. This leads to the following assertions being hit in cdt_agent_record_hash_add():
+
+LASSERT(carl0->carl_cat_idx == carl1->carl_cat_idx);
+
+LASSERT(carl0->carl_rec_idx == carl1->carl_rec_idx);
+
+Applying the fix from https://review.whamcloud.com/#/c/38963/ allows the HSM coordinator to return -EAGAIN, instead of hitting the assertions.
+
+Steps to reproduce:
+
+1. Set up a minimal Lustre cluster, one with llmount.sh and cfg/local.sh is sufficient; a copytool is not needed, but lhsmtool_posix can be used
+
+2. Start the HSM coordinator
+
+3. Set grace_delay to a large value, e.g. 1200; this allows HSM requests to remain in the llog long enough for the reproducer to take place and cause the assertions to be hit
+
+4. Create 1001 files
+
+5. Archive 1000 of the files
+
+6. Archive the last file; notice that a small delay is incurred. During this delay window, shut down and enable the coordinator
+
+With a branch derived from somewhat recent master, the following output is observed:
+
+# lfs hsm_archive /mnt/lustre/testfile1001
+# dmesg -c
+...
+ kernel:LustreError: 30362:0:(mdt_hsm_cdt_actions.c:139:cdt_agent_record_hash_add()) ASSERTION( carl0->carl_rec_idx == carl1->carl_rec_idx ) failed:
+ ...
+  kernel:LustreError: 30362:0:(mdt_hsm_cdt_actions.c:139:cdt_agent_record_hash_add()) LBUG
+  [root@c02sxfm0gtfm-mds1 tests]# dmesg -c
+  [19605.583099] LustreError: 30362:0:(mdt_hsm_cdt_actions.c:139:cdt_agent_record_hash_add()) ASSERTION( carl0->carl_rec_idx == carl1->carl_rec_idx ) failed:
+  [19605.583105] LustreError: 30362:0:(mdt_hsm_cdt_actions.c:139:cdt_agent_record_hash_add()) LBUG
+  [19605.583107] Pid: 30362, comm: hsm_cdtr 3.10.0-1062.9.1.el7.x86_64 #1 SMP Fri Dec 6 15:49:49 UTC 2019
+  [19605.583108] Call Trace:
+  [19605.583121]  [] libcfs_call_trace+0x8c/0xc0 [libcfs]
+  [19605.583131]  [] lbug_with_loc+0x4c/0xa0 [libcfs]
+  [19605.583136]  [] cdt_agent_record_hash_add+0x355/0x3c0 [mdt]
+  [19605.583154]  [] mdt_cdt_waiting_cb.isra.26+0x729/0xcc0 [mdt]
+  [19605.583167]  [] mdt_coordinator_cb+0x162/0x290 [mdt]
+  [19605.583180]  [] llog_process_thread+0x85f/0x1a20 [obdclass]
+  [19605.583199]  [] llog_process_or_fork+0xcf/0x520 [obdclass]
+  [19605.583210]  [] llog_cat_process_cb+0x239/0x250 [obdclass]
+  [19605.583222]  [] llog_process_thread+0x85f/0x1a20 [obdclass]
+  [19605.583234]  [] llog_process_or_fork+0xcf/0x520 [obdclass]
+  [19605.583245]  [] llog_cat_process_or_fork+0x1f1/0x370 [obdclass]
+  [19605.583256]  [] llog_cat_process+0x2e/0x30 [obdclass]
+  [19605.583268]  [] cdt_llog_process+0xc6/0x3a0 [mdt]
+  [19605.583280]  [] mdt_coordinator+0x541/0x19f0 [mdt]
+  [19605.583291]  [] kthread+0xd1/0xe0
+  [19605.583296]  [] ret_from_fork_nospec_end+0x0/0x39
+  [19605.583300]  [] 0xffffffffffffffff
+
+An LBUG can be triggered due to this issue in cdt_agent_record_hash_add() on either carl_cat_idx or carl_rec_idx (as shown in the example above) depending on whether the two llog entries are in the same catalog entry or not. With the fix from https://review.whamcloud.com/#/c/38963/ applied, this same code allows the MDT to return -EAGAIN, instead of triggering one of the two LBUGs:
+
+# lfs hsm_archive /mnt/lustre/testfile1000
+Cannot send HSM request (use of /mnt/lustre/testfile1000): Resource temporarily unavailable
+# dmesg -c
+[  385.347189] Lustre: lustre-OST0000-osc-ffff97ad8ac4a800: reconnect after 16s idle
+[  385.347324] Lustre: lustre-OST0000: Connection restored to b3fb17d8-3cf4-5172-6801-684ff0fc684a (at 192.168.42.90@tcp)
+
+-EAGAIN is returned from the following change that the fix introduces in mdt_agent_record_add():
+
+if ((cdt->cdt_state == CDT_STOPPED || cdt->cdt_state == CDT_INIT) &&
+	    !(flags & HAL_CDT_FORCE))
+		GOTO(unavail, rc = -EAGAIN);
+
+--- Comment (gerrit, Wed, 17 Jun 2020 11:51:48 +0000) ---
+Nikitas Angelinas (nikitas.angelinas@hpe.com) uploaded a new patch: https://review.whamcloud.com/38963
+
+Subject: LU-13689 hsm: replace cdt_state_lock with cdt_llog_lock
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 3123d6498c1310ab5472d44ea255b49aa62bda41

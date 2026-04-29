@@ -1,0 +1,105 @@
+Key:        LU-7014
+Summary:    IAM index delete operation can require extra credits under certain situations
+Link:       https://jira.whamcloud.com/browse/LU-7014
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Andreas Dilger
+Reporter:   Kit Westneat
+Created:    Mon, 17 Aug 2015 19:21:44 +0000
+Updated:    Sat, 19 Sep 2015 05:32:29 +0000
+Resolved:   Sat, 19 Sep 2015 05:32:29 +0000
+
+--- Description ---
+In testing the nodemap save config patch (http://review.whamcloud.com/#/c/11813/), I ran into a situation where I can consistently cause a kernel panic by creating a large number of index records, and then deleting them. The cause appears to be that under certain circumstances the delete operation requires more credits than are allocated. 
+
+Here's the LBUG and jbd2 abort:
+
+...
+[ 5846.233511]  [] __ldiskfs_handle_dirty_metadata+0x1d2/0x230 [ldiskfs]
+[ 5846.233613]  [] ? jbd2_journal_get_write_access+0x32/0x40 [jbd2]
+[ 5846.233724]  [] iam_txn_dirty+0x2a/0x60 [osd_ldiskfs]
+[ 5846.233835]  [] iam_it_rec_delete+0x4f3/0x6d0 [osd_ldiskfs]
+[ 5846.233943]  [] iam_delete+0x64/0xe0 [osd_ldiskfs]
+[ 5846.234073]  [] osd_index_iam_delete+0x227/0x6c0 [osd_ldiskfs]
+[ 5846.234185]  [] ? iam_lfix_split+0x140/0x140 [osd_ldiskfs]
+[ 5846.234347]  [] nodemap_idx_delete+0x2e2/0x4e0 [ptlrpc]
+...
+[ 5846.237738] LDISKFS-fs: iam_txn_dirty:606: aborting transaction: error 28 in __ldiskfs_handle_dirty_metadata
+[ 5846.237837] LDISKFS: jbd2_journal_dirty_metadata failed: handle type 0 started at line 991, credits 2/0, errcode -28
+[ 5846.237855] LDISKFS-fs error (device loop0) in iam_txn_dirty:608: error 28
+
+[ 5846.243727] Lustre: 9062:0:(osd_iam.c:2410:iam_recycle_leaf()) test-MDT0000: idle blocks failed, will lose the blk 2
+[ 5846.243799] Lustre: 9062:0:(osd_internal.h:1087:osd_trans_exec_check()) op 9: used 2, used now 2, reserved 1
+[ 5846.243868] Lustre: 9062:0:(osd_handler.c:902:osd_trans_dump_creds())   create: 0/0/0, destroy: 0/0/0
+[ 5846.243938] Lustre: 9062:0:(osd_handler.c:909:osd_trans_dump_creds())   attr_set: 0/0/0, xattr_set: 1/1/0
+[ 5846.244028] Lustre: 9062:0:(osd_handler.c:919:osd_trans_dump_creds())   write: 0/0/0, punch: 0/0/0, quota 0/0/0
+[ 5846.244096] Lustre: 9062:0:(osd_handler.c:926:osd_trans_dump_creds())   insert: 0/0/0, delete: 1/1/2
+[ 5846.244165] Lustre: 9062:0:(osd_handler.c:933:osd_trans_dump_creds())   ref_add: 0/0/0, ref_del: 0/0/0
+[ 5846.244243] LustreError: 9062:0:(osd_internal.h:1090:osd_trans_exec_check()) LBUG
+
+I also added some debugging code to iam_it_rec_delete to track credits of the form:
+
+CDEBUG(D_INFO, "about to delete, credits: %d\n", h->h_buffer_credits);
+
+Here is the sequence that caused the LBUG:
+
+00000001:00000040:1.0:1439827725.734445:0:9062:0:(osd_iam.c:2443:iam_it_rec_delete()) about to delete, credits: 2
+00000001:00000040:1.0:1439827725.734447:0:9062:0:(osd_iam.c:2445:iam_it_rec_delete()) about to dirty, credits: 2
+00000001:00000040:1.0:1439827725.734449:0:9062:0:(osd_iam.c:2451:iam_it_rec_delete()) about to shrink, credits: 1                                                                                                              
+00000001:00000040:1.0:1439827725.734453:0:9062:0:(osd_iam.c:2460:iam_it_rec_delete()) about to recycle, credits: 0                                                                                                                
+
+It looks like dirty, shrink , and recycle can each consume a credit, but don't always:
+
+00000001:00000040:1.0:1439827725.620483:0:9002:0:(osd_iam.c:2443:iam_it_rec_delete()) about to delete, credits: 2
+00000001:00000040:1.0:1439827725.620485:0:9002:0:(osd_iam.c:2445:iam_it_rec_delete()) about to dirty, credits: 2
+00000001:00000040:1.0:1439827725.620486:0:9002:0:(osd_iam.c:2451:iam_it_rec_delete()) about to shrink, credits: 2
+00000001:00000040:1.0:1439827725.620490:0:9002:0:(osd_iam.c:2460:iam_it_rec_delete()) about to recycle, credits: 2
+
+It seems like you could just modify osd_dto_credits_noquota[DTO_INDEX_DELETE] to be 2 instead of 1, but I wasn't sure what the consequence of that would be. I also noticed that in osd_declare_object_destroy(), there are extra credits taken for the recycle operation:
+
+        /* Recycle idle OI leaf may cause additional three OI blocks                                                  
+         * to be changed. */                                                                                          
+        osd_trans_declare_op(env, oh, OSD_OT_DELETE,                                                                  
+                             osd_dto_credits_noquota[DTO_INDEX_DELETE] + 3);                                          
+
+Anyway, I wasn't sure what the best way to proceed is and was hoping for some insight. Thanks.
+
+--- Comment (pjones, Sat, 19 Sep 2015 05:32:29 +0000) ---
+Landed for 2.8
+
+--- Comment (gerrit, Sat, 19 Sep 2015 03:34:46 +0000) ---
+Oleg Drokin (oleg.drokin@intel.com) merged in patch http://review.whamcloud.com/16213/
+
+Subject: LU-7014 osd: add additional credits for generic IAM delete
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 5bfa3e3150a9de7c97aa6bcb5f9e2c00d1c0e030
+
+--- Comment (gerrit, Thu, 3 Sep 2015 10:52:37 +0000) ---
+Alex Zhuravlev (alexey.zhuravlev@intel.com) uploaded a new patch: http://review.whamcloud.com/16213
+
+Subject: LU-7014 osd: add additional credits for generic IAM delete
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: a2b19e4693aeee866cfbe0f66fd87eaef8d7c862
+
+--- Comment (jgmitter, Tue, 18 Aug 2015 17:18:47 +0000) ---
+Hi Alex,
+
+Can you investigate this issue?
+
+Thanks.
+
+Joe

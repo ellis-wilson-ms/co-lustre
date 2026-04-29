@@ -1,0 +1,197 @@
+Key:        LU-8299
+Summary:    (vvp_io.c:922:vvp_io_fault_start()) ASSERTION( cl_index(obj, offset) == fio->ft_index )
+Link:       https://jira.whamcloud.com/browse/LU-8299
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Alexander Zarochentsev
+Reporter:   Patrick Farrell
+Created:    Fri, 17 Jun 2016 20:00:19 +0000
+Updated:    Mon, 20 Feb 2023 10:06:47 +0000
+Resolved:   Wed, 27 Feb 2019 05:40:16 +0000
+Attachments: mmap_test.c
+
+--- Description ---
+Full stack of the panic:
+
+LustreError: 15833:0:(vvp_io.c:1233:vvp_io_fault_start()) ASSERTION( cl_index(obj, offset) == fio->ft_index ) failed:
+LustreError: 15833:0:(vvp_io.c:1233:vvp_io_fault_start()) LBUG
+Pid: 15833, comm: a.out
+
+Call Trace:
+ [] libcfs_debug_dumpstack+0x55/0x80 [libcfs]
+ [] lbug_with_loc+0x47/0xb0 [libcfs]
+ [] vvp_io_fault_start+0x9ab/0xc70 [lustre]
+ [] ? libcfs_debug_msg+0x41/0x50 [libcfs]
+ [] ? libcfs_log_return+0x28/0x40 [libcfs]
+ [] cl_io_start+0x6a/0x140 [obdclass]
+ [] cl_io_loop+0xb4/0x1b0 [obdclass]
+ [] ll_fault+0x2de/0x510 [lustre]
+ [] __do_fault+0x54/0x530
+ [] handle_pte_fault+0xf7/0xb00
+ [] ? __mem_cgroup_try_charge+0x19/0x5d0
+ [] ? cfs_set_ptldebug_header+0x2b/0xc0 [libcfs]
+ [] ? find_get_page+0x1e/0xa0
+ [] ? _cond_resched+0x9/0x40
+ [] ? filemap_fault+0xd3/0x500
+ [] handle_mm_fault+0x22a/0x300
+ [] __do_page_fault+0x138/0x480
+ [] ? inode_has_perm+0x54/0xa0
+ [] ? avc_has_perm+0x71/0x90
+ [] ? tty_wakeup+0x3d/0x80
+ [] do_page_fault+0x3e/0xa0
+ [] page_fault+0x25/0x30
+ [] ? copy_user_generic_unrolled+0x2f/0xb0
+ [] ? tty_write+0x1ff/0x2a0
+ [] ? n_tty_write+0x0/0x460
+ [] vfs_write+0xb8/0x1a0
+ [] sys_write+0x51/0x90
+ [] ? __audit_syscall_exit+0x25e/0x290
+ [] system_call_fastpath+0x16/0x1b
+
+This is triggered by a trivial mmap test code which accidentally passes in an argument >2^63.  I'll attach code for the test.
+
+Running it like this:
+
+truncate -s 8589934592 file
+./mmap_test file 8589934500 8
+
+Will cause that panic.  The test is incorrect, but it still shouldn't panic nodes.
+
+In vvp_io_fault_start, we calculate the index with cl_index.  This treats its argument (offset) as signed...  But offset (which is the same as ft_index here, which is that argument from userspace) is greater than 2^63, so it's negative, so this doesn't work.
+
+/**
+ * Converts a page index into a byte offset within object \a obj.
+ */
+pgoff_t cl_index(const struct cl_object *obj, loff_t offset)
+{
+        return offset >> PAGE_CACHE_SHIFT;
+}
+EXPORT_SYMBOL(cl_index);
+
+When offset is negative, bit shift division is invalid.  Oops.
+
+This is corrected by making the function in question (cl_index) accept its argument as unsigned.  This gets the bits twiddled correctly, but it's nasty, because offset in vvp_io_fault_start is still loff_t...  and loff_t is still signed.
+
+I don't have a larger solution, because loff_t being signed is something we get from the kernel.  It seems wrong, but I'm not sure what to do about it.
+
+I'll post my little patch and the powers that be can ponder the larger situation.
+
+--- Comment (pjones, Wed, 27 Feb 2019 05:40:16 +0000) ---
+Landed for 2.13
+
+--- Comment (gerrit, Wed, 27 Feb 2019 02:03:22 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/34242/
+
+Subject: ft_index )" class="issue-link" data-issue-key="LU-8299">LU-8299 llite: ll_fault should fail for insane file offsets
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: ada3b33b52cdc6420e3b186c0aba4dd0b0337d8c
+
+--- Comment (simmonsja, Wed, 13 Feb 2019 18:33:59 +0000) ---
+awesome!!!
+
+--- Comment (zam, Wed, 13 Feb 2019 18:21:02 +0000) ---
+> Since we have a reproducer could we add that to the sanity test 
+
+yes. just uploaded new revision with mmap_sanity/tst9.  below is how it fails w/o the fix 
+
+(machine hanged, I had to reboot it):
+
+[root@devvm1 tests]# ./mmap_sanity -d /mnt/lustre
+mmap test1: basic mmap operation (PASS, 0.022238s)
+mmap test2: MAP_PRIVATE not write back (PASS, 0.006258s)
+mmap test3: concurrent mmap ops on two nodes (SKIPPED, 0s)
+mmap test4: c1 write to f1 from mmapped f2, c2 write to f1 from mmapped f1 (SKIPPED, 0s)
+fwrite failed for '/sys/fs/lustre/ldlm/namespaces/lustre-OST0000-osc-MDT0000/lru_size': Bad file descriptor
+mmap test5: read/write file to/from the buffer which mmapped to just this file (PASS, 0.008157s)
+mmap test6: check mmap write/read content on two nodes (SKIPPED, 0s)
+mmap test7: file i/o with an unmapped buffer (PASS, 0.007631s)
+mmap test8: SIGBUS for beyond file size (PASS, 0.001838s)
+packet_write_wait: Connection to 192.168.56.101 port 22: Broken pipe
+C02T94HYGTFM:lustre-wc-rel c17826$
+
+--- Comment (simmonsja, Wed, 13 Feb 2019 17:16:04 +0000) ---
+Since we have a reproducer could we add that to the sanity test
+
+--- Comment (pfarrell, Wed, 13 Feb 2019 16:27:15 +0000) ---
+spitzcor I think the proper approach is to take Zam's patch and abandon the other one - It's a bit of a pain to get right, and with Zam's patch, it's irrelevant.  (I see you suggested that in Gerrit.)
+
+--- Comment (zam, Wed, 13 Feb 2019 12:15:24 +0000) ---
+running the reproducer with the fix from https://review.whamcloud.com/34242 :
+
+[root@devvm1 tests]# ~zam/work/tasks/LUS-1392/mmap_test /mnt/lustre/bar 8589934500 8
+ command line: /mnt/lustre/bar 8589934500 8
+ file size 8589934592, offset -92, length 8589934684
+write: Bad address
+[root@devvm1 tests]#
+
+--- Comment (zam, Wed, 13 Feb 2019 11:23:50 +0000) ---
+My understanding is that the kernel allows negative file offsets for certain special cases (e.g. accessing kernel memory via /dev/kmem on some CPU architectures), but this should be blocked when accessing filesystems. 
+
+yes, absolute file offset should not be negative. filemap_fault() has the following code :
+
+int filemap_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
+{
+        int error;
+        struct file *file = vma->vm_file;
+        struct address_space *mapping = file->f_mapping;
+        struct file_ra_state *ra = &file->f_ra;
+        struct inode *inode = mapping->host;
+        pgoff_t offset = vmf->pgoff;
+        struct page *page;
+        pgoff_t size;
+        int ret = 0;
+
+        size = (i_size_read(inode) + PAGE_CACHE_SIZE - 1) >> PAGE_CACHE_SHIFT;
+        if (offset >= size)
+                return VM_FAULT_SIGBUS;
+
+Lustre tries to handle such a large offset usual way and has all those problems with conversion page offset to file offset and back.  I submitted a small patch to return an error early in ll_fault() for obviously insane page indexes https://review.whamcloud.com/34242 .
+
+--- Comment (gerrit, Wed, 13 Feb 2019 10:54:49 +0000) ---
+Alexander Zarochentsev (c17826@cray.com) uploaded a new patch: https://review.whamcloud.com/34242
+
+Subject: ft_index )" class="issue-link" data-issue-key="LU-8299">LU-8299 llite: ll_fault should fail for insane file offsets
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: f49e3d20b7175f7686aff0a6e690468a5a7c99dd
+
+--- Comment (spitzcor, Fri, 18 Jan 2019 15:05:47 +0000) ---
+bobijam and pfarrell what should be done with https://review.whamcloud.com/#/c/20861 ?  Patrick contributed that a while back and it was last touched six months ago.  It has some negative feedback.  Who should address that and finish the work up?
+
+--- Comment (adilger, Fri, 17 Jun 2016 20:13:08 +0000) ---
+My understanding is that the kernel allows negative file offsets for certain special cases (e.g. accessing kernel memory via /dev/kmem on some CPU architectures), but this should be blocked when accessing filesystems.  Negative offsets are definitely blocked in llseek_execute(), but I'm not sure if we are missing some check at a high-level routine for mmap() that should do the same.
+
+--- Comment (paf, Fri, 17 Jun 2016 20:07:56 +0000) ---
+Meant to include this code from vvp_io_fault_start in my original posting:
+
+        /* offset of the last byte on the page */
+        offset = cl_offset(obj, fio->ft_index + 1) - 1;
+        LASSERT(cl_index(obj, offset) == fio->ft_index);
+
+Note that the specific error here is that for our value, cl_index doesn't actually do the expected "divide by page size", so cl_index(obj, offset) has the same value as "offset".
+
+--- Comment (gerrit, Fri, 17 Jun 2016 20:04:46 +0000) ---
+Patrick Farrell (paf@cray.com) uploaded a new patch: http://review.whamcloud.com/20861
+
+Subject: ft_index )" class="issue-link" data-issue-key="LU-8299">LU-8299 clio: correct arithmetic in cl_index
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: b72725d2325072b9beb2a9e5a48ed8843dacf9b5

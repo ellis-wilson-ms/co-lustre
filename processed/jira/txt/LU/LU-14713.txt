@@ -1,0 +1,474 @@
+Key:        LU-14713
+Summary:    Process hung with waiting for mmap_sem
+Link:       https://jira.whamcloud.com/browse/LU-14713
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Zhenyu Xu
+Reporter:   Zhenyu Xu
+Created:    Thu, 27 May 2021 03:49:01 +0000
+Updated:    Wed, 21 Jan 2026 09:11:46 +0000
+Resolved:   Sat, 20 Nov 2021 14:42:48 +0000
+Links:      Related: is related to LU-15397
+
+--- Description ---
+Write and Truncate IO will serialized on ll_trunc_sem::ll_trunc_{readers|waiters}, if one process quit abruptly (be killed), the other will keep waiting for the semaphore (task state be set as TASK_INTERRUPTIBLE):
+
+ INFO: task a.out:109684 blocked for more than 120 seconds.
+      Tainted: G          IOE    --------- -  - 4.18.0-240.15.1.el8_3.x86_64 #1
+ "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+ Call Trace:
+ __schedule+0x2a6/0x700
+ schedule+0x38/0xa0
+ trunc_sem_down_read+0xa6/0xb0 [lustre]
+ vvp_io_write_start+0x107/0xb80 [lustre]
+ cl_io_start+0x59/0x110 [obdclass]
+ cl_io_loop+0x9a/0x1e0 [obdclass]
+ ll_file_io_generic+0x380/0xb10 [lustre]
+ ll_file_write_iter+0x136/0x5a0 [lustre]
+ new_sync_write+0x124/0x170
+ vfs_write+0xa5/0x1a0
+ ksys_write+0x4f/0xb0
+ do_syscall_64+0x5b/0x1a0
+
+--- Comment (eaujames, Fri, 20 May 2022 12:47:01 +0000) ---
+We likely hit this issue at the CEA in production.
+
+After upgrading from 2.12.6 to 2.12.7, we observed regularly hangs on the clients when canceling a job.
+
+The hang is observed on mmap_sem when closing the /dev/infiniband/uverb* device:
+
+void ib_umem_release(struct ib_umem *umem)
+{
+        if (!umem)
+                return;
+.....
+
+#ifdef HAVE_ATOMIC_PINNED_VM
+        atomic64_sub(ib_umem_num_pages(umem), &umem->owning_mm->pinned_vm);
+#else
+        down_write(&umem->owning_mm->mmap_sem);                 
+
+MOFED: 5.4
+
+kernel: 3.10
+
+lustre: client 2.12.7
+
+So I am not 100% sure, but I think we hit the regression from 21dc165991 "LU-13182 llite: Avoid eternel retry loops with MAP_POPULATE" (landed in 2.12.7).
+
+This patch could cause mmap_sem to be released (up_read) twice (only for kernel < 5.1).
+
+--- Comment (gerrit, Thu, 19 May 2022 19:31:51 +0000) ---
+"Etienne AUJAMES " uploaded a new patch: https://review.whamcloud.com/47404
+
+Subject: LU-14713 llite: tighten condition for fault not drop mmap_sem
+
+Project: fs/lustre-release
+
+Branch: b2_12
+
+Current Patch Set: 1
+
+Commit: cdf66f48b5100b0b209be3f1741e6163000299e2
+
+--- Comment (pjones, Sat, 20 Nov 2021 14:42:48 +0000) ---
+Landed for 2.15
+
+--- Comment (gerrit, Sat, 20 Nov 2021 06:30:57 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/43844/
+
+Subject: LU-14713 llite: mend the trunc_sem_up_write()
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 39745c8b5493159bbca62add54ca9be7cac6564f
+
+--- Comment (gerrit, Sat, 20 Nov 2021 06:25:39 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/44715/
+
+Subject: LU-14713 llite: tighten condition for fault not drop mmap_sem
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 81aec05103558f57adb10fd319847304cdf44aa7
+
+--- Comment (bobijam, Fri, 20 Aug 2021 14:37:43 +0000) ---
+As ll_fault0() shows, if ll_filemap_fault() returns VM_FAULT_RETRY, it presumes mmap_sem has not dropped and continues to normal fault under DLM lock, which will eventually drop the mmap_sem.
+
+ll_fault0()
+
+279         if (ll_sbi_has_fast_read(ll_i2sbi(file_inode(vma->vm_file)))) {         
+280                 /* do fast fault */                                             
+281                 bool has_retry = vmf->flags & FAULT_FLAG_RETRY_NOWAIT;          
+282                                                                                 
+283                 /* To avoid loops, instruct downstream to not drop mmap_sem */  
+284                 vmf->flags |= FAULT_FLAG_RETRY_NOWAIT;                          
+285                 ll_cl_add(vma->vm_file, env, NULL, LCC_MMAP);                   
+286                 fault_ret = ll_filemap_fault(vma, vmf);                         
+287                 ll_cl_remove(vma->vm_file, env);                                
+288                 if (!has_retry)                                                 
+289                         vmf->flags &= ~FAULT_FLAG_RETRY_NOWAIT;                 
+290                                                                                 
+291                 /* - If there is no error, then the page was found in cache and 
+292                  *   uptodate;                                                  
+293                  * - If VM_FAULT_RETRY is set, the page existed but failed to   
+294                  *   lock. We will try slow path to avoid loops.                
+295                  * - Otherwise, it should try normal fault under DLM lock. */   
+296                 if (!(fault_ret & VM_FAULT_RETRY) &&                            
+297                     !(fault_ret & VM_FAULT_ERROR))                              
+298                         GOTO(out, result = 0);                                  
+299                                                                                 
+300                 fault_ret = 0;                                                  
+301         }            
+
+But filemap_fault() shows that returning VM_FAULT_RETRY  while not dopping mmap_sem needs vmf->flags contains both FAULT_FLAG_ALLOW_RETRY and FAULT_FLAG_RETRY_NOWAIT, otherwise it could possibly return VM_FAULT_RETRY with mmap_sem released.
+
+filemap_fault()
+
+2421         if (!lock_page_or_retry(page, vma->vm_mm, vmf->flags)) {                
+2422                 page_cache_release(page);                                       
+2423                 return ret | VM_FAULT_RETRY;                                            
+2424         }      
+
+410 static inline int lock_page_or_retry(struct page *page, struct mm_struct *mm,   
+411                                      unsigned int flags)                                 
+412 {                                                                               
+413         might_sleep();                                                          
+414         return trylock_page(page) || __lock_page_or_retry(page, mm, flags);     
+415 } 
+
+ 854 int __lock_page_or_retry(struct page *page, struct mm_struct *mm,               
+ 855                          unsigned int flags)                                    
+ 856 {                                                                               
+ 857         if (flags & FAULT_FLAG_ALLOW_RETRY) {                                   
+ 858                 /*                                                              
+ 859                  * CAUTION! In this case, mmap_sem is not released              
+ 860                  * even though return 0.                                        
+ 861                  */                                                             
+ 862                 if (flags & FAULT_FLAG_RETRY_NOWAIT)                            
+ 863                         return 0;                                               
+ 864                                                                                 
+ 865                 up_read(&mm->mmap_sem);                                         
+ 866                 if (flags & FAULT_FLAG_KILLABLE)                                
+ 867                         wait_on_page_locked_killable(page);                     
+ 868                 else                                                            
+ 869                         wait_on_page_locked(page);                                      
+ 870                 return 0;  
+ 871         } else {                                                                
+ 872                 if (flags & FAULT_FLAG_KILLABLE) {                              
+ 873                         int ret;                                                
+ 874                                                                                 
+ 875                         ret = __lock_page_killable(page);                       
+ 876                         if (ret) {                                              
+ 877                                 up_read(&mm->mmap_sem);                         
+ 878                                 return 0;                                               
+ 879                         }                                                       
+ 880                 } else                                                          
+ 881                         __lock_page(page);                                      
+ 882                 return 1;                                                       
+ 883         }     
+ 884 }
+
+--- Comment (gerrit, Fri, 20 Aug 2021 14:15:24 +0000) ---
+"Bobi Jam " uploaded a new patch: https://review.whamcloud.com/44715
+
+Subject: LU-14713 llite: tighten condition for fault not drop mmap_sem
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 0cccc61c4bd48cc6942963394cd2ea70e30b8563
+
+--- Comment (gerrit, Thu, 22 Jul 2021 01:11:10 +0000) ---
+Neil Brown (neilb@suse.de) uploaded a new patch: https://review.whamcloud.com/44372
+
+Subject: LU-14713 llite: add memory barriier to the trunc_sem.
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 1b20297bce772534dd557abaa11859447da8651b
+
+--- Comment (neilb, Wed, 21 Jul 2021 23:11:43 +0000) ---
+It seems I was wrong about atomic_set implying a barrier, but I'm slightly less convinced that x86 doesn't require them.
+
+So I'd still be very surprised if barriers were causing the problem, but there is something worth fixing there.
+
+ 
+
+The atomic_set in trunc_sem_uip_write should be atomic_set_release(), and  that atomic_reads should be atomic_read_acquire().
+
+ 
+
+I would still like to see the exact source code for the kernel modules which produced the hang, if that is possible.
+
+--- Comment (bobijam, Wed, 21 Jul 2021 07:07:58 +0000) ---
+Neil,
+
+I'm not familiar with the memory barrier while I noticed a kernel comment about wake_up_var()->__wake_up_bit()->waitqueue_active()
+
+  97 /**                                                                             
+  98  * waitqueue_active -- locklessly test for waiters on the queue                 
+  99  * @wq_head: the waitqueue to test for waiters                                  
+ 100  *                                                                              
+ 101  * returns true if the wait list is not empty                                   
+ 102  *                                                                              
+ 103  * NOTE: this function is lockless and requires care, incorrect usage _will_    
+ 104  * lead to sporadic and non-obvious failure.                                    
+ 105  *                                                                              
+ 106  * Use either while holding wait_queue_head::lock or when used for wakeups      
+ 107  * with an extra smp_mb() like::                                                
+ 108  *                                                                              
+ 109  *      CPU0 - waker                    CPU1 - waiter                           
+ 110  *                                                                              
+ 111  *                                      for (;;) {                              
+ 112  *      @cond = true;                     prepare_to_wait(&wq_head, &wait, state);
+ 113  *      smp_mb();                         // smp_mb() from set_current_state()  
+ 114  *      if (waitqueue_active(wq_head))         if (@cond)                       
+ 115  *        wake_up(wq_head);                      break;                         
+ 116  *                                        schedule();                           
+ 117  *                                      }                                       
+ 118  *                                      finish_wait(&wq_head, &wait);           
+ 119  *                                                                              
+ 120  * Because without the explicit smp_mb() it's possible for the                  
+ 121  * waitqueue_active() load to get hoisted over the @cond store such that we'll  
+ 122  * observe an empty wait list while the waiter might not observe @cond.  
+
+Does that mean there should be smp_mb() in trunc_sem_up_write() before wake_up_var()?
+
+347 static inline void trunc_sem_up_write(struct ll_trunc_sem *sem)                 
+ 348 {                                                                               
+ 349         atomic_set(&sem->ll_trunc_readers, 0);                                                       
+ 350         wake_up_var(&sem->ll_trunc_readers);                                    
+ 351 }
+
+--- Comment (neilb, Fri, 4 Jun 2021 06:02:46 +0000) ---
+I'm confident that memory barriers aren't a problem.  atomic_set() and atomic_read() provide any memory barriers they need, and none are needed on x86.
+
+So I'm stumped - for today at least.
+
+ll_trunc_readers is definitely 0 and whenever it is set to zero a wake_up happens.  But the waiter didn't wake up.
+
+I'd still like to see the exact lustre source code for these modules, but I doubt it will show anything.
+
+--- Comment (neilb, Fri, 4 Jun 2021 04:19:46 +0000) ---
+Looking at the vmcore  "bt -FF 4718" show
+
+ 
+
+#1 [ffffbe8540f3bb88] schedule at ffffffff8f6d38a8
+
+ ffffbe8540f3bb90: [ffff9f9b3d8c37a0:lustre_inode_cache] trunc_sem_down_read+166 
+
+ #2 [ffffbe8540f3bb98] trunc_sem_down_read at ffffffffc12523c6 [lustre]
+
+ ffffbe8540f3bba0: [ffff9f9b3d8c37a0:lustre_inode_cache] 00000000ffffffff
+
+ 
+
+So ffffbe8540f3bba0 must be the address of the ll_trunc_sem.
+
+crash> x/2wx 0xffff9f9b3d8c37a0
+
+0xffff9f9b3d8c37a0: 0x00000000 0x00000000
+
+so both ll_trunc_waiters and ll_trunc_readers are zero.  So trunc_sem_down_read() shouldn't block.
+
+This suggests a missed wake-up.  It could only be the wakeup from trunc_sem_up_write().  Maybe a barrier is needed after the atomic_set, and before the atomic_add_unless_negative.
+
+But I thought barriers like that weren't needed on x86.
+
+I'll read up about memory ordering again.
+
+--- Comment (bobijam, Fri, 4 Jun 2021 03:12:31 +0000) ---
+I can open it, but I'm having difficulty to find 'struct ll_trunc_sem'. vmcore is available from:
+
+same here.
+
+crash> struct ll_trunc_sem
+struct: invalid data structure reference: ll_trunc_sem
+
+seems lack of lustre module debug info.
+
+rpm -qpl lustre-client-debuginfo-2.12.6_ddn19-1.el8.x86_64.rpm
+
+shows that it does not contain lustre module info, only some tools.
+
+--- Comment (neilb, Fri, 4 Jun 2021 01:44:48 +0000) ---
+> The reported version is 2.12.6-ddn19
+
+The public "lustre-release" git tree doesn't have any branch or tag with a name like that, and the public "2.12.6" doesn't contain trunc_sem_down_read() at all.
+
+Is there somewhere I can get the source code for that release?
+
+--- Comment (bobijam, Fri, 4 Jun 2021 01:01:34 +0000) ---
+The reported version is 2.12.6-ddn19 (both client and server). And unfortunately I failed to load teh vmcore with crqsh
+
+# crash ./120035_YITP_client_ioerror/usr/lib/debug/lib/modules/4.18.0-240.15.1.el8_3.x86_64/vmlinux 120035_YITP_client_ioerror/vmcore 
+
+crash 7.2.3-11.el7_9.1
+Copyright (C) 2002-2017  Red Hat, Inc.
+Copyright (C) 2004, 2005, 2006, 2010  IBM Corporation
+Copyright (C) 1999-2006  Hewlett-Packard Co
+Copyright (C) 2005, 2006, 2011, 2012  Fujitsu Limited
+Copyright (C) 2006, 2007  VA Linux Systems Japan K.K.
+Copyright (C) 2005, 2011  NEC Corporation
+Copyright (C) 1999, 2002, 2007  Silicon Graphics, Inc.
+Copyright (C) 1999, 2000, 2001, 2002  Mission Critical Linux, Inc.
+This program is free software, covered by the GNU General Public License,
+and you are welcome to change it and/or distribute copies of it under
+certain conditions.  Enter "help copying" to see the conditions.
+This program has absolutely no warranty.  Enter "help warranty" for details.
+ 
+GNU gdb (GDB) 7.6
+Copyright (C) 2013 Free Software Foundation, Inc.
+License GPLv3+: GNU GPL version 3 or later 
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.  Type "show copying"
+and "show warranty" for details.
+This GDB was configured as "x86_64-unknown-linux-gnu"...
+
+WARNING: kernel relocated [222MB]: patching 97897 gdb minimal_symbol values
+
+please wait... (gathering task table data)                             
+crash: radix trees do not exist or have changed their format
+
+--- Comment (neilb, Fri, 4 Jun 2021 00:05:32 +0000) ---
+Another question:  If you still have the core file and can find the 'struct ll_trunc_sem"  that the process is blocked on, could you report the contents of that.  I'm guessing the two atomic_t's are -1 and 0, but it would be highly informative if they had other values.  Maybe some sort of memory corruption caused the problem.
+
+--- Comment (neilb, Fri, 4 Jun 2021 00:02:23 +0000) ---
+Could you please report precisely which version of Lustre is in used (ideally the git commit hash).  The "Affected versions" above says "None" which isn't helpful.
+
+--- Comment (neilb, Thu, 3 Jun 2021 11:30:35 +0000) ---
+Thanks for the excellent explanation.  The bug must be hiding somewhere else then.  I'll keep digging.
+
+--- Comment (bobijam, Thu, 3 Jun 2021 09:15:51 +0000) ---
+The clio layer always (at least for now) stacks like this VVP upon LOV upon OSC/MDC, and cl_io_start() calls from top to bottom, which is vvp_io_xxx_start() then lov_io_xxx_start() which is nested with {mdc|osc}_io_xxx_start(), and that makes vvp_io_setattr_start() the first to be called in the CIT_SETATTR cl_io_loop call path.
+
+Like following example shows
+
+00000020:00000001:0.0:1622711194.323939:0:20024:0:(cl_io.c:755:cl_io_loop()) Process entered
+00000020:00000001:0.0:1622711194.323940:0:20024:0:(cl_io.c:390:cl_io_iter_init()) Process entered
+...
+00000020:00000001:0.0:1622711194.323955:0:20024:0:(cl_io.c:402:cl_io_iter_init()) Process leaving (rc=0 : 0 : 0)
+00000020:00000001:0.0:1622711194.323958:0:20024:0:(cl_io.c:311:cl_io_lock()) Process entered
+...
+00000020:00000001:0.0:1622711194.324421:0:20024:0:(cl_io.c:331:cl_io_lock()) Process leaving (rc=0 : 0 : 0)
+00000020:00000001:0.0:1622711194.324422:0:20024:0:(cl_io.c:516:cl_io_start()) Process entered
+00000080:00000001:0.0:1622711194.324422:0:20024:0:(vvp_io.c:737:vvp_io_setattr_start()) Process entered
+...
+00000080:00000001:0.0:1622711194.324427:0:20024:0:(vvp_io.c:763:vvp_io_setattr_start()) Process leaving (rc=0 : 0 : 0)
+00020000:00000001:0.0:1622711194.324427:0:20024:0:(lov_io.c:1487:lov_io_setattr_start()) Process entered
+...
+00000008:00000001:0.0:1622711194.324429:0:20024:0:(osc_io.c:582:osc_io_setattr_start()) Process entered
+...
+00000008:00000001:0.0:1622711194.324459:0:20024:0:(osc_io.c:687:osc_io_setattr_start()) Process leaving (rc=0 : 0 : 0)
+...
+00020000:00000001:0.0:1622711194.324461:0:20024:0:(lov_io.c:1502:lov_io_setattr_start()) Process leaving (rc=0 : 0 : 0)
+00000020:00000001:0.0:1622711194.324462:0:20024:0:(cl_io.c:528:cl_io_start()) Process leaving (rc=0 : 0 : 0)
+
+So basically vvp_io_setattr_start() will be called whatever in CIT_SETATTR cl_io_start().
+
+--- Comment (adilger, Thu, 3 Jun 2021 07:10:42 +0000) ---
+@Andreas does this seem at all possible?
+
+That is really a question for Bobijam to answer, as I'm not nearly as expert in the client IO code as he is.
+
+--- Comment (neilb, Thu, 3 Jun 2021 00:44:40 +0000) ---
+Thanks for the crash data.  I could not find the other process that I was sure must exist.
+
+The only process that looks at all suspicious is PID 46556 (ll_imp_inval) and I suspect it is waiting on the a.out thread, not the other way around.
+
+It is very likely that the ll_trunc_sem that a.out is blocked on has ll_trunc_waiters == 0 and ll_trunc_reads == -1.
+
+There are two ways this can happen:
+
+1/ a thread calls trunc_sem_down_write, but never calls trunc_sem_up_write
+
+2/ a thread calls trunc_sem_up_write without having first called trunc_sem_down_write.  If it does this while some other thread is holding a read lock, then the up_write call will set ll_trunc_reads to 0, and when the other thread calls trunc_sem_up_read, ll_trunc_reads will be decremented to -1.
+
+I cannot see a code path that leads to option 1.  I can see a code path that might lead to option 2, but there may be considerations that I'm not aware of which make it impossible.  I'll explain it in case it is possible.
+
+trunc_sem_up/down_write are only called from vvp_io_setattr_start/end.  These are only called from cl_io_start/end which are always paired.
+
+They are called directly in ll_readahead_handle_work and cl_io_loop where cl_io_end will always follow cl_io_start, and indirectly through love_io_start/end which will be paired properly exactly if  vvp_io_setattr_start/end are paired properly.
+
+cl_io_end will always call all of the ->cio_end functions, so missing a call to trunc_sem_up write is (should be) impossible.
+
+However cl_io_start will sometimes not  call all cio_start functions.  If one of the cio_start functions in the stack returns non-zero, the remainder are not called.  However the matching cio_end function will be called.  This seems very strange.  I might be missing something, but it certainly seems that is the what would happen.
+
+So if some cio_start function before vvp_io_setattr_start returned non-zero, then trunc_sem_down_write would not be called, but trunc_semd_up_write would.  This would often not cause a problem.  But if some other thread had called trunc_sem_down_read(), then it would provide exactly the symptom you observe.
+
+@Andreas does this seem at all possible?
+
+--- Comment (mnishizawa, Wed, 2 Jun 2021 06:26:32 +0000) ---
+Ah, we usually don't share our customer's data publicly.  So I attached it to DDN-2177, but it would be better to digging into the root cause.  
+
+Here is the stack trace:  [^crash.log] 
+
+I may delete the attachment later.
+
+--- Comment (neilb, Wed, 2 Jun 2021 06:05:53 +0000) ---
+I don't know how to access "DDN-2177".  I don't suppose you can attach them here?
+
+--- Comment (mnishizawa, Wed, 2 Jun 2021 01:43:00 +0000) ---
+I attached stack traces in DDN-2177.  Please note that this issue occurred twice on this client and the process "a.out:109684" in problem description is when this occurred first time.  The customer restarted the client, the issue occurred again and then vmcore was captured (vmcore is available in DDN-2177).  The stack traces attached is from this vmcore and so the process is "a.out:4718".  Hope this helps,
+
+--- Comment (neilb, Fri, 28 May 2021 05:46:25 +0000) ---
+Thanks for the stack trace.
+
+I think there must have been a least one other process blocked on a mutex or semphore.  Was anything else in the logs?
+
+trunc_sem_down_read() can only block in two circumstances: 1/ ll_trunc_readers is negative so a write lock it held, 2/ ll_waiters is non-zero so some process is waiting for a write lock.
+
+In case 2, that process will be blocked on trunc_sem_down_write() and should get a soft-lockup warning.
+
+In case 1, the writer must have called vvp_io_setattr_start and either
+
+A/ not yet called vvp_io_setattr_end(), or
+
+B/ changed io->ci_type or cio->u.ci_setattr.sa_subtype so taht when vvp_io_setattr_end() was called it didn't release the lock.
+
+B seems extremely unlikely.
+
+A implies that the process is still waiting as _end is always called after _start before the process can exit or return to user space.
+
+The only scenario that I can think of (other than 1B) where there would be no other process triggering the soft-lockup detector is that the process holding the write lock is in an TASK_INTERRUPTIBLE or TASK_IDLE wait.  That seems unlikely, but should be easy to find if it is the case.
+
+Given that the program that generated the stack trace was "a.out" I assume you can reproduce the problem.  Could you do that, then "echo t > /proc/sysrq-trigger" to generate a stack trace of all tasks.  Then provide me with the full set of stack traces?
+
+ 
+
+I agree that it would be good to be able to kill tasks blocked on mutexes or semphores, but that tends to take a lot more careful effort than just returning an error code.
+
+--- Comment (gerrit, Thu, 27 May 2021 09:00:53 +0000) ---
+Bobi Jam (bobijam@hotmail.com) uploaded a new patch: https://review.whamcloud.com/43844
+
+Subject: LU-14713 llite: make trunc_sem_down_xxx waiting killable
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: e335dad76a6edc7ede7a45b4ed60098dfa2c356f
+
+--- Comment (adilger, Thu, 27 May 2021 06:19:40 +0000) ---
+Making the wait interruptible is good.  It would also be good if the interrupted process woke up any waiters for the lock, so that they do not wait forever.

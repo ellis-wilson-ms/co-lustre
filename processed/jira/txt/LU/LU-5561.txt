@@ -1,0 +1,97 @@
+Key:        LU-5561
+Summary:    Lustre random reads: 80% performance loss from 1.8 to 2.6
+Link:       https://jira.whamcloud.com/browse/LU-5561
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Not a Bug
+Assignee:   WC Triage
+Reporter:   Patrick Farrell
+Created:    Fri, 29 Aug 2014 16:03:20 +0000
+Updated:    Fri, 21 Sep 2018 23:29:24 +0000
+Resolved:   Wed, 7 Sep 2016 20:05:38 +0000
+Links:      Duplicate: is duplicated by LU-2032; Related: is related to  LU-4931; Related: is related to LU-11416
+Attachments: 1.8.9_brw_stats.txt, 2.6_brw_stats.txt
+
+--- Description ---
+In a random read benchmark with a moderate amount of data, reading from disk (IE, cache cold), we see an 80-90% performance loss going from 1.8 to 2.6.  We have not tested 2.4/2.5.  (We've tried both Cray's 1.8.6 client on SLES and Intel's 1.8.9 client on CentOS and had similar results.)
+
+This is the IOR command line to read the file - the file is single striped:
+
+IOR -E -F -e -g -b 2964m -t 19k -k -C -Q 17 -r -z -v
+
+The IOR command is a single task reading 2.89 GB in 19KB chunks, entirely randomly.
+
+After writing the file out (same command with -w), then dropping server & client caches (echo 3 > /proc/sys/vm/drop_caches), we see (numbers are from a virtual cluster; numbers on real hardware were similar in terms of % change), I saw the following read rates on 1.8.9:
+
+33.8 MB/s
+
+22.5 MB/s
+
+20.3 MB/s
+
+22.9 MB/s
+
+And these read rates on 2.6:
+
+3.48 MB/s
+
+3.57 MB/s
+
+Server is running 2.6; we saw very similar numbers with a 2.1 server, so it doesn't seem to be related to the server version.
+
+I'll be attaching attached brw_stats for the OST where the file was located, for one run each of 1.8 and 2.6.  The main thing I noted was that the 1.8 client seemed to do many more large reads, and many, many fewer reads overall.
+
+The 1.8 client read a total of (approximately - estimated from brw_stats) ~4040 MB, but did it in ~11k total RPCs/disk I/O ops.
+
+The 2.6 client read a total (again, estimated from brw_stats) of ~4060 MB.  It used roughly 140k total RPCs/disk I/O ops.  More than ten time as many IO requests from the 2.6 client.  The distribution of IO sizes, unsurprisingly, skews much more towards small IOs.
+
+Thoughts?  I know random IO is generally not a good use of Lustre, but some codes do it, and this change in performance from 1.8 to 2.6 is kind of staggering.
+
+--- Comment (adilger, Wed, 7 Sep 2016 20:05:38 +0000) ---
+Actually closing.  The llapi_ladvise() functionality landed for 2.9.0, and fadvise() has been in Linux for a long time.  Getting these hints from the IO libraries could improve IO performance under some workloads significantly.
+
+--- Comment (adilger, Fri, 8 May 2015 00:31:50 +0000) ---
+Closing this for now.
+
+--- Comment (paf, Thu, 4 Sep 2014 15:32:43 +0000) ---
+Thanks, Andreas.
+
+Just to back up your thought that 2.6's approach is superior for files that significantly exceed memory size, I did such a test on the same test setup (dropped the RAM on the VMs to 512 MB and read in a ~6 GB file).  In that test, both were very slow, but 2.6 was consistently ~10% faster than 1.8 across multiple trials.  (2.40 vs 2.20 MB/s)
+
+I'm not sure this ticket is the place for that further discussion of heuristics, etc, so feel free to close it.  That's a project unto itself.  Cray is considering putting some work in to this area, so if it's something we do work on, we'll be in touch.
+
+--- Comment (adilger, Sat, 30 Aug 2014 19:09:42 +0000) ---
+For better or worse, fadvise() is implemented entirely in the VM layer and doesn't call into the filesystem (except to actually read pages into memory for FADV_WILLNEED), so the behaviour is the same for all filesystems.  From my quick reading of the code, FADV_WILLNEED will readahead the data of the requested range of the file in 2MB chunks, up to a maximum of (free_pages + inactive_pages) / 2.  FADV_DONTNEED will mark pages for eviction from the cache if they are no longer needed, though I don't recall if they are flushed immediately or just put at the end of the LRU list.
+
+As for heuristics on reading extra data under random read workloads, I'm still open to discuss this.  I agree that in common use cases such files will often end up having a large amount of the file accessed by the application, so as long as they have a reasonable chance to fit into RAM and cost of reading e.g. 1MB of data into the client cache is not significantly more expensive than fetching 8KB or 16KB.
+
+--- Comment (paf, Fri, 29 Aug 2014 19:51:02 +0000) ---
+I see your point (and thank you very much for the pointer towards the fadvise info & LU-4931, both are very interesting), but it brings to mind a question or two for me:
+
+Given that a significant portion of the time, the data to be read by an individual client will fit in RAM, is it unreasonable to pull more of it in as you go?
+
+I suppose in a multi-threaded situation, you're likely to evict data that someone else may want, and are better off reading in what's needed and no more.
+
+I suppose in the end, the best solution is, as you said, to formalize this behavior in some way.  The multi-thread multi-file case, where one thread evicts data that might be desired by another, seems to make that optimization much harder.
+
+An fadvise(FADV_WILLNEED) seems like a very worthwhile thing to try here.  Is there any information available about what fadvise requests/modes Lustre supports, and how it actually handles them?  IE, with FADV_WILLNEED, what cache is holding the file data in the client RAM?
+
+--- Comment (adilger, Fri, 29 Aug 2014 19:08:33 +0000) ---
+What is interesting here is that this actually implies that the random read behaviour is broken on 1.8 and not on 2.6.  If the 19KB random reads at the client are generating 1MB reads at the server, then if the file is larger than RAM there will be IO multiplication of over 50x at the server.  So by all rights, 2.6 is doing the right thing by only reading the requested data under random IO workloads instead of data that may never be accessed by this client.  This test case is hitting the sweet spot where the file can fit entirely into client RAM and reading in 1MB chunks helps the aggregate performance instead of hurting it.
+
+That said, I'm not against "formalizing" this behaviour so that random reads on files that have a reasonable expectation to fit into RAM results in reading the file in full RPC chunks (i.e. prefetching the neighbouring blocks on the expectation they may be used).  This is similar in behaviour to the max_read_ahead_whole_mb tunable that will read all of a small file into the client cache on the second read instead of waiting for readahead to kick in.
+
+In addition to filesystem-level heuristics that try to do the right thing based on incomplete information, you may also consider adding hints to the application to tell the filesystem what it is doing, such as fadvise(FADV_WILLNEED) to prefetch the whole file into the client RAM before the random IO starts, and/or comment on LU-4931 which would allow passing such hints to the backend storage (e.g. if the file is randomly accessed by many clients and is larger than client RAM, but is striped widely enough that the OST RAM could hold it all).
+
+--- Comment (paf, Fri, 29 Aug 2014 16:10:29 +0000) ---
+Forgot to include this info:
+
+IOR's reported operations per second:
+
+1.8.9: 1163.68
+
+2.6: 176.85
+
+--- Comment (paf, Fri, 29 Aug 2014 16:04:14 +0000) ---
+brw_stats from a 2.6 OSS from the IOR run described below with a 1.8 and a 2.6 client.

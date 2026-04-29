@@ -1,0 +1,110 @@
+Key:        LU-17335
+Summary:    allow "lctl barrier_freeze" to exclude MGS target
+Link:       https://jira.whamcloud.com/browse/LU-17335
+Type:       Improvement
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   Emoly Liu
+Reporter:   Andreas Dilger
+Created:    Tue, 5 Dec 2023 23:31:13 +0000
+Updated:    Fri, 8 Dec 2023 07:49:16 +0000
+
+--- Description ---
+For doing storage system configuration changes (e.g. adding new MDTs and OSTs to the filesystem) it is desirable to allow blocking modifications to the filesystem using the "lctl barrier_freeze" command.  However, this also freezes the MGT device, preventing new MDT and OST devices from registering themselves with the MGS.
+
+It would be desirable to have an option like "lctl barrier_freeze --nomgs" (similar to the "nomgs" option for mkfs.lustre and mount.lustre) to freeze all of the storage targets (MDT, OST) but exclude the MGT device.  Currently, if barrier_freeze is used the MDT/OST addition fails with the following error on the MGS:
+
+Lustre: MGS: the system is in barrier, refuse the connection from MDT es01a-MDT0007 temporary
+
+and the following on the MDS server:
+
+LustreError: 15f-b: es01a-MDT0007: cannot register this server with the MGS: rc = -16. Is the MGS running?
+LustreError: 41629:0:(obd_mount_server.c:2061:server_fill_super()) Unable to start targets: -16
+LustreError: 41629:0:(obd_mount_server.c:1641:server_put_super()) no obd es01a-MDT0007
+LustreError: 41629:0:(obd_mount_server.c:133:server_deregister_mount()) es01a-MDT0007 not registered
+Lustre: server umount es01a-MDT0007 complete
+
+For testing, this could use a modified version of test_46b in patch https://review.whamcloud.com/53300 that adds an "lctl barrier_freeze --nomgs ..." command before the new MDT/OST devices are added to the filesystem, and then un-freezes the filesystem after the OSTs appear on the client (e.g. in "lfs df").
+
+--- Comment (emoly.liu, Fri, 8 Dec 2023 07:49:16 +0000) ---
+Hi adilger ,
+
+The patch at https://review.whamcloud.com/c/fs/lustre-release/+/53359 passed the new test case conf-sanity.sh test_46c at https://testing.whamcloud.com/test_logs/f346e68c-ce10-46db-b847-f30fbe6cc5fe/show_text 
+
+Could you please review it to see if both the fix and test case did work as we expect ? 
+
+Thanks.
+
+--- Comment (gerrit, Thu, 7 Dec 2023 07:47:51 +0000) ---
+"Emoly Liu " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/53359
+
+Subject: LU-17335 mgs: new option "lctl barrier_freeze --nomgs"
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 0e38e7b1cd84695231e83fb380518d887161dc44
+
+--- Comment (emoly.liu, Wed, 6 Dec 2023 02:29:49 +0000) ---
+OK, I will look into it.
+
+--- Comment (adilger, Wed, 6 Dec 2023 00:18:57 +0000) ---
+Parsing a new --nomgs option in "jt_barrier_freeze()" is needed. This could add a flag "BF_NOMGS" in the high bits of bc_cmd:
+
+enum barrier_commands {
+        BC_FREEZE       = 1,
+        BC_THAW         = 2,
+        BC_STAT         = 3,
+        BC_RESCAN       = 4,
++       BC_MASK         = 0xFFU,
++       /* allow up to 255 commands, the high 24 bits are for flags */
++       BF_NOMGS        = 0x00000100U,
++       /* list of known flags, maybe different for each command */
++       BF_KNOWN_FREEZE = BF_NOMGS,
++       BF_MASK         = ~BC_MASK
+};
+
+This would be passed to mgs_iocontrol_barrier() (if used with an old kernel that does not understand this flag it would return -EINVAL because "bc_cmd = 0x00000101" would be unknown:
+
+int mgs_iocontrol_barrier(const struct lu_env *env, struct mgs_device *mgs,
+                          struct obd_ioctl_data *data)
+{
+        struct barrier_ctl *bc = (struct barrier_ctl *)(data->ioc_inlbuf1);
+
+-        switch (bc->bc_cmd) {
++        switch (bc->bc_cmd & BC_MASK) {
+}
+
+int mgs_barrier_freeze(const struct lu_env *env, struct mgs_device *mgs,
+                              struct barrier_ctl *bc)
+{
+        snprintf(name, sizeof(mgs_env_info(env)->mgi_fsname) - 1, "%s-%s",
+                 bc->bc_name, BARRIER_FILENAME);
+
++       if (bc->bc_cmd & ~BF_KNOWN_FREEZE) {
++               rc = -EINVAL;
++               CERROR("MGS: unknown barrier_freeze flags %#x: rc = %d\n",
++                      bc->bc_cmd & ~BF_KNOWN_FLAGS, rc);
++               RETURN(rc);
++       }
+        :
+                        fsdb->fsdb_barrier_status = BS_FREEZING_P1;
++                       if (bc->bc_cmd & BF_NOMGS)
++                               fsdb->fsdb_flags |= FSDB_BARRIER_NOMGS;
+
+It looks like the other important code on the MGS is in mgs_target_reg() to check this flag:
+
+        if (mti->mti_flags & LDD_F_SV_TYPE_MDT) {
+                if ((b_fsdb->fsdb_barrier_status == BS_FREEZING_P1 ||
+                     b_fsdb->fsdb_barrier_status == BS_FREEZING_P2 ||
+                     b_fsdb->fsdb_barrier_status == BS_FROZEN) &&
++                    !(b_fsdb->fsdb_barrier_flags & FSDB_BARRIER_NOMGS)) {
+                        LCONSOLE_WARN("%s: the system is in barrier, refuse "
+                                      "the connection from MDT %s temporary\n",
+                                      obd->obd_name, mti->mti_svname);
+                        GOTO(out_norevoke, rc = -EBUSY);
+                }

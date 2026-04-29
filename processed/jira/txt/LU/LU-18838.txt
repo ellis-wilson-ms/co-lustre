@@ -1,0 +1,311 @@
+Key:        LU-18838
+Summary:    stat ahead panic at  _atomic_dec_and_lock()
+Link:       https://jira.whamcloud.com/browse/LU-18838
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Qian Yingjin
+Reporter:   Qian Yingjin
+Created:    Thu, 20 Mar 2025 08:04:02 +0000
+Updated:    Tue, 17 Feb 2026 19:58:17 +0000
+
+--- Description ---
+The Janitor testing on racer slow failed and crash as follows:
+
+https://knox.linuxhacker.ru/crashdb_ui_external.py.cgi?newid=69679
+
+Hardware name: Red Hat KVM, BIOS 1.16.0-3.module_el8.7.0+1218+f626c2ff 04/01/2014
+task: ffff8802e7a59280 ti: ffff88031be08000 task.ti: ffff88031be08000
+RIP: 0010:[] [] _atomic_dec_and_lock+0xc/0x70
+[] ll_statahead_thread+0xe01/0x22b0 [lustre]
+[] ? _raw_spin_lock+0x1e/0x20
+[] ? put_prev_entity+0x31/0x400
+[] ? do_raw_spin_unlock+0x49/0x90
+[] ? _raw_spin_unlock_irq+0xe/0x30
+[] ? finish_task_switch+0x5d/0x1b0
+[] ? ll_statahead_handle.constprop.29+0x1c0/0x1c0 [lustre]
+[] kthread+0xe4/0xf0
+[] ? kthread_create_on_node+0x140/0x140
+[] ret_from_fork_nospec_begin+0x7/0x21
+[] ? kthread_create_on_node+0x140/0x140 
+
+The panic line of code:
+
+static inline void ll_sax_put(struct inode *dir,
+			      struct ll_statahead_context *ctx)
+{
+	struct ll_inode_info *lli = ll_i2info(dir);
+
+	if (atomic_dec_and_lock(&ctx->sax_refcount, &lli->lli_sa_lock)) { ===> panic
+		LASSERT(list_empty(&ctx->sax_sai_list));
+		lli->lli_sai = NULL;
+
+--- Comment (gerrit, Tue, 17 Feb 2026 19:58:17 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/64093
+
+Subject: LU-18838: llite: Debug NULL ctx
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 5ff56911562ee1eb5ea1148c0e44fd78a3d68475
+
+--- Comment (qian_wc, Fri, 30 Jan 2026 02:56:38 +0000) ---
+Question & Quick Answer
+
+Q: Can dentry->d_inode become NULL between dget(dentry) and dput(dentry)?
+
+A: Yes, it can. dget() only guarantees the dentry object itself won't be freed; it does not guarantee the stability of its association with an inode. 
+
+What dget() Actually Protects
+
+The function dget(dentry) performs a single crucial task: it increments the dentry's reference count (d_count), preventing the memory of the dentry object itself from being deallocated until a corresponding dput() is called .
+
+It explicitly does NOT protect :
+
+•   The dentry->d_inode pointer from becoming NULL.
+
+•   The inode pointed to by d_inode from being disassociated or freed.
+
+•   The dentry's state (e.g., from "positive" to "negative").
+
+The lifetime of the dentry object and its association with an inode are managed independently.
+
+Scenario: How d_inode Can Become NULL
+
+A typical race condition involves two threads operating on the same path :
+
+Thread A (Your Code):
+
+	1. Holds a pointer to a dentry (e.g., from a lookup).
+
+	2. Calls dget(dentry) to grab a reference.
+
+	3. Intends to access dentry->d_inode later.
+
+Thread B (Concurrent Operation):
+
+	1. Performs a delete operation (e.g., unlink) on the same file.
+
+	2. This triggers a call to d_delete(dentry) in the kernel.
+
+	3. If certain conditions are met (e.g., the dentry's reference count is 1 at the start of the delete operation), the kernel calls dentry_unlink_inode(dentry). The key function here is __d_clear_type_and_inode(dentry), which directly sets dentry->d_inode = NULL .
+
+Result for Thread A:
+
+    When Thread A checks dentry->d_inode after this sequence, it will find it is NULL, even though the dentry object itself remains valid. The dentry has transitioned from a "positive" state to a "negative" state .
+
+Key Takeaway
+
+This behavior is a normal and intentional part of the VFS design. You must always assume that dentry->d_inode can become NULL after dget(). The dget() function protects the dentry's existence, not its connection to an inode.
+
+Safe Usage Pattern
+
+To safely access the inode, you should not rely solely on dget(). A common safe practice involves:
+
+1.  Using locks (like dentry->d_lock) to briefly check the d_inode pointer.
+
+2.  If the pointer is valid, obtaining a separate reference to the inode using ihold() or igrab().
+
+3.  Then releasing the dentry lock.
+
+This pattern ensures that once you have a reference to the inode, it won't be freed prematurely.
+
+Example pseudo-code:
+
+struct inode *inode = NULL;
+
+spin_lock(&dentry->d_lock);
+if (dentry->d_inode) {
+    inode = dentry->d_inode;
+    ihold(inode); // Take a reference on the inode
+}
+spin_unlock(&dentry->d_lock);
+
+if (inode) {
+    // ... Safely use the inode ...
+    iput(inode); // Release the inode reference
+} else {
+    // Handle negative dentry (file doesn't exist)
+}
+
+Using higher-level helper functions like d_inode() (which may include safety checks) is also recommended .
+
+When is it Stable?
+
+The association is stable only under broader synchronization mechanisms, such as when holding a parent directory's lock (e.g., i_rwsem), which prevents concurrent renames or deletions within that directory. This stability comes from the directory lock, not from dget(). 
+
+The main panic is caused by the case that dentry->d_inode becomes NULL even after get() before final dput().
+
+So I think the simple solution maybe your later patch:
+
+https://review.whamcloud.com/c/fs/lustre-release/+/63645
+
+--- Comment (green, Thu, 29 Jan 2026 21:14:10 +0000) ---
+Ugh, so I am trying to wrap my head around sai/sax in lli and everything is too convoluted, so I will write a comment here so we can have a bit of a discussion may be?
+
+so ll_sax_put could in theory drop the refcount to 0 and that would lead to it cleaning lli->lli_sai and lli->lli_sax
+
+the lli is taken from an externally-passed inode which potentially could have aboslutely nothing to do with the one initial statahead was called for I think? (e.g. statahead kicked off, parent invalidated and on revaliadtion another inode was pulled in for whatever reason)
+
+The https://review.whamcloud.com/c/fs/lustre-release/+/63644 I have tries to address this by actually using internal inode pointer for the update - this takes care of the random inode lli clobbering, but highlights another issue:
+
+it's all done with no locking whatsoever. In fact we can see the code everywhere goes to the great effort to call ll_sax_put outside of the lli_sai_lock somehow. Sure in some cases inside it would lock it, but why not make it mandatory to call with this lock called externally?
+
+Similar situation with ll_sai_put.
+
+The other problem here is: nothing appears to be actually pinning the inode, but if we actually pin it within sai (sax already pins the inode it attaches to) with the https://review.whamcloud.com/c/fs/lustre-release/+/63645 patch - we should be all good?
+
+So with conversion like this we can make the sai_refcount non-atomic as all users are under lli_sa_lock with the exception of one call to __ll_sai_get() in ll_start_agl() that we'll need to cover probably at the callsite?
+
+qian_wc what do you think?
+
+ 
+
+Ah, I now see we fall into the same trap when we do it:
+
+	the externally locked lli could be wrong one
+
+	even if not as we do ll_sa[ix]_free() it unpins the inode and potentially frees the lli thta we still need to unlock, sigh
+
+--- Comment (gerrit, Thu, 29 Jan 2026 15:43:27 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/63645
+
+Subject: LU-18838 llite: Add inode to struct ll_statahead_info
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 8963e9c23707059d3caf445ca0fba9ccbad66153
+
+--- Comment (gerrit, Thu, 29 Jan 2026 15:43:26 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/63644
+
+Subject: LU-18838 lli: WIP Fix sax use race condition in ll_statahead_thread
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: f7c1d4ba6f3a812b934e08a62fc82f9989cc4410
+
+--- Comment (gerrit, Mon, 12 Jan 2026 08:15:37 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/63323
+
+Subject: LU-18838 llite: fix race conditions in statahead causing NULL pointer crashes
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 47994ab3ffa33d0be3443a578df7cf649856502a
+
+--- Comment (gerrit, Thu, 30 Oct 2025 03:36:27 +0000) ---
+"Sohei Koyama " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/62110
+
+Subject: LU-18838 llite: fix race condition at putting sax
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 4d1a8f830e82de2bb9e2abe77a9e8b0d18c32bda
+
+--- Comment (bzzz, Fri, 12 Sep 2025 03:48:37 +0000) ---
+and yet another one:
+
+[ 1690.809607] LustreError: 1456771:0:(statahead.c:1721:ll_deauthorize_statahead()) ASSERTION( lli->lli_stat_pid != 0 ) failed: 
+[ 1690.809749] LustreError: 1456771:0:(statahead.c:1721:ll_deauthorize_statahead()) LBUG
+[ 1690.809808] CPU: 0 PID: 1456771 Comm: lfs Tainted: G        W  O      -------- -  - 4.18.0 #2
+[ 1690.809870] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.17.0-4.fc41 04/01/2014
+[ 1690.809934] Call Trace:
+[ 1690.810418]  dump_stack+0x6e/0xa0
+[ 1690.810498]  lbug_with_loc.cold.3+0x5/0x4e [libcfs]
+[ 1690.810548]  ll_deauthorize_statahead+0x2f8/0x3e0 [lustre]
+[ 1690.810631]  ll_file_release+0x69b/0xa20 [lustre]
+[ 1690.810704]  ? lock_acquire+0x1ab/0x310
+[ 1690.810740]  __fput+0xc5/0x260
+[ 1690.810776]  task_work_run+0x8a/0xc0
+[ 1690.810811]  exit_to_usermode_loop+0xc5/0xd0
+[ 1690.810852]  do_syscall_64+0x126/0x1a0
+[ 1690.810885]  entry_SYSCALL_64_after_hwframe+0x4e/0xc3
+
+--- Comment (green, Thu, 8 May 2025 01:41:07 +0000) ---
+other related issues:
+
+this one in various forms happens quite a bit too
+
+https://knox.linuxhacker.ru/crashdb_ui_external.py.cgi?newid=72722
+
+ [ 8341.721043] LustreError: 30853:0:(statahead.c:2037:revalidate_statahead_dentry()) ASSERTION( sai == entry->se_sai ) failed:
+[ 8341.723477] LustreError: 30853:0:(statahead.c:2037:revalidate_statahead_dentry()) LBUG
+[ 8341.782623] CPU: 12 PID: 30853 Comm: ls Kdump: loaded Tainted: P           OE  ------------   3.10.0-7.9-debug #2
+[ 8341.783741] Hardware name: Red Hat KVM, BIOS 1.16.0-3.module_el8.7.0+1218+f626c2ff 04/01/2014
+[ 8341.784772] Call Trace:
+[ 8341.785254]  [] dump_stack+0x19/0x1b
+[ 8341.785851]  [] lbug_with_loc+0x4d/0xa0 [libcfs]
+[ 8341.786425]  [] revalidate_statahead_dentry+0x14db/0x1620 [lustre]
+[ 8341.787443]  [] ? kvm_sched_clock_read+0x9/0x20
+[ 8341.787990]  [] ? sched_clock+0x9/0x10
+[ 8341.788529]  [] ? __raw_callee_save___pv_queued_spin_unlock_slowpath+0x15/0x24
+[ 8341.789643]  [] ? .slowpath+0x9/0x15
+[ 8341.790184]  [] ll_revalidate_statahead+0x80/0x360 [lustre]
+[ 8341.790762]  [] ll_revalidate_dentry+0x256/0x290 [lustre]
+[ 8341.791324]  [] lookup_fast+0x1d4/0x220
+[ 8341.865941]  [] do_last+0x3d6/0x1280
+[ 8341.866480]  [] ? link_path_walk+0x27e/0x8c0
+[ 8341.867142]  [] path_openat+0xcd/0x5b0
+[ 8341.867674]  [] do_filp_open+0x4d/0xb0
+[ 8341.868208]  [] ? do_raw_spin_unlock+0x49/0x90
+[ 8341.868760]  [] ? _raw_spin_unlock+0xe/0x20
+[ 8341.869298]  [] ? __alloc_fd+0xc3/0x170
+[ 8341.869854]  [] do_sys_open+0x124/0x220
+[ 8341.870390]  [] ? system_call_after_swapgs+0x96/0x13a
+[ 8341.870947]  [] SyS_openat+0x14/0x20
+[ 8341.871481]  [] system_call_fastpath+0x1f/0x24
+[ 8341.872033]  [] ? system_call_after_swapgs+0xa2/0x13a
+[ 8341.872735] Kernel panic - not syncing: LBUG
+
+https://knox.linuxhacker.ru/crashdb_ui_external.py.cgi?newid=68922
+
+ [ 1592.623112] LustreError: 32300:0:(statahead.c:583:ll_sax_put()) ASSERTION( list_empty(&ctx->sax_sai_list) ) failed:
+[ 1592.624438] LustreError: 32300:0:(statahead.c:583:ll_sax_put()) LBUG
+[ 1592.625093] CPU: 10 PID: 32300 Comm: ll_sa_32268 Kdump: loaded Tainted: P           OE  ------------   3.10.0-7.9-debug #2
+[ 1592.626372] Hardware name: Red Hat KVM, BIOS 1.16.0-3.module_el8.7.0+1218+f626c2ff 04/01/2014
+[ 1592.627404] Call Trace:
+[ 1592.627875]  [] dump_stack+0x19/0x1b
+[ 1592.628517]  [] lbug_with_loc+0x4d/0xa0 [libcfs]
+[ 1592.638372]  [] ll_sax_put.part.21+0x36/0x36 [lustre]
+[ 1592.639291]  [] ll_statahead_thread+0x1fef/0x2000 [lustre]
+[ 1592.639948]  [] ? _raw_spin_lock+0x1e/0x20
+[ 1592.640593]  [] ? put_prev_entity+0x31/0x400
+[ 1592.641234]  [] ? do_raw_spin_unlock+0x49/0x90
+[ 1592.641904]  [] ? _raw_spin_unlock_irq+0xe/0x30
+[ 1592.642570]  [] ? finish_task_switch+0x5d/0x1b0
+[ 1592.643267]  [] ? ll_statahead_handle.constprop.28+0x1c0/0x1c0 [lustre]
+[ 1592.644465]  [] kthread+0xe4/0xf0
+[ 1592.645087]  [] ? kthread_create_on_node+0x140/0x140
+[ 1592.645722]  [] ret_from_fork_nospec_begin+0x7/0x21
+[ 1592.646404]  [] ? kthread_create_on_node+0x140/0x140
+[ 1592.647090] Kernel panic - not syncing: LBUG
+
+And so on.
+
+ 
+
+Basically if you go to https://knox.linuxhacker.ru/crashdb_ui_external.py.cgi?search=statahead
+
+and then ignore all the ones that have have obd_get_mod_rpc_slot as the crashing location, the rest are directly related or could be(just listing the IDs): 70579, 72764, 67850, 68523,

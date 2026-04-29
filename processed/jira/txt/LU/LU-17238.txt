@@ -1,0 +1,73 @@
+Key:        LU-17238
+Summary:    negative xattr cache on client
+Link:       https://jira.whamcloud.com/browse/LU-17238
+Type:       Improvement
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Andreas Dilger
+Created:    Sat, 28 Oct 2023 07:41:53 +0000
+Updated:    Thu, 12 Feb 2026 02:22:42 +0000
+Labels:     medium, performance
+Links:      Related: is related to  LU-10276; Related: is related to  LU-2869; Related: is related to LU-17239
+
+--- Description ---
+It should be possible to cache negative xattr entries (i.e. xattr names that do not exist) for an inode on the client if it has the MDS_INODELOCK_XATTR lock locally, since a new xattr cannot be created on the inode without the MDS cancelling this lock.
+
+There are a few xattrs that are handled differently.  See ll_xattr_cache_refill():
+
+	XATTR_NAME_ACL_ACCESS is cached under the MDS_INODELOCK_LOOKUP lock since it is permission related
+
+	XATTR_NAME_SOM shouldn't be cached since it may change without a lock
+
+	XATTR_NAME_SELINUX, XATTR_NAME_SMACK are cached in the kernel already since they shouldn't be modified for files after creation
+
+The negative cached ll_xattr_entry could store "xe_value = ERR_PTR(-ENODATA)" (or presumably whatever other error was returned for the MDS_GETXATTR for that xattr name to indicate the xattr doesn't exist.
+
+There is also a discussion in LU-10276 to store some xattrs under a different DLM lock, which would cause problems for using listxattr() for cached xattrs that are not actually in the client cache.  In such cases it would be possible to store "xe_value = ERR_PTR(-EREMOTE)" in the xattr cache, so that they still appear in the listxattr() output but the values are not actually stored in the cache.
+
+It appears that the lack of some xattrs in the client cache is already a problem for listxattr() today, since security.selinux is not being listed on the client, even though it is stored on the inode:
+
+# getfattr -d -m - -e hex /myth/tmp
+getfattr: Removing leading '/' from absolute path names
+# file: myth/tmp
+trusted.link=0xdff1ea11010000002d000000000000000000000000000000001500000000002080011c08b68000000000746d70
+trusted.lma=0x0000000000000000625f030002000000b07f000000000000
+
+# debugfs -c -R "stat ROOT/tmp" /dev/vgmyth/lvmythmdt0.ssd
+debugfs 1.47.0-wc4 (22-Jun-2023)
+:
+Extended attributes:
+  lma: fid=[0x200035f62:0x7fb0:0x0] compat=0 incompat=0
+  security.selinux (37) = "unconfined_u:object_r:unlabeled_t:s0\000"
+  linkea: idx=0 parent=[0x208001:0x1c08b680:0x0] name='tmp'
+
+For the security.selinux xattr this isn't a huge problem, since most applications will just request the xattr without first listing if it exists, but it should properly be listed when requested (e.g for backups and similar).
+
+--- Comment (sthiell, Thu, 12 Feb 2026 02:22:42 +0000) ---
+I’ve been running into something that feels very aligned with this ticket.
+
+ We were seeing huge storms of getxattr RPCs returning ENODATA (-61), especially when large job arrays of *conda/matlab run (lots of repeated path walks + execs… not pretty, but it’s what our users do). Typical client log snippet looks like:
+
+00000100:00000040:45.0:1770760290.599614:0:123532:0:(client.c:1366:ptlrpc_check_status()) @@@ check status: rc = -61  req@ffff8ca1db48f080 x1855645481035136/t0(0) o49->oak-MDT0000-mdc-ffff8e0ef4661800@10.0.2.52@o2ib5:23/10 lens 480/448 e 0 to 0 dl 1770760443 ref 2 fl Rpc:RQU/0/0 rc 0/-61 job:'15468754'
+
+00000100:00000040:45.0:1770760290.599621:0:123532:0:(lustre_net.h:2402:ptlrpc_rqphase_move()) @@@ move request phase from Interpret to Complete  req@ffff8ca1db48f080 x1855645481035136/t0(0) o49->oak-MDT0000-mdc-ffff8e0ef4661800@10.0.2.52@o2ib5:23/10 lens 480/448 e 0 to 0 dl 1770760443 ref 2 fl Interpret:RQU/0/0 rc -61/-61 job:'15468754'
+
+00000100:00100000:45.0:1770760290.599623:0:123532:0:(client.c:2215:ptlrpc_check_set()) Completed RPC req@ffff8ca1db48f080 pname:cluuid:pid:xid:nid:opc:job preprocessannot:138c256d-14c7-4617-b592-c29b3074f526:123532:1855645481035136:10.0.2.52@o2ib5:49:15468754
+
+ 
+
+From what I can tell, these are checks for:
+
+	system.posix_acl_access
+
+	system.posix_acl_default
+
+…on FIDs where no ACLs are set. The key issue seems to be: when those xattrs are absent, the clients don’t negative-cache that fact, so the same getxattr(...)=ENODATA misses keep generating RPCs. In our case it can spike to ~200K RPC/s, mostly hitting MDT0 (where the “base” directories live), and drives high load in the MDT rdpg service threads (since getxattr is handled there). We also see high inode_permission counts in MDT stats, which I assume is the kernel repeatedly re-checking perms during these path accesses (often executables being launched very frequently).
+
+As an experiment, I set a dummy ACL + default ACL on those base directories. After doing that, the corresponding xattr values appear to get cached normally on the clients, and MDS load dropped significantly. Deeper in the tree we usually do have default ACLs, and we don’t see the same behavior there (presumably because those xattrs are present and cacheable).
+
+So negative xattr caching (at least for these common “checked all the time” ACL xattrs) would be hugely helpful, and would avoid hacks like that.
+
+This is on Lustre 2.15. Let me know if I’m misunderstanding what’s happening here, or if there’s a better workaround I should be looking at.

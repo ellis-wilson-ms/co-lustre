@@ -1,0 +1,196 @@
+Key:        LU-2177
+Summary:    ldlm_flock_completion_ast causes LBUG because of a race
+Link:       https://jira.whamcloud.com/browse/LU-2177
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Emoly Liu
+Reporter:   Hiroya Nozaki
+Created:    Mon, 15 Oct 2012 00:33:01 +0000
+Updated:    Mon, 4 Jan 2016 19:18:54 +0000
+Resolved:   Thu, 12 Jun 2014 06:19:03 +0000
+Labels:     patch
+Links:      Related: is related to LU-7626
+
+--- Environment ---
+MDSx1, OSSx1(OSTx3), Clientx1, running an application program using flock
+
+--- Description ---
+I believe that I have found a possible race condition between ldlm_cli_enqueue_fini() and cleanup_resource() when these handle flocks. The case is below:
+
+thread A: flock
+
+1) In ldlm_cli_enqueue_fini(), ldlm_lock_enqueue() has returned in success. it means that the lock is being handled now has been registered with a list in a ldlm_resouce, lr_granted or lr_waiting. And it also means that the spin lock which protects the ldlm_resouce of flock has been released already because ldlm_lock_enqueue calls unlock_res_and_lock() right before its returning.
+
+thread B: evict
+
+2) For some reason, an evict process has been driven and will call cleanup_resouce() with the same lock which is now being handled by ldlm_cli_enqueue_fini() because the lock has been registered the list in the ldlm_resouce of flock and the lock which protects the ldlm_resouce has been released already.
+
+thread B: evict
+
+3) Since the lock is now being handled in a success way, l_writers or l_readers must be more than 1. So, after checking these variables and relesing the res lock, cleanup_resouce() will call ldlm_flock_completion_ast().
+
+cleanup_resource()
+
+static void cleanup_resource(struct ldlm_resource *res, cfs_list_t *q,
+                             int flags)
+{
+
+                ...
+
+                /* Set CBPENDING so nothing in the cancellation path
+                 * can match this lock */
+                lock->l_flags |= LDLM_FL_CBPENDING;
+                lock->l_flags |= LDLM_FL_FAILED;
+                lock->l_flags |= flags;
+
+                /* ... without sending a CANCEL message for local_only. */
+                if (local_only)
+                        lock->l_flags |= LDLM_FL_LOCAL_ONLY;
+
+                if (local_only && (lock->l_readers || lock->l_writers)) {
+                        /* This is a little bit gross, but much better than the
+                         * alternative: pretend that we got a blocking AST from
+                         * the server, so that when the lock is decref'd, it
+                         * will go away ... */
+                        unlock_res(res);
+                        LDLM_DEBUG(lock, "setting FL_LOCAL_ONLY");
+                        if (lock->l_completion_ast)
+                                lock->l_completion_ast(lock, 0, NULL);
+                        LDLM_LOCK_RELEASE(lock);
+                        continue;
+                }
+
+                ...
+}
+
+thread A: flock
+
+4) After returning ldlm_lock_enqueue(), ldlm_cli_enqueue_fini() will also call ldlm_flock_compleiton_ast() because there is no condition-statement between ldlm_lock_enqueue() and ldlm_flock_completion_ast().
+
+ldlm_cli_enqueue_fini()
+
+int ldlm_cli_enqueue_fini(struct obd_export *exp, struct ptlrpc_request *req,
+                          ldlm_type_t type, __u8 with_policy, ldlm_mode_t mode,
+                          int *flags, void *lvb, __u32 lvb_len,
+                          struct lustre_handle *lockh,int rc)
+{
+
+        ...
+
+        if (!is_replay) {
+                rc = ldlm_lock_enqueue(ns, &lock, NULL, flags);
+                if (lock->l_completion_ast != NULL) {
+                        int err = lock->l_completion_ast(lock, *flags, NULL);
+                        if (!rc)
+                                rc = err;
+                        if (rc)
+                                cleanup_phase = 1;
+                }
+        }
+
+        ...
+
+}
+
+Result: Both threads are possible
+
+5) Since the l_flags of the lock has been set by cleanup_resouce() in order to call ldlm_lock_decref_internal() in ldlm_flock_completion_ast(), ldlm_lock_decref_internal() will be called twice and this race will cause LBUG() in ldlm_lock_decref_internal() 
+
+ldlm_flock_completion_ast()
+
+ldlm_flock_completion_ast(struct ldlm_lock *lock, int flags, void *data)
+{
+        cfs_flock_t                    *getlk = lock->l_ast_data;
+        struct obd_device              *obd;
+        struct obd_import              *imp = NULL;
+        struct ldlm_flock_wait_data     fwd;
+        struct l_wait_info              lwi;
+        ldlm_error_t                    err;
+        int                             rc = 0;
+        ENTRY;
+
+        CDEBUG(D_DLMTRACE, "flags: 0x%x data: %p getlk: %p\n",
+               flags, data, getlk);
+
+        /* Import invalidation. We need to actually release the lock
+         * references being held, so that it can go away. No point in
+         * holding the lock even if app still believes it has it, since
+         * server already dropped it anyway. Only for granted locks too. */
+        if ((lock->l_flags & (LDLM_FL_FAILED|LDLM_FL_LOCAL_ONLY)) ==
+            (LDLM_FL_FAILED|LDLM_FL_LOCAL_ONLY)) {
+                if (lock->l_req_mode == lock->l_granted_mode &&
+                    lock->l_granted_mode != LCK_NL &&
+                    NULL == data)
+                        ldlm_lock_decref_internal(lock, lock->l_req_mode);
+
+                /* Need to wake up the waiter if we were evicted */
+                cfs_waitq_signal(&lock->l_waitq);
+                RETURN(0);
+        }
+        ....
+}
+
+the blow is the dlmtrace. it actually says that ldlm_lock_decref_interanl_nolock() was done to the same lock twice, althought it rw refcount has reached zero.
+
+5827: flock
+
+5829: evict
+
+00010000:00000001:13:1350018852.706543:0:5827:0:(ldlm_request.c:409:ldlm_cli_enqueue_fini()) Process entered
+00010000:00000001:13:1350018852.706543:0:5827:0:(ldlm_lock.c:451:__ldlm_handle2lock()) Process entered
+00000020:00000001:13:1350018852.706544:0:5827:0:(lustre_handles.c:172:class_handle2object()) Process entered
+00000020:00000001:13:1350018852.706545:0:5827:0:(lustre_handles.c:195:class_handle2object()) Process leaving (rc=18446604488316264960 : -139585393286656 : ffff810c3e37a200)
+00010000:00000001:13:1350018852.706548:0:5827:0:(ldlm_resource.c:1105:ldlm_resource_putref_internal()) Process entered
+00010000:00000001:13:1350018852.706549:0:5827:0:(ldlm_resource.c:1118:ldlm_resource_putref_internal()) Process leaving (rc=0 : 0 : 0)
+00010000:00000001:13:1350018852.706551:0:5827:0:(ldlm_lock.c:502:__ldlm_handle2lock()) Process leaving
+00010000:00000001:13:1350018852.706552:0:5827:0:(ldlm_lock.c:1217:ldlm_lock_enqueue()) Process entered
+00010000:00000001:13:1350018861.719601:0:5827:0:(ldlm_lock.c:895:ldlm_grant_lock()) Process entered
+00010000:00000001:13:1350018861.719602:0:5827:0:(ldlm_lock.c:914:ldlm_grant_lock()) Process leaving
+00010000:00000001:13:1350018861.719603:0:5827:0:(ldlm_lock.c:1329:ldlm_lock_enqueue()) Process leaving via out (rc=0 : 0 : 0)
+00010000:00000001:13:1350018861.719604:0:5827:0:(ldlm_flock.c:525:ldlm_flock_completion_ast()) Process entered
+00010000:00010000:4:1350018861.719604:0:5829:0:(ldlm_resource.c:574:cleanup_resource()) ### setting FL_LOCAL_ONLY ns: fefs-MDT0000-mdc-ffff8105e9bbbc00 lock: ffff810c3e37a200/0xee16fc0aef26bb17 lrc: 5/0,1 mode: PW/PW res: 12/706300508 rrc: 2 type: FLK pid: 5827 [0->16777215] flags: 0x2000c10 remote: 0xa520aeaebdefc517 expref: -99 pid: 5827 timeout: 0
+00010000:00010000:13:1350018861.719605:0:5827:0:(ldlm_flock.c:528:ldlm_flock_completion_ast()) flags: 0x40000 data: 0000000000000000 getlk: ffff810c3ecc1ad8
+00010000:00000001:13:1350018861.719607:0:5827:0:(ldlm_lock.c:659:ldlm_lock_decref_internal()) Process entered
+
+1
+==================================================
+00010000:00010000:13:1350018861.719607:0:5827:0:(ldlm_lock.c:637:ldlm_lock_decref_internal_nolock()) ### ldlm_lock_decref(PW) ns: fefs-MDT0000-mdc-ffff8105e9bbbc00 lock: ffff810c3e37a200/0xee16fc0aef26bb17 lrc: 5/0,1 mode: PW/PW res: 12/706300508 rrc: 2 type: FLK pid: 5827 [0->16777215] flags: 0x2000c10 remote: 0xa520aeaebdefc517 expref: -99 pid: 5827 timeout: 0
+==================================================
+
+00010000:00000001:4:1350018861.719611:0:5829:0:(ldlm_flock.c:525:ldlm_flock_completion_ast()) Process entered
+00010000:00000001:13:1350018861.719612:0:5827:0:(ldlm_lock.c:152:ldlm_lock_put()) Process entered
+00010000:00010000:4:1350018861.719612:0:5829:0:(ldlm_flock.c:528:ldlm_flock_completion_ast()) flags: 0x0 data: 0000000000000000 getlk: ffff810c3ecc1ad8
+00010000:00000001:13:1350018861.719613:0:5827:0:(ldlm_lock.c:182:ldlm_lock_put()) Process leaving
+00010000:00010000:13:1350018861.719613:0:5827:0:(ldlm_lock.c:683:ldlm_lock_decref_internal()) ### final decref done on cbpending lock ns: fefs-MDT0000-mdc-ffff8105e9bbbc00 lock: ffff810c3e37a200/0xee16fc0aef26bb17 lrc: 4/0,0 mode: PW/PW res: 12/706300508 rrc: 2 type: FLK pid: 5827 [0->16777215] flags: 0x2000c10 remote: 0xa520aeaebdefc517 expref: -99 pid: 5827 timeout: 0
+00010000:00000001:13:1350018861.719617:0:5827:0:(ldlm_lock.c:206:ldlm_lock_remove_from_lru()) Process entered
+00010000:00000001:13:1350018861.719618:0:5827:0:(ldlm_lock.c:210:ldlm_lock_remove_from_lru()) Process leaving
+00010000:00000001:13:1350018861.719619:0:5827:0:(ldlm_lockd.c:1763:ldlm_bl_to_thread()) Process entered
+00010000:00000001:4:1350018861.719619:0:5829:0:(ldlm_lock.c:659:ldlm_lock_decref_internal()) Process entered
+
+2
+==================================================
+00010000:00010000:4:1350018861.719619:0:5829:0:(ldlm_lock.c:637:ldlm_lock_decref_internal_nolock()) ### ldlm_lock_decref(PW) ns: fefs-MDT0000-mdc-ffff8105e9bbbc00 lock: ffff810c3e37a200/0xee16fc0aef26bb17 lrc: 5/0,0 mode: PW/PW res: 12/706300508 rrc: 2 type: FLK pid: 5827 [0->16777215] flags: 0x2000c10 remote: 0xa520aeaebdefc517 expref: -99 pid: 5827 timeout: 0
+==================================================
+
+--- Comment (emoly.liu, Thu, 12 Jun 2014 06:19:03 +0000) ---
+The patch http://review.whamcloud.com/10005 landed to 2.6 .
+
+--- Comment (vitaly_fertman, Fri, 18 Apr 2014 00:50:05 +0000) ---
+CODE: http://review.whamcloud.com/10005
+
+--- Comment (nozaki, Thu, 18 Oct 2012 06:21:13 +0000) ---
+I uploaded the patch to fix the problem for b1_8 and master branches.
+
+So, could someone check and reviews them ? thank you.
+
+--- Comment (nozaki, Thu, 18 Oct 2012 05:07:19 +0000) ---
+patch for master
+
+http://review.whamcloud.com/#change,4291
+
+--- Comment (nozaki, Thu, 18 Oct 2012 03:53:59 +0000) ---
+patch for b1_8
+
+http://review.whamcloud.com/#change,4290

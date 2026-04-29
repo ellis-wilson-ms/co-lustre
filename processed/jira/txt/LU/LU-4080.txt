@@ -1,0 +1,255 @@
+Key:        LU-4080
+Summary:    Troubleshooting poor filesystem performance
+Link:       https://jira.whamcloud.com/browse/LU-4080
+Type:       Task
+Priority:   Major
+Status:     Closed
+Resolution: Fixed
+Assignee:   Oleg Drokin
+Reporter:   George Jackson
+Created:    Wed, 9 Oct 2013 18:02:57 +0000
+Updated:    Tue, 29 Oct 2013 22:44:22 +0000
+Resolved:   Tue, 29 Oct 2013 22:44:22 +0000
+
+--- Environment ---
+RHEL 6.4, Lustre client kernel 2.6.32-279.2.1_x86-64
+
+96TB filesystem comprised of 6 x 16 TB OSTs on 2 OSS - 3 OSTs per OSS
+
+--- Description ---
+On a Lustre client with 96 TB filesystem mounted over Infiniband, we seem to be having write performance issues and need assistance with troubleshooting. On this particular client, we receive ~600,000 binary data files daily from an external source. Each file is anywhere from 100 bytes to 1 MB. These small files are then appended to data files already on the system from previous writes/appends.
+
+The speed at which the files are appended is very poor compared to a less powerful system we have that runs an old version of HP's IBRIX filesystem. What commands or troubleshooting steps can I take to find out where the bottleneck is in processing?
+
+Note this is a DOD classified system no connected to the internet so supplying logs may be problematic. I will be glad to answer any questions about the filesystem layout and configuration itself as well as discuss output from any commands you recommend I run.
+
+Thanks,
+
+George Jackson
+
+--- Comment (jacksong, Tue, 29 Oct 2013 16:59:05 +0000) ---
+Please close this ticket as resolved based on recommendations made and implemented regarding striping. Other suggestions will be taken into account.
+
+Thanks,
+
+George Jackson
+
+--- Comment (jacksong, Wed, 23 Oct 2013 16:09:34 +0000) ---
+I have an answer from our application developer about the sync methods used when for files written to disk. Your question was:
+
+Another question is whether the files are being sync'd to disk (e.g. application calling fsync() for each file, or opening with O_SYNC, or marking the directory dirsync)? 
+
+From our developer:
+
+"To answer your question, SiLK does not use fsync() or any of the
+
+other sync methods mentioned.
+
+When rwreceiver receives a file, it uses mmap() to allocate space on
+
+disk and writes the blocks it receives into that space.  mmap()
+
+works best when the files are on a local disk.
+
+The main processing loop of rwflowappend does the following:
+
+1. Get the name of an incremental file.
+
+2. Open the incremental file for read and read its header.
+
+3. Determine which hourly file corresponds to the incremental file.
+
+4. Check to see if the hourly file exists.  If yes, goto 5.  If no,
+
+   goto 9.
+
+5. open() the existing hourly file with flags O_RDWR | O_APPEND.  If
+
+   open() fails because the file does not exist, goto 10.
+
+6. Get a write lock on the hourly file.
+
+7. Attempt to read() the hourly file's header.  If that fails
+
+   because no bytes are available, use fcntl() to remove O_APPEND
+
+   from the file's flags and goto 13.
+
+8. Goto 14.
+
+9. Check whether directory path to the hourly file exists.  If not,
+
+   create it.
+
+10. open() the new file with flags O_RDWR | O_CREAT | O_EXCL.  If
+
+    open() fails because the file already exists, goto 5.
+
+11. Get a write lock on the file.
+
+12. Attempt to read the hourly file's header.  If that unexpectedly
+
+    succeeds, use fcntl() to add O_APPEND to the file's flags, and
+
+    goto 14.
+
+13. Write the new hourly file's header.
+
+14. Read records from the incremental file and write them to the
+
+    hourly file.
+
+15. fflush() the hourly file.  If fflush() fails, ftruncate() the
+
+    file to its original size.
+
+16. close() the hourly file.
+
+17. close() the incremental file and dispose of it.
+
+18. Goto 1. 
+
+Writing the file's header involves a few write() calls on small
+
+buffers.
+
+Writing the SiLK Flow records uses write() on a block whose maximum
+
+size is 64k.
+
+Note that each incremental files involves an open(), write(),
+
+fflush(), close() sequence on the hourly file.  If the incremental
+
+files are small, there will be a lot of overhead due to the repeated
+
+calls to open() and close()."
+
+So based on this and what you suggested before, we are studying the possibility of moving our collection (the rwreceiver process) to work on local disk rather than Lustre fs. The appended files and subsequent data at rest will still be stored on Lustre fs.
+
+Please let me know if you have other questions or suggestions.
+
+Thanks,
+
+George Jackson
+
+--- Comment (jacksong, Mon, 21 Oct 2013 20:21:31 +0000) ---
+Andreas,
+
+Thanks for the command to set stripe count to 1 for the dir in which we collect our data. Having monitored throughout the day, it seems to have helped performance a good deal. I understand however there may be other things going on that we still need to tune.
+
+I have not yet heard back from our application developer for the question you asked earlier about how files are sync'd to disk by the application. Please stand by for an answer to that.
+
+Thanks,
+
+George Jackson
+
+--- Comment (adilger, Thu, 17 Oct 2013 18:48:12 +0000) ---
+If you are using a stripe count of 6 for the small files, this is causing a considerable amount of overhead for every single file (i.e. 5x { OST object allocations, inode writes to disk, inode reads from disk, RPCs to lock object } for objects that aren't even used for anything).  Not only does it reduce the overhead on the clients, but it also increases the available IOPS by a factor of 5x since there is no longer false contention for each file accessed across all of the OSTs.
+
+Increased stripe count is only needed to improve the bandwidth or maximum size of a single large file accessed by multiple clients concurrently.
+
+I would strongly recommend to change the default stripe count on the "capture" directories to 1 (which is the Lustre default), and hopefully this will improve your capture performance.  Something like the following would work:
+
+lfs find /path/to/capture/directory -type d -print | xargs lfs setstripe -c 1
+
+While this may not make the small file IO as fast as we'd like, at least there isn't gratuitous overhead making it worse than necessary.
+
+--- Comment (jacksong, Wed, 16 Oct 2013 17:55:05 +0000) ---
+For any file within the filesystem that we are appending and reading, an lfs getstripe says:
+
+lmm_stripe_count:    6
+
+lmm_stripe_size:     1048576
+
+lmm_stripe_offset:   4
+
+The offset is different for each file but the count and size are the same. The output goes on to list the obdidx and objid info but I think the count and size were what you wanted.
+
+I am unable to provide any more information at this time on the issue. Until I can figure out more of what's going on please feel free to close this ticket and I will open a different ticket with more detailed info based on the information you have provided so far.
+
+Thanks,
+
+George Jackson
+
+--- Comment (green, Mon, 14 Oct 2013 21:08:55 +0000) ---
+70-100 samples every 5 seconds is 14-20 conflicting file access per second, which is usually a signal that something tried to read the file very soon after it was appended. So this is a kind of cuncurrence where one client writes a file and then the other clients read it quite soon afterwards, and then if the same file needs appending again, the reading clients would also need to drop their caches and so on (all organized via internal Lustre locking).
+
+you can use lfs getstrip command with a filename of the file you are interested in to see how is it striped.
+
+BTW, another disadvantage of these small unaligned writes is before you can even write somewhere, a partial file block needs to be fetched in first.
+
+if the reading clients never read more than one piece of sequential data, switching them to directio probably would have helped if not for the directio alignment requirements. Unfortunately unaligned directio is not supported in 2.1 clients.
+
+Essentially cache ping pong s a situation where:
+
+client1: write some data into file1 (obtains a lock on the region to write, which in case of O_APPEND is from known end of file to infinity, then populate local cache with first clean dat athat it reads from the server for the partial page affected, then with dirty data from the application)
+
+cleint2: attempt to read some data from file1 (blocked at attempt to lock the intended file region for read)
+
+client1: received request to drop the lock on the region in file1 it holds (writes all dirty cache pages to the server, then drops the lock)
+
+client2: reads some data from file1 (gets the lock, reads some data from the server and populates local cache with the data).
+
+client1: attempt to write some data to file1 again (blocks on the attempt to lock the file region in file1 again, causing client2 to drop all of it's ache and release the lock ...)
+
+and so on.
+
+--- Comment (jacksong, Fri, 11 Oct 2013 19:10:45 +0000) ---
+Thank you both for your comments. To answer Oleg's questions first:
+
+The typical size for files entering the filesystem from remote host is anywhere from ~100 bytes up to 3 MB. Over the course of a day, the file getting appended to by these incremental files grows as much as 3 GB. There is no file locking during this operation, which is indeed a file open with the O_APPEND flag then the binary data is written. Afterwards, it becomes data at rest for an indefinite period of time to be read by user applications. I am not sure what the typical striping is. Is there a command I could run or file I can look at to find this? We do stripe data across the 6 OSTs if that is what you mean.
+
+Although we have 5 clients that mount the fs, only one client does the writes/appends. All other clients only perform reads. So no concurrency.
+
+My apologies for not quantifying what I mean by poor. I am currently gathering some stats to give you more detail on the performance I'm seeing and will provide at a later date.
+
+I'm not familiar with the cache ping pong term you mentioned but I looked at the ldlm_bl_callback samples in /proc/fs/lustre/ldlm/services/ldlm_cbd/stats and found that over the course of one minute, the first number incremented by 70-95 samples every 5 seconds. Is that significant?
+
+For Andreas' questions:
+
+I couldn't determine what sync function is being used but am trying to get in touch with the developer of the application that does the writes/appends for an answer.
+
+I'm studying the possibility of initially staging the incremental files on a local fs but it doesn't look good. The internal disks we have on these hosts are only 300GB so we rely mostly on SAN (which is what we use for Lustre) for all our storage needs.
+
+I think I see what you are talking about in your assessment of file writes. Is there some type of configuration parameter we can set to make processing smaller files more efficient? In other words, in our scenario of writing mostly smaller files (Thanks again for your help,
+
+George Jackson
+
+--- Comment (adilger, Fri, 11 Oct 2013 00:03:27 +0000) ---
+Another question is whether the files are being sync'd to disk (e.g. application calling fsync() for each file, or opening with O_SYNC, or marking the directory dirsync)?  That would definitely kill performance right off the bat.
+
+The other major question is whether the 600k files/day could initially be staged into a separate filesystem (e.g. fast locally-attached SSD with ext4) before being appended onto the larger files in Lustre?
+
+Writing a 100-byte file into Lustre currently requires at least four separate RPCs (open/create, OST lock enqueue, OST write, close, not counting the OST lock cancel which might be batched with another RPC).  At a minimum, each write of a file needs at least:
+
+  ~64 bytes MDT filename
++ 512 byte MDT inode
++ 128 byte MDT replay log
++ 32 byte MDT object index
++ 256 byte OST inode
++ 128 byte OST replay log
+* 2 because of metadata journaling
++ file size rounded up to 4096 byte multiple
+
+This 2kB+ of overhead is already averaged over many file updates already and does not include operations that happen asynchronously in the background, it would be even higher for individual files.  It also involves many separate IOs (i.e. seeks), though these are also amortized over many files.  It is the same regardless of the file size, so the overhead only gets acceptable (e.g. That isn't to say that there isn't anything to be done to improve the performance (I can't really comment without knowing exactly what "good" and "poor" are in your scenario), but there are currently limits on how efficient small file IO can get.  We are already working on a feature for significantly reducing the small file IO overhead for future releases, but this is the situation today.
+
+--- Comment (green, Thu, 10 Oct 2013 19:37:50 +0000) ---
+What's the typical size for the files that are being appended? What's the typical striping for such files?
+
+When you say append, is it done by opening the file with O_APPEND flag andthen writing some data or how do you do it?
+
+How much concurrency is there (as in, none = every client writes to files that only it touches at all times, or high = there are frequently many clients that append to the same file (or in quick succession). How many clients)?
+
+When you say slow, is there some number or something that makes it slow, like "open takes 2 seconds" or "append-write takes 0.1 seconds for every 100k" or some other quantifiable number and ideally an operation that's slow?
+
+Cache ping pong between nodes might result in significant slowdowns in writes, you can check for it in /proc/fs/lustre/ldlm/services/ldlm_cbd/stats and check if the first number in ldlm_bl_callback line increases at a fast pace.
+
+--- Comment (pjones, Thu, 10 Oct 2013 19:32:52 +0000) ---
+Oleg
+
+Could you please assist with this one?
+
+Thanks
+
+Peter

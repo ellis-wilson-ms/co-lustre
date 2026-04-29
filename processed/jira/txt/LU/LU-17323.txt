@@ -1,0 +1,259 @@
+Key:        LU-17323
+Summary:    fork() leaks ERESTARTNOINTR (errno 513) to user application
+Link:       https://jira.whamcloud.com/browse/LU-17323
+Type:       Bug
+Priority:   Critical
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Mike D
+Created:    Wed, 29 Nov 2023 21:59:25 +0000
+Updated:    Mon, 8 Jul 2024 20:52:43 +0000
+Links:      Related: is related to  LU-17405
+Attachments: repro.c
+
+--- Environment ---
+RHEL6, RHEL7/CentOS7 (various kernels)
+
+--- Description ---
+When using file locks on a Lustre mount with the 'flock' mount option, fork()
+
+can leak ERESTARTNOINTR to a user application.  The fork() system call checks
+
+if a signal is pending, and if so, cleans up everything it did and returns 
+
+ERESTARTNOINTR.  The kernel transparently restarts the fork() from scratch,
+
+the user application is never supposed to get the ERESTARTNOINTR errno.
+
+The fork() cleanup code calls exit_files() which calls Lustre code.  I'm not
+
+positive what the problem is at a low level.  It may be that the Lustre code
+
+clears the TIF_SIGPENDING flag, which prevents the kernel from restarting the
+
+fork() and it leaks the ERESTARTNOINTR errno to the user application.
+
+It seems there has to be multiple threads involved.  My reproducer has two
+
+threads. Thread 1 does fork() calls in an infinite loop, spawning children
+
+that exit after a random number of seconds.  Thread 2 sleeps for a random
+
+number of seconds in an infinite loop.  There is a SIGCHLD handler set up and
+
+both threads can handle SIGCHLD signals.  The fork() gets interrupted by
+
+pending SIGCHLD signals from exiting children.  I think thread 2 has to handle
+
+the SIGCHLD signal for the problem to happen.  If thread 2 has SIGCHLD signals
+
+blocked, the problem never happens.
+
+The problem doesn't reproduce with the 'localflock' mount option, so we
+
+believe 'localflock' is safe from this issue.
+
+We've seen this on RHEL6, RHEL7/CentOS7 kernels,
+
+and Lustre 2.11.0, 2.12.5 and 2.12.6
+
+Lustre 2.12.0 does not reproduce the issue.
+
+Steps to reproduce:
+
+1) Lustre mount must be using 'flock' mount option.
+
+2) gcc -o repro ./repro.c -lpthread
+
+3) Run reproducer:
+
+Problem usually reproduces within 5-60 seconds.
+
+Reproducer runs indefinitely or until the issue occurs, 
+
+enter Ctrl-C to quit
+
+> touch /lustre_mnt/testfile.txt
+
+> ./repro /lustre_mnt/testfile.txt
+
+Fork returned -1, errno = 513, exiting...
+
+Use POSIX style read lock
+
+> ./repro /lustre_mnt/testfile.txt posix
+
+Fork returned -1, errno = 513, exiting...
+
+Use BSD style read lock
+
+> ./repro /lustre_mnt/testfile.txt flock
+
+Fork returned -1, errno = 513, exiting...
+
+Don't lock at all (this won't reproduce and will run indefinitely)
+
+> ./repro /lustre_mnt/testfile.txt none
+
+NOTE: be aware the reproducer can exhaust your maxprocs limit
+
+--- Comment (spitzcor, Mon, 8 Jul 2024 20:23:41 +0000) ---
+mikedoo4, FYI ^^^.
+
+It seems that https://review.whamcloud.com/c/fs/lustre-release/+/55534 should not be applied to Lustre master.  Can you verify that you can't reproduce the problem on a modern kernel?  [EDIT: sorry, I forgot that you said earlier that you "have not been able to reproduce the issue on CentOS7"].  If so, what do you think about resolving this ticket?
+
+--- Comment (panda, Wed, 26 Jun 2024 09:09:44 +0000) ---
+I pushed a fix for the -513 errno to https://review.whamcloud.com/c/fs/lustre-release/+/55534 (it's based on top of 2.12.6). I can reproduce the bug without it and cannot reproduce the bug when it is applied. The kernel I used is 3.10.0-957.27.2.el7.x86_64.
+
+It seems that fork()/copy_process() was rewritten so that the kernel first checks for pending signals and no cleanup part is needed if it finds a pending signal. This change got into early rhel8 kernels and later kernels so we probably don't need to fix the Lustre versions where we still use recalc_sigpending() or clear_*thread_flag(*TIF_SIGPENDING).
+
+While the signal manipulations in l_wait_event() do not look safe, it looks more like a kernel issue because recalc_sigpending() is an exported function without any obvious restrictions for file closing handlers mentioned in the code or Documentation.
+
+--- Comment (JIRAUSER18805, Wed, 31 Jan 2024 21:41:14 +0000) ---
+Linked LU-17405 which tracks the side issue uncovered with gcc when testing the Lustre 2.15 client with 2.12.x servers.
+
+--- Comment (JIRAUSER18805, Mon, 8 Jan 2024 23:24:23 +0000) ---
+I'll note that csh vs bash behavior is different.
+
+	csh case (a.out not found until the ls is run)
+
+$ gcc hello.c
+
+$ ./a.out
+
+./a.out: Command not found
+
+$ ./a.out
+
+./a.out: Command not found
+
+$ ./a.out
+
+./a.out: Command not found
+
+$ ls a.out
+
+a.out
+
+$ ./a.out
+
+hello world
+
+ 
+
+	bash case (a.out works after the bad ELF interpreter error)
+
+$ gcc hello.c
+
+$ ./a.out
+
+bash: ./a.out: /lib64/ld-linux-x86-64.so.2: bad ELF interpreter: No such file or directory
+
+$ ./a.out
+
+hello world
+
+ 
+
+The main thing I've noticed in the client debug log:
+
+running a.out
+
+file.c:2012:ll_file_read_iter() file a.out:[0x2000XXXXX:0x9:0x0], ppos: 0, count: 80
+
+file.c:2012:ll_file_read_iter() file a.out:[0x2000XXXXX:0x9:0x0], ppos: 6456, count: 1984
+
+file.c:2012:ll_file_read_iter() file a.out:[0x2000XXXXX:0x9:0x0], ppos: 6186, count: 268
+
+file.c:2012:ll_file_read_iter() file a.out:[0x2000XXXXX:0x9:0x0], ppos: 64, count: 504
+
+file.c:2012:ll_file_read_iter() file a.out:[0x2000XXXXX:0x9:0x0], ppos: 568, count: 200
+
+running a.out again
+
+file.c:2012:ll_file_read_iter() file a.out:[0x2000XXXXX:0x9:0x0], ppos: 0, count: 128
+
+file.c:2012:ll_file_read_iter() file a.out:[0x2000XXXXX:0x9:0x0], ppos: 64, count: 504
+
+file.c:2012:ll_file_read_iter() file a.out:[0x2000XXXXX:0x9:0x0], ppos: 568, count: 28
+
+ 
+
+I may be able to get a full log if needed but I don't know when I'll have time to get back to this.  I'll look at entering a new ticket with some of this info.  Thanks for the help so far.
+
+--- Comment (paf0186, Fri, 15 Dec 2023 20:42:40 +0000) ---
+Also, since it's easy to reproduce, but doesn't happen in our usual test environments, could you grab client debug logs and attach them to the new LU?
+
+Something like this would do the trick:
+
+DEBUGMB=`lctl get_param -n debug_mb`
+lctl clear
+lctl set_param *debug=-1 debug_mb=10000
+lctl mark "running gcc"
+gcc hello.c
+lctl mark "running a.out"
+./a.out
+lctl mark "running ls"
+/bin/ls a.out
+lctl mark "running a.out again"
+./a.out
+# Write out logs
+lctl dk > /tmp/log
+# Set debug to minimum, this leaves on error, warning, etc
+lctl set_param debug=0
+lctl set_param debug_mb=$DEBUGMB 
+
+(Will probably want to compress that before attaching it)
+
+--- Comment (adilger, Fri, 15 Dec 2023 20:19:57 +0000) ---
+Mike, please file your gcc issue in a separate Jira ticket, or it will be lost here. There should be proper interop between 2.15 clients and 2.12 servers.
+
+--- Comment (JIRAUSER18805, Fri, 15 Dec 2023 19:54:23 +0000) ---
+I tried the latest Lustre 2.15 client and have not been able to reproduce the issue on CentOS7.  However, I did notice a problem (I haven't investigated it much yet):
+
+> gcc hello.c
+
+> ./a.out
+
+./a.out: Command not found.
+
+> /bin/ls a.out
+
+a.out
+
+> ./a.out
+
+hello world
+
+ 
+
+The file isn't there until I do the ls.  This is reproducible every time.
+
+ 
+
+Is it recommended to use a Lustre 2.15 client with 2.12.x servers?
+
+--- Comment (JIRAUSER18805, Mon, 4 Dec 2023 18:42:29 +0000) ---
+I plan to try Lustre 2.15 client (assuming that will connect to the 2.12.x server) but it will probably be several weeks before I can try it and report back.  I don't know if the problem occurs with RHEL8/9 as I don't have an easy way to test that.
+
+--- Comment (paf0186, Wed, 29 Nov 2023 22:52:35 +0000) ---
+Interesting that the signal clearing is in those macros.  Those are the ones neilb ported in to Lustre to replace our hand rolled stuff, so maybe the issue isn't fixed.  Or perhaps Neil knows - should've tagged him earlier.
+
+--- Comment (adilger, Wed, 29 Nov 2023 22:45:16 +0000) ---
+Mike, thank you for the detailed analysis (including a reproducer!). 
+
+Since RHEL6/7 are basically EOL at this point, this issue would only be of interest if the problem persists in RHEL8/9 since we've run the full lifetime of EL6/7 without hitting this problem in actual production usage (or at least nothing has been reported to us up to this point).
+
+I don't see ERESTARTNOINTR used or returned anywhere in the Lustre code, so this error code is definitely coming from the kernel fork() handling.  There is indeed code in libcfs/include/libcfs/linux/linux-wait.h that is clearing TIF_SIGPENDING in the RPC completion wait routines (__wait_event_idle() or __wait_event_lifo(), which are conditionally used depending on the kernel version in use.  I suspect these routines are clones of similar code from newer kernels just for compatibility use with older kernels, so there may be some variations.
+
+If the problem still persists with newer kernels and Lustre releases then it would be useful to continue investigation and add the repro.c test case into our regression test suite.
+
+--- Comment (paf0186, Wed, 29 Nov 2023 22:22:55 +0000) ---
+Hi Mike,
+
+I think I know the issue you're hitting here and its root cause.  Historically, Lustre had to do some nasty things with signal handling due to the lack of the ability to express "waiting" without contributing to load, and we also rolled our own for some waiting primitives that didn't exist at the time.  This results in some weird behavior with certain signals in some cases.  I saw this with ptrace, but this problem has a very similar feel to it.
+
+Neil Brown did a thorough rework of signal handling and task waiting in Lustre, spread over a number of patches (If it were just one, I would link it), which I believe landed for 2.13 but I don't think was ported to 2.12 (it was seen as code cleanup rather than fixing specific bugs).  (I think your not hitting the problem with 2.12 is probably a coincidence/timing change.)
+
+2.15 is the current maintenance release, so it would be good to see if you can reproduce this with 2.15, which has the full bevy of wait and signal handling changes.

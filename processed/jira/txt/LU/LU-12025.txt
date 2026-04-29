@@ -1,0 +1,143 @@
+Key:        LU-12025
+Summary:    Adding OST may cause EIO - delay activation of new OSTs on existing filesystem
+Link:       https://jira.whamcloud.com/browse/LU-12025
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Andreas Dilger
+Reporter:   Di Wang
+Created:    Wed, 27 Feb 2019 03:34:02 +0000
+Updated:    Sun, 19 Nov 2023 00:24:42 +0000
+Resolved:   Fri, 8 Nov 2019 07:56:00 +0000
+Links:      Related: is related to LU-12036; Related: is related to LU-17299; Related: is related to LU-12998
+
+--- Description ---
+During OST addition, 
+
+1. MDT gets configuration refreshment first.
+
+2. Then MDT get create request from the client, might allocate the object the new OST, then reply to the client.
+
+3. If client does not refresh its configuration yet, then do I/O with the EA, it might get EIO because it does not know the OST.
+
+So it probably needs add version to the config log to avoid this happen.
+
+This happens quite often in cloud environment.   though not sure if there is duplicate ticket already.
+
+--- Comment (gerrit, Thu, 12 Dec 2019 23:05:45 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/36872/
+
+Subject: LU-12025 osp: allow OS_STATE_* flags from OSTs
+
+Project: fs/lustre-release
+
+Branch: b2_12
+
+Current Patch Set: 
+
+Commit: b0194200146a54ee45df208da88dcc6b916fb51f
+
+--- Comment (gerrit, Tue, 26 Nov 2019 15:46:55 +0000) ---
+Minh Diep (mdiep@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/36872
+
+Subject: LU-12025 osp: allow OS_STATE_* flags from OSTs
+
+Project: fs/lustre-release
+
+Branch: b2_12
+
+Current Patch Set: 1
+
+Commit: 8f2b85288f973681bd8bd6d8a04f421f57a78a04
+
+--- Comment (adilger, Fri, 8 Nov 2019 07:56:00 +0000) ---
+This allows the OST to completely disable itself from precreation without having to hack around in the state.  Using "degraded" is only partially disabled (can still be used in emergency), and faking "out of space" is a hack.
+
+In LU-12036 we should allow mounting the OST with the "OS_STATE_NOPRECREATE" flag set, so that it can be mounted but it will not be used.
+
+--- Comment (gerrit, Tue, 22 Oct 2019 23:57:28 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/35029/
+
+Subject: LU-12025 osp: allow OS_STATE_* flags from OSTs
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 9b0ebf78f7919a144673edadc4a95bad84fae2d3
+
+--- Comment (gerrit, Sat, 1 Jun 2019 05:05:21 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/35029
+
+Subject: LU-12025 osp: allow OS_STATE_* flags from OSTs
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 1227336419caed88199f8d21076fb9358070f004
+
+--- Comment (pfarrell, Thu, 28 Feb 2019 22:31:34 +0000) ---
+I think the request from LU-12036 could/should probably be integrated here.
+
+--- Comment (adilger, Wed, 27 Feb 2019 23:00:19 +0000) ---
+In relation to LU-11963, one easy way to allow a new OST to be added to the filesystem that would still prevent the MDS from using it immediately would be to send the "OS_STATE_NOPRECREATE" flag from the OST in the OST_STATFS RPC reply.  The MDS already checks for this (it sets it internally), similar to the "OS_STATE_DEGRADED" flag, but it is an absolute rather than a hint.
+
+The code in osp_pre_update_status() needs to be cleaned up to avoid clearing the OS_STATE_NOPRECREATE flag (and probably OS_STATE_ENOSPC and OS_STATE_ENOINO, so the OST could send these itself as well).  The obd_statfs structure is refreshed every few seconds, so the MDS shouldn't need to clear the flags it sets itself.
+
+Also, it appears there is a bit of a race in osp_statfs_interpret() calling osp_pre_update_status():
+
+        d->opd_statfs = *msfs;
+
+        if (d->opd_pre)
+                osp_pre_update_status(d, rc);
+
+since there is a window between  when the new *msfs is stored in opd_statfs that is returned by osp_statfs(), and when osp_pre_update_status() might set the various OS_STATE_* flags that the create threads check.  That may allow file creation on an OST that should otherwise be unavailable (out of space, disabled, etc).  Instead, the new *msfs should be passed as an argument to osp_pre_update_status() and updated before it is stored into opd_statfs.
+
+--- Comment (di.wang, Wed, 27 Feb 2019 20:19:54 +0000) ---
+it would only fix the problem of one client creating and using a file itself, but would not fix the problem of a different client trying to access that file before it had processed the config llog updates (which may be delayed tens of seconds if there are many clients)
+
+Oh, I mean the stale client should not be allowed to access the "newer" server until it refreshes its own config from MGS, but this indeed needs a lot changes, probably not worth for this as you said.  Adding timeout is probably good enough here. thanks.
+
+--- Comment (adilger, Wed, 27 Feb 2019 19:59:03 +0000) ---
+It isn't clear that having a per-target version number would help.  The target being added (OST) can provide a version number, but the client shouldn't have to pass its "connect/config version" for every OST it knows about to the MDS for every file it is creating.
+
+Sending a single "config record version" (really just the last MGS config record number that the client processed) from the client to the MDS with each create would be more useful, since this would (indirectly) tell the MDS which OSTs the client is connected to and it could skip ones that were added after that version.  Something like storing a "minimum config record number" on each target in LOD which is the config llog record in which the OST was added, and the client request would include their "current config record number" along with each request.   A check like:
+
+        if (req->current_config_rec target[ost_idx]->tgt_min_config_rec)
+                continue;
+
+during create would be enough to skip the OST for that create.
+
+HOWEVER this has some significant drawbacks:
+
+	it needs a protocol change so that clients will always send this field with each create request and the MDS will check it, to fix a problem that happens very rarely for most users
+
+	the config llog record numbers may not be easily accessible in the right parts of the code (haven't looked at that yet)
+
+	it would only fix the problem of one client creating and using a file itself, but would not fix the problem of a different client trying to access that file before it had processed the config llog updates (which may be delayed tens of seconds if there are many clients)
+
+So, my suggestion for a simpler solution is just to use a timeout (maybe variable), based on how quickly config llog records are processed by clients, before an OST (or MDT, for DNE) can be used for new file allocations.  There is already a small delay before the OST could be used, because the MDS needs to precreate objects there, but that is only a fraction of a second in most cases.  Instead of storing the "config version" in the LOD target, store the "config time" for the target, and skip it for new allocations for e.g. 10s after it connects.  This should handle the case where the MDS itself was just mounted and all OSTs are pre-existing (e.g. only delay usage if the lov_objids entry was just added).
+
+--- Comment (di.wang, Wed, 27 Feb 2019 17:48:07 +0000) ---
+My initial thought is MGS maintains a version number, which can bump up when new target is added (or removed?), then all other nodes will get the version number when it fetches the config log from MGS.   when client send request to server, if their version  number does not match, then either client or server will needs to refresh their configuration from MGS. 
+
+Or even further, each server target can also maintain its own version number (when it is being added to MGS), then the target can process the request as long as the req version number is newer than the target version.
+
+--- Comment (adilger, Wed, 27 Feb 2019 05:20:34 +0000) ---
+I saw another related comment recently about the desire to be able to configure new OSTs on the filesystem, but not have them immediately active on the MDS until the administrator wants them enabled.
+
+I suspect there are a number of simple mechanisms that might allow this to happen:
+
+	have a time delay between when the OST is first added to the filesystem before it can be used for object allocation, maybe 30-60s IFF the OSTs are added and there are clients already mounted and the MDS is not just newly formatted.  I suspect we already have workarounds for this issue in test-framework.sh (e.g. sleep for some time until the OST is visible on the client) because we are constantly formatting and adding new OSTs to the filesystem, but possibly we are mounting the client after the OSTs and don't see it.  There are probably a few places where an OST is added to a running filesystem during a test, but maybe we don't try to write to it immediately.
+
+	pass a flag from the OST at the first connect time to the MDS that indicates the OST should be inactive until the admin enables it manually.  This may be desirable for a number of reasons.  This could be done by setting osp.-OSTnnnn.max_create_count=0 on the MDS for the new OSTnnnn the first time it is connected.
+
+	mark the OST unavailable locally (e.g. OS_STATE_ENOINO or something set via mkfs.lustre) before it mounts and tries to connect to the MDS the first time so there is no window on the MDS when there is a problem, and it keeps the implementation more localized instead of depending on the MDS as well
+
+Allowing both modes (autmatic activation after timeout, wait for manual activation) may be useful under different circumstances.

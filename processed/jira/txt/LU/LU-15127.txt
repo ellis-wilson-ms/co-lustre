@@ -1,0 +1,139 @@
+Key:        LU-15127
+Summary:    import invalidation vs writeback deadlock
+Link:       https://jira.whamcloud.com/browse/LU-15127
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Patrick Farrell
+Reporter:   Alex Zhuravlev
+Created:    Tue, 19 Oct 2021 06:10:28 +0000
+Updated:    Fri, 11 Oct 2024 15:45:54 +0000
+Resolved:   Wed, 10 Apr 2024 14:45:39 +0000
+Links:      Duplicate: duplicates LU-12522; Related: is related to LU-15340
+
+--- Description ---
+racer hits this deadlock few times a day:
+
+schedule,osc_extent_wait,osc_cache_wait_range,osc_cache_writeback_range,osc_io_fsync_start,cl_io_start,lov_io_call,cl_io_start,cl_io_loop,cl_sync_file_range,ll_delete_inode,evict,__dentry_kill,dentry_kill,dput,ll_dirty_page_discard_warn,vvp_page_completion_write,cl_page_completion,osc_ap_completion,osc_extent_finish,brw_interpret,ptlrpc_check_set,ptlrpcd
+	PIDs(1): "ptlrpcd_00_00":4889 
+
+schedule,osc_extent_wait,osc_cache_wait_range,osc_cache_writeback_range,osc_ldlm_blocking_ast,ldlm_cancel_callback,ldlm_cli_cancel_local,ldlm_cli_cancel,osc_ldlm_blocking_ast,ldlm_handle_bl_callback,ldlm_bl_thread_main
+	PIDs(1): "ldlm_bl_02":7759 
+
+schedule,ptlrpc_invalidate_import,ptlrpc_invalidate_import_thread
+	PIDs(1): "ll_imp_inval":293752 
+
+schedule,ptlrpc_invalidate_import,ptlrpc_set_import_active,osc_iocontrol,lov_iocontrol,ll_umount_begin,ksys_umount,__x64_sys_umount
+	PIDs(1): "umount":449648
+
+--- Comment (pjones, Wed, 10 Apr 2024 14:45:39 +0000) ---
+ok thanks - then let's close out this ticket and track the landing of the second patch under a different Jira if James finds it useful...
+
+--- Comment (paf, Wed, 10 Apr 2024 14:36:15 +0000) ---
+Hey Peter,
+
+Yes, sure - we could move it.  To be clear, the cleanup patch isn't just code cleanup - it's an attempt at a fix for the second deadlock Alex found.  Cleanup here is cleaning up here during import invalidation (I believe unmount and eviction).  But that's different from what this was originally opened for, and that second issue hasn't come up since Alex reported it.  Hang on unmount is obnoxious but I think quite rare, so...
+
+So I'm sort of ambivalent about it - It's probably worth tracking this with a new ticket, but unless it turns out to be the fix for James's problem...  Yeah.
+
+--- Comment (simmonsja, Tue, 9 Apr 2024 17:02:52 +0000) ---
+I actually see a bug with my rhashtable ldlm patch in this area. Wonder if it would help?
+
+https://testing.whamcloud.com/test_logs/6b6788aa-0a86-4a60-8786-506f2d77cf3b/show_text
+
+--- Comment (pjones, Tue, 9 Apr 2024 16:47:35 +0000) ---
+Patrick
+
+A real blast from the past here. It looks like only the "clean up" patch - https://review.whamcloud.com/#/c/fs/lustre-release/+/45658/ - is still being tracked under this ticket. Is that still required? If so a rebase and adding some reviewers would move things along. Otherwise I would say that we should close this as fixed in 2.16 and track and residual issues under a new ticket.
+
+Any objections to that approach?
+
+Peter
+
+--- Comment (paf0186, Wed, 24 Nov 2021 17:42:58 +0000) ---
+There are a few fairly heroic guesses in that patch, but I think it's probably right...  Alex, if you can try it in your test rig...
+
+--- Comment (gerrit, Wed, 24 Nov 2021 17:42:34 +0000) ---
+"Patrick Farrell " uploaded a new patch: https://review.whamcloud.com/45658
+
+Subject: LU-15127 osc: Resource cleanup in osc invalidate
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 7bad59f258269dd358d066bd023defeaec955f6d
+
+--- Comment (paf0186, Wed, 24 Nov 2021 17:00:32 +0000) ---
+So looking at osc_import_event for INVALIDATE, we call:
+
+ldlm_namespace_cleanup
+
+osc_ldlm_resource_invalidate (which calls osc_object_invalidate)
+
+Then call
+
+ldlm_namespace_cleanup
+
+again
+
+ldlm_namespace_cleanup calls ldlm_resource_clean, then ldlm_resource_complain.
+
+ldlm_resource_complain shows that we can sometimes have locks left after ldlm_resource_clean
+
+So the thread doing 'cp' is trying to match an existing lock.
+
+So the lock survives the call to ldlm_resource_clean, then the osc oo_nr_ios is > 0, so we cannot invalidate the OSC object, so we do not try to clean up the lock again.
+
+I don't know why a lock would survive ldlm_resource_clean, but that seems like the issue.
+
+Maybe we need to call ldlm_resource_clean from osc_object_invalidate if oo_nr_ios is > 0 ?
+
+--- Comment (paf0186, Wed, 24 Nov 2021 16:47:06 +0000) ---
+Are you able to dump the LDLM namespaces for that hang?
+
+--- Comment (paf0186, Wed, 24 Nov 2021 16:44:22 +0000) ---
+Hmm...  So osc_object_invalidate is probably waiting for nr_ios to be zero, and that's incremented in cl_io_iter_init (osc_io_iter_init) before the lock request is made.
+
+So I guess it's waiting for that competion ast, which is waiting for the lock to be granted or cancelled.
+
+So somehow that lock isn't getting granted or cancelled I guess?
+
+I'm not quite sure how pending lock requests are cancelled when an import is invalidated.
+
+--- Comment (bzzz, Wed, 24 Nov 2021 16:22:46 +0000) ---
+the invalidation path still deadlock, but much less frequently. I guess this is a bit different issue?
+
+schedule,ldlm_completion_ast,ldlm_lock_match_with_skip,osc_enqueue_base,osc_lock_enqueue,cl_lock_enqueue,lov_lock_enqueue,cl_lock_enqueue,cl_lock_request,cl_io_lock,cl_io_loop,cl_setattr_ost,ll_setattr_raw,do_truncate,path_openat,do_filp_open,do_sys_open
+	PIDs(1): "cp":367053 
+
+schedule,osc_object_invalidate,osc_ldlm_resource_invalidate,cfs_hash_for_each_relax,cfs_hash_for_each_nolock,osc_import_event,ptlrpc_invalidate_import,ptlrpc_invalidate_import_thread
+	PIDs(1): "ll_imp_inval":384198 
+
+schedule,osc_object_invalidate,osc_ldlm_resource_invalidate,cfs_hash_for_each_relax,cfs_hash_for_each_nolock,osc_import_event,ptlrpc_invalidate_import,ptlrpc_set_import_active,osc_iocontrol,lov_iocontrol,ll_umount_begin,ksys_umount,__x64_sys_umount
+	PIDs(1): "umount":384405
+
+--- Comment (gerrit, Fri, 12 Nov 2021 16:34:54 +0000) ---
+"Patrick Farrell " uploaded a new patch: https://review.whamcloud.com/45550
+
+Subject: LU-15127 llite: Remove path from discard_warn
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: d04a1929b3adb776173b02e0f6b82d396046dd14
+
+--- Comment (bzzz, Fri, 12 Nov 2021 13:01:04 +0000) ---
+please, go ahead, I'm busy with another stuff.
+
+--- Comment (paf0186, Fri, 12 Nov 2021 12:32:24 +0000) ---
+I think I can figure out a fix (unless you’re already working on it).
+
+--- Comment (paf0186, Fri, 12 Nov 2021 12:31:11 +0000) ---
+Ah, i think this is the classic dirty page discard warn issue… it takes a reference to print a debug message and can end up deadlocked because of it.

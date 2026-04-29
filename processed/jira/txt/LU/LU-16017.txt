@@ -1,0 +1,144 @@
+Key:        LU-16017
+Summary:    Suboptimal dnode size used for ZFS
+Link:       https://jira.whamcloud.com/browse/LU-16017
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Brian Behlendorf
+Reporter:   Brian Behlendorf
+Created:    Fri, 15 Jul 2022 21:07:02 +0000
+Updated:    Fri, 23 Sep 2022 23:54:05 +0000
+Labels:     llnl, zfs
+
+--- Environment ---
+Any Lustre filesystem using ZFS-based servers.
+
+--- Description ---
+When allocating new objects for a ZFS-based server the dnode should be sized large enough to store all of the base Lustre extended attributes (trusted.lma, trusted.fid, trusted.version) in order to avoid requiring a spill block.  In practice, this means a minimum size of 1K is required to accommodate the packed xattr nvlist in the bonus area.
+
+> zdb -e -p /tmp/ -dddd lustre-ost1/ost1 1500
+
+Dataset lustre-ost2/ost2 [ZPL], ID 391, cr_txg 8, 18.8M, 614 objects, rootbp DVA[0]= DVA[1]= [L0 DMU objset] fletcher4 lz4 unencrypted LE contiguous unique double size=1000L/200P birth=89L/89P fill=614 cksum=dd5e644f1:50403505c9e:f29fa6075ec6:1fd1540cabc5f5
+
+    Object  lvl   iblk   dblk  dsize  dnsize  lsize   %full  type
+
+      1500    1   128K    64K    64K      1K    64K  100.00  ZFS plain file
+
+                                               356   bonus  System attributes
+
+        dnode flags: USED_BYTES USERUSED_ACCOUNTED USEROBJUSED_ACCOUNTED
+
+        ...
+
+        SA xattrs: 204 bytes, 3 entries
+
+                trusted.lma = \010\000\000\000\000\000\000\000\000\000\001\000\001\000\000\000\360\000\000\000\000\000\000\000
+
+                trusted.fid = \001\004\000\000\002\000\000\000\335\001\000\000\000\000\000\000\000\000\020\000\001\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000
+
+                trusted.version = \357\000\000\000\001\000\000\000
+
+However, by default 512b dnodes are created forcing a spill block to be allocated for each object which significantly increases the required storage and reduces performance due to the additional I/O.
+
+It appears the issue is caused by OSD_BASE_EA_IN_BONUS being set incorrectly.  This value needs to account not just for the data size (which it does), but also for the xattr key text and XDR encoding overhead for the packed nvlist.  After everything is taken in to account the correct size is 204 bytes according to zdb.
+
+It seems to me the correct fix here is to update OSD_BASE_EA_IN_BONUS accordingly.  Making the follow change fixes the issue in my testing.  It'd be great if someone else could review this change to make sure additional changes aren't needed.
+
++/*
+
++ * The base extended attribute SA size including the keys, values,
+
++ * and XDR encoding overhead as reported by zdb.
+
++ *
+
++ * SA xattrs: 204 bytes, 3 entries
+
++ *     trusted.lma = \000\000\000\000...
+
++ *     trusted.fid = \000\000\000\000...
+
++ *     trusted.version = \000\000\000...
+
++ */
+
++#define OSD_BASE_EA_IN_BONUS   (ZFS_SA_BASE_ATTR_SIZE + 204)
+
+Until a fix is merged a reasonable workaround for this is to explicitly set the dnodesize property for the ZFS datasets to 1K on pools containing OSTs, and possibly larger on pools containing MDTs.
+
+zfs set dnodesize=1k pool/ost
+
+--- Comment (ofaaland, Fri, 23 Sep 2022 23:54:05 +0000) ---
+Cory and Alexander, sorry that took so long.  Reviews appreciated.
+
+--- Comment (gerrit, Fri, 23 Sep 2022 23:44:09 +0000) ---
+"Olaf Faaland " uploaded a new patch: https://review.whamcloud.com/48646
+
+Subject: LU-16017 osd-zfs: OSD_BASE_EA_IN_BONUS should include names
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 010a36889fc430d498b3b0dfb41838aaf8aae024
+
+--- Comment (spitzcor, Fri, 23 Sep 2022 15:48:37 +0000) ---
+ofaaland, were you still planning to push a patch?
+
+--- Comment (ofaaland, Mon, 29 Aug 2022 21:33:49 +0000) ---
+Hi Alexander, I took this over from Brian and haven't pushed a patch yet.  Probably later today.
+
+--- Comment (aboyko, Mon, 29 Aug 2022 13:52:56 +0000) ---
+Hi behlendorf, I see that you was going to prepare a fix.  Was it pushed ? I don't see any link here.
+
+Thanks.
+
+--- Comment (ofaaland, Tue, 19 Jul 2022 23:14:52 +0000) ---
+For my reference, our local ticket is TOSS5732
+
+--- Comment (behlendorf, Tue, 19 Jul 2022 17:06:21 +0000) ---
+Right, I'll push a proper patch to for review in the next couple of days.  I'm happy to structure it as you suggested.
+
+--- Comment (adilger, Sat, 16 Jul 2022 16:34:00 +0000) ---
+Brian, it would probably be best for review if you pushed a patch that embodied your change. 
+
+That said, it would be preferable IMHO if the change used "sizeof(foo)" instead of a fixed number, possibly with a fudge-factor (2x or 7/4 or whatever) to compensate for encoding and other overhead.
+
+--- Comment (behlendorf, Sat, 16 Jul 2022 00:50:53 +0000) ---
+Assuming a 1k dnode it looks like we've got  476 byes of bonus space still available for an OST regular file object and 336 bytes available for an MDT regular file object.  How much space does a PFL layout typically need?
+
+Then it sounds like 1k dnodes are sized reasonably for the OSTs to avoid wasting space, but we probably want to go larger by default of the MDTs.  The code automatically sizes the dnode based on the expected xattr size so it seems we'll need to teach it about those additional MDT xattrs.
+
+--- Comment (ofaaland, Sat, 16 Jul 2022 00:44:20 +0000) ---
+A very brief sample from one of our file systems found that zdb reports between 1028 and 1076 bytes used for SA xattrs, for about 95% of objects of type "ZFS plain file", on an MDT. Some of those could be objects created and used internally by Lustre, but I believe most are not
+
+Sampled from MDT0001 on CZlustre2
+
+  count   dnodesize
+ 650274 1K
+1157816 512
+
+The most commonly seen sizes for SA xattrs were:
+
+count    size
+ 257173 SA xattrs bytes 1064
+ 238096 SA xattrs bytes 1052
+ 210535 SA xattrs bytes 1040
+ 198597 SA xattrs bytes 1044
+ 145498 SA xattrs bytes 1060
+ 134837 SA xattrs bytes 1056
+ 128782 SA xattrs bytes 1036
+ 116194 SA xattrs bytes 1048
+  96032 SA xattrs bytes 1072
+  71828 SA xattrs bytes 1068
+  51614 SA xattrs bytes 1032
+  51206 SA xattrs bytes 1028
+  35392 SA xattrs bytes 1076
+
+I haven't looked at an OST yet.
+
+--- Comment (ofaaland, Fri, 15 Jul 2022 23:56:36 +0000) ---
+Brian, I believe that sites with large large layouts due to striping over large OST counts or due to use of PFL (we use it) will need much more space than that.  I'm gathering a sample from one of our newer OCF file systems to get a sense of it.

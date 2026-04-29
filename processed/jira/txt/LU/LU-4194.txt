@@ -1,0 +1,265 @@
+Key:        LU-4194
+Summary:    kfree fails kernel paging request under ldlm_lock_put()
+Link:       https://jira.whamcloud.com/browse/LU-4194
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Bruno Faccini
+Reporter:   Christopher Morrone
+Created:    Thu, 31 Oct 2013 22:16:41 +0000
+Updated:    Fri, 7 Feb 2014 08:52:46 +0000
+Resolved:   Mon, 2 Dec 2013 17:07:57 +0000
+Labels:     mn4
+
+--- Environment ---
+Lustre [2.4.0-18chaos|https://github.com/chaos/lustre/tree/2.4.0-18chaos] on the client.  Similar on the servers, using ZFS OSDs.
+
+--- Description ---
+We have a lustre client dedicated to the task of running robinhood.  This node is running lustre 2.4.0-18chaos and talking to our 55PB zfs-osd filesystem running a similar tag of lustre.
+
+The lustre client node that runs robinhood is hitting a "BUG: unable to handle kernel paging request at " as a result of attempting to kfree() a bad pointer in lustre's ldlm_lock_put() function.
+
+There are two stacks that we have seen lead up to this, both ending in the same failed kfree.
+
+The first is from ldlm_bl_* threads:
+
+cfs_free
+ldlm_lock_put
+ldlm_cli_cancel_list
+ldlm_bl_thread_main
+
+The second was under a robinhood process:
+
+cfs_free
+ldlm_lock_put
+ldlm_cli_cancel_list
+ldlm_prep_elc_req
+ldlm_prep_enqueue_req
+mdc_intent_getattr_pack
+mdc_enqueue
+mdc_intent_lock
+lmv_intent_lookup
+lmv_intent_lock
+ll_lookup_it
+ll_lookup_nd
+do_lookup
+__link_path_walk
+path_walk
+do_path_lookup
+user_path_at
+vfs_fstatat
+vfs_lstat
+sys_newlstat
+system_call_fastpath
+
+Note that it was the second call to ldlm_cli_cancel_list() in ldlm_prep_elc_req() that we were under.
+
+The problem is pretty reproducible on our system.  The client node usually crashes in less than an hour.  But I am not aware of how to reproduce this elsewhere.  We have other server clusters with robinhood instances on clients that are not crashing.
+
+--- Comment (yujian, Fri, 7 Feb 2014 08:52:46 +0000) ---
+Patches http://review.whamcloud.com/8270 and http://review.whamcloud.com/8298 were cherry-picked to Lustre b2_5 branch.
+
+--- Comment (simmonsja, Thu, 16 Jan 2014 18:45:14 +0000) ---
+It looks like we just hit this bug with one of our 2.4 clients.
+
+--- Comment (pjones, Mon, 2 Dec 2013 17:07:57 +0000) ---
+Landed for 2.6
+
+--- Comment (bfaccini, Mon, 18 Nov 2013 08:11:33 +0000) ---
+Great job!! BTW, the fact it was an address from the VMALLOC range becomes obvious with the kmem sub-command translation.
+
+--- Comment (morrone, Sat, 16 Nov 2013 01:52:29 +0000) ---
+Robinhood has been running for two hours one the client with patch http://review.whamcloud.com/8298 without a problem.  That looks like our problem.
+
+I will be away at SC'13 all of next week.  If you could take over working on a finalized version of http://review.whamcloud.com/8298 while I am gone, that would be great.
+
+--- Comment (morrone, Fri, 15 Nov 2013 23:34:15 +0000) ---
+Brian Behlendorf provided me with a key insight:
+
+#define VMALLOC_START    _AC(0xffffc90000000000, UL)
+#define VMALLOC_END      _AC(0xffffe8ffffffffff, UL)
+
+So 0xffffc90046218000, the address that we are attempting to kfree, is in the vmalloc address range.
+
+And sure enough, it looks like ldlm_lock_put() is using OBD_FREE(), which is kfree-only.  However, there are a couple of functions, at least mdc_finish_enqueue() and ll_layout_fetch() that are allocating buffers using OBD_FREE_LARGE() and pointing to them from the ldlm_lock's l_lvb_data pointer.
+
+I am testing the following patch in which I attempt to use the alloc and free functions a bit more consistently.
+
+http://review.whamcloud.com/8298
+
+I am not entirely sure that we want to use OBD_ALLOC_LARGE all the time in ldlm_lock_create().  I don't know how often the buffers will be large enough to switch to vmalloc.  The fix could certainly be implemented other ways.  But this should suffice for testing.
+
+This code really needs some cleanup work.
+
+--- Comment (morrone, Fri, 15 Nov 2013 18:42:48 +0000) ---
+Again, can you tell me what returns the "kmem 0xffffc90046218000" sub-command ? Does-it return a page-table entry address of 0xffffeae380f57540 ??
+
+No, it does not.  But I don't understand what I am seeing yet.  I'll transcribe it here and maybe you can help me:
+
+crash> kmem 0xffffc90046218000
+VM_STRUCT                  ADDRESS  RANGE                          SIZE
+ffff885e3df9ed80      ffffc90046218000 - fffc9004621e000          24576
+
+    PAGE              PHYSICAL       MAPPING          INDEX CNT  FLAGS
+ffffea0149d59378    5e3d059000             0              0   1  c0000000000000
+
+--- Comment (bfaccini, Fri, 15 Nov 2013 18:02:30 +0000) ---
+And patch attempt to set l_lvb_type coherent is at http://review.whamcloud.com/#/c/8270/.
+
+--- Comment (bfaccini, Fri, 15 Nov 2013 10:58:56 +0000) ---
+Hello Chris, thanks again for this low-level VM debugging !
+
+I am not 100% sure but according to your last inputs, I think there is something contradictory here, how crash tool allows you to read poisoned memory meaning it was able to do virt2phys translation, when the corresponding page-table entry address resolution (to find corresponding/owning kmem-cache), itself using the same virt2phys translation to compute the page-frame number and find offset in page-table, fails ???
+
+Again, can you tell me what returns the "kmem 0xffffc90046218000" sub-command ? Does-it return a page-table entry address of 0xffffeae380f57540 ??
+
+--- Comment (morrone, Fri, 15 Nov 2013 05:22:22 +0000) ---
+It looks like the backtrace below kfree() where we hit the page fault failure looks a little like this:
+
+constant_test_bit
+test_bit
+virt_to_page
+virt_to_head_page
+virt_to_cache
+kfree
+
+At least crash claims that we are on the pointer dereference under constant_test_bit(), and looking forward and backwards a bit from kfree+0x173 seems to place us under virt_to_page().
+
+I started to try to calculate virt_to_page by hand, but that way lies madness.  I am just going to assume that:
+
+virt_to_page(0xffffc90046218000) = 0xffffeae380f57540
+
+All that doesn't really change anything.  But I feel somewhat enlightened.
+
+--- Comment (morrone, Fri, 15 Nov 2013 04:15:01 +0000) ---
+I'm glad that you have a theory, because I'm lost.
+
+In one of the recent tests, the kernel complains about a page fault at
+
+ffffeae380f57540
+
+The lustre log extracted from that crash dump tells me the the last message from the thread that hit the page fault Oops was doing the final ldlm_lock_put() on the ldlm_lock at this address:
+
+ffff885e3d09ce00
+
+The lock->l_lvb_data pointer is:
+
+ffffc90046218000
+
+When I use crash's "rd" command to dump the contents of the l_lvb_data buffer, it is indeed poisoned with OBD_FREE's repeated bytes of 0x5a.  The pointer to the buffer has not, on the other hand, been poisoned yet.
+
+Which all probably just confirms that we are in kfree() under cfs_free() under ldlm_lock_put() at the time of the Oops.
+
+But where does the page fault address of ffffeae380f57540 come from?  I find it in both the RAX and CR2 registers under cfs_free from crash's backtrace output.  RAX is a common register, and CR2 is the Page Fault Linear Address register, which makes sense because we Oops under the failed page fault.
+
+I just wish that I understood where kfree() was getting that particular address.
+
+--- Comment (bfaccini, Thu, 14 Nov 2013 16:27:16 +0000) ---
+Thanks for the answers/confirmations.
+
+My comment before about "the fact that there is LVB data with a type of LVB_T_NONE comes from layout_fetch()" is wrong and must be inverted, it can NOT come from layout_fetch() !!… but I think now can better come from un-expected/requested Layout embedding within LVB reply from Server, and this can happen at least in ldlm_handle_cp_callback().
+
+I am currently testing a fix for that.
+
+--- Comment (morrone, Wed, 13 Nov 2013 18:53:31 +0000) ---
+So Chris, if I understand you correctly, the kfree() failure is not due to freeing the lock itself but more likely during invalid LVB freeing ?
+
+Yes, I think it is failing here:
+
+                        OBD_FREE(lock->l_lvb_data, lock->l_lvb_len);
+
+Chris, just to be sure I work on the right source code, to get it, I did 
+
+Yes, that tag from github is correct.  I'm using -19chaos now, but that is just because I used the top of the tree in testing, not because I thought the minor differences between -18chaos and -19chaos would make a difference for this bug.
+
+Humm, 18464 bytes could be something like a layout/LOV-EA for a stripe count of 768, does this seems reasonable with the config you use ?
+
+Yes, our OST (and OSS) count is exactly 768.
+
+--- Comment (bfaccini, Wed, 13 Nov 2013 17:50:28 +0000) ---
+Humm, 18464 bytes could be something like a layout/LOV-EA for a stripe count of 768, does this seems reasonable with the config you use ?
+
+May be (got inputs from Johann and Jinshan about this possibility) the fact that there is LVB data with a type of LVB_T_NONE comes from layout_fetch(), but anyway this does not explain why the LVB reference can be wrong and this should come from some race …
+
+--- Comment (bfaccini, Wed, 13 Nov 2013 15:07:29 +0000) ---
+Chris, just to be sure I work on the right source code, to get it, I did :
+
+git clone https://github.com/chaos/lustre.git
+git checkout 2.4.0-18chaos
+
+ist it ok ? I am asking because actually I don't find a path in source code that can lead to this situation.
+
+Also the size of 18464 bytes seems not usual for LVB … And LVB_T_NONE value is 0, so how were the others fields of the suspected ldlm_lock ? And did you find the same kind/range of values/pointers for the second crash-dump ?
+
+What is the answer of "crash" tool "kmem" sub-command when using the 0xffffc90046218000 pointer as the argument ?
+
+You indicate that BUG()/Oops occurs in kfree(), but is this what you learned from the error msgs in Console/crash-dump?
+
+Last, was there any msg of interest in the log/Console sometime before any crash ??
+
+I am sorry to ask you so many questions, but I try to consider all the possible scenarios.
+
+--- Comment (bfaccini, Wed, 13 Nov 2013 01:20:25 +0000) ---
+So Chris, if I understand you correctly, the kfree() failure is not due to freeing the lock itself but more likely during invalid LVB freeing ?
+
+Have you been able to double-check it for the 2nd crash you indicated ?
+
+If it is, I agree, likely to be the case, the failing address (CR2 register in exception context of the Oops'ing thread stack) should be around l_lvb_data pointer value.
+
+I will review the locations in the code where l_lvb_data is allocated/freed/initialized and see where this (l_lvb_data still referenced/non-null but freed ?) can happen.
+
+--- Comment (morrone, Tue, 12 Nov 2013 01:44:13 +0000) ---
+FYI, we still hit a kfree() failure with early_lock_cancel disabled.  Although it was a new call path that triggered it this time.  It failed under the ll_imp_inval thread something like this:
+
+cfs_free
+ldlm_lock_put
+cleanup_resource
+ldlm_resource_cleanup
+cfs_hash_for_each_relax
+cfs_hash_for_each_nolock
+ldlm_namespace_cleanup
+mdc_import_event
+ptlrpc_invalidate_import
+ptlrpc_invalidate_import_thread
+
+--- Comment (morrone, Fri, 8 Nov 2013 05:01:45 +0000) ---
+From the lustre log I got the pointer to the lock in question (I think).  The l_lvb_* fields are interesting.  They are something like this:
+
+l_lvb_type = LVB_T_NONE
+l_lvb_len = 18464
+l_lvb_data = 0xffffc90046218000
+
+Is it valid for there to be data there when the type is LVB_T_NONE?
+
+--- Comment (bfaccini, Tue, 5 Nov 2013 13:32:22 +0000) ---
+According to the different threads/stacks you reported to trigger the same BUG()/Oops seems that we may face a race during ELC (aka Early Lock Cancel) process. And again this is likely to be triggered due to RobinHood work-load.
+
+When I continue to investigate this way, you may try to run with ELC feature disabled (/proc/fs/lustre/ldlm/namespaces/*/early_lock_cancel = 0) for sometimes and see if this work-around ?
+
+Also, have you been able to find something of interest in lustre-log extracted from crash-dump ?
+
+--- Comment (morrone, Mon, 4 Nov 2013 19:17:31 +0000) ---
+I can get the lustre log from the crash dump.  We have an extension to crash that enables that.  Unfortunately, I cannot share that log of the crash dump.  I will continue to investigate.
+
+Our installation of robinhood is, of course, employing Lustre changelogs.
+
+--- Comment (bfaccini, Sat, 2 Nov 2013 19:08:15 +0000) ---
+Hello Chris,
+
+Thanks to detail the context where this crash occurs. But more infos are required for sure.
+
+Since it is a crash you don't have the lustre_log available (BTW, do you know the debug_mask in place at the time of crash?), but do you know how to extract it from the crash-dump if any was taken ? Or can the dump be available ?
+
+By experience, I don't think problem comes from RobinHood itself but more due to its induced work-load. 
+
+Also, do you use the "Lustre-aware" version of RH (ie, the one polling the Change-log) ?
+
+--- Comment (pjones, Thu, 31 Oct 2013 22:18:57 +0000) ---
+Bruno
+
+Could you please help with this one?
+
+Thanks
+
+Peter

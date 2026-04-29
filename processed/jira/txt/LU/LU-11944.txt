@@ -1,0 +1,251 @@
+Key:        LU-11944
+Summary:    WARNING:  at ../fs/attr.c:212 notify_change doing tiny_writes
+Link:       https://jira.whamcloud.com/browse/LU-11944
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Patrick Farrell
+Reporter:   Ann Koehler
+Created:    Thu, 7 Feb 2019 21:41:13 +0000
+Updated:    Mon, 8 Apr 2019 14:31:29 +0000
+Resolved:   Sun, 3 Mar 2019 14:50:16 +0000
+
+--- Description ---
+Tiny writes to a regular file with setuid enabled results in a warning from notify_change() because the inode is not locked. As the write continues through ll_setattr_raw(), it sometimes hangs trying to lock the inode.
+
+Warning in console log:
+
+2019-01-25T19:30:35.591624-06:00 c0-0c1s10n1 ------------[ cut here ]------------
+2019-01-25T19:30:35.591630-06:00 c0-0c1s10n1 WARNING: CPU: 11 PID: 15121 at ../fs/attr.c:212 notify_change+0x398/0x408
+
+2019-01-25T19:30:35.591644-06:00 c0-0c1s10n1 CPU: 11 PID: 15121 Comm: memfill2 Tainted: P        W  O     4.12.14-25.22_5.0.64-cray_ari_c #1 SLE15 (unreleased)
+2019-01-25T19:30:35.591649-06:00 c0-0c1s10n1 Hardware name: Cavium Inc. Borg/Unknown, BIOS Cavium reference firmware version 6.3 05/01/2018
+2019-01-25T19:30:35.591655-06:00 c0-0c1s10n1 task: ffff80be1a1be100 task.stack: ffff00001bd90000
+2019-01-25T19:30:35.591660-06:00 c0-0c1s10n1 PC is at notify_change+0x398/0x408
+2019-01-25T19:30:35.591665-06:00 c0-0c1s10n1 LR is at file_remove_privs+0xc4/0xf8
+2019-01-25T19:30:35.591671-06:00 c0-0c1s10n1 pc : [] lr : [] pstate: 20000009
+2019-01-25T19:30:35.591676-06:00 c0-0c1s10n1 sp : ffff00001bd93c20
+2019-01-25T19:30:35.591676-06:00 c0-0c1s10n1 sp : ffff00001bd93c20
+2019-01-25T19:30:35.591759-06:00 c0-0c1s10n1 Call trace:
+2019-01-25T19:30:35.591823-06:00 c0-0c1s10n1 [] notify_change+0x398/0x408
+2019-01-25T19:30:35.591828-06:00 c0-0c1s10n1 [] file_remove_privs+0xc4/0xf8
+2019-01-25T19:30:35.591834-06:00 c0-0c1s10n1 [] __generic_file_write_iter+0x5c/0x1d0
+2019-01-25T19:30:35.591840-06:00 c0-0c1s10n1 [] ll_file_write_iter+0x2c8/0x5b0 [lustre]
+2019-01-25T19:30:35.591845-06:00 c0-0c1s10n1 [] __vfs_write+0xd4/0x130
+2019-01-25T19:30:35.591850-06:00 c0-0c1s10n1 [] vfs_write+0xac/0x1b8
+2019-01-25T19:30:35.591855-06:00 c0-0c1s10n1 [] SyS_write+0x54/0xb0
+
+The warning code from notify_change is:
+
+    WARN_ON_ONCE(!inode_is_locked(inode));
+
+The warning occurs on the ll_tiny_write path through ll_file_write_iter:
+
+updates/kernel/fs/lustre > gdb lustre.ko
+(gdb) list *(ll_file_write_iter+0x2c8)
+0x1e7f8 is in ll_file_write_iter (/home/abuild/rpmbuild/BUILD/cray-lustre-2.11.0.200_cray_79_g4c42971/lustre/llite/file.c:1613).
+1608	/home/abuild/rpmbuild/BUILD/cray-lustre-2.11.0.200_cray_79_g4c42971/lustre/llite/file.c: No such file or directory.
+(gdb)
+
+Source from lustre/llite/file.c
+1597 static ssize_t ll_do_tiny_write(struct kiocb *iocb, struct iov_iter *iter)
+1598 {
+1599         ssize_t count = iov_iter_count(iter);
+1600         struct file *file = iocb->ki_filp;
+1601         struct inode *inode = file_inode(file);
+1602         ssize_t result = 0;
+1603
+1604         ENTRY;
+1605
+1606         /* Restrict writes to single page and = PAGE_SIZE ||
+1610             (iocb->ki_pos & (PAGE_SIZE-1)) + count > PAGE_SIZE)
+1611                 RETURN(0);
+1612
+1613         result = __generic_file_write_iter(iocb, iter);   
+
+Note that the other Lustre call to __generic_file_write_iter in vvp_io_write_start() is wrapped with lock/unlock calls that are not included in the tiny write case.
+
+1023 static int vvp_io_write_start(const struct lu_env *env,
+1024                               const struct cl_io_slice *ios)
+1025 {
+...
+1033         bool                     lock_inode = !lli->lli_inode_locked &&
+1034                                               !IS_NOSEC(inode);
+...
+1092         if (lock_inode)
+1093                 inode_lock(inode);
+1094         result = __generic_file_write_iter(&io->u.ci_rw.rw_iocb,
+1095                                            &io->u.ci_rw.rw_iter);
+1096         if (lock_inode)
+1097                 inode_unlock(inode);
+
+The proposed fix is to add this same logic to ll_do_tiny_write().
+
+Because the inode is not locked, tiny writes can race in ll_setattr_raw(). The inode rw_semaphore gets corrupted, so the down_write request waits forever.
+
+crash_arm64> bt 15121
+PID: 15121  TASK: ffff80be1a1be100  CPU: 11  COMMAND: "memfill2"
+ #0 [ffff00001bd939e0] __switch_to at ffff000008086500
+ #1 [ffff00001bd93a00] __schedule at ffff000008773cbc
+ #2 [ffff00001bd93a70] schedule at ffff000008774330
+ #3 [ffff00001bd93a80] rwsem_down_write_failed at ffff0000087774a4
+ #4 [ffff00001bd93b00] down_write at ffff000008776884
+ #5 [ffff00001bd93b40] ll_setattr_raw at ffff0000013af07c [lustre]
+ #6 [ffff00001bd93c00] ll_setattr at ffff0000013af6c4 [lustre]
+ #7 [ffff00001bd93c20] notify_change at ffff000008270f28
+ #8 [ffff00001bd93c70] file_remove_privs at ffff0000082703c8
+ #9 [ffff00001bd93cf0] __generic_file_write_iter at ffff0000081cbe58
+#10 [ffff00001bd93d40] ll_file_write_iter at ffff0000013867cc [lustre]
+#11 [ffff00001bd93db0] __vfs_write at ffff00000824b760
+#12 [ffff00001bd93e40] vfs_write at ffff00000824cc48
+#13 [ffff00001bd93e80] sys_write at ffff00000824e300
+#14 [ffff00001bd93ff0] el0_svc_naked at ffff000008083c7c
+
+crash_arm64> bt -FF | grep inode ==> yields inode and lli pointers:
+ll_inode_info ffff809e6d14bb80
+inode ffff809e6d14bc08
+
+crash_arm64> struct -o inode | grep i_rwsem
+  [160] struct rw_semaphore i_rwsem;
+crash_arm64> eval 0xffff809e6d14bc08 + 160 | grep hex
+hexadecimal: ffff809e6d14bca8
+
+crash_arm64> rw_semaphore ffff809e6d14bca8
+struct rw_semaphore {
+  count = {
+    counter = -1
+  },
+  wait_list = {
+    next = 0xffff00001bd93ae0,
+    prev = 0xffff00001bd93ae0
+  },
+  wait_lock = {
+    raw_lock = {
+      owner = 1,
+      next = 1
+    }
+  },
+  osq = {
+    tail = {
+      counter = 0
+    }
+  },
+  owner = 0x0
+}
+1584 int ll_setattr_raw(struct dentry *dentry, struct iattr *attr, bool hsm_import)
+1585 {
+....
+1646         if (S_ISREG(inode->i_mode)) {
+1647                 if (attr->ia_valid & ATTR_SIZE)
+1648                         inode_dio_write_done(inode);
+1649                 inode_unlock(inode);
+1650         }
+.....
+1720         EXIT;
+1721 out:
+1722         if (op_data != NULL)
+1723                 ll_finish_md_op_data(op_data);
+1724
+1725         if (S_ISREG(inode->i_mode)) {
+1726                 inode_lock(inode);
+1727                 if ((attr->ia_valid & ATTR_SIZE) && !hsm_import)
+1728                         inode_dio_wait(inode);
+1729                 /* Once we've got the i_mutex, it's safe to set the S_NOSEC
+1730                  * flag.  ll_update_inode (called from ll_md_setattr), clears
+1731                  * inode flags, so there is a gap where S_NOSEC is not set.
+1732                  * This can cause a writer to take the i_mutex unnecessarily,
+1733                  * but this is safe to do and should be rare. */
+1734                 inode_has_no_xattr(inode);
+1735         }
+
+I haven't figured out the exact scenario that causes i_rwsem to end up with the -1 value, but it's not too important because ll_setattr_raw() should never be called without the semaphore already being locked.
+
+--- Comment (gerrit, Mon, 8 Apr 2019 06:32:51 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/34461/
+
+Subject: LU-11944 llite: Lock inode on tiny write if setuid/setgid set
+
+Project: fs/lustre-release
+
+Branch: b2_12
+
+Current Patch Set: 
+
+Commit: 009ee0ba61e965327ab0f91f151dbb5932e016d4
+
+--- Comment (gerrit, Tue, 19 Mar 2019 17:45:07 +0000) ---
+Minh Diep (mdiep@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/34461
+
+Subject: LU-11944 llite: Lock inode on tiny write if setuid/setgid set
+
+Project: fs/lustre-release
+
+Branch: b2_12
+
+Current Patch Set: 1
+
+Commit: 8a80304db8040c905a9f5ec814b72bc596b1a5b0
+
+--- Comment (pjones, Sun, 3 Mar 2019 14:50:16 +0000) ---
+Landed for 2.13
+
+--- Comment (gerrit, Sun, 3 Mar 2019 00:21:42 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/34218/
+
+Subject: LU-11944 llite: Lock inode on tiny write if setuid/setgid set
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: f39a552922ca2db0c6974374fa3a917a34a4a747
+
+--- Comment (gerrit, Fri, 8 Feb 2019 22:55:47 +0000) ---
+Ann Koehler (amk@cray.com) uploaded a new patch: https://review.whamcloud.com/34218
+
+Subject: LU-11944 llite: Lock inode on tiny write if setuid/setgid set
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: bdce813a7e2f19c3fb2625d20057cc5e49b0ccfe
+
+--- Comment (pfarrell, Thu, 7 Feb 2019 22:30:52 +0000) ---
+amk and I talked this one over; as author of tiny writes, I'll review and assist if required.
+
+I was a little puzzled that the first write - which does not use the tiny writes path, because there's no dirty page yet - does not clear the setuid bit.
+
+But after actually looking at this more carefully, I see it now.  One write is sufficient, because:
+
+The tiny write path is tried, to see if there's a dirty page to be found.  This calls __generic_file_write_iter, which tries to do this setuid check.  The actual write does not complete with tiny writes because no page is found, but we trigger this check before that.
+
+ 
+
+This has no impact on the suggested solution, it's just a point of confusion I had.
+
+--- Comment (amk, Thu, 7 Feb 2019 21:54:17 +0000) ---
+Reproducing the notify_change warning is fairly simple. Note however that the message is issued with WARN_ONCE so the node must be rebooted after the message has been issued once (unless you've got a newer kernel with the clear_warn_once /proc variable).
+
+As root:
+
+> cd 
+
+> mkdir dir
+
+> touch dir/tfile
+
+> chmod u+s dir/tfile
+
+> chmod a+rwx dir
+
+> su user0
+
+> dd conv=notrunc if=/dev/zero of=dir/tfile bs=8 count=10
+
+> dmesg

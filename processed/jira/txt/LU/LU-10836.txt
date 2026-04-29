@@ -1,0 +1,102 @@
+Key:        LU-10836
+Summary:    MDS hangs on --replace and remount OSTs
+Link:       https://jira.whamcloud.com/browse/LU-10836
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Jesse Stroik
+Created:    Wed, 21 Mar 2018 22:18:03 +0000
+Updated:    Fri, 23 Mar 2018 01:29:41 +0000
+Attachments: mds-mar21-trace.txt
+
+--- Environment ---
+Centos 7.4 w/ mellanox OFED 4.2-1.2.0.0
+
+ZFS OSTs, ldiskfs MDT
+
+--- Description ---
+I recreated two OSTs on one of our file systems because they had corrupted ZFS meta data affecting their spacemaps. Their files had been migrated, they were set to max_create_count=0 and also deactivated for the destroy / --replace.
+
+I ran these commands on the OSS:
+
+ 
+
+ 
+
+umount /mnt/lustre/local/iliad-OST0018
+umount /mnt/lustre/local/iliad-OST0019
+zpool list
+zpool destroy iliad-ost18
+zpool destroy iliad-ost19
+zpool list
+mkfs.lustre --fsname=iliad --ost --replace --backfstype=zfs --index=24 --mgsnode=172.16.25.4@o2ib iliad-ost18/ost18 /dev/mapper/mpathc
+mkfs.lustre --fsname=iliad --ost --replace --backfstype=zfs --index=25 --mgsnode=172.16.25.4@o2ib iliad-ost19/ost19 /dev/mapper/mpathdsystemctl restart lustre
+
+ 
+
+ 
+
+Then on the MDS:
+
+lctl set_param osp.iliad-OST0019-osc-MDT0000.active=1
+lctl set_param osp.iliad-OST0018-osc-MDT0000.active=1
+lctl set_param lod.iliad-MDT0000-mdtlov.qos_threshold_rr=17
+lctl get_param osp.iliad-OST0019-osc-MDT0000.max_create_count
+lctl set_param osp.iliad-OST0019-osc-MDT0000.max_create_count=20000
+lctl set_param osp.iliad-OST0018-osc-MDT0000.max_create_count=20000
+
+ 
+
+At this point, I noticed the inode count on each OST was 10191 and it wasn't increasing. I tried to copy a file but the command hung. I checked the status of the MDS with the following commands, ultimately remounting the ldiskfs MDT:
+
+ 
+
+lctl get_param osp.iliad-OST00*.active
+dmesg
+less /var/log/messages
+umount /mnt/meta
+dmesg | tail
+mount /mnt/meta
+
+ 
+
+Upon mount, the file system went into recovery, completed in 20 seconds, and began operating normally. The stack trace is attached, truncated to avoid redundant traces.
+
+The file system appears to be fine and I am currently migrating files back onto the replaced OSTs.
+
+--- Comment (adilger, Fri, 23 Mar 2018 01:29:41 +0000) ---
+I suspect the problem is that when the MDS reconnects to a replaced OST the first time, it tries to precreate the objects up to what it expects in lov_objids.  However, the OST doesn't know how many objects it needs to precreate (i.e. what the former LAST_ID value was) so it precreates the maximum number of files, which is 10000.  It isn't clear why this would take more than a few seconds, but it seems to take long enough to make the MDS unhappy.
+
+LNet: Service thread pid 4963 was inactive for 212.77s.
+Pid: 4963, comm: mdt01_001
+Call Trace:
+schedule+0x29/0x70
+schedule_timeout+0x174/0x2c0
+osp_precreate_reserve+0x2e8/0x800 [osp]
+osp_declare_create+0x193/0x590 [osp]
+lod_sub_declare_create+0xdc/0x210 [lod]
+lod_qos_declare_object_on+0xbe/0x3a0 [lod]
+lod_alloc_qos.constprop.17+0xea2/0x1590 [lod]
+lod_qos_prep_create+0x1291/0x17f0 [lod]
+lod_prepare_create+0x298/0x3f0 [lod]
+lod_declare_striped_create+0x1ee/0x970 [lod]
+lod_declare_create+0x1e4/0x540 [lod]
+mdd_declare_create_object_internal+0xdf/0x2f0 [mdd]
+mdd_declare_create+0x53/0xe20 [mdd]
+mdd_create+0x7d9/0x1320 [mdd]
+mdt_reint_open+0x218c/0x31a0 [mdt]
+mdt_reint_rec+0x80/0x210 [mdt]
+mdt_reint_internal+0x5fb/0x9c0 [mdt]
+mdt_intent_reint+0x162/0x430 [mdt]
+mdt_intent_policy+0x43e/0xc70 [mdt]
+ldlm_lock_enqueue+0x387/0x970 [ptlrpc]
+ldlm_handle_enqueue0+0x9c3/0x1680 [ptlrpc]
+tgt_enqueue+0x62/0x210 [ptlrpc]
+tgt_request_handle+0x925/0x1370 [ptlrpc]
+ptlrpc_server_handle_request+0x236/0xa90 [ptlrpc]
+ptlrpc_main+0xa92/0x1e40 [ptlrpc]
+kthread+0xcf/0xe0
+
+On the one hand, the MDS wants to allocate new objects on these OSTs, because they are the least full, but on the other hand, the MDS should skip them if they do not yet have any objects available.  I suspect that if the MDS was left alone for a few minutes it might recover, but it isn't ideal behaviour. That is probably a minor bug in lod_alloc_qos() which leads the MDS to allow the new OST to be selected before it is available.  We could also limit the number of OST objects precreated on a new OST to a much smaller number, and rely on any previously-existing objects to be created on demand.

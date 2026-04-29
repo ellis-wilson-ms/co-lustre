@@ -1,0 +1,103 @@
+Key:        LU-13834
+Summary:    HSM requests lost after retries (NoRetryAction disabled)
+Link:       https://jira.whamcloud.com/browse/LU-13834
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Dominique Martinet
+Reporter:   Dominique Martinet
+Created:    Thu, 30 Jul 2020 10:28:03 +0000
+Updated:    Thu, 30 Jul 2020 13:11:55 +0000
+Labels:     CEA
+
+--- Description ---
+A bit of setup first, our hpss lhsm agents have a configuration that tell them to accept up to x restore, y archive etc etc.
+
+On the other hand the number of requests that can be sent by the server is greater than the number of either of these (because why make restores wait if the servers are only busy archiving), but there is no knob to specify at a coordinator level the max per type of operation so the max concurrent requests is bigger than what the agents can handle with any single type of operation.
+
+ 
+
+Back in 2.10, we noticed disabling NoRetryAction was bugged (request was dropped when told to try again but the coordinator would keep lock on file so that was pretty horrible)... So we kept the setting to it is by default, and when the coordinator sends such a request the agents refuse and the request is just dropped. Restore requests (e.g. client read) in 2.10 would just keep retrying, our own hsm helpers also retried, and archives would also just be retried later all is fine.
+
+Upon upgrading to 2.12, users complained frequently seeing "no data available" when reading released files. We noticed that apparently on 2.12 if all servers are busy and a request is refused, the client behaviour changed from transparent retry to just giving the error back to userspace, and user codes aren't ready to handle that (despite our efforts to tell them to use our helper...)
+
+This led to us re-enabling the retry (disabling NoRetryAction), as after audit we were convinced the problem we had in 2.10 is no longer there in 2.12 (that's why we never opened a ticket for it back then, that issue IS fixed)
+
+ 
+
+Now I am seeing some retries happening, but we still experience some troubles:
+
+	after a few retries, the request is stuck as "STARTED" in lctl get_param mdt.*.hsm.actions{{}}
+
+lrh=[type=10680000 len=144 idx=163/35484] fid=[0xc0002e5a8:0x3ed:0x0] dfid=[0xc0002e5a8:0x3ed:0x0] compound/cookie=0x0/0x5efd18e3 action=ARCHIVE archive#=1 flags=0x0 extent=0x0-0xffffffffffffffff gid=0x0 datalen=6 status=STARTED data=[636F733D32]
+
+	I see no such request on the lhsm agents, looking at logs all requests have been bounced as busy, for example:
+
+2020/07/30 03:51:24 lhsmd_hpss[26995]: Request 0x5efd18e3: action=ARCHIVE, len=78, fid=0xc0002e5a8:0x3ed:0x0 dfid=0xc0002e5a8:0x3ed:0x0
+2020/07/30 03:51:24 lhsmd_hpss[26995]: Too many simultaneous 'archive' operations (8), telling coordinator to retry later
+--
+2020/07/30 03:51:25 lhsmd_hpss[26995]: Request 0x5efd18e3: action=ARCHIVE, len=78, fid=0xc0002e5a8:0x3ed:0x0 dfid=0xc0002e5a8:0x3ed:0x0
+2020/07/30 03:51:25 lhsmd_hpss[26995]: Too many simultaneous 'archive' operations (8), telling coordinator to retry later
+--
+2020/07/30 03:51:26 lhsmd_hpss[26995]: Request 0x5efd18e3: action=ARCHIVE, len=78, fid=0xc0002e5a8:0x3ed:0x0 dfid=0xc0002e5a8:0x3ed:0x0
+2020/07/30 03:51:26 lhsmd_hpss[26995]: Too many simultaneous 'archive' operations (8), telling coordinator to retry later
+--
+2020/07/30 03:51:27 lhsmd_hpss[26995]: Request 0x5efd18e3: action=ARCHIVE, len=78, fid=0xc0002e5a8:0x3ed:0x0 dfid=0xc0002e5a8:0x3ed:0x0
+2020/07/30 03:51:27 lhsmd_hpss[26995]: Too many simultaneous 'archive' operations (8), telling coordinator to retry later
+--
+2020/07/30 03:51:28 lhsmd_hpss[26995]: Request 0x5efd18e3: action=ARCHIVE, len=78, fid=0xc0002e5a8:0x3ed:0x0 dfid=0xc0002e5a8:0x3ed:0x0
+2020/07/30 03:51:28 lhsmd_hpss[26995]: Too many simultaneous 'archive' operations (8), telling coordinator to retry later
+--
+2020/07/30 03:51:29 lhsmd_hpss[26995]: Request 0x5efd18e3: action=ARCHIVE, len=78, fid=0xc0002e5a8:0x3ed:0x0 dfid=0xc0002e5a8:0x3ed:0x0
+2020/07/30 03:51:29 lhsmd_hpss[26995]: Too many simultaneous 'archive' operations (8), telling coordinator to retry later
+--
+2020/07/30 03:51:30 lhsmd_hpss[26995]: Request 0x5efd18e3: action=ARCHIVE, len=78, fid=0xc0002e5a8:0x3ed:0x0 dfid=0xc0002e5a8:0x3ed:0x0
+2020/07/30 03:51:30 lhsmd_hpss[26995]: Too many simultaneous 'archive' operations (8), telling coordinator to retry later
+--
+2020/07/30 03:51:31 lhsmd_hpss[26995]: Request 0x5efd18e3: action=ARCHIVE, len=78, fid=0xc0002e5a8:0x3ed:0x0 dfid=0xc0002e5a8:0x3ed:0x0
+2020/07/30 03:51:31 lhsmd_hpss[26995]: Too many simultaneous 'archive' operations (8), telling coordinator to retry later
+
+ 
+
+	Also, the cdt_request_list is completely empty on the server:
+
+crash> struct coordinator 0xffff8875b86b3a38
+# coherent data
+crash> struct -o coordinator | grep cdt_request_list
+ [0x1a0] struct list_head cdt_request_list;
+crash> p/x 0xffff8875b86b3a38 + 0x1a0
+ $2 = 0xffff8875b86b3bd8
+crash> list -H 0xffff8875b86b3bd8
+ (empty)
+
+So there are no action on the server, yet the action list is full of seemingly started actions?
+
+	After the request timeout, requests that were started there do get CANCELLED ; so there must be some reference somewhere I'm missing? or does it get it back from catalog at some point? I'm not sure...
+
+	While the request is STARTED there, if another lfs hsm_archive/hsm_restore is issued it is ignored completely. This is particularily annoying for restore, as a read will then be stuck for however long the hsm timeout is (8 hours for us); then probably fail with no data available? (a process I had left stuck there did eventually terminate but I didn't get to see how)
+
+ 
+
+I've just enabled hsm debug logs on the MDS, will provide more infos if I have something.
+
+--- Comment (pjones, Thu, 30 Jul 2020 13:11:55 +0000) ---
+Ok. All the best in your future endeavours!
+
+--- Comment (martinetd, Thu, 30 Jul 2020 13:10:45 +0000) ---
+Hi Peter,
+
+I will at least look at the dk log tomorrow and report on that, but not sure I will have time to look further.
+
+FYI I am leaving CEA next week (!!), so don't expect too much !
+
+Dominique
+
+--- Comment (pjones, Thu, 30 Jul 2020 13:01:01 +0000) ---
+Dominique
+
+Is this something that you plan to investigate?
+
+Thanks
+
+Peter

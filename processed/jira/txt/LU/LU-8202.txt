@@ -1,0 +1,95 @@
+Key:        LU-8202
+Summary:    Data corruption during failover due to overlapping extent locks
+Link:       https://jira.whamcloud.com/browse/LU-8202
+Type:       Bug
+Priority:   Blocker
+Status:     Closed
+Resolution: Duplicate
+Assignee:   WC Triage
+Reporter:   Patrick Farrell
+Created:    Tue, 24 May 2016 20:33:27 +0000
+Updated:    Fri, 1 Jul 2016 15:11:24 +0000
+Resolved:   Fri, 1 Jul 2016 15:11:24 +0000
+Attachments: mpi_test.c
+
+--- Description ---
+Due to the "just grant already granted locks" behavior on servers during failover, it is possible to get overlapping extent locks granted, which can lead to data corruption in a number of ways.
+
+The specific case we have seen in customer testing is shared file I/O from multiple clients, when two clients are trying to write to the same page.  (Note these are NOT overlapping writes - They're writing to different parts of the page.)
+
+One client has a granted LDLM lock covering this page and the other client is waiting when the OST is failed over, then during recovery, the client which was waiting contacts the server first.  Its waiting lock is processed and granted, because nothing is in the way.  Then the client which already had a granted lock arrives, and its lock is granted immediately.
+
+The two clients are then allowed to write to this page at the same time.  Since it's a partial page write, it is a read-modify-write operation, and if two read-modify-write operations happen at the same time, they can end up with old data in part of the page.  Because they can both read the page before the other process modifies it.  So whichever one writes last will modify part of the page, but for the rest of the page, it will re-write what was in the page before.
+
+(Feel free to read 'page' as 'disk block' in parts of the above.  Also, this scenario assumes the writethrough cache is disabled, as I believe cache locking would prevent this particular scenario.)
+
+This is the simplest example of corruption due to this behavior, and we have a test case which can replicate it with reasonable confidence.  However, many other possible scenarios are available.
+
+Consider this additional case:
+
+Client 1 is writing to an area - write completes on the client (returns to userspace), client 1 communicates to client 2 saying "data is ready", client 2 reads the same area, generates a waiting lock behind the write lock for client 1, failover happens. Waiting read lock from client 2 is granted before the write lock from client 1.
+
+Client 2 reads data, gets bad data.
+
+—
+
+There are a variety of other possible scenarios as well, and I should stress that none of this is limited to multiple clients working on the same page.
+
+I will attach a test case and provide logs of an example in the comments.
+
+--- Comment (paf, Fri, 1 Jul 2016 15:11:24 +0000) ---
+Duplicate of LU-8175 and LU-8347 (mostly LU-8347)
+
+--- Comment (paf, Fri, 1 Jul 2016 15:10:36 +0000) ---
+Zam is right.  I think it might be worth keeping the test case, but this issue is resolved by those two changes, so we can close it out.
+
+--- Comment (zam, Fri, 1 Jul 2016 14:59:15 +0000) ---
+LU-8347 and LU-8175  are to fix this issue.
+
+--- Comment (paf, Tue, 24 May 2016 20:35:32 +0000) ---
+This is the aforementioned test case.
+
+It must be run on at least three nodes, with the ranks arranged round-robin across the nodes. This can be done with mpirun with the --map-by-node option, for example:
+
+mpirun -n 3 --map-by-node --host centclient02,centclient03,centclient04 mpi_test.o
+
+Once you've got at least three nodes, you can run any number of copies of the job. They write to files name test_file#, where # is the 'group' number. (Every three ranks is a group, and every group has a file.)
+
+Start the job, then do failover. We find that with just one instance of this job (three ranks, three nodes), it seems to fail most of the time.
+
+Surprisingly, we've seen our best results with just one instance of the job. We have not tried, say, 2 or 3 (6 or 12 ranks), but we did try a few hundred ranks on ~20-30 nodes and had trouble reproducing the problem.
+
+--- Comment (paf, Tue, 24 May 2016 20:34:22 +0000) ---
+The test case runs on three Lustre clients - two writers, one reader. It works like this:
+
+Two writers each write half of the same page with two different recognizable strings, then a reader reads the result and checks it. If the result is incorrect, the reader aborts the job.
+
+Here's a more detailed explanation. There are MPI_Barrier calls at the start and end of both the write and read functions. The write function skips the start barrier the first time, which has the effect of linking the "end of write" barrier to the "start of read" barrier and the "end of read" barrier to the "start of write" barrier.
+
+Step 1:
+
+Writer 1 writes the first 2048 bytes of the file with all 'A's, writer 2 writes the next 2048 bytes (the second half of the page) with all 'B's. There is no ordering control between these two writers, but since the writes don't really overlap, we should get a page of AAA...BBB....
+
+Step 2:
+
+MPI_Barrier at the end of the write. Reader is already waiting at this barrier, so once writers are done, reader starts.
+
+Writers start over, but this time through, they wait at a barrier before writing.
+
+Step 3:
+
+Reader reads the file and verifies the expected contents (And aborts if the contents are bad)
+
+Reader hits the 'end of read' barrier, which wakes up the writers to write again, and the reader waits on the "start of read" barrier.
+
+Step 4.
+
+Writers switch halves of the page - Writer 1 now writes the second half of the page with 'A's, writer 2 writes the first half with 'B's.
+
+Job continues like this.
+
+The verifier looks for anything other than the expected output. The possibilities for bad data are:
+
+1) The same corruption issue as in the customer test overlapping read-modify-write, in which case we get either all As or all Bs in the file on disk.
+
+2) The reader gets in before one or both of the writers have finished. In this case, the reader will report an issue, but the final file on disk may be OK.

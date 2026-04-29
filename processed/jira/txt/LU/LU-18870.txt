@@ -1,0 +1,63 @@
+Key:        LU-18870
+Summary:    ptlrpcd to avoid client cores that are very busy
+Link:       https://jira.whamcloud.com/browse/LU-18870
+Type:       Improvement
+Priority:   Minor
+Status:     Resolved
+Resolution: Duplicate
+Assignee:   Fred Dilger
+Reporter:   Andreas Dilger
+Created:    Sat, 29 Mar 2025 23:17:00 +0000
+Updated:    Wed, 23 Jul 2025 15:31:11 +0000
+Resolved:   Wed, 23 Jul 2025 15:31:11 +0000
+Labels:     medium
+Links:      Cloners: Clones LU-17501
+
+--- Description ---
+Some (non Lustre) filesystems consume 100% of the CPU cycles on one or more cores busy-waiting by polling for event completion and scheduled at a high priority (not sure if "real time" or not).  They also apparently configure the CPU scheduler to deny scheduling of other processes on some CPU cores.
+
+The ptlrpcd threads handle RPC sending and receiving and are normally distributed evenly across cores and bound to each NUMA domain to minimize cross-CPU memory traffic when there are well-distributed application workloads running on a system (e.g. multi-threaded computational workload) that allocate and dirty data pages on all of the NUMA domains evenly.  In some cases, where the number of cores is larger than the number of active application threads, then it is advantageous for ptlrpcd threads on other CPU cores to take over the RPC processing in order to offload CPU-intensive tasks like checksums, compression, and encryption to cores that are otherwise under utilized.
+
+At no time do ptlrpcd (or other Lustre service) threads exclusively utilize or busy wait on CPU cores or prevent application threads from using them when they are not actively processing requests on behalf of the application. 
+
+However, if ptlrpcd threads are started on a NUMA core and then try to process RPCs, they can become stalled when threads on that NUMA domain could not be scheduled for lengthy periods of time.  This causes intermittent laggy RPC handling when those threads are processing a time-sensitive RPC.
+
+To work around this issue, we used lscpu to determine the NUMA configuration of the CPUs installed and then created a CPT configuration that avoided scheduling the ptlrpcd threads on cores that had been taken over by the other filesystem:
+
+# lscpu | grep NUMA
+NUMA:
+ NUMA node(s):     2
+ NUMA node0 CPU(s):   0-63,128-191
+ NUMA node1 CPU(s):   64-127,192-255
+
+In the /etc/modprobe.d/lustre.conf file the following lines were added to create the Lustre CPU Partition Table to the last 8 cores (of  64) in each of 4 NUMA nodes, to avoid the other filesystem that was heating up the first two cores on each of the NUMA nodes:
+
+options libcfs cpu_npartitions=4
+options libcfs cpu_pattern="0[56-63] 1[120-127] 2[184-191] 3[248-255]"
+options ptlrpcd max_ptlrpcds=64
+
+That allows those threads to run on 32 different cores, with a maximum of 16 threads running across the 8 cores in each NUMA node.
+
+However, this is only a workaround solution, as specifying the cpu_pattern and cpu_npartitions is relatively complex and CPU-specific, and likely needs to be different for different systems within the same cluster.  It would be better to have more flexible mechanisms to avoid this issue.
+
+LU-17501 implemented the "C[0-1]" style exclude list to skip specific cores in each NUMA domain.  However, when interacting with some systems in the field it was clear that the exclude list does not need to be uniform across all NUMA domains.  In particular, with some AMD CPUs there are 8 NUMA domains, and cpu-hogging processes are running on only a specific subset of cores (e.g. cores 17-20 only on node1, or cores 0-3 on node0):
+
+# lscpu | grep NUMA
+NUMA:
+ NUMA node(s):     8
+ NUMA node0 CPU(s):   0-15
+ NUMA node1 CPU(s):   16-31
+ NUMA node2 CPU(s):   32-47
+ NUMA node3 CPU(s):   48-63
+ NUMA node4 CPU(s):   64-79
+ NUMA node5 CPU(s):   80-95
+ NUMA node6 CPU(s):   96-111
+ NUMA node7 CPU(s):   112-127
+
+Artificially restricting the number of ptlrpcd threads within a single CPT can impact performance because the "work stealing" algorithm processes RPCs (with checksums) on another core that may not have direct access to the pages, and become bottlenecked on cross-CPU interlinks.
+
+Another option is needed to exclude specified cores when configuring the CPT map, something like the following to exclude the specified cores in each of two NUMA nodes:
+
+options libcfs cpu_pattern="X[0-3] X[17-20]"
+
+A further improvement would be to dynamically detect when the CPU scheduler has been configured to reserve cores and avoid scheduling Lustre processes on those particular cores, and/or dynamically detect when ptlrpcd is unable to be scheduled on a core and avoid using it entirely (probably with a console message to that effect), similar to CPU hot-unplug.  Dynamic exclusion/load detection is more complex to implement, but would avoid the need to statically configure the cpu_pattern on nodes entirely, and work around the breakage that is introduced by other filesystems.

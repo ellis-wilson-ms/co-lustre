@@ -1,0 +1,100 @@
+Key:        LU-16311
+Summary:    Lustre 2.15 IOR rewrite IOPS are lower than 2.12 (after fix for LU-13013)
+Link:       https://jira.whamcloud.com/browse/LU-16311
+Type:       Bug
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Petros Koutoupis
+Created:    Mon, 14 Nov 2022 20:23:50 +0000
+Updated:    Mon, 14 Nov 2022 20:23:50 +0000
+
+--- Description ---
+When using a simple IOR script to test BIO rewrite performance (see example script below), there seems to be a very noticeable regression when comparing anything from the 2.15 family to 2.12. This can only be observed when you begin to saturate the target systems (specifically, the OSS nodes) with load. For instance, I am running 64 processes per node across 21 clients. On my system, we are talking about approximately 25% performance loss.
+
+ 
+
+2.12 64 PPN BIO random rewrites (70 - 85% CPU util):
+
+Summary of all tests:
+Operation   Max(MiB)   Min(MiB)  Mean(MiB)     StdDev   Max(OPs)   Min(OPs)  Mean(OPs)
+write         748.31     748.31     748.31       0.00  191566.59  191566.59  191566.59
+
+ 
+
+2.15 64 PPN BIO random rewrites (85 - 95% CPU util):
+
+Summary of all tests:
+Operation   Max(MiB)   Min(MiB)  Mean(MiB)     StdDev   Max(OPs)   Min(OPs)  Mean(OPs)
+write         575.92     575.92     575.92       0.00  147434.55  147434.55  147434.55 
+
+ 
+
+Perf captures and ftrace data (with the help of git blame) have led me down the path to a root cause:
+
+commit 17ed9ed24bffd038e2cd116012f9a40d09afc9fc
+Author: Alex Zhuravlev 
+Date:   Tue Nov 26 16:24:55 2019 +0300
+ 
+    LU-13013 osd: do not count credits for mapped blocks
+ 
+    this should help to save credits if an application
+    overwrites using many tiny fragments.
+
+HOWEVER, reverting commit 17ed9ed24b is reliant (at a minimum) on reverting both:
+
+commit 42cda8781f94ad1138afac2d23180ea48f3c3450
+Author: Wang Shilong 
+Date:   Wed Jun 2 09:52:39 2021 +0800
+ 
+    LU-14729 osd-ldiskfs: declare dirty block groups correctly
+ 
+    Calculate dirty block groups only include estimated extents,
+    indirect blocks and extent node/leaf blocks are missed, this
+    could make us short of credits.
+ 
+
+commit e1bd38e27a810bad7a25813ebc1ca0535c9d7228
+Author: Wang Shilong 
+Date:   Wed Nov 11 14:51:09 2020 +0800
+ 
+    LU-14131 osd-ldiskfs: reduce credits for overwritting
+ 
+    If all blocks are mapped which means this is overwritting
+    case or space has been allocated by fallocate.
+ 
+    There is no need to modify exten tree, and we only
+    need 1 credits for inode.
+
+Because of this dependency, all three commits need to be reverted in order to restore the IOR rewrite regression. With them reverted, 2.15 reports an improved 207K OPs with IOR.
+
+ 
+
+Note - There is likely more code that is affected, so reverting only what is mentioned above may not be the correct solution.
+
+----------------
+
+Example IOR script:
+
+#!/bin/bash
+ 
+NODES=21
+PPN=64
+MDT_COUNT=1
+DEST=kjlmo2
+DIR=flash
+IOR=ior-3.3.0-CentOS-8.2/install/bin/ior
+DIO="--posix.odirect"
+ 
+ 
+# DIO writes (prefill)
+sudo pdsh -w c-lmo[1004-1024] sh /home/bloewe/bin/sudo-flush.sh
+srun --mpi=pmi2 -N $NODES --ntasks-per-node $PPN ~bloewe/benchmarks/$IOR -F -w -t 64m -k $DIO -b 8g -vv -o /mnt/$DEST/pkoutoupis/$DIR/test.01 2>&1 |& tee flash_write_dio_01.out
+sleep 30
+# Rewrites
+sudo pdsh -w c-lmo[1004-1024] sh /home/bloewe/bin/sudo-flush.sh
+srun --mpi=pmi2 -N $NODES --ntasks-per-node $PPN ~bloewe/benchmarks/$IOR -F -w -t 4k -E -k -D 180 -b 8g -vv -z -o /mnt/$DEST/pkoutoupis/$DIR/test.01 2>&1 |& tee flash_rewrite_bio_01.out
+ 
+
+^ Note that the flush script only drops caches on the clients.

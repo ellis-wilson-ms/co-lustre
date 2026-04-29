@@ -1,0 +1,85 @@
+Key:        LU-15281
+Summary:    inode size disparity on ZFS MDTs
+Link:       https://jira.whamcloud.com/browse/LU-15281
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Peter Jones
+Reporter:   Dneg
+Created:    Fri, 26 Nov 2021 22:31:03 +0000
+Updated:    Mon, 29 Nov 2021 21:01:48 +0000
+Attachments: echo-get-all, lima-get-all
+
+--- Environment ---
+CentOS 7.6
+
+--- Description ---
+We have two clusters running, echo and lima.  Before I go further, we are comparing apples and oranges a bit here as:
+
+The MDT pool on echo is composed of two vdevs that are hardware RAIDs (legacy hardware) so no ZFS mirroring.  The MDT pool on lima is composed of 4 NVMe cards in 2 mirrors.
+
+The MDS on echo keeps getting very close to filling and we can't work out why.
+
+The two clusters are both used to do backups with heavy use of hard-linking (using dirvish/rsync).
+
+I know this is an oversimplification since it's not just inodes on the MDT but, running df -k and df -i to get kB and inodes used then dividing one by the other yields ~14kB/inode on echo and ~3kB/inode on lima.
+
+Are there any particular diagnostic tools/commands we could use to find what's using all the space on the ZFS MDT?
+
+echo's MDT is currently using 4.8TB for 350M inodes
+
+lima's MDT is currently using 2.8TB for 946M inodes
+
+Happy to provide any other info/params that might be useful.
+
+--- Comment (dneg, Mon, 29 Nov 2021 21:01:48 +0000) ---
+Ok thanks.
+
+Given the prevalence of 4k block devices now, I guess we're either gonna have to just grab more of those 512 NVMe cards, drastically increase our expected MDT size, or switch MDS back to ldiskfs.
+
+--- Comment (adilger, Mon, 29 Nov 2021 20:37:09 +0000) ---
+OK, that means there is no stray changelog usage, and it can't be the cause of the difference in space usage, so I think it is only the ashift.  Unfortunately, the only way to change ashift is to reformat the whole pool, and even then that isn't recommended if the underlying storage is using 4KB sectors with 512-byte emulation, and will not work at all if it has only 4KB sector size.
+
+--- Comment (dneg, Mon, 29 Nov 2021 19:38:58 +0000) ---
+Output of that command:
+
+mdd.echo-MDT0000.changelog_size=0
+
+--- Comment (adilger, Mon, 29 Nov 2021 19:24:54 +0000) ---
+The ashift value represents the smallest possible on-disk unit of allocation, so having a larger ashift is definitely going to inflate space usage. This can become significant with RAID-Z2, but is less so with mirrors.
+
+Since ZFS is always compressing metadata, and dnode allocation is done in larger chunks (64KB) the ratio of MDT space usage is 13.71KB/inode vs. 2.96KB/inode, 4.6x and not 8x as would be expected just from the ashift ratio. 
+
+Unfortunately, this is a property of how ZFS is implemented.
+
+The only other possible cause for excessive space usage on the MDT would be if "echo" has an old Changelog user registered that is not consuming the records. This can be checked on the MDS with "lctl get_param mdd.*.changelog_size".
+
+--- Comment (dneg, Mon, 29 Nov 2021 17:11:17 +0000) ---
+zdb -U /etc/zfs/zpool.cache on both does show what you suggest in that lima's devices have an ashift of 9 and echo's are 12.
+
+Given the physical/logical block sizes reported by /sys/block this seems appropriate right?
+
+Without knowing deep internals of ZFS, it seems to me there are two things at play here (although I'll freely admit these are educated guesses):
+
+1) The logicalused/used disparity on echo - Is this explained by 4096/512/ashift-9?
+
+2) The logicalused/logicalused disparity between echo and lima - 1.7ish TB for 350M files on echo and 1.4ish TB for 946M on lima.
+
+--- Comment (adilger, Sat, 27 Nov 2021 01:25:57 +0000) ---
+The first thing to check here would be whether ashift is different on the two pools.  The lima filesystem may be using ashift=9 (512-byte sectors) and echo using ashift=12 (4096-byte sectors).  ZFS will normally automatically select ashift based on the hardware sector size, even if the device claims a smaller sector size.
+
+Using ashift=9 on 4096-byte sector devices can dramatically hurt performance, as well as potentially cause data errors because of the internal read-modify-write of a sector may be modifying in-use blocks that are not part of the ZFS transaction causing errors in the "other" sub-sectors.  This would mostly not be fatal, because of redundancy would likely allow those errors to be recovered, but they would be at risk if a device failed.
+
+--- Comment (dneg, Fri, 26 Nov 2021 23:43:41 +0000) ---
+echo:  logicalused: 1.74TB, used: 4.73TB
+
+lima:  logicalused: 1.38TB, used: 2.74TB
+
+So lima is still way smaller per inode but the used/logicalused disparity is huge too.
+
+echo has physical block size of 4096, logical of 512
+
+lima has physical and logical of 512
+
+Both use 128K recordsize

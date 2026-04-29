@@ -1,0 +1,227 @@
+Key:        LU-17190
+Summary:    Client-side high priority I/O handling under lock blocking AST
+Link:       https://jira.whamcloud.com/browse/LU-17190
+Type:       New Feature
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Qian Yingjin
+Reporter:   Qian Yingjin
+Created:    Fri, 13 Oct 2023 02:37:34 +0000
+Updated:    Fri, 29 Aug 2025 20:14:31 +0000
+
+--- Description ---
+We found a deadlock caused by parallel DIO on a single client:
+
+T1: writer
+Obtain DLM extent lock: L1=PW[0, EOF]
+T2: DIO reader: 50M data, iosize=64M, max_pages_per_rpc=1024 (4M) max_rpcs_in_flight=8
+ll_direct_IO_impl()
+use all available RPC slots: number of read RPC in flight is 9
+on the server side:
+->tgt_brw_read()
+->tgt_brw_lock() # server side locking
+-> Try to cancel the conflict locks on client: L1=PW[0, EOF]
+T3: reader
+take DLM lock ref on L1=PW[0, EOF]
+Read-ahead pages (prepare pages);
+wait for RPC slots to send the read RPCs to OST
+deadlock: T2->T3: T2 is waiting for T3 to release DLM extent lock L1;
+T3->T2: T3 is waiting for T2 finished to free RPC slots...
+
+ 
+
+ 
+
+To solve this problem, we propose a client-side high priority I/O where the extent lock protecting it is under blocking AST.
+
+It implements as follows:
+
+When receive a lock blocking AST and the lock is in use (reader and writer count are not zero), it check whether there are any I/O extent (osc_extent) protected by this lock is outstanding (i.e. waiting for RPC slot). Make this kind of read/write I/O with high priority and put them to the HP list. Thus the client will force to send the HP I/Os even the available RPC slots is use out.
+
+By this way, it makes I/O engine on OSC layer more efficient. For the normal urgent I/O, the client will tier over the object list one by one and send I/O one by one. Moreover, the in-flight I/O count can not exceed the max RPCs in flight.
+
+The hight priority I/Os are put into HP list of the client, will handle more quickly.
+
+It can avoid the possible deadlock caused by parallel DIO and response the lock blocking AST more quickly.
+
+--- Comment (gerrit, Thu, 2 Jan 2025 20:48:23 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/56327/
+
+Subject: LU-17190 osc: client-side high prio I/O under blocking AST
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 61a01fd9b6894ecee17d2cfe9f52aa7748f89045
+
+--- Comment (gerrit, Mon, 2 Dec 2024 05:50:13 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/56324/
+
+Subject: LU-17190 llite: release locks after all read-head pages submit
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 1dad1b111b163704aaff40e96e0248416a49b1d9
+
+--- Comment (gerrit, Sun, 24 Nov 2024 06:06:06 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/56325/
+
+Subject: LU-17190 osc: account DIO in flight using server-side locking
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 984cb502a175e712ec3d0f0ba2f17bb4ef613167
+
+--- Comment (shadow, Tue, 12 Nov 2024 12:29:13 +0000) ---
+>have the "lockless DIO" requests still send a DLM lock handle in the OSS RPC, so that the server doesn't try to get another lock. This might make Patrick unhappy, since it will add a DLM lock lookup to every DIO syscall, but it allows the "lockless DIO" and regular BIO to be submitted and processed at the same time.
+
+just my 2cents. any IO have to go via osc_attr_set - which had search lock by offset. So it should don't have extra search.
+
+--- Comment (gerrit, Wed, 11 Sep 2024 07:38:35 +0000) ---
+"Qian Yingjin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/56327
+
+Subject: LU-17190 osc: client-side high prio I/O under blocking AST
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 4502c0595b8cbe125ec201925c2b931807099f6f
+
+--- Comment (gerrit, Wed, 11 Sep 2024 04:19:44 +0000) ---
+"Qian Yingjin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/56325
+
+Subject: LU-17190 osc: account DIO in flight using server-side locking
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: cafff8d1389c1df63ed16fb31b4ad6efb8f606cb
+
+--- Comment (gerrit, Wed, 11 Sep 2024 04:04:23 +0000) ---
+"Qian Yingjin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/56324
+
+Subject: LU-17190 llite: release locks after all read-head pages submit
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: cb8672d921a97e565a1c1202967f5b4c2a9e3308
+
+--- Comment (shadow, Mon, 11 Mar 2024 09:33:22 +0000) ---
+>I definitely prefer the first approach - I think readahead locking needs to be much more 'normal', taking and holding dlmlocks in a more regular fashion.  So I strongly prefer the first option.  The second one would work but it feels 'clever' rather than 'right'.
+
+dlm lock holds just in submit time, but DIO is completely different. DIO submit covers an IO execution on the OST side, this causes this backside effect. I think much simple solution - disable lockless parallel DIO. 
+
+As about other .. DIO not a single case to have such deadlock. 
+
+FIEMAP want a flush all dirty data before obtain an info. This produce deadlock in similar way.
+
+So some kind prioritisation for data flush in queue needs to be implemented.
+
+--- Comment (qian_wc, Fri, 10 Nov 2023 03:22:47 +0000) ---
+The test scripts sanity/test_441 (https://review.whamcloud.com/c/fs/lustre-release/+/53065) can reproduce the deadlock problem easily on master branch without PCC-RO locally.
+
+So this is a general deadlock bug in both b_es6_0 and master.
+
+--- Comment (gerrit, Fri, 10 Nov 2023 03:20:53 +0000) ---
+"Qian Yingjin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/53065
+
+Subject: LU-17190 test: parallel DIO should not cause deadlock
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: a14b0d9b1e7e4ea42957799d1d5596fe94ce3c4f
+
+--- Comment (qian_wc, Tue, 31 Oct 2023 01:29:41 +0000) ---
+Yes, I will refine the patch of the first solution. Thanks!
+
+--- Comment (paf0186, Mon, 30 Oct 2023 16:11:51 +0000) ---
+I definitely prefer the first approach - I think readahead locking needs to be much more 'normal', taking and holding dlmlocks in a more regular fashion.  So I strongly prefer the first option.  The second one would work but it feels 'clever' rather than 'right'.
+
+Yingjin, does that answer your questions?  I know you had some stuff in Gerrit as well, are there other issues to consider?
+
+--- Comment (qian_wc, Wed, 18 Oct 2023 16:28:39 +0000) ---
+Hi Andreas,
+
+ 
+
+I have implemented two solutions for this bug:
+
+	https://review.whamcloud.com/#/c/ex/lustre-release/+/52682/
+
+	https://review.whamcloud.com/c/ex/lustre-release/+/52747
+
+In the firat patch, it puts all acquired DLM extent locks in a list. After submit all read-ahead I/Os, the client releases all acquired DLM extent locks. By this way, in a lock blocking AST, all reading extents has already submitted and put into the list @oo_reading_exts of the OSC object. Then in blocking AST, the client can check this list to find out the conflict outstanding extents as all I/O RPC slots are used out by direct I/O.
+
+Otherwise, If we use original way that match DLM lock, add read-ahead page into queue list and release the matched DLM lock; repeat it for read-ahead and finally submit all I/Os (osc_io_submit), the conflict lockdone extents may be added into the list @oo_reading_exts after the check in blocking AST. And on the client the blocking AST for the server-side locking for DIO will try to lock the pages in these lockdone extents (all pages in lockdone extents are PG_locked, and this extent maybe watis for RPC slots and all RPC slots are used out by DIO). Thus it may cause deadlock.
+
+ 
+
+The second patch gives another solution: for each matched read-ahead DLM extent lock, tag the last read-ahead page (osc_page), and increase the tagged accounting for the OSC object. After submit all I/O and add lockdone extents for read-ahead pages into the list @oo_reading_exts, reduce the tagged accounting. Once tagged count becomes zero, wake up waiters. In lock blocing AST, we first wait until the tagged count becomes zero, and then check @oo_reading_exts list to avoid the deadlock.
+
+ 
+
+The first patch has passed the customized Maloo test (test_99b).
+
+The second patch has passed in my local testing (I think it can achieve the same effort with solution 1).
+
+ 
+
+Could you please review these two solutions, give some advice which one is better?
+
+ 
+
+(BTW, test_99a sometimes failed due to PCC mmap problem, I will fix it later.
+
+ 
+
+Regards,
+
+Qian
+
+--- Comment (adilger, Mon, 16 Oct 2023 15:56:55 +0000) ---
+There may be a couple of other ways to fix this issue:
+
+	don't allow sending lockless DIO RPCs when the client is already holding a DLM lock on that object.
+
+	similar to the previous option, but have the lockless DIO RPC block on the local DLM lock while it is in-use by another thread and then "pre-cancel" the DLM lock with the RPCs under the blocked lock. This is not great, because it may block the new IO for a long time.
+
+	have the "lockless DIO" requests still send a DLM lock handle in the OSS RPC, so that the server doesn't try to get another lock. This might make Patrick unhappy, since it will add a DLM lock lookup to every DIO syscall, but it allows the "lockless DIO" and regular BIO to be submitted and processed at the same time.
+
+--- Comment (gerrit, Mon, 16 Oct 2023 15:02:43 +0000) ---
+"Qian Yingjin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/52711
+
+Subject: LU-17190 osc: force I/O when all RPC slots used out by DIO
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 612a050c6386a18306d627a095e3ad29d1455177

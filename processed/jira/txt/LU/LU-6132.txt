@@ -1,0 +1,159 @@
+Key:        LU-6132
+Summary:    Unable to unload ib drivers with lustre loaded
+Link:       https://jira.whamcloud.com/browse/LU-6132
+Type:       Bug
+Priority:   Critical
+Status:     Open
+Resolution: Unresolved
+Assignee:   Dmitry Eremin
+Reporter:   Yan Burman
+Created:    Sun, 18 Jan 2015 15:11:11 +0000
+Updated:    Tue, 28 May 2019 15:46:04 +0000
+Labels:     llnl
+Links:      Duplicate: is duplicated by LU-7755; Related: is related to  LU-9439; Related: is related to  LU-8384; Related: is related to LU-11066
+
+--- Environment ---
+RHEL 6.5 with MLNX_OFED 2.3 and ConnectX3/ConnectX3 Pro/ConnectIB  HW (but I'm guessing is reproducible with any OS and any OFED/upstream kernel).
+
+--- Description ---
+Unloading IB drivers results in hung task message and driver unloading is stuck forever.
+
+Steps to reproduce:
+
+1) Have a lustre mount to server
+
+2) On server do /etc/init.d/openibd stop
+
+3) openibd script is stuck
+
+4) After 120 seconds, following message is seen in dmesg:
+
+LNetError: 131-3: Received notification of device removal
+
+Please shutdown LNET to allow this to proceed
+
+INFO: task modprobe:2837 blocked for more than 120 seconds.
+
+      Not tainted 2.6.32_431.el6_lustre.x86_64 #1
+
+"echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+
+modprobe      D 0000000000000000     0  2837   2777 0x00000000
+
+ ffff88011c649bf8 0000000000000082 00000000ffffffff 00000000ffffffff
+
+ ffff88011c649c38 ffffffff81060b13 ffff88011c649c78 00000000811a591f
+
+ ffff8800cc23f058 ffff88011c649fd8 000000000000fbc8 ffff8800cc23f058
+
+Call Trace:
+
+ [] ? perf_event_task_sched_out+0x33/0x70
+
+ [] ? __dequeue_entity+0x30/0x50
+
+ [] schedule_timeout+0x215/0x2e0
+
+ [] ? thread_return+0x4e/0x76e
+
+ [] wait_for_common+0x123/0x180
+
+ [] ? default_wake_function+0x0/0x20
+
+ [] ? __cond_resched+0x2a/0x40
+
+ [] wait_for_completion+0x1d/0x20
+
+ [] cma_remove_one+0x18e/0x210 [rdma_cm]
+
+ [] ib_unregister_device+0x4f/0x100 [ib_core]
+
+ [] mlx4_ib_remove+0xc6/0x300 [mlx4_ib]
+
+ [] mlx4_remove_device+0x71/0x90 [mlx4_core]
+
+ [] mlx4_unregister_interface+0x43/0x80 [mlx4_core]
+
+ [] __exit_compat+0x15/0x69 [mlx4_ib]
+
+ [] sys_delete_module+0x194/0x260
+
+ [] ? do_page_fault+0x3e/0xa0
+
+ [] system_call_fastpath+0x16/0x1b
+
+The cause of this is that ko2iblnd does not handle device removal (should probably handle it the same as disconnected event).
+
+--- Comment (adilger, Thu, 19 Jan 2017 22:29:52 +0000) ---
+I don't see why the client would need to be evicted, per-se if the IB interface is stopped.  In theory, if the client has some other form of communication with the server (e.g. TCP or OPA) it could continue to work after the IB interface is stopped.  Handling that cleanly would definitely need some development work, and is best left until after the LNet Multi-Rail code is landed, since I suspect it will need to deal with that situation in any case.
+
+One simple option for handling this in the short term is adding an /sbin/umount.lustre script which tries lustre_rmmod to unload the modules, but fails silently if the modules are in use (i.e. another filesystem is mounted).  That would drop the LNet references and disconnect the client, allowing the IB modules to be unloaded.  However, this depends on the client unmount happening before the IB modules are cleaned up.  The other option is a systemd script (see patch http://review.whamcloud.com/21457 "LU-8384 scripts: Add scripts to systemd for EL7").
+
+--- Comment (simmonsja, Wed, 18 Jan 2017 23:29:49 +0000) ---
+It is possible to make lustre aware when the IB core is unloaded but i haven't had cycles to implement this. I guess in that case we would have to force evictions of clients if that happens.
+
+--- Comment (dmiter, Wed, 18 Jan 2017 16:49:14 +0000) ---
+This happens when you have Lustre share mounted but try to unload OFED drivers. The shutdown sequence should be following:
+
+	umount /mnt/lustre
+
+	lustre_rmmod
+
+	unload OFED drivers
+
+We can make first 2 steps in our shutdown script but cannot guarantee that OFED drivers will not be unloaded first.
+
+--- Comment (dinatale2, Wed, 18 Jan 2017 15:59:53 +0000) ---
+We've encountered this problem as well on both lustre clients and lustre servers. Problem usually occurs, as Gregoire mentioned, when a lustre fs is mounted on a client or a lustre server has a target mounted during shut down.
+
+--- Comment (pichong, Mon, 20 Jul 2015 15:59:47 +0000) ---
+This issue has been reported by one of our customer. It usually occurs when shutting down a Lustre client while Lustre file systems are still mounted.
+
+--- Comment (isaac, Wed, 4 Mar 2015 17:52:36 +0000) ---
+2-4 could be handled by removing the IB NI first with DLC, since they are all admin actions. Case 1 could probably be cleaned up with DLC NI shutdown after it has happened.
+
+--- Comment (yanb, Wed, 4 Mar 2015 12:55:45 +0000) ---
+Other use cases where you may get device removal event are:
+
+1) Card/FW failure and reset issued on the card
+
+2) VPI - changing in runtime between ethernet and IB port type
+
+3) Unloading driver perhaps for maintenance
+
+4) Hotplug of card (as well as VF in SRIOV case)
+
+--- Comment (isaac, Mon, 2 Mar 2015 19:55:43 +0000) ---
+I think the shutdown scripts should be fixed to honor the correct dependency - i.e. shutdown the IB users (e.g. LNet) before any attempts to shutdown any part of IB. As to LNet support of device removal, if there's a valid use case for that we should certainly support it. But I'd tend to say incorrect shutdown order isn't a valid use case. If there's other scenarios where LNet would need to handle device removal, please point it out.
+
+--- Comment (yanb, Mon, 2 Mar 2015 14:47:58 +0000) ---
+The problem would happen if the mlx4/mlx5 drivers are unloaded before LNET is cleaned up or if device is removed (which is easily simulated by unloading mlx
+
+{4,5}
+_* modules).
+
+Fixing the script (assuming it's a script problem) will fix one scenario out of few. Handling the device removal event will be cleaner and handle other scenarios as well.
+
+Handling CM ID of a connection should be similar if not identical to handling of disconnected event.
+
+The only non-trivial (as far as I understood) part is identifying that the CM ID belongs to a listener, as it is not being saved currently from what I saw.
+
+What do you think of this idea?
+
+--- Comment (adilger, Thu, 26 Feb 2015 19:01:10 +0000) ---
+It seems to me that the correct solution here is during shutown to clean up the LNET routes/modules before unconfiguring IB.  That should happen via the /etc/init.d/lnet script.  Not clear why that isn't happening?
+
+--- Comment (yanb, Tue, 20 Jan 2015 08:41:23 +0000) ---
+One scenario would be reboot. Also, device removal event will be received upon PCI reset to device or unbind/hotplug.
+
+From my experience on other projects, there are two changes that need to be done to support this:
+
+1) Be able to differentiate between CM IDs of the listener and of connections
+
+2) If CM ID is of a connection, do the same handling as disconnected event. In case of listener, just destroy the CM ID
+
+--- Comment (adilger, Mon, 19 Jan 2015 18:06:06 +0000) ---
+Could you please explain why you would want to be able to unload the IB module while Lustre is up and running?
+
+--- Comment (liang, Mon, 19 Jan 2015 13:50:25 +0000) ---
+Release 2.7 will have Dynamic LNet Config (DLC) which allows user to dynamically add/remove LNet NI in userspace, after that you should be able to unload ib drivers. So far we don’t plan to handle this event and trigger NI removal in kernel space.

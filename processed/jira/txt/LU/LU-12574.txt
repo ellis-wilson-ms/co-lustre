@@ -1,0 +1,270 @@
+Key:        LU-12574
+Summary:    Replicating lustre's metadata only with changelog records + DNEv2
+Link:       https://jira.whamcloud.com/browse/LU-12574
+Type:       Question/Request
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Etienne Aujames
+Reporter:   CEA
+Created:    Mon, 22 Jul 2019 15:55:02 +0000
+Updated:    Sat, 1 Nov 2025 14:09:19 +0000
+Links:      Related: is related to  LU-12084; Related: is related to  LU-10283
+
+--- Description ---
+I recently noticed that RENME changelog records are emitted by the MDT of the target directory (and only this MDT):
+
+#> MDSCOUNT=2 lustre/tests/llmount.sh
+#> lctl --device lustre-MDT0000 changelog_register
+#> lctl --device lustre-MDT0001 changelog_register
+#>
+#> lfs mkdir -i 0 /mnt/lustre/mdt-0
+#> lfs mkdir -i 1 /mnt/lustre/mdt-1
+#> touch /mnt/lustre/mdt-0/file-0
+#> mv /mnt/lustre/mdt-0/file-0 /mnt/lustre/mdt-1
+#>
+#> lfs changelog lustre-MDT0000
+1 02MKDIR 14:28:45.489241745 2019.07.22 0x0 t=[0x200000402:0x1:0x0] j=lt-lfs.0 ef=0xf u=0:0 nid=10.200.0.1@tcp p=[0x200000007:0x1:0x0] mdt-0
+2 01CREAT 14:28:54.679826073 2019.07.22 0x0 t=[0x200000402:0x2:0x0] j=touch.0 ef=0xf u=0:0 nid=10.200.0.1@tcp p=[0x200000402:0x1:0x0] file-0
+3 11CLOSE 14:28:54.717755997 2019.07.22 0x42 t=[0x200000402:0x2:0x0] j=touch.0 ef=0xf u=0:0 nid=10.200.0.1@tcp
+#> lfs changelog lustre-MDT0001
+1 02MKDIR 14:28:48.788225263 2019.07.22 0x0 t=[0x240000402:0x1:0x0] j=lt-lfs.0 ef=0xf u=0:0 nid=10.200.0.1@tcp p=[0x200000007:0x1:0x0] mdt-1
+2 08RENME 14:29:03.315736883 2019.07.22 0x0 t=[0:0x0:0x0] j=mv.0 ef=0xf u=0:0 nid=10.200.0.1@tcp p=[0x240000402:0x1:0x0] file-0 s=[0x200000402:0x2:0x0] sp=[0x200000402:0x1:0x0] file-0
+
+The HLINK changelog record behaves similarly. But CREAT and UNLNK are still emitted by the MDT that is in charge of them.
+
+Now, I may be wrong, but I think that for an application that relies on changelog records to mirror a filesystem's metadata (eg. RobinHood), it is not always possible to order those records. At the very least, I pretend that performance would take a serious hit as changelog consumers would have to synchronize with one another.
+
+As an example, consider the following series or renames: A/file --> B/file, B/file --> A/file; where A and B are directories that live on different MDTs. Let R1, and R2 be the changelog consumers for respectively A's MDT and B's MDT.
+
+Without any synchronization between R1 and R2, R1 may process its RENME record first: it will try to delete B/file from whatever backend it uses, and then insert (/create) A/file. If R1 chooses to fail the transaction because B/file does not exist, it effectively waits for R2 [*]. Otherwise, some time later, R2 discovers its own RENME record: it will delete A/file from its backend and add B/file to it.
+
+[*] And even then, if R1 waits for B/file to exist before deleting it, it is possible that the original series of renames is followed by: A/file --> C/file; in which case, R3 the changelog consumer for C's MDT will compete with R2 when trying to delete A/file (if R3 wins, R1 is stuck forever).
+
+I think it is possible to solve this by requiring that CREAT and UNLNK records are matched with CREAT-TO and UNLNK-TO records emitted by the MDT of the affected entry's parent. And for renames, that an additional RENME-FROM record is emitted on the source directory's MDT. [**]
+
+[**] I leave it to someone else to find good names for these record types. =)
+
+This would allow a changelog consumer to process any changelog record it sees without the need to synchronize with any other consumer.
+
+In the previous example: R1 can still see its RENME record first but not before it sees the RENME-FROM (emitted by A/file --> B/file). In this case, it will necessary delete A/file before re-inserting it. R2 does something similar in that it will necessarily insert B/file before it deletes it. The processing becomes rather simple: on RENME create the target, on RENME-FROM delete the source.
+
+--- Comment (pjones, Sat, 1 Nov 2025 14:09:19 +0000) ---
+Is this idea still of interest to CEA?
+
+--- Comment (olaf, Thu, 16 Jul 2020 08:32:32 +0000) ---
+A unique ID would be helpful for the DMF implementation - we have to do similar synchronization for reasons not related to Lustre, and could use such an identifier. Apart from that I agree with his points.
+
+--- Comment (bougetq, Thu, 16 Jul 2020 07:06:51 +0000) ---
+Yes, but I would rather like to avoid it as well. It just moves the synchronization issue further down the stack (ie. to changelog consumers), and :
+
+	I assume there is already some kind of synchronization between MDTs, to ensure a consistent view of the filesystem ;
+
+	there isn't any sort of synchronization right now in my implementation of changelog consumers.
+
+As a matter of fact, it does not matter much to me that both records are committed in-order. What really matters is that either both are committed, or none.
+
+ I suppose it incurs the same amount of complexity though.
+
+--- Comment (adilger, Thu, 16 Jul 2020 03:10:29 +0000) ---
+Would it be sufficient to add some kind of unique identifier for the split records (e.g. distributed transaction ID) so that they can be linked between the two Changelogs?  I wouldn't want to impose performance slowdowns due to synchronization between MDTs to ensure that they are always committed in-order to disk.
+
+--- Comment (olaf, Mon, 30 Sep 2019 09:41:52 +0000) ---
+For context, DMF7 uses a number of tables to track namespace state. For this LU, of interest are the inode and name tables. If I understand Quentin's update above correctly, CREATE/UPDATE/DELETE would apply to the DMF7 inode table, reflecting when a new inode is created, updated, and destroyed. The other operations, LINK/UNLINK, update the parent+name to fid mapping maintained in the name table.
+
+So a Lustre RENME record can expand to an UNLINK, a LINK, and if there is a victim, also a DELETE.
+
+The MIGRT record expands to a DELETE for the old fid, CREATE for the new one, matching UNLINK and LINK for the name, plus maybe some magic to trace file history across MIGRT.
+
+In either case it would be useful if the UNLINK action were visible in the changelog on the source MDT. If you want to synchronize changelog readers across MDTs, it tells you there should be a matching RENME or MIGRT on the other MDT. Without synchronization across MDTs it at least allows for the name changes within a directory to be correctly ordered because they can all be handled using the changelog for just that MDT. If the "RENAME-FROM" contains the source dir fid, source name, and fid of the inode being renamed then I think that would be sufficient for both DMF and RobinHood to work with.
+
+--- Comment (bougetq, Thu, 26 Sep 2019 12:13:34 +0000) ---
+The whole LU was discussed at LAD'19. For now, RobinHood (v4) will assume that at some point Lustre will support some sort of RENAME-FROM event on the source MDT.
+
+If it becomes clear this is not the way to go forward, please let me know.
+
+--- Comment (bougetq, Wed, 25 Sep 2019 18:15:06 +0000) ---
+We discussed at LAD'19 the need for a way to extract the mdt-index out of a FID. It turns out this is already implemented in the llapi by llapi_get_mdt_index_by_fid().
+
+--- Comment (bougetq, Thu, 25 Jul 2019 12:31:50 +0000) ---
+the default is that the create and unlink are done on a single MDT
+
+I did not know that... But I think this is still workable.
+
+We are re-architecturing how Robinhood processes changelogs and we defined 5 new types of changelog records for metadata mirroring:
+
+	CREATE
+
+	LINK
+
+	UNLINK
+
+	DELETE
+
+	UPDATE
+
+where CREATE and UPDATE are pretty much the same thing (we use upsert on the backend in both case).
+
+CREATE, UPDATE and DELETE maintain metadata of a given inode, LINK and UNLINK take care of the namespace.
+
+The mapping from Lustre's records to Robinhood's looks like:
+
+Lustre
+Robinhood
+
+CREAT
+CREATE + LINK
+
+HLINK
+LINK
+
+UNLNK
+UNLINK
+
+UNLNK (last)
+UNLINK + DELETE
+
+RENME (DNEv1)
+UNLINK + LINK
+
+RENME (DNEv2)
+LINK
+
+RENME-FROM (DNEv2)
+UNLINK
+
+TBD
+TBD
+
+If I understand correctly, with striped directories, it is possible to see:
+
+	RENME ( LINK) before CREAT ( CREATE);
+
+	RENME-FROM / RENME ( UNLINK / LINK) after UNLNK (last) / RENME (last) ( DELETE).
+
+1. Works well by default (there will be entries with only namespace metadata for a while, but that is eventually consistent).
+
+ 2. On DELETE, record the index of the last changelog record on each MDT and defer the actual deletion until after the last of those records is processed. This is not ideal, but it should still perform quite well as Robinhood can keep processing any other record.
+
+One area I left out is cross-MDT migration. They might require a bit of work, but I think it is manageable without adding any new changelog record.
+
+--- Comment (adilger, Wed, 24 Jul 2019 20:44:11 +0000) ---
+I think you misunderstood my example, I am not trying to handle concurrent renames. When I wrote A/file --> B/file, B/file --> A/file, I meant two sequential renames, that are totally ordered on the FS
+
+Yes, this was understood.
+
+A changelog consumer does not need to know whether the file was unlinked or renamed. It only needs to know "this path for this FID is no longer valid".
+
+That might be a possible solution.
+
+Except when the parent directory is striped over several MDTs, in which case, the CREAT record is emitted on the created entry's MDT, not the parent directory's.
+
+Even in the striped directory case, the default is that the create and unlink are done on a single MDT because the client hashes the filename and selects which MDT shard to create the inode on (there is no mechanism to create a regular file with a remote name at this time).  The only time remote operations are needed is if the file has been renamed/hard linked to a different MDT (hopefully relatively rare), or for remote directories.
+
+--- Comment (bougetq, Tue, 23 Jul 2019 09:38:48 +0000) ---
+I think you misunderstood my example, I am not trying to handle concurrent renames. When I wrote A/file --> B/file, B/file --> A/file, I meant two sequential renames, that are totally ordered on the FS:
+
+$> mv A/file B/file
+$> mv B/file A/file
+
+My point is that although they are ordered on the FS, it is not possible to infer the order from changelog records only.
+
+I think it might help to use a concrete example, so I will go with RobinHood.
+
+In RobinHood (v3) the namespace is maintained in a table named NAMES that matches every (Parent FID, Name) with a FID. When a RENME occurs (one that does not overwrite the destination file), RobinHood issues two SQL requests:
+
+DELETE FROM NAMES
+WHERE parent_id = old_parent AND name = old_name AND id = fid;
+INSERT INTO NAMES (parent_id, name, id)
+VALUES (new_parent, new_name, fid)
+
+And this only works if there is never more than one process issuing this kind of request for a given FID.
+
+With the example in the description, and this initial state:
+
+parent_id
+name
+id
+
+A-FID
+file
+file-FID
+
+The correct final state should be:
+
+parent_id
+name
+id
+
+A-FID
+file
+file-FID
+
+But the following can happen:
+
+R1 processes B/file --> A/file first (without synchronizing with R2), it issues:
+
+DELETE FROM NAMES
+WHERE parent_id = B-FID AND name = file AND id = fid;
+INSERT INTO NAMES (parent_id, name, id)
+VALUES (A-FID, file, fid)
+
+And the result is:
+
+parent_id
+name
+id
+
+A-FID
+file
+file-FID
+
+(No record is actually inserted because there is a unique constraint on (parent_id, name))
+
+R2 then processes A/file --> B/file and issues:
+
+DELETE FROM NAMES
+WHERE parent_id = A-FID AND name = file AND id = fid;
+INSERT INTO NAMES (parent_id, name, id)
+VALUES (B-FID, file, fid)
+
+The final state is:
+
+parent_id
+name
+id
+
+B-FID
+file
+file-FID
+
+ -----
+
+Of course, the fact remains that it would be hard to add the changelog records I described.
+
+> Such an update record might also be generated in case of an unlink
+
+This does not need to be an issue. A changelog consumer does not need to know whether the file was unlinked or renamed. It only needs to know "this path for this FID is no longer valid".
+
+> there would likely need to be some resync between the changelog consumers at the point of distributed operations
+
+I think it can be proven that this is not always possible. If someone can suggest something that always works (and is moderately performant), I will happily take it.
+
+> so file creation and such are typically only done in the local parent directory
+
+Except when the parent directory is striped over several MDTs, in which case, the CREAT record is emitted on the created entry's MDT, not the parent directory's.
+
+--- Comment (adilger, Mon, 22 Jul 2019 22:24:38 +0000) ---
+My understanding of the RENME record is that if the A/file -> B/file rename resulted in a t=[FID] (target) field being included in that record, like the following record for a (local) rename "mv list list.old" in directory [0x2000061c1:0x87d:0x0] that deletes the list.old target with FID [0x20001ffd1:0x3a4:0x0]:
+
+66701284 08RENME 10:28:34.579612216 2019.07.22 0x1 t=[0x20001ffd1:0x3a4:0x0] j=mv.500 p=[0x2000061c1:0x87d:0x0] list.old s=[0x20001ffd1:0x3c5:0x0] sp=[0x2000061c1:0x87d:0x0] list
+
+Otherwise, the rename did not delete a target file, and if one is found then the resync operation should be treated with suspicion. 
+
+In your above example, the R1 consumer knows whether the A/file -> B/file (with B/file overwrite) is valid because it knows the FID of the target file being unlinked.  If B/file does not match the expected FID, then it is not the right target to be removing.  Likewise, the R2 consumer should knows that the B/file source is not the correct source FID to be renaming.
+
+I'm not fundamentally against adding a changelog record on the source MDT, but there are definitely real implementation complexities associated with this.  Firstly, the MDT of the source directory doesn't really see the rename "operation" at all, since this is handled by the MDT of the target directory.  The source MDT only sees an OSP "update" request to remove the name entry from the source directory, possibly with a decref on the source directory if it is a directory being renamed vs. a regular file.  Such an update record might also be generated in case of an unlink, so it isn't possible to determine on the source MDT side what needs to be added to the changelog just from this update request.  It might be enough to insert a changelog record from the OSP update that serves as a "resync point" if it can contain enough information about the originating MDT operation to link the two records.  This may be complicated by ordering constraints, because I don't think the MDT transno is assigned at the time that the changelog record is written, otherwise it would have been included in the record itself already.
+
+The DNE distributed transaction mechanism has distributed transaction recovery logs written to all the involved remote MDTs (the "source directory MDT" in this case) from the master MDT (the "target directory MDT"), but those transaction logs are not interpreted by the remote MDT, only "blobs" are written by the master MDT for its own eventual use in case of distributed recovery is needed if the master MDT crashes.  It would add implementation and recovery complexity if the master MDT was also injecting records into the remote MDT's changelog during its distributed transactions, since this introduces further ordering constraints during transaction replay.
+
+Since this issue only exists in the case of distributed transactions, there would likely need to be some resync between the changelog consumers at the point of distributed operations (at least those involved in a particular operation), even if they are not coordinated during other activity. Otherwise, any number of problems could be introduced in the resync activities, as is shown in the above examples.  This is one reason why we generally try to avoid distributed operations if possible, so file creation and such are typically only done in the local parent directory.

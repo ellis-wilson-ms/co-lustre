@@ -1,0 +1,108 @@
+Key:        LU-3671
+Summary:    why are permission changes synchronous?
+Link:       https://jira.whamcloud.com/browse/LU-3671
+Type:       Bug
+Priority:   Critical
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Lai Siyao
+Reporter:   Ned Bass
+Created:    Tue, 30 Jul 2013 18:39:57 +0000
+Updated:    Tue, 6 Nov 2018 10:53:57 +0000
+Resolved:   Wed, 4 Sep 2013 18:56:01 +0000
+Labels:     zfs
+Links:      Duplicate: duplicates LUDOC-180; Related: is related to LU-3660; Related: is related to LU-7239
+
+--- Description ---
+mdd_acl_set() sets the ACL xattr synchronously if /proc/fs/lustre/mdd/lustre-MDT0000/sync_permission is set (it is set by default).  This can have a large performance impact for operations like cp -a or tar --xattr.  Should this be the default behavior?  How does this relate to other permissions-related changed like chown, chmod, etc.? It would be good to explain the security implications of this setting in code comments and in the Lustre manual.
+
+Some background information:
+
+http://wiki.lustre.org/index.php/Architecture_-_Version_Based_Recovery#Permissions
+
+https://projectlava.xyratex.com/show_bug.cgi?id=15390
+
+http://git.whamcloud.com/gitweb?p=lustre.git;a=commit;h=0509770778396825ba1d7f1b42be5993aac1d6f3
+
+LLNL-bug-ID: TOSS-2207
+
+--- Comment (adilger, Wed, 4 Sep 2013 18:56:01 +0000) ---
+I filed LUDOC-180 to track the documentation for this /proc tunable, and this one can be closed since the patch to avoid sync operations for regular files and non-permission setattrs has landed for 2.5.0.
+
+It could potentially also be cherry-picked for 2.4.x and 2.1.x.
+
+--- Comment (adilger, Wed, 4 Sep 2013 18:35:39 +0000) ---
+Ned, your second assessment is correct, and I should have made that more clear in my comment.  The danger is that the user thinks the chmod (or chown by root) succeeded, but it was lost during recovery, and this exposes files in the directory that shouldn't be visible to other users.  Mike is correct that if file3/4 are created before MDS recovery (while the chmod/chown is still in the MDS cache) then they will be refused during replay because the dir1 permission change was lost when client1 failed and the creates will depend on the now-missing dir1 version.  However, if file3/4 are created after MDS recovery (with chmod/chown lost) they will succeed.
+
+I guess sync_permissions is over & above what POSIX requires even of a local filesystem, since a local filesystem would lose the chmod after a crash and the user might forget to re-do it, but at least there was a visible interruption to the user when the local node crashed.  With a distributed filesystem, the failing node might be out of sight of the user.
+
+--- Comment (tappro, Wed, 4 Sep 2013 10:16:12 +0000) ---
+Andreas, yes, chmod changed version of directory, so depended replays will be denied. But nothing prevents just regular creations in that directory after recovery, it will stay without permission for a while. So sync_permission flag is not just about recovery but more like policy when server guarantee all such changes to be done for sure, without sync_permission all works as before but permission might be lost, note this problem exists in all Lustre versions and is not about VBR. All further optimization are just attempts to find some balance between security and performance.
+
+--- Comment (nedbass, Wed, 4 Sep 2013 06:22:24 +0000) ---
+I think I understand the point of the example now. The touch is predicated on the knowledge that chmod succeeded and the directory has secure permissions.  If the chmod is lost, the directory contents become exposed to unauthorized users.  I was assuming in my last comment that client3 couldn't see the results of the chmod until it was committed to disk, but now I suspect that it could.  Do I have that right?
+
+--- Comment (nedbass, Wed, 4 Sep 2013 00:58:46 +0000) ---
+Andreas, thanks for the explanation, but the pieces still aren't quite fitting together for me.  In your example, dir1 perms change from 755 to 700, so non-owners lack write permission before and after the chmod. I'm not sure if that's what you intended.
+
+Given the optimization recently landed, we're only interested in the case where permissions are reduced.  In that case, I imagine the spirit of the example is that touch would normally succeed before the chmod, but fail after.  But if the chmod isn't replayed in recovery, client3 cannot distinguish that from the case where client1 never ran chmod (because it crashed), and therefore it is perfectly consistent to allow the touch to succeed.  The directory would still have the old permissions which permitted file creation.
+
+--- Comment (rread, Tue, 3 Sep 2013 23:56:00 +0000) ---
+Suggestion: That example (once the details have been confirmed) would make an excellent addition to the manual.
+
+--- Comment (adilger, Tue, 3 Sep 2013 22:43:05 +0000) ---
+Ned,
+
+the specific problem that is being avoided here relates to Version Based Recovery (VBR), is a mechanism to allow some clients to recover from an MDS failure even in the (not so uncommon) case that one or more other active clients do not reconnect MDS and do their own recovery.  Basic version-based recovery in the following situation:
+
+# umask is 022, so dir1 is created with rwxr-xr-x permission
+client1$ mkdir /lustre/dir1
+client2$ mkdir /lustre/dir2
+client1$ chmod 700 /lustre/dir1
+client3$ touch /lustre/dir1/file3
+client4$ touch /lustre/dir1/file4
+:
+:
+
+If client2 fails at the same time as the MDS (right after dir1 is created) and does not participate during MDS recovery, old Lustre recovery would prevent client[34] from creating file[34] because there would be a gap in the MDS transaction sequence, even though there is no dependency between these files and dir2.  Similarly, if client1 failed, then file2 and file3 would not be able to recover, even if the dir1 creation was committed on the MDT before if crashed.
+
+With VBR, the replay for file3 and file4 would be dependent on the version of dir1 (transaction number in which dir1 was created/last modified), and not on each other.  That would allow the files to be recreated from any running client, and only files created by the failing node would be lost.
+
+The sync_permission flag is concerned with avoiding the case where client1 fails after creating dir1 and running chmod, but the MDS only committed the mkdir and not the chmod before it fails.  That would potentially allow the file creations to be replayed in a directory that does not have the correct permissions.
+
+Mike, thinking about this further, is the version of dir1 changed by the chmod so that the later file creates are dependent upon the new version of dir1 and not the old one?  That would also prevent the later files to be created without any sync at all, though in most cases where permission changes are not being done this would increase the number of unreplayable RPCs in case of MDS failure.  Could you please further clarify what specific problem the sync_permission behaviour is avoiding?
+
+--- Comment (nedbass, Tue, 3 Sep 2013 20:13:15 +0000) ---
+The patch addresses the performance issue, but not the lack of documentation.  I would like to see a step-by-step example scenario in which an asynchronous permission update leads to an inconsistent or insecure state.  The example should explain why the problem is only relevant for directories.  In other words, explain in precise terms the risks of disabling sync_permission.
+
+--- Comment (jlevi, Tue, 3 Sep 2013 19:49:09 +0000) ---
+Did the patch landed fix this issue?
+
+--- Comment (laisiyao, Wed, 7 Aug 2013 10:49:32 +0000) ---
+I made a patch according to the optimization proposal mentioned above: http://review.whamcloud.com/7257
+
+--- Comment (nedbass, Wed, 31 Jul 2013 15:35:51 +0000) ---
+Mikhail, thanks, but in that case I don't understand the optimizations discussed by Robert and Andreas in bz15390.  They claim the sync is only needed on directories, and only when the permissions are being reduced.
+
+https://bugzilla.lustre.org/show_bug.cgi?id=15390
+
+--- Comment (tappro, Wed, 31 Jul 2013 12:22:10 +0000) ---
+IIRC, there is no harm or bug related to sync_permission, that is just an attempt to make any permission changes persistent and be not lost due to recovery. The sync_permission guarantees that changes are persistently stored when reply is got. With sync_permission == 0 we might have lost changes due to recovery if client node isn't alive, e.g. powered off right after command was executed and return success but changes weren't committed yet on server.
+
+--- Comment (nedbass, Tue, 30 Jul 2013 22:13:07 +0000) ---
+To clarify our immediate priority here, how risky would it be to turn off sync_permission?  We're feeling significant pain due to this issue on our production filesystems, so we'd like to take prompt action if its reasonably safe to do so.
+
+My impression is that we're trying to prevent something like an open() getting incorrectly replayed before a chmod() during recovery, allowing a client to circumvent permissions.   This seems fairly low risk, but I'm not sure I understand this issue completely.
+
+--- Comment (pjones, Tue, 30 Jul 2013 19:52:52 +0000) ---
+Lai
+
+This seems related to LU-3660 which you are already working on
+
+Peter
+
+--- Comment (nedbass, Tue, 30 Jul 2013 19:25:21 +0000) ---
+This setting does apply to chmod, chown, etc.  In a VM environment with ZFS backend, chmod or chown of 60 files takes about 15s with sync_permission=1, versus 100ms with sync_permission=0.
+
+--- Comment (morrone, Tue, 30 Jul 2013 18:47:24 +0000) ---
+This (and/or LU-3660) is LLNL's top support priority.

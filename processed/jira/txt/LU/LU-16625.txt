@@ -1,0 +1,122 @@
+Key:        LU-16625
+Summary:    improved Lustre thread debugging
+Link:       https://jira.whamcloud.com/browse/LU-16625
+Type:       Improvement
+Priority:   Major
+Status:     In Progress
+Resolution: Unresolved
+Assignee:   Core Lustre Triage
+Reporter:   Andreas Dilger
+Created:    Wed, 8 Mar 2023 19:48:30 +0000
+Updated:    Sat, 22 Mar 2025 17:20:19 +0000
+Labels:     lug24dd, medium, support
+Links:      Duplicate: duplicates LU-16375; Related: is related to  LU-17584; Related: is related to  LU-17242; Related: is related to LU-17540
+
+--- Description ---
+I was thinking about how we might improve the debugging of Lustre threads that are busy (e.g. threads stuck in ldlm_cli_enqueue_local() or ldlm_completion_ast() or possibly on a mutex/spinlock).
+
+One thing that would help, especially for post-facto debugging where we only have watchdog stack traces dumped to dmesg/messages, would be to print the FID/resource of locks that the thread is holding and/or blocked on as part of the watchdog stack trace.  Since doing this in a generic way would be difficult, it would be possible to either create a thread-local data structure (similar to, or part of, "env") that contained "well-known" slots for e.g. parent/child FIDs, locked LDLM resources, next LDLM resource to lock.  Possibly these would be kept in ASCII format so that the whole chunk could just be printed as-is without much interpretation (maybe walking through NUL-terminated 32-char slots and only printing those that are used).
+
+It would also be useful to print the JobID and XID of the RPC that is being processed.
+
+Potentially this could be looked up by PID during watchdog stack dump, but would typically only be accessed by the local thread. 
+
+The main benefit here would be that instead of just seeing the stack traces being dumped, we could also see which resources the thread is (or was) holding, and this would greatly simplify the ability to analyze stuck thread issues after the fact.
+
+--- Comment (JIRAUSER18433, Tue, 20 Aug 2024 02:42:47 +0000) ---
+I think we should define something like lustre_dump_info() and lustre_dump_task_info(struct task_struct *p) that would dump all of the info not currently output by dump_stack(). Then we could define macros like:
+
+ 
+
+#define lustre_dump_stack() \
+do { \
+lustre_dump_info(); \
+dump_stack(); \
+} while (0)
+
+and:
+
+#define lustre_show_task(task) \
+do { \
+lustre_dump_task_info(task); \
+libcfs_debug_dumpstack(task); \
+} while (0)
+
+This is kind of a partial revert of https://review.whamcloud.com/c/fs/lustre-release/+/53625 (i.e. keep the bug fix and reintroduce the wrapper function/macro). These dump info functions could also be used in the panic handler (I think the libcfs panic is essentially a no-op right now). And libcfs_debug_dumpstack(task) can eventually be superseded by sched_show_task(task), which is EXPORT_SYMBOL_GPL() in newer (5.xx?) kernels. The upstream client could use sched_show_task(task) directly and drop a bunch of custom code.
+
+ 
+
+For  mds.MDS.mdt.threads.THREAD_NAME I think one file would be the simplest, IMHO.
+
+--- Comment (adilger, Wed, 7 Aug 2024 18:23:08 +0000) ---
+I think there are two possible options for moving this forward without having an automatic hook into the stack dumping code:
+
+	print the Lustre-specific state from lbug_with_loc() to the console before it calls dump_stack()
+
+	have parameter file(s) under e.g. mds.MDS.mdt.threads.THREAD_NAME that dumps thread-specific information to stdout for that service thread
+
+It is up for discussion whether THREAD_NAME would be a directory that holds a number of files for each parameter, or an aggregate YAML file like import that prints a bunch of different information?
+
+As for what to print, for all threads it would be possible to print:
+
+	Lustre build version
+
+	struct lu_env contents (though this is a bit tricky since the contents are flexible)
+
+For server threads it would be desirable to print:
+
+	lu/obd device name
+
+	ptlrpc_request being processed
+
+	client NID for RPC being processed (if not in ptlrpc_request above)
+
+	lu_fid of objects/inodes being accessed
+
+	granted DLM locks for this thread/export
+
+	DLM lock being enqueued
+
+	(stretch) DLM locks blocked by locks being held, threads/NIDs already holding DLM lock being enqueued (this may be quite large)
+
+For many threads it should be possible to print struct lu_env/lu_fid, since (AFAIR) lu_env is available on the client via lookup by PID.  Ideally, this would print the name/type and value of each field in each layer of lu_env and we could use this as a central point where all of the thread state is available.  If the granted/ungranted DLM lock handles are referenced by or stored in lu_env, then they could be printed as well.
+
+It seems practical to at least stash things like the lu_fid of relevant objects/inodes being accessed by each thread into a common part of lu_env so that it is possible to dump this if the thread is blocked.  This might increase lu_fid usage somewhat, but I think it is already pretty widely used by the service and client threads.
+
+Printing things like held semaphores/spinlocks might be tricky/expensive, and we would have to wrap every access in the Lustre code in order to log these in lu_env, so I don't think this should be an initial goal, though it would be nice to have.  Maybe something to pursue on the kernel side to get this info into the task struct and printed via dump_stack()?
+
+--- Comment (bzzz, Mon, 26 Feb 2024 08:34:20 +0000) ---
+It  looks like there is some infrastructure to handle this already:
+
+unfortunately nothing similar is used during echo t >/proc/sysrq-trigger
+
+--- Comment (adilger, Tue, 23 Jan 2024 00:06:30 +0000) ---
+It  looks like there is some infrastructure to handle this already:
+
+static int ipa_smp2p_panic_notifier_register(struct ipa_smp2p *smp2p)
+{
+        /* IPA panic handler needs to run before modem shuts down */
+        smp2p->panic_notifier.notifier_call = ipa_smp2p_panic_notifier;
+        smp2p->panic_notifier.priority = INT_MAX;       /* Do it early */
+
+        return atomic_notifier_chain_register(&panic_notifier_list,
+                                              &smp2p->panic_notifier);
+}
+
+but this looks like it is only for a panic, not necessarily a stack trace...
+
+--- Comment (JIRAUSER18433, Mon, 22 Jan 2024 16:15:49 +0000) ---
+The discussion was on LU-17242.
+
+Seems useful. I think we could register a custom panic handler. I see upstream drivers (like drivers/net/ipa/ipa_smp2p.c) doing something like that. We could avoid extending custom Lustre debugging and it should work on every panic. Adding current->journal_info to the handler would be easy. Getting the Lustre specific info might be tougher, but I saw some ideas upstream we could probably copy. The ipa just embedded the notifier_block in a larger struct and used container_of to get everything else.
+
+--- Comment (adilger, Mon, 22 Jan 2024 16:12:09 +0000) ---
+timday, stancheff I recall a discussion that mentioned it is possible to extend the dump_stack() functionality to include more information, and this was already being done in some device driver.  Unfortunately, I can't find that here or LU-16375 that is also discussing a similar issue.
+
+--- Comment (paf0186, Wed, 8 Mar 2023 20:14:39 +0000) ---
+I'm not sure about how it would be implemented - not quite obvious to me what you're getting at - but if we do this, we should definitely dump all the locks on the resource we're trying to lock.
+
+--- Comment (adilger, Wed, 8 Mar 2023 19:54:08 +0000) ---
+I'd welcome input on this idea, whether you think it is practical to implement, or if there is something better we could do?
+
+Having a full crash dump available can be very helpful if it is captured in a timely manner, or having a mechanism in sysfs (like LU-14858) to dump the lock state at the time of the problem is useful, but often the issue is only caught afterward, or the customer doesn't want to crashdump the machine and/or the size of the crashdump makes it impractical.

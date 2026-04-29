@@ -1,0 +1,218 @@
+Key:        LU-19076
+Summary:    resend can hit the original request on server
+Link:       https://jira.whamcloud.com/browse/LU-19076
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Qian Yingjin
+Reporter:   Alex Zhuravlev
+Created:    Fri, 30 May 2025 15:28:30 +0000
+Updated:    Thu, 12 Jun 2025 14:28:43 +0000
+Links:      Related: is related to  LU-3338; Related: is related to  LU-5703
+
+--- Description ---
+in some environment the following race is possible:
+
+	client sends GETATTR with say 1K reply buffer
+
+	MDS replies back with 2K buffer (LOVEA has just changed)
+
+	client resends GETATTR with an extended buffer
+
+	MDS finds the original request on on export's list and reject the new one
+
+	client has no reply, times out
+
+if the client holds a lock for this request, then the client can get evicted and applications can may hit EIO problem.
+
+--- Comment (gerrit, Thu, 12 Jun 2025 06:37:18 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/59497/
+
+Subject: LU-19076 ptlrpc: resend can hit original req
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 3f2bfd1b0e2ec78b12bd64f58d0a48a9b4f04978
+
+--- Comment (adilger, Tue, 10 Jun 2025 05:34:34 +0000) ---
+I think there are a few options here:
+
+	previously discussed change to the layout refresh, to base this on the actual file layout in use (plain or PFL) instead of just randomly picking a large number
+
+	have some sort of counter on the client to detect if a large number of files are being opened without close, and start shrinking the RPC replay buffer in that case.  For the open/close/open/close workload the size of the buffer is not important, but when many files are opened then the extra overhead of shrinking the buffer is worthwhile.
+
+	re-implement how open file handles are replayed on the client, instead of storing the RPC reply buffer in memory forever.  Once the open is committed, we don't really need to save the RPC buffer anymore, and a new open RPC could be generated during replay (see  LU-5703 for details.  This would be more work, but improves the open recovery for multiple reasons.
+
+--- Comment (adilger, Mon, 9 Jun 2025 18:11:26 +0000) ---
+Maybe there are some place wrong and break it in the current Lustre code?
+
+This is often the case when there is not a test case verifying the correct functioning, or maybe the above changes were not quite implemented correctly and it wasn't noticed because there was no test case. At least sanity test_51f has caught this issue indirectly. That is why I don't want to weaken this test case by manually resetting the MDS easize to make the test case pass.
+
+--- Comment (qian_wc, Mon, 9 Jun 2025 10:39:45 +0000) ---
+It is strange that we hit sanity/test_51f as we save the actual lOV/LMV EA data into the request buffer (in mdc_save_lmm()) for open replay instead of reply buffer on the client side.
+
+And we have a feature to free reply buffer earlier for open RPCs:
+
+https://review.whamcloud.com/#/c/fs/lustre-release/+/27208/
+
+LU-9514 ptlrpc: free reply buffer earlier for open RPC
+
+It is unnecessary to keep the reply buffer for open RPC. Replay
+related data has already been saved in the request buffer when
+the RPC replied. If the open replay really happen, the replay
+logic will alloc the reply buffer when needed.
+
+On the other hand, the client always tries to alloc big enough
+space to hold the open RPC reply since the client does not exactly
+know how much data the server will reply to the client. So the reply
+buffer may be quite larger than the real needed. Under such case,
+keeping the large reply buffer for the open RPC will occupy a lot
+of RAM as to OOM if the are too many open RPCs to be replayed.
+
+This patch frees the reply buffer for the open RPC when only
+the replay logic holds the last reference of the RPC. 
+
+static int __ptlrpc_req_put(struct ptlrpc_request *request, int locked)
+/*
+	 * For open RPC, the client does not know the EA size (LOV, ACL, and
+	 * so on) before replied, then the client has to reserve very large
+	 * reply buffer. Such buffer will not be released until the RPC freed.
+	 * Since The open RPC is replayable, we need to keep it in the replay
+	 * list until close. If there are a lot of files opened concurrently,
+	 * then the client may be OOM.
+	 *
+	 * If fact, it is unnecessary to keep reply buffer for open replay,
+	 * related EAs have already been saved via mdc_save_lmm() before
+	 * coming here. So it is safe to free the reply buffer some earlier
+	 * before releasing the RPC to avoid client OOM. LU-9514
+	 */
+	if (count == 1 && request->rq_early_free_repbuf && request->rq_repbuf) {
+		spin_lock(&request->rq_early_free_lock);
+		sptlrpc_cli_free_repbuf(request);
+		request->rq_repbuf = NULL;
+		request->rq_repbuf_len = 0;
+		request->rq_repdata = NULL;
+		request->rq_reqdata_len = 0;
+		spin_unlock(&request->rq_early_free_lock);
+	}
+	spin_unlock(&request->rq_lock);
+
+I am curious why we still hit OOM with the features above...
+
+Maybe there are some place wrong and break it in the current Lustre code?
+
+--- Comment (qian_wc, Mon, 9 Jun 2025 02:24:13 +0000) ---
+I think the right long-term solution here is for the client to allocate an appropriate sized buffer for the layout refresh based on the maximum size of the (PFL) layout instead of XATTR_MAX_SIZE. This will avoid too-large allocations, while also avoiding most RPC resends
+
+This is current the patch https://review.whamcloud.com/c/fs/lustre-release/+/59557 does.
+
+The above patch only caps the maximum default EA size with the min. value of the returned maximum layout EA size from MDT and XATTR_MAX_SIZE, not set it with XATTR_MAX_SIZE.
+
+The shortcoming of the patch is that it can not shrink or reduce the maximum default EA size on the client (only growing it).
+
+ 
+
+Thus the better solution may be using a time sliding window to determine the maximum default EA size on both client/server side and it can adjust according the workloads over time to avoid always using the largest value.
+
+--- Comment (JIRAUSER19463, Sun, 8 Jun 2025 23:02:01 +0000) ---
+Somehow I'm not able to log into review.whamcloud.com any more, but I think this line https://review.whamcloud.com/c/fs/lustre-release/+/59497/11/lustre/ptlrpc/niobuf.c#742 might be a little bit too intrusive, because it may affect the case the reply is somehow lost in the network and the tx is not committed yet, it may introduce issues because it will no longer be able to reconstruct a reply.
+
+(I haven't checked into the code yet but) Would it be possible to reply a retryable error so that the next time the original request may be taken out from the list?
+
+--- Comment (JIRAUSER19463, Sun, 8 Jun 2025 22:48:43 +0000) ---
+I sort of agree with Alex on this since this case is very rare so it's probably inappropriate to always request the largest possible buffer on the first try, but it's probably okay to request the largest buffer size on retry.
+
+--- Comment (adilger, Sun, 8 Jun 2025 19:27:37 +0000) ---
+I think the right long-term solution here is for the client to allocate an appropriate sized buffer for the layout refresh based on the maximum size of the (PFL) layout instead of XATTR_MAX_SIZE. This will avoid too-large allocations, while also avoiding most RPC resends.
+
+--- Comment (gerrit, Wed, 4 Jun 2025 10:17:56 +0000) ---
+"Qian Yingjin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/59557
+
+Subject: LU-19076 obd: change OBD_MAX_DEFAULT_EA_SIZE with XATTR_SIZE_MAX
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 294c90200a19d576457c4a0918b024d78060ab52
+
+--- Comment (adilger, Wed, 4 Jun 2025 09:13:56 +0000) ---
+OBD_ALLOC_LARGE() is calling kmalloc() first, and only falls back to vmalloc() if this fails.  I suspect on modern systems that 64KB allocations will mostly be handled by kmalloc() so we shouldn't have as much overhead as Lustre 2.5-era kernels.
+
+We can still optimize the allocation size for layout refresh, so it doesn't need to allocate the full 64KB for each file.
+
+--- Comment (bzzz, Wed, 4 Jun 2025 03:13:16 +0000) ---
+I'm fine to make reply fix, but would like to notice:
+
+	the original problem (where the overflow happens) is very rare in the first place while vmalloc brings permanent overhead to every request
+
+	it's still possible with a larger buffer
+
+I'll try to check how often we resend in the scenario above.
+
+--- Comment (adilger, Tue, 3 Jun 2025 23:40:41 +0000) ---
+Except that most of the allocations won't be vmalloc(), they will be kmalloc() with a multi-page allocation.  Back in the 2.5 release when the LU-3338 patch was written, OBD_ALLOC_LARGE() was hard-coded to change over to vmalloc() at 16KiB, rather than try kmalloc() first:
+
+#define OBD_ALLOC_BIG (4 * PAGE_CACHE_SIZE)
+#define OBD_ALLOC_LARGE(ptr, size)                                            \
+do {                                                                          \
+        if (size > OBD_ALLOC_BIG)                                             \
+                OBD_VMALLOC(ptr, size);                                       \
+        else                                                                  \
+                OBD_ALLOC(ptr, size);                                         \
+} while (0)
+
+In any case, we can still do better than just "allocate the maximum size every time" if refetching the layout after the layout lock cancellation, but this one-line change will at least tell us if having the largest buffer from the beginning avoids the RPC retry issue being seen.
+
+It also has the benefit of being a client-side fix, which is more easily tested, and is complementary to Alex's server-side fix, so that either new client or server will fix the issue.
+
+--- Comment (paf0186, Tue, 3 Jun 2025 21:52:57 +0000) ---
+This suggestion makes sense to me - vmalloc is supposedly much improved, so we're not as likely to pile up on a single lock.  We should be aware of that possibility during something like mdtest - It could be we'd still absolutely pile up behind some portion of the vmalloc subsystem.  That's why this change was made - a large number of threads piling up on effectively a single vmalloc lock, if memory serves.
+
+So it's worth a try, just be aware it might bite us under some loads and we should probably check.
+
+--- Comment (adilger, Tue, 3 Jun 2025 21:24:51 +0000) ---
+bzzz, I think this could be solved most efficiently by having the client allocate a large enough buffer for the layout on the first request.  If it is doing a layout lock refresh, then the client will already have a copy of the previous trusted.lov xattr for the file (possibly with uninitialized last components), and it could use that to calculate the maximum xattr size if the layout was fully instantiated (with "stripe_count = -1" replaced with ost_count (even though the actual stripe allocation may be limited by actual pool usage, etc.).
+
+It looks like the relevant code was reworked in patch http://review.whamcloud.com/6339 ("LU-3338 llite: Limit reply buffer size") and it imposed a limit:
+
+/*
+ * Limit reply buffer size for striping data to one x86_64 page. This
+ * value is chosen to fit the striping data for common use cases while
+ * staying well below the limit at which the buffer must be backed by
+ * vmalloc(). Excessive use of vmalloc() may cause spinlock contention
+ * on the MDS.
+ */
+#define OBD_MAX_DEFAULT_EA_SIZE 4096
+
+This should be changed to at least PAGE_SIZE rather than 4096, since the original issue was about multi-page vmalloc() allocations causing memory pressure on old kernels (el6=3.12).  That doesn't apply to large-PAGE_SIZE clients like aarch64, so they shouldn't be restricted in ll_set_default_mdsize() to such a small size.
+
+It could safely be increased further to max(PAGE_SIZE, 8192), since OBD_ALLOC_LARGE() is trying kmalloc() first which should almost always succeed for at least 8KB, so it should avoid vmalloc() overhead unless necessary, and newer kernels have improved vmalloc() performance anyway.  Even so, vmalloc() overhead is nothing compared to sending 2-3 extra RPC round trips.
+
+I think this fix to the client allocating the reply buffer more optimally, and your patch fixing the server for cases where the client does not have the patch, or in case the uncommon case that the layout grows suddenly and the client doesn't know what layout size to use.
+
+As a prototype, it should be enough to change the maximum xattr buffer size and see if the problem can still be reproduced:
+
+#define OBD_MAX_DEFAULT_EA_SIZE XATTR_SIZE_MAX
+
+This would need the client to have accessed at least one large file layout before the load was applied...
+
+--- Comment (gerrit, Fri, 30 May 2025 15:46:54 +0000) ---
+"Alex Zhuravlev " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/59497
+
+Subject: LU-19076 tests: resend can hit original req
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 6af261c4b22afccaa191bf47a50033ebe2d0f427

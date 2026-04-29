@@ -1,0 +1,227 @@
+Key:        LU-12667
+Summary:    Read doesn't perform well in complex NUMA configuration
+Link:       https://jira.whamcloud.com/browse/LU-12667
+Type:       Bug
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Shuichi Ihara
+Created:    Thu, 15 Aug 2019 14:19:41 +0000
+Updated:    Mon, 8 Jun 2020 22:19:40 +0000
+Links:      Related: is related to  LU-12194
+Attachments: LU-12667-lnetselftest-results.txt, lnet_selftest.sh
+
+--- Environment ---
+master branch, AMD EYPC CPU
+
+--- Description ---
+For instance, AMD EPYC 7551(32 CPU cores) has 4 dies on an CPU socket and each die consists of 8 CPU cores and also each numa node.
+
+ If two CPU sockets per client, total 64 CPU cores (128 CPU cores with logical processors) and 8 NUMA nodes.
+
+# numactl -H
+available: 8 nodes (0-7)
+node 0 cpus: 0 1 2 3 4 5 6 7 64 65 66 67 68 69 70 71
+node 0 size: 32673 MB
+node 0 free: 31561 MB
+node 1 cpus: 8 9 10 11 12 13 14 15 72 73 74 75 76 77 78 79
+node 1 size: 32767 MB
+node 1 free: 31930 MB
+node 2 cpus: 16 17 18 19 20 21 22 23 80 81 82 83 84 85 86 87
+node 2 size: 32767 MB
+node 2 free: 31792 MB
+node 3 cpus: 24 25 26 27 28 29 30 31 88 89 90 91 92 93 94 95
+node 3 size: 32767 MB
+node 3 free: 31894 MB
+node 4 cpus: 32 33 34 35 36 37 38 39 96 97 98 99 100 101 102 103
+node 4 size: 32767 MB
+node 4 free: 31892 MB
+node 5 cpus: 40 41 42 43 44 45 46 47 104 105 106 107 108 109 110 111
+node 5 size: 32767 MB
+node 5 free: 30676 MB
+node 6 cpus: 48 49 50 51 52 53 54 55 112 113 114 115 116 117 118 119
+node 6 size: 32767 MB
+node 6 free: 30686 MB
+node 7 cpus: 56 57 58 59 60 61 62 63 120 121 122 123 124 125 126 127
+node 7 size: 32767 MB
+node 7 free: 32000 MB
+node distances:
+node   0   1   2   3   4   5   6   7 
+  0:  10  16  16  16  32  32  32  32 
+  1:  16  10  16  16  32  32  32  32 
+  2:  16  16  10  16  32  32  32  32 
+  3:  16  16  16  10  32  32  32  32 
+  4:  32  32  32  32  10  16  16  16 
+  5:  32  32  32  32  16  10  16  16 
+  6:  32  32  32  32  16  16  10  16 
+  7:  32  32  32  32  16  16  16  10 
+
+Also first generation EYPC(Naples) has PCI controller per die (NUMA node) and IB HCA connected to one of PCIe controller like below.
+
+# cat /sys/class/infiniband/mlx5_0/device/numa_node 
+5
+
+mlx5_0 adapter conneted to CPU1's NUMA node1 which is numa node 5 in 2 socket configuration.
+
+In this case, default LNET performance doesn't perform well and it requires manual CPT setting, but still highly relies on what CPT configuration and cpu cores are involved.
+
+ Here is quick LNET selftest results with default CPT and NUMA aware an CPT configuration.
+
+default CPT setting(cpu_npartitions=8)
+client:server   PUT(GB/s)  GET(GB/s)
+     1:1          7.0        6.8 
+     1:2         11.3        3.2
+     1:4         11.4        3.4
+
+1 CPT(cpu_npartitions=1 cpu_pattern="0[40-47,104,111]")
+client:server   PUT(GB/s)  GET(GB/s)
+     1:1         11.0       11.0
+     1:2         11.4       11.4
+     1:4         11.4       11.4
+
+numa aware CPT configuration made much better LNET performance, but CPT requires not only LNET, but also all other Lustre client threads. In general, we want to get more number of CPU cores and CPTs involved, but LNET needs to be ware of CPT and NUMA node where network interface installed.
+
+--- Comment (sihara, Thu, 29 Aug 2019 22:46:59 +0000) ---
+Actually, I understood that there is PCI bandwdith limiation on dual port HCA, but 3-4GB is REALLY lower than expected single EDR bandwdith and I was suspecting something NUMA  or NUMA/IO or CPT related problem behind. I don't want to get higher bandwdith by number of HCA here, but I am trying number of configurations (e.g. increasing peers, pin CPT to interface, use an dedicate CPT, etc) since as I said before, we are getting better performance on single EPYC client, but once added another CPU, read performance drops.
+
+--- Comment (bobhawkins, Thu, 29 Aug 2019 20:39:53 +0000) ---
+Perhaps this is why two ports on one HCA are not scaling?
+
+Examine the card slot:
+
+One PCIe gen3 lane has max electrical signaling bandwidth of 984.6 MB/s.One “PCIe gen3 x16” slot has sixteen lanes: 16 * 984.6 = 15.75 GB/s max (guaranteed not to exceed)
+
+And the dual-port HCA:
+
+One dual-port EDR-IB card requires a x16 slot but “offers” two 100Gb/s (12.5 GB/s) ports.Data encoding allows 64 of 66 bits to be used; 2 bits are for error correction.12.5 GB/s max * (64/66) leaves 12.1 GB/s usable bandwidth for one port to run at full speed.
+
+ 
+
+Therefore, the 15.75 GB/s “x16” slot only allows one port to run at full 12.1 GB/s EDR-IB speed. Cabling both ports, and assigning LNETs to both ports, without LNET knowing how to apportion bandwidth among the two ports, seems problematic. The x16 slot only provides ~65% of the bandwidth required to run both ports at speed.
+
+--- Comment (ashehata, Thu, 29 Aug 2019 18:03:54 +0000) ---
+I've observed that if you add two ports on the same HCA as different interfaces to the LNet network there is no performance boost. Performance boost is only seen when you add two different physical HCA cards. Not 100% sure why that is.
+
+A read test would do an RDMA write from the server to the client. Have you tried a write selftest from the two servers to the client? I'm wondering if you'd get the 11GB/s performance in this case.
+
+--- Comment (sihara, Wed, 28 Aug 2019 23:54:00 +0000) ---
+If another interface is added on client as multi-rail, read performance bumps up.
+
+but, it's a bit strange.. if I added an interface which is same numa node as primary interface, performance doesn't scale. but if i added an interface which is different numa node from primary interface, performance improved.
+
+e.g. 
+
+root@mds15:~# cat /sys/class/net/ib0/device/numa_node 
+5
+root@mds15:~# cat /sys/class/net/ib1/device/numa_node 
+5
+root@mds15:~# cat /sys/class/net/ib2/device/numa_node 
+6
+root@mds15:~# cat /sys/class/net/ib3/device/numa_node 
+6
+
+options lnet networks="o2ib10(ib0)"
+Max Read:  3881.91 MiB/sec (4070.48 MB/sec)
+
+options lnet networks="o2ib10(ib0,ib1)"
+Max Read:  3193.72 MiB/sec (3348.86 MB/sec)
+
+options lnet networks="o2ib10(ib0,ib2)"
+Max Read:  6110.81 MiB/sec (6407.65 MB/sec)
+
+--- Comment (sihara, Thu, 22 Aug 2019 01:07:37 +0000) ---
+OK, here is a test result which configured only an CPT and allocates all cpus in numa node 5 into that CPT.
+
+ like this
+
+options lnet networks="o2ib10(ib0)"
+options libcfs cpu_npartitions=1 cpu_pattern="0[40-47,104,111]"
+
+# cat /sys/kernel/debug/lnet/cpu_partition_table
+0	: 40 41 42 43 44 45 46 47 104 111
+
+LNET selftest performs 11GB/sec from single client to against either 2 or 4 servers, but IOR read still hit 4GB/sec against 2 OSS (not only two OSS, but also any number of multiple servers)
+
+ If number of OSS reduced to 1, performance goes up 8GB/sec. This is exact same IOR results above.
+
+--- Comment (ashehata, Thu, 22 Aug 2019 00:13:33 +0000) ---
+One thing to consider is that when RDMAing to/from buffers, these buffers are allocated on a specific NUMA node. They could be spread across all the NUMA nodes. If the NUMA node the buffer is allocated on is far from the IB interface doing the RDMAing, then it would impact performance. When we were doing the MR testing we noticed a significant impact due to these NUMA penalties. Granted they were on large UV machine, but the same problem could be happening here as well.
+
+One thing to try is to restrict buffer allocation to NUMA node 5. Can we try this and see how it impacts performance.
+
+--- Comment (sihara, Wed, 21 Aug 2019 15:08:14 +0000) ---
+this is not striped file and it's file-per-process..
+
+--- Comment (wshilong, Wed, 21 Aug 2019 15:04:27 +0000) ---
+FYI, there is a known problem for read for striped files:
+
+https://review.whamcloud.com/#/c/35438/
+
+This should help read for striped different OST/OSS performances I guess.
+
+--- Comment (sihara, Wed, 21 Aug 2019 14:52:37 +0000) ---
+it's same read preformance degradation regardless CPT binding or not.
+
+But, at least, I saw good lnet selftest performance even against multiple OSSs with CPT binding, but when client does actual IO read operation, perforamnce doesn't scale by nunber of OSS.
+
+--- Comment (pfarrell, Wed, 21 Aug 2019 14:30:54 +0000) ---
+Well, that makes sense to me if it's a CPT binding issue of some kind, because the CPT binding is linked to the OSS, not OST.  And the CPT binding stuff in Lustre on the client mostly matters at the Lnet/o2ib type layers, as you know, so...  That sort of fits.
+
+Hm.  I'll reply to your email.
+
+--- Comment (sihara, Wed, 21 Aug 2019 09:05:19 +0000) ---
+Originally, we wanted good single client write and read performance, but initial read performance was bad. I was thinking this was because cpt configuration for LNET was not optimal for such numa node configuration. However, problem seems to be even complex and still not sure this is LNET problem or others.
+
+Here is quick test results.
+
+# cat /etc/modprobe.d/lustre.conf 
+options lnet networks="o2ib10(ib0)[5]"
+
+LNET selftest (RPC PUT)
+
+client - oss1 11.0GB/sec
+client - oss2 11.0GB/sec
+client - oss1,oss2 (distributed) 11.4GB/sec 
+
+All lnet performance seems to be good.
+
+IOR (read, FPP, 1MB)
+
+mpirun -np 32 /work/tools/bin/ior -o /scratch0/2ost/file -a POSIX -r -e -b 4g -t 1m -F -C -vv  -k
+client - oss1 (2xOST) 8.1GB/sec 
+client - oss2 (2xOST) 8.1GB/sec
+client - oss1,oss2 (4xOST) distributed 3.9GB/sec
+client - oss1 (4xOST) 8.1GB/sec
+
+If client read data from single OSS, performance is reasonable (still not perfect, but not so bad), but if client talks multiple OSSs, read performance drops.
+
+ I thought it's related to numbers of OSC, but as far as I tested same same 4xOSC, but it was single OSS, performance is good. I will dig more..
+
+--- Comment (ashehata, Thu, 15 Aug 2019 15:27:24 +0000) ---
+For the sake of keeping a record. As discussed:
+
+the performance issue comes from the fact that the LND threads are spread across all the CPTs
+
+I'm guessing in this NUMA configuration that has a performance impact
+
+by restricting the NI on the set of CPTs you're interested in, then the LND threads are only spawned on these cores. 
+
+RDMA is more efficient since it doesn't have to cross NUMA boundary.
+
+The issue with automated tuning is that there is no criteria to base the tuning on in this case. Do you have suggestion on how to automate this config?
+
+--- Comment (sihara, Thu, 15 Aug 2019 14:55:12 +0000) ---
+Then, assign of an CPT to NI works. automated fine tunning (e.g defects numa node for NI) might be better, but manual setting is workable solsuion as a workaround.
+
+options lnet networks="o2ib10(ib0)[5]"
+
+# cat /sys/kernel/debug/lnet/cpu_partition_table
+0	: 0 1 2 3 4 5 6 7 64 65 66 67 68 69 70 71
+1	: 8 9 10 11 12 13 14 15 72 73 74 75 76 77 78 79
+2	: 16 17 18 19 20 21 22 23 80 81 82 83 84 85 86 87
+3	: 24 25 26 27 28 29 30 31 88 89 90 91 92 93 94 95
+4	: 32 33 34 35 36 37 38 39 96 97 98 99 100 101 102 103
+5	: 40 41 42 43 44 45 46 47 104 105 106 107 108 109 110 111
+6	: 48 49 50 51 52 53 54 55 112 113 114 115 116 117 118 119
+7	: 56 57 58 59 60 61 62 63 120 121 122 123 124 125 126 127

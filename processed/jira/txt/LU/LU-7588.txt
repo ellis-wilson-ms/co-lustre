@@ -1,0 +1,191 @@
+Key:        LU-7588
+Summary:    endless recovery on lustre 2.7
+Link:       https://jira.whamcloud.com/browse/LU-7588
+Type:       Bug
+Priority:   Critical
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Di Wang
+Reporter:   Sergey Cheremencev
+Created:    Mon, 21 Dec 2015 18:54:46 +0000
+Updated:    Fri, 11 May 2018 18:27:42 +0000
+Resolved:   Fri, 9 Sep 2016 17:48:14 +0000
+
+--- Description ---
+After upgrading Lustre from 2.5.1 to 2.7.61 on snx11117 the clients can not be mounted (mount client hangs) because of endless recovery:
+
+[423225.578209] Lustre: snx11117-MDT0000: Denying connection for new client 3ec3f6c4-e172-39d7-383c-d4c19737f54c(at 10.9.100.9@o2ib3), waitin
+g for 2 known clients (2 recovered, 0 in progress, and 0 evicted) to recover in 21188498:05                                                  
+[423225.601237] Lustre: Skipped 41 previous similar messages   
+
+It seems "LU-3540 lod: update recovery thread" broke recovery_time_hard functionality.
+
+check_for_recovery_ready causes endless loop in target_recovery_overseer when flag tdtd_replay_ready is not set:
+
+static int check_for_recovery_ready(struct lu_target *lut)
+...
+       if (!obd->obd_abort_recovery && !obd->obd_recovery_expired) {
+                LASSERT(clnts obd_max_recoverable_clients);
+                if (clnts + obd->obd_stale_clients obd_max_recoverable_clients)
+                        return 0;
+        }    
+
+        if (lut->lut_tdtd != NULL) {
+                if (!lut->lut_tdtd->tdtd_replay_ready) {
+                        /* Let's extend recovery timer, in case the recovery
+                         * timer expired, and some clients got evicted */
+                        extend_recovery_timer(obd, obd->obd_recovery_timeout,
+                                              true);
+                        return 0;
+                } else {
+                        dtrq_list_dump(lut->lut_tdtd, D_HA);
+                }    
+        }    
+
+check_for_recovery_ready doesn't return 1 despite of the fact that all clients already connected and recovery has expired:
+
+00010000:00080000:0.0:1450170133.405945:0:243397:0:(ldlm_lib.c:2081:check_for_recovery_ready()) connected 2 stale 0 max_recoverable_clients 2 abort 0 expired 1
+
+Because of not set tdtd_replay_ready flag check_for_recovery_ready returns 0 and trying to extend recovery timer(without success):
+
+00010000:00080000:0.0:1450170133.405947:0:243397:0:(ldlm_lib.c:1745:extend_recovery_timer()) snx11117-MDT0000: recovery timer will expire in 4294905278 seconds
+
+Imo below strings brake previous logic of target_recovery_overseer and recovery_time_hard:
+
+        if (!obd->obd_abort_recovery && !obd->obd_recovery_expired) {
+                LASSERT(clnts obd_max_recoverable_clients);
+                if (clnts + obd->obd_stale_clients obd_max_recoverable_clients)
+                        return 0;
+        }
+
+See the difference with check_for_clients used before LU-3540:
+
+static int check_for_clients(struct obd_device *obd)
+{
+       unsigned int clnts = atomic_read(&obd->obd_connected_clients);
+
+       if (obd->obd_abort_recovery || obd->obd_recovery_expired)
+               return 1;
+       LASSERT(clnts obd_max_recoverable_clients);
+       return (clnts + obd->obd_stale_clients ==
+               obd->obd_max_recoverable_clients);
+}
+
+--- Comment (di.wang, Fri, 9 Sep 2016 17:48:14 +0000) ---
+http://review.whamcloud.com/17885 is already landed.  Let's close the ticket for now.  Sergey, if you do not think this  solve your problem, feel free to re-open it.
+
+--- Comment (di.wang, Fri, 12 Feb 2016 18:44:06 +0000) ---
+Sorry for delay response.
+
+Do you have any documentation about this ?
+{no format}
+
+Sorry, no formal document yet. But check this patch http://review.whamcloud.com/17885 LU-7638, the console message has been improved to notify the user to abort or wait a few more minutes.
+
+{ noformat}
+Want to note that delay above recovery_time_hard will cause recovery abort and loss of all replays as result.
+Is it reasonable to arm recovery_timer only when tdtd_replay_ready is set ?
+I mean we can add to recovery_time_hard the difference between the start_of_recovery and the time when tdtd_replay_ready is set.
+This gives the ability to complete recovery in case when too much time spent to update logs from all MDTs.
+
+recovery_time_hard is sth the user provides (or define by system) to limit the time of recovery, I am not sure we should extend it during recovery. Hmm, the reason we do not abort DNE recovery is to keep the namespace consistency, but after COS is landed, maybe we should stop DNE recovery as well when it reaches to obd_recovery_time_hard.
+
+Anyway, please check the latest master, which already includes http://review.whamcloud.com/17885, see if you can still reproduce the problem. Thanks.
+
+--- Comment (sergey, Tue, 29 Dec 2015 20:12:17 +0000) ---
+Thanks for explanation. 
+
+Yes, it was DNE system.
+
+Recovery continued for several days before was aborted and lustre logs don't cover the moment of recovery start.
+
+Console logs also don't include any information about the failure. Both are spammed with:
+
+309642.675887] Lustre: snx11117-MDT0000: Client snx11117-MDT0001-mdtlov_UUID (at 10.9.100.15@o2ib3) reconnecting, waiting for 22 clients in recovery for 21183383:17
+...
+and
+00010000:00080000:4.0:1449753210.886072:0:174125:0:(ldlm_lib.c:2081:check_for_recovery_ready()) connected 2 stale 0 max_recoverable_clients 22 abort 0 expired 1
+00010000:00080000:4.0:1449753210.886074:0:174125:0:(ldlm_lib.c:1745:extend_recovery_timer()) snx11117-MDT0000: recovery timer will expire in 4294901676 seconds
+00010000:00080000:4.0:1449753220.469393:0:174125:0:(ldlm_lib.c:2081:check_for_recovery_ready()) connected 2 stale 0 max_recoverable_clients 22 abort 0 expired 1
+00010000:00080000:4.0:1449753220.469397:0:174125:0:(ldlm_lib.c:1745:extend_recovery_timer()) snx11117-MDT0000: recovery timer will expire in 4294901666 seconds
+
+If it is expected behaviour that recovery should be aborted manually in such case I agree we can lower ticket priority.
+
+I asked our testers to try to reproduce the problem and gather more logs.
+
+For DNE system, cross-MDT recovery will not expire by normal timeout, until sys admin abort recovery manually (obd_force_abort_recovery == 1), to avoid filesystem inconsistency.
+
+Do you have any documentation about this ?
+
+Want to note that delay above recovery_time_hard will cause recovery abort and loss of all replays as result.
+
+Is it reasonable to arm recovery_timer only when tdtd_replay_ready is set ?
+
+I mean we can add to recovery_time_hard the difference between the start_of_recovery and the time when tdtd_replay_ready is set.
+
+This gives the ability to complete recovery in case when too much time spent to update logs from all MDTs.
+
+Also suggest to add following fix:
+
+--- a/lustre/ldlm/ldlm_lib.c
++++ b/lustre/ldlm/ldlm_lib.c
+@@ -1740,8 +1740,9 @@ static void extend_recovery_timer(struct obd_device *obd, int drt, bool extend)
+         }
+        spin_unlock(&obd->obd_dev_lock);
+ 
+-       CDEBUG(D_HA, "%s: recovery timer will expire in %u seconds\n",
+-               obd->obd_name, (unsigned)cfs_time_sub(end, now));
++       if (end > now)
++               CDEBUG(D_HA, "%s: recovery timer will expire in %u seconds\n",
++                       obd->obd_name, (unsigned)cfs_time_sub(end, now));
+ }
+
+And something should be done with "to recover in 21188498:05":
+
+diff --git a/lustre/ldlm/ldlm_lib.c b/lustre/ldlm/ldlm_lib.c
+index 13e3e59..65f4a72 100644
+--- a/lustre/ldlm/ldlm_lib.c
++++ b/lustre/ldlm/ldlm_lib.c
+@@ -1216,17 +1216,25 @@ no_export:
+                        i = atomic_read(&target->obd_lock_replay_clients);
+                        k = target->obd_max_recoverable_clients;
+                        s = target->obd_stale_clients;
+-                       t = cfs_timer_deadline(&target->obd_recovery_timer);
+-                       t = cfs_time_sub(t, cfs_time_current());
+-                       t = cfs_duration_sec(t);
+                        LCONSOLE_WARN("%s: Denying connection for new client %s"
+                                      "(at %s), waiting for %d known clients "
+                                      "(%d recovered, %d in progress, and %d "
+-                                     "evicted) to recover in %d:%.02d\n",
++                                     "evicted) to recover\n",
+                                      target->obd_name, cluuid.uuid,
+                                      libcfs_nid2str(req->rq_peer.nid), k,
+-                                     c - i, i, s, (int)t / 60,
+-                                     (int)t % 60);
++                                     c - i, i, s);
++                       t = cfs_timer_deadline(&target->obd_recovery_timer);
++                       if (cfs_time_befor(cfs_time_current(), t)) {
++                               t = cfs_time_sub(t, cfs_time_current());
++                               t = cfs_duration_sec(t);
++                               LCONSOLE_WARN("%s: Recover expired in %d:%.02d\n",
++                                       target->obd_name, (int)t / 60,
++                                       (int)t % 60);
++                       } else {
++                               LCONSOLE_WARN("%s: Recover expired in unknown time\n",
++                                       target->obd_name);
++                       }
++
+                        rc = -EBUSY;
+                } else {
+
+--- Comment (di.wang, Tue, 22 Dec 2015 18:48:25 +0000) ---
+Yes, the protocol has been changed here. For DNE system, cross-MDT recovery will not expire by normal timeout, until sys admin abort recovery manually (obd_force_abort_recovery == 1), to avoid filesystem inconsistency. Is this multiple MDT filesystem?  I think we need to know why the recovery hang there (or even failed)  Could you please post the stack trace and console log here?
+
+Though this console message is misleading, and needs to be fixed.
+
+--- Comment (pjones, Tue, 22 Dec 2015 18:32:17 +0000) ---
+Di
+
+I know that things have changed in this area recently. Is this a duplicate of an existing issue or something new?
+
+Peter

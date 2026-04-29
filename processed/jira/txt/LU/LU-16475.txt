@@ -1,0 +1,105 @@
+Key:        LU-16475
+Summary:    Reusing OST indexes after lctl del_ost
+Link:       https://jira.whamcloud.com/browse/LU-16475
+Type:       Improvement
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Stephane Thiell
+Reporter:   Stephane Thiell
+Created:    Sat, 14 Jan 2023 04:53:48 +0000
+Updated:    Tue, 9 Apr 2024 06:11:28 +0000
+Links:      Related: is related to  LU-16722; Related: is related to  LU-7668; Related: is related to LU-3458
+
+--- Description ---
+I have been investigating the possibility of reusing OST indexes after lctl del_ost and I wanted to describe the current known issues and ideas for improvements in a ticket to get some feedback.
+
+We have been using lctl del_ost in production (backported to 2.12) on two different systems, and it worked great, as long as one doesn't intend to reuse the indexes of the deleted OSTs.
+
+lctl del_ost removes OSTs llog entries on the MGS in CONFIGS/fsname-MDT* and CONFIG/fsname-client. The MGS propagates those changes to MDTs and client. However, as long as the MDTs and clients are not restarted, they keep in-memory references to the deleted OSTs.
+
+Let's test after removing an OST as follow:
+
+ # lctl conf_param newfir-OST0000.osc.active=0 # deactive the OST
+ # lctl --device MGS del_ost --target newfir-OST0000 # remove OST from the config
+
+Using the following command on the MDS, we can see that the deleted OST (here OST0000) is still referenced:
+
+mds# lctl get_param osc.{*}OST{*}.prealloc_status
+osc.newfir-OST0000-osc-MDT0000.prealloc_status=-108
+osc.newfir-OST0001-osc-MDT0000.prealloc_status=0
+osc.newfir-OST0002-osc-MDT0000.prealloc_status=0
+osc.newfir-OST0003-osc-MDT0000.prealloc_status=0
+osc.newfir-OST0004-osc-MDT0000.prealloc_status=0
+osc.newfir-OST0005-osc-MDT0000.prealloc_status=0
+osc.newfir-OST0006-osc-MDT0000.prealloc_status=0
+osc.newfir-OST0007-osc-MDT0000.prealloc_status=0
+
+On the client, it can be seen with a "inactive device" in lfs df -v:
+
+[root@fir-rbh03 ~]# lfs df -v /newfir
+UUID 1K-blocks Used Available Use% Mounted on
+newfir-MDT0000_UUID 9056940 5548 8233744 1% /newfir[MDT:0]
+OST0000 : inactive device
+newfir-OST0001_UUID 148751801588 240244 147251465344 1% /newfir[OST:1] f
+newfir-OST0002_UUID 148751801588 175304 147251530284 1% /newfir[OST:2] f
+newfir-OST0003_UUID 148751801588 292072 147251413516 1% /newfir[OST:3] f
+newfir-OST0004_UUID 148751801588 299544 147251406044 1% /newfir[OST:4] f
+newfir-OST0005_UUID 148751801588 323452 147251382136 1% /newfir[OST:5] f
+newfir-OST0006_UUID 148751801588 226332 147251479256 1% /newfir[OST:6] f
+newfir-OST0007_UUID 148751801588 274664 147251430924 1% /newfir[OST:7] f
+
+filesystem_summary: 1041262611116 1831612 1030760107504 1% /newfir
+
+Ideally, all references to the OST should be removed after lctl del_ost, so that we can just reuse the OST index as if it were never used before.. But that seems quite a big endeavour.
+
+Now, if we remount the MDTs and clients, it's much better, there is no trace of the deleted OST in memory anymore. In theory, we should be able to reuse the OST index in that case. However, I found a problem with the current implementation of lctl del_ost which keeps a configuration file under CONFIGS/fsname-OST0000 on the MGS for the deleted OST. This is a problem that probably should be fixed (I will try to submit a patch for that). Indeed if we try to start a fresh OST with the same index after del_ost and a full restart of all targets, we still get the following error:
+
+Jan 13 15:10:55 fir-io1-s1 kernel: LustreError: 141-4: The config log for newfir-OST0000 already exists, yet the server claims it never registered. It may have been reformatted, or the index changed. writeconf the MDT to regenerate all logs.
+Jan 13 15:10:55 fir-io1-s1 kernel: LustreError: 55854:0:(mgs_llog.c:4351:mgs_write_log_target()) Can't write logs for newfir-OST0000 (-114)
+Jan 13 15:10:55 fir-io1-s1 kernel: LustreError: 55854:0:(mgs_handler.c:526:mgs_target_reg()) Failed to write newfir-OST0000 log (-114)
+
+it comes from mgs/mgs_llog.c in mgs_write_log_ost():
+
+3089         /* If the ost log already exists, that means that someone reformatted
+3090            the ost and it called target_add again. */
+3091         if (!mgs_log_is_empty(env, mgs, mti->mti_svname)) {
+3092                 LCONSOLE_ERROR_MSG(0x141, "The config log for %s already "
+3093                                    "exists, yet the server claims it never "
+3094                                    "registered. It may have been reformatted, "
+3095                                    "or the index changed. writeconf the MDT to "
+3096                                    "regenerate all logs.\n", mti->mti_svname);
+3097                 RETURN(-EALREADY);
+3098         }
+
+By manually removing CONFIGS/newfir-OST0000 from the MGS after del_ost, this error goes away, and then mounting a freshly formatted OST with the same index seems to work.
+
+The last thing I haven't heavily tested is the LAST_ID issue. In my tests, working only with few files, this doesn't seem to be an issue (does not trigger a lfsck layout check to try to repair it), but I wonder if that could be a problem in production, when LAST_ID is very high, as it doesn't seem to be reset to 0 when I check osc.newfir-OST0000-osc-MDT0000.prealloc_last_id when registering the replacement OST. I am wondering if there is a way to do ensure it is reset on del_ost? (where is it stored? perhaps this is also something we can clean on del_ost?)
+
+Just to clarify, note that we have never used mkfs.lustre --replace here, as we do actually want the new OST to register to the MGS+MDTs.
+
+--- Comment (adilger, Tue, 9 Apr 2024 06:07:50 +0000) ---
+sthiell, I had occasion today to think about this issue, and I came up with a potential solution (a few actually, but this is the best one IMHO):
+
+	when an OST is removed from the filesystem with del_ost (and future MDT removal with a new del_mdt), in addition to cancelling the existing configuration records, it should add a new "unconfig OSTxxxx" record at the end of the config llog
+
+	this new config record would be sent to mounted clients to unconfigure this OST if they have it
+
+	the "unconfig OSTxxxx" record would be a no-op if the OST is not already configured
+
+	the "unconfig OSTxxxx" LCTL record type could be chosen so that old clients ignore it, since they are no worse off than today, and unmounting would fix their limitation in either case
+
+	this leaves some "cruft" in the MGS config llog for each OST removed, but not a huge issue
+
+If the "cruft" in the MGS config log gets extreme (which can also happen for other reasons), there might be some benefit to renaming the old log to e.g. "FSNAME-client.MOUNT_GEN" and creating a new FSNAME-client log that is a compacted version of the original, but is only given out to new clients. Any new config changes would be added to the both (multiple) config logs until there are no more clients referencing the old config llog, at which point it could be deleted (e.g. at last client disconnect or at the end of recovery). That is not a required functionality for the OST removal, but could be useful for other reasons.
+
+ 
+
+That said, there is also benefit to the idea of LU-16722 to completely replace the MGS config llog with e.g. a YAML file that is managed by something like etcd/ctdb and the MGS can process this, and be told to reprocess it as needed.  That would allow the config file to be modified more easily, and potentially the clients could still be fed "config llog" records to maintain protocol compatibility/updates, or a new protocol feature could be used to ship the entire new YAML config wholesale to the clients and they "reprocess and update their config" as needed.  That might get expensive if there are 20k records in the config and 20k clients, but I suspect some savings could be had by simplifying the OST/MDT records to just be high-level "add FSNAME-OSTxxxx" and the details of device configuration are handled by each system (client or MDS).
+
+--- Comment (adilger, Sat, 14 Jan 2023 12:28:39 +0000) ---
+Two things here:
+
+	the config llogs are meant to be read in ascending order, and the clients just keep a cursor of where they are in the log. If new config records are added at the end (new OST or new parameter) the clients will read from the cursor to the current end of the log. With del_ost the clients have no way to know that records earlier in the llog were cancelled. It was expected that clients would have remounted long before there is a need to reuse the index.
+
+	the LAST_ID value is intentionally not reset to avoid giving out the same OST object number/FID+ost_index for two different files. The newly formatted OST will understand that the MDS has used objects op to N and start at N+1. There should not be any concern with this numbering. I'm not totally sure this is 100% fixed in 2.12.

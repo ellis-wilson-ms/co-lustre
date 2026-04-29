@@ -1,0 +1,186 @@
+Key:        LU-19784
+Summary:    tunefs.lustre takes very long with ldiskfs
+Link:       https://jira.whamcloud.com/browse/LU-19784
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Dongyang Li
+Reporter:   Alex Zhuravlev
+Created:    Thu, 15 Jan 2026 06:19:32 +0000
+Updated:    Wed, 21 Jan 2026 01:49:19 +0000
+Links:      Related: is related to  LU-13932; Related: is related to  LU-18818
+
+--- Description ---
+with LU-18818 tunefs.lustre takes much longer now.
+
+for example, conf-sanity/73b took ~20s before, now it takes 600+s on tmpfs backend.
+
+in AT it was ~100s before, now 700+s.
+
+AFAIU, this is due to MMP enabled as adding EXT2_FLAG_SKIP_MMP to open_flags_rw fixes the issue. I understand why MMP was enabled, but sure this behavior will be found confusing.
+
+--- Comment (gerrit, Wed, 21 Jan 2026 01:49:19 +0000) ---
+"Li Dongyang " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/63488
+
+Subject: LU-19784 tests: mmp/test_8 wait time changes
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: c7482cd6e6e6a4d17db82528a2e139fbcd06f802
+
+--- Comment (gerrit, Tue, 20 Jan 2026 07:32:42 +0000) ---
+"Li Dongyang " uploaded a new patch: https://review.whamcloud.com/c/tools/e2fsprogs/+/63478
+
+Subject: LU-19784 ext2fs: mmp wait time ajustments
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 1
+
+Commit: 373af3e8504daefd11ccc62d9065fc98b38393b1
+
+--- Comment (dongyang, Mon, 19 Jan 2026 02:13:27 +0000) ---
+I should elaborate in the previous comment, and yes I was talking about there should be a small delay between writing and reading back the mmp block.
+
+and I think if they both wait the same time, it's still protected as "write A, write B could happen as the same time, then sleep small delay; read A and read B would give either A or B, and the node failed the read back check will yield.
+
+The only case I can think of loosing the protection is:
+
+Node A
+Node B
+
+Read SEQ_CLEAN
+Read SEQ_CLEAN
+
+write A
+ 
+
+sleep delay
+ 
+
+read A OK
+ 
+
+mount proceeds, starts kmmpd
+
+and write A for the first time
+ 
+
+ 
+write B
+
+ 
+sleep delay
+
+ 
+read B OK
+
+Which I think is not likely if the small delay is reasonable like 2? We don't want the full on delay for the clean case, but we also don't want the delay to be too small to make the above case possible.
+
+--- Comment (adilger, Fri, 16 Jan 2026 14:20:03 +0000) ---
+NB: if you are working on this code (e.g. to initialize wait_time = 1), it would also be good to fix LU-13932 so that the overall wait time can still be reduced in most systems.
+
+--- Comment (adilger, Fri, 16 Jan 2026 14:15:06 +0000) ---
+nodes could mount the same fs up if they try to mount at the same time and both see EXT4_MMP_SEQ_CLEAN in the beginning?
+
+That is true even if they both wait the same time as well.  What is more important in this case is that they both check after writing the MMP block whether they got back the data they previously wrote.  However, they should have at least some delay between writing and reading, so that one of the two should get back a different value.  Otherwise, there is a tiny chance to have "write A; read A OK; write B; read B OK" succeed in quick succession without actually seeing that the other node updated the MMP block.
+
+What should be happening is "write A; write B; sleep A/B; read A FAIL; read B OK" and B claims ownership of the filesystem, while A refuses to mount it.  It would probably be enough to have the sleep A/B time only a second or two in the "clean" case, enough time to ensure that the initial "clean read + write + re-read" cannot overlap with a second "clean read + write re-read" without one of them seeing the write of the other.
+
+ZFS does this slightly differently, by writing multiple different (über?)blocks in a random order, then immediately reading them all back.  The chance of both nodes writing the same blocks in the same order is very low, so at least some of them would return the other nodes' signature (though this would cause both mounts to fail).
+
+--- Comment (dongyang, Fri, 16 Jan 2026 11:21:15 +0000) ---
+I think it's not e2fsprogs having a bug, but the kernel's ext4_multi_mount_protect is buggy. and as a result the kernel's mount doesn't wait at all.
+
+from ext4_multi_mount_protect() in kernel:
+
+/*
+ * Protect the filesystem from being mounted more than once.
+ */
+int ext4_multi_mount_protect(struct super_block *sb,
+                                    ext4_fsblk_t mmp_block)
+{
+        struct ext4_super_block *es = EXT4_SB(sb)->s_es;
+        struct buffer_head *bh = NULL;
+        struct mmp_struct *mmp = NULL;
+        u32 seq;
+        unsigned int mmp_check_interval = le16_to_cpu(es->s_mmp_update_interval);
+        unsigned int wait_time = 0;
+        int retval;
+...
+        seq = le32_to_cpu(mmp->mmp_seq);
+        if (seq == EXT4_MMP_SEQ_CLEAN)
+                goto skip;
+
+        if (seq == EXT4_MMP_SEQ_FSCK) {
+                dump_mmp_msg(sb, mmp, "fsck is running on the filesystem");
+                retval = -EBUSY;
+                goto failed;
+        }
+
+        wait_time = min(mmp_check_interval * 2 + 1,
+                        mmp_check_interval + 60);
+...
+skip:
+        /*
+         * write a new random sequence number.
+         */
+        seq = mmp_new_seq();
+        mmp->mmp_seq = cpu_to_le32(seq); 
+
+        /*
+         * On mount / remount we are protected against fs freezing (by s_umount
+         * semaphore) and grabbing freeze protection upsets lockdep
+         */
+        retval = write_mmp_block_thawed(sb, bh);
+        if (retval)
+                goto failed;
+
+        /*
+         * wait for MMP interval and check mmp_seq.
+         */
+        if (schedule_timeout_interruptible(HZ * wait_time) != 0) {
+                ext4_warning(sb, "MMP startup interrupted, failing mount");
+                retval = -ETIMEDOUT;
+                goto failed;
+        }
+
+        retval = read_mmp_block(sb, &bh, mmp_block);
+        if (retval)
+                goto failed;
+        mmp = (struct mmp_struct *)(bh->b_data);
+        if (seq != le32_to_cpu(mmp->mmp_seq)) {
+                dump_mmp_msg(sb, mmp,
+                             "Device is already active on another node.");
+                retval = -EBUSY;
+                goto failed;
+        }
+
+So if the sequence in mmp block is EXT4_MMP_SEQ_CLEAN, which is from a clean umount, it just goes to skip label without initializing wait_time, it's still 0.
+
+For the wait and check after writing the mmp block, in kernel we end up not waiting at all because wait_time is 0.
+
+If I'm correct 2 nodes could mount the same fs up if they try to mount at the same time and both see EXT4_MMP_SEQ_CLEAN in the beginning?
+
+--- Comment (bzzz, Fri, 16 Jan 2026 07:59:43 +0000) ---
+should Dongyang Li take a look?
+
+no, I don't have a solution, pardon.
+
+--- Comment (bzzz, Fri, 16 Jan 2026 07:58:15 +0000) ---
+it looks like MMP implementation in e2fsprogs is doing something wrong as kernel's mount doesn't wait that long.
+
+--- Comment (dongyang, Fri, 16 Jan 2026 07:44:10 +0000) ---
+So I think the delay is from the 60 iterations of tunefs.lustre, and each of the tunefs.lustre is sleeping about 11 seconds, because we wait mmp_check_interval * 2 + 1, and the default mmp_check_interval is 5 seconds.
+
+But seems if we are mounting the fs and then write ldd like the old ways, the kernel would still wait that period at least that's what I'm seeing from the code? I will dig more and report.
+
+--- Comment (adilger, Thu, 15 Jan 2026 20:29:27 +0000) ---
+bzzz do you already have a patch, or should dongyang take a look?

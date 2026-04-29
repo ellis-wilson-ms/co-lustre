@@ -1,0 +1,115 @@
+Key:        LU-19083
+Summary:    Skip duplicate check for BRW
+Link:       https://jira.whamcloud.com/browse/LU-19083
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Chris Horn
+Reporter:   Chris Horn
+Created:    Mon, 2 Jun 2025 19:30:23 +0000
+Updated:    Tue, 3 Jun 2025 20:09:39 +0000
+Attachments: dklogs.tar.bz2
+
+--- Description ---
+While testing a patch I observed the following. It causes client I/O to pause for 3 minutes.
+
+Client sends OST_WRITE:
+00000100:00100000:18.0:1747414833.706272:0:23387:0:(client.c:1739:ptlrpc_send_new_req()) Sending RPC req@0000000082a49555 pname:cluuid:pid:xid:nid:opc:job ptlrpcd_04_02:374cc1c6-8429-4b07-8b62-e2126738e254:23387:1832221755976640:16@kfi:4:
+00000100:00000200:18.0:1747414833.707643:0:321:0:(events.c:64:request_out_callback()) @@@ type 5, status 0  req@0000000082a49555 x1832221755976640/t0(0) o4->lustre-OST0000-osc-ffff914438ce6000@16@kfi:6/4 lens 488/448 e 0 to 0 dl 1747414986 ref 3 fl Rpc:r/0/ffffffff rc 0/-1 job:''
+Server starts handling:
+00000100:00100000:16.0:1747414833.741533:0:2453229:0:(service.c:2398:ptlrpc_server_handle_req_in()) got req x1832221755976640
+00000100:00100000:17.0:1747414833.744217:0:2451940:0:(service.c:2570:ptlrpc_server_handle_request()) Handling RPC req@0000000034418825 pname:cluuid+ref:pid:xid:nid:opc:job ll_ost_io05_000:374cc1c6-8429-4b07-8b62-e2126738e254+95:23387:x1832221755976640:12345-1@kfi:4:
+Client disconnect, reconnect, and resend:
+00000100:00080000:3.0:1747414833.769865:0:23370:0:(import.c:83:import_set_state_nolock()) 00000000ff08514c lustre-OST0000_UUID: changing import state from FULL to DISCONN
+00000100:00080000:1.0:1747414833.813929:0:15920:0:(import.c:83:import_set_state_nolock()) 00000000ff08514c lustre-OST0000_UUID: changing import state from DISCONN to CONNECTING
+00000100:00080000:10.0:1747414833.847275:0:23368:0:(import.c:83:import_set_state_nolock()) 00000000ff08514c lustre-OST0000_UUID: changing import state from CONNECTING to RECOVER
+00000100:00080000:10.0:1747414833.847314:0:23368:0:(client.c:3036:ptlrpc_resend_req()) @@@ going to resend  req@0000000082a49555 x1832221755976640/t0(0) o4->lustre-OST0000-osc-ffff914438ce6000@16@kfi:6/4 lens 488/448 e 0 to 0 dl 1747414986 ref 2 fl Rpc:eQr/0/ffffffff rc 0/-1 job:''
+00000100:00080000:10.0:1747414833.847317:0:23368:0:(import.c:83:import_set_state_nolock()) 00000000ff08514c lustre-OST0000_UUID: changing import state from RECOVER to FULL
+Server sees duplicate request and discards:
+00000100:00080000:16.0:1747414833.847115:0:2453103:0:(service.c:2100:ptlrpc_server_request_add()) @@@ Found duplicate req in processing  req@00000000f987a5ed x1832221755976640/t0(0) o4->374cc1c6-8429-4b07-8b62-e2126738e254@1@kfi:640/0 lens 488/0 e 0 to 0 dl 1747414920 ref 1 fl New:/2/ffffffff rc 0/-1 job:''
+00000100:00080000:16.0:1747414833.847118:0:2453103:0:(service.c:2101:ptlrpc_server_request_add()) @@@ Request being processed  req@0000000034418825 x1832221755976640/t0(0) o4->374cc1c6-8429-4b07-8b62-e2126738e254@1@kfi:640/0 lens 488/448 e 0 to 0 dl 1747414920 ref 2 fl Interpret:/0/0 rc 0/0 job:''
+Server fails bulk write because of reconnect:
+00010000:00020000:17.0:1747414834.797193:0:2451940:0:(ldlm_lib.c:3601:target_bulk_io()) @@@ Reconnect on bulk WRITE  req@0000000034418825 x1832221755976640/t0(0) o4->374cc1c6-8429-4b07-8b62-e2126738e254@1@kfi:640/0 lens 488/448 e 0 to 0 dl 1747414920 ref 1 fl Interpret:/0/0 rc 0/0 job:''
+00000100:00020000:17.0:1747414960.685895:0:2552251:0:(events.c:484:server_bulk_callback()) event #1832221755976640/682655eea2bc0 type 5, status -110, desc 0000000048604b68/ffff9a131da21800
+Client now waits full timeout period for reply:
+00000100:00000400:19.0F:1747415040.929986:0:23387:0:(client.c:2310:ptlrpc_expire_one_request()) @@@ Request sent has timed out for slow reply: [sent 1747414833/real 1747414833]  req@0000000082a49555 x1832221755976640/t0(0) o4->lustre-OST0000-osc-ffff914438ce6000@16@kfi:6/4 lens 488/448 e 2 to 1 dl 1747415040 ref 2 fl Rpc:XQr/2/ffffffff rc -11/-1 job:''
+
+The BRW resend gets new match bits (struct ptlrpc_request::rq_mbits and struct ptlrpc_request::rq_rep_mbits) but not a new xid. So server sees it as a duplicate and discards. Existing RPCs should have the reply match bits updated so replies for the old request will match the new reply buffer on the client. However, BRW rpcs are special in that they are completely dropped by the server upon client reconnect. In this case we actually want the server to process the "duplicate" request. Thus, it seems the duplicate checking should be skipped for BRW RPCs.
+
+--- Comment (hornc, Tue, 3 Jun 2025 19:41:19 +0000) ---
+Oleg requested I run the reproducer with revert of bb83a8af59d30b3f9e6de171eca962316ab7f6f4. I did this and observed the same symptoms. Included a little more context in these excerpts and I will attach the client and server dklogs.
+
+Client side:
+
+00000100:00100000:30.0:1748973892.109966:0:10877:0:(client.c:1788:ptlrpc_send_new_req()) Sending RPC req@00000000e129dcc1 pname:cluuid:pid:xid:nid:opc:job ptlrpcd_07_00:b52f721c-4ac2-4d28-bd7f-7cdac8443543:10877:1833930112600320:16@kfi:4:
+00000100:00000200:30.0:1748973892.109984:0:10877:0:(niobuf.c:935:ptl_send_rpc()) Setup reply buffer: 1024 bytes, xid 1833930112600320, portal 4
+00000100:00000200:30.0:1748973892.109986:0:10877:0:(niobuf.c:86:ptl_send_buf()) Sending 488 bytes to portal 6, xid 1833930112600320, offset 0
+00000100:00080000:19.0:1748973892.115162:0:10867:0:(import.c:83:import_set_state_nolock()) 0000000025daa279 lustre-OST0001_UUID: changing import state from FULL to DISCONN
+00000100:00080000:20.0:1748973892.115180:0:20832:0:(import.c:83:import_set_state_nolock()) 0000000025daa279 lustre-OST0001_UUID: changing import state from DISCONN to CONNECTING
+00000100:00100000:20.0:1748973892.115191:0:20832:0:(import.c:813:ptlrpc_connect_import_locked()) @@@ (re)connect request (timeout 13)  req@00000000a3ebbd11 x1833930112602240/t0(0) o8->lustre-OST0001-osc-ffff952e5b954800@16@kfi:28/4 lens 520/544 e 0 to 0 dl 0 ref 1 fl New:NQU/0/ffffffff rc 0/-1 job:'' uid:4294967295 gid:4294967295
+00000100:00100000:6.0F:1748973892.115205:0:10848:0:(client.c:1788:ptlrpc_send_new_req()) Sending RPC req@00000000a3ebbd11 pname:cluuid:pid:xid:nid:opc:job ptlrpcd_rcv:b52f721c-4ac2-4d28-bd7f-7cdac8443543:10848:1833930112602240:16@kfi:8:
+00000100:00000200:6.0:1748973892.115210:0:10848:0:(niobuf.c:935:ptl_send_rpc()) Setup reply buffer: 1024 bytes, xid 1833930112602240, portal 4
+00000100:00000200:6.0:1748973892.115211:0:10848:0:(niobuf.c:86:ptl_send_buf()) Sending 520 bytes to portal 28, xid 1833930112602240, offset 0
+00000100:00000200:29.0:1748973892.122071:0:16262:0:(events.c:58:request_out_callback()) @@@ type 5, status 0  req@00000000e129dcc1 x1833930112600320/t0(0) o4->lustre-OST0001-osc-ffff952e5b954800@16@kfi:6/4 lens 488/448 e 0 to 0 dl 1748974059 ref 3 fl Rpc:r/200/ffffffff rc 0/-1 job:'' uid:0 gid:0
+00000100:00000200:6.0:1748973892.122072:0:22401:0:(events.c:58:request_out_callback()) @@@ type 5, status 0  req@00000000a3ebbd11 x1833930112602240/t0(0) o8->lustre-OST0001-osc-ffff952e5b954800@16@kfi:28/4 lens 520/544 e 0 to 0 dl 1748973977 ref 2 fl Rpc:Nr/200/ffffffff rc 0/-1 job:'' uid:0 gid:0
+00000100:00000200:8.0:1748973892.150892:0:22555:0:(events.c:99:reply_in_callback()) @@@ type 2, status 0  req@00000000a3ebbd11 x1833930112602240/t0(0) o8->lustre-OST0001-osc-ffff952e5b954800@16@kfi:28/4 lens 520/544 e 0 to 0 dl 1748973977 ref 1 fl Rpc:NQr/200/ffffffff rc 0/-1 job:'' uid:0 gid:0
+00000100:00000200:6.0F:1748973892.150902:0:10848:0:(events.c:99:reply_in_callback()) @@@ type 6, status 0  req@00000000a3ebbd11 x1833930112602240/t0(0) o8->lustre-OST0001-osc-ffff952e5b954800@16@kfi:28/4 lens 520/544 e 0 to 0 dl 1748973977 ref 1 fl Rpc:RNQ/200/ffffffff rc 0/-1 job:'' uid:0 gid:0
+00000100:00000200:6.0:1748973892.150906:0:10848:0:(events.c:121:reply_in_callback()) @@@ unlink  req@00000000a3ebbd11 x1833930112602240/t0(0) o8->lustre-OST0001-osc-ffff952e5b954800@16@kfi:28/4 lens 520/544 e 0 to 0 dl 1748973977 ref 1 fl Rpc:RNQU/200/ffffffff rc 0/-1 job:'' uid:0 gid:0
+00000100:00080000:6.0:1748973892.150924:0:10848:0:(import.c:83:import_set_state_nolock()) 0000000025daa279 lustre-OST0001_UUID: changing import state from CONNECTING to RECOVER
+00000100:00080000:6.0:1748973892.150936:0:10848:0:(client.c:3088:ptlrpc_resend_req()) @@@ going to resend  req@00000000e129dcc1 x1833930112600320/t0(0) o4->lustre-OST0001-osc-ffff952e5b954800@16@kfi:6/4 lens 488/448 e 0 to 0 dl 1748974059 ref 2 fl Rpc:Qr/200/ffffffff rc 0/-1 job:'' uid:0 gid:0
+00000100:00080000:6.0:1748973892.150948:0:10848:0:(import.c:83:import_set_state_nolock()) 0000000025daa279 lustre-OST0001_UUID: changing import state from RECOVER to FULL
+00000100:00100000:6.0:1748973892.151078:0:10848:0:(client.c:2276:ptlrpc_check_set()) Completed RPC req@00000000a3ebbd11 pname:cluuid:pid:xid:nid:opc:job:rc ptlrpcd_rcv:b52f721c-4ac2-4d28-bd7f-7cdac8443543:10848:1833930112602240:16@kfi:8::0/0
+00000100:00000200:29.0F:1748973892.151139:0:10877:0:(events.c:99:reply_in_callback()) @@@ type 6, status 0  req@00000000e129dcc1 x1833930112600320/t0(0) o4->lustre-OST0001-osc-ffff952e5b954800@16@kfi:6/4 lens 488/448 e 0 to 0 dl 1748974059 ref 2 fl Rpc:SQr/200/ffffffff rc -11/-1 job:'' uid:0 gid:0
+00000100:00000200:29.0:1748973892.151143:0:10877:0:(events.c:121:reply_in_callback()) @@@ unlink  req@00000000e129dcc1 x1833930112600320/t0(0) o4->lustre-OST0001-osc-ffff952e5b954800@16@kfi:6/4 lens 488/448 e 0 to 0 dl 1748974059 ref 2 fl Rpc:SQU/200/ffffffff rc -11/-1 job:'' uid:0 gid:0
+00000100:00000200:29.0:1748973892.151203:0:10877:0:(niobuf.c:935:ptl_send_rpc()) Setup reply buffer: 1024 bytes, xid 1833930112600320, portal 4
+00000100:00000200:29.0:1748973892.151204:0:10877:0:(niobuf.c:86:ptl_send_buf()) Sending 488 bytes to portal 6, xid 1833930112600320, offset 0
+00000100:00000200:28.0:1748973892.154311:0:28888:0:(events.c:58:request_out_callback()) @@@ type 5, status 0  req@00000000e129dcc1 x1833930112600320/t0(0) o4->lustre-OST0001-osc-ffff952e5b954800@16@kfi:6/4 lens 488/448 e 0 to 0 dl 1748974059 ref 3 fl Rpc:r/202/ffffffff rc -11/-1 job:'' uid:0 gid:0
+00000100:00000400:30.0F:1748974059.144009:0:10877:0:(client.c:2362:ptlrpc_expire_one_request()) @@@ Request sent has timed out for slow reply: [sent 1748973892/real 1748973892]  req@00000000e129dcc1 x1833930112600320/t0(0) o4->lustre-OST0001-osc-ffff952e5b954800@16@kfi:6/4 lens 488/448 e 0 to 1 dl 1748974059 ref 2 fl Rpc:XQr/202/ffffffff rc -11/-1 job:'' uid:0 gid:0
+
+Server side:
+
+00000100:00100000:3.0:1748973892.123556:0:1290377:0:(service.c:2360:ptlrpc_server_handle_req_in()) unwrap req x1833930112600320
+00000100:00100000:3.0:1748973892.123556:0:1290377:0:(service.c:2425:ptlrpc_server_handle_req_in()) got req x1833930112600320
+00000100:00100000:4.0:1748973892.123786:0:1290482:0:(service.c:2604:ptlrpc_server_handle_request()) Handling RPC req@000000005edf1981 pname:cluuid+ref:pid:xid:nid:opc:job ll_ost_io01_052:b52f721c-4ac2-4d28-bd7f-7cdac8443543+54:10877:x1833930112600320:12345-0@kfi:4:
+00000100:00000200:4.0:1748973892.123787:0:1290482:0:(service.c:2609:ptlrpc_server_handle_request()) got req 1833930112600320
+00000100:00100000:3.0:1748973892.124405:0:1289282:0:(service.c:2360:ptlrpc_server_handle_req_in()) unwrap req x1833930112602240
+00000100:00100000:3.0:1748973892.124406:0:1289282:0:(service.c:2425:ptlrpc_server_handle_req_in()) got req x1833930112602240
+00000100:00000200:3.0:1748973892.124429:0:1289282:0:(nrs.c:911:ptlrpc_nrs_hpreq_add_nolock()) @@@ high priority req  req@00000000e53e5fee x1833930112602240/t0(0) o8->b52f721c-4ac2-4d28-bd7f-7cdac8443543@0@kfi:0/0 lens 520/0 e 0 to 0 dl 1748974168 ref 1 fl New:H/200/ffffffff rc 0/-1 job:'' uid:0 gid:0
+00000100:00100000:3.0:1748973892.124437:0:1289282:0:(service.c:2604:ptlrpc_server_handle_request()) Handling RPC req@00000000e53e5fee pname:cluuid+ref:pid:xid:nid:opc:job ll_ost01_000:b52f721c-4ac2-4d28-bd7f-7cdac8443543+57:10848:x1833930112602240:12345-0@kfi:8:
+00000100:00000200:3.0:1748973892.124438:0:1289282:0:(service.c:2609:ptlrpc_server_handle_request()) got req 1833930112602240
+00000100:00000200:4.0:1748973892.149629:0:1282635:0:(events.c:479:server_bulk_callback()) event #1833930112600320/683f320e78900 type 5, status 0, desc 00000000cfc64279/ffff99f286ddf000
+00000100:00000200:4.0:1748973892.149631:0:1282635:0:(events.c:479:server_bulk_callback()) event #0/0 type 3, status 0, desc 00000000cfc64279/ffff99f286ddf000
+00000100:00000200:4.0:1748973892.149637:0:1282635:0:(events.c:479:server_bulk_callback()) event #1833930112600321/683f320e78901 type 5, status 0, desc 00000000cfc64279/ffff99f286ddf000
+00000100:00000200:4.0:1748973892.149638:0:1282635:0:(events.c:479:server_bulk_callback()) event #0/0 type 3, status 0, desc 00000000cfc64279/ffff99f286ddf000
+00000100:00000200:4.0:1748973892.149644:0:1282635:0:(events.c:479:server_bulk_callback()) event #1833930112600322/683f320e78902 type 5, status 0, desc 00000000cfc64279/ffff99f286ddf000
+00000100:00000200:4.0:1748973892.149646:0:1282635:0:(events.c:479:server_bulk_callback()) event #0/0 type 3, status 0, desc 00000000cfc64279/ffff99f286ddf000
+00000100:00000200:4.0:1748973892.149652:0:1282635:0:(events.c:479:server_bulk_callback()) event #1833930112600323/683f320e78903 type 5, status 0, desc 00000000cfc64279/ffff99f286ddf000
+00000100:00000200:4.0:1748973892.149653:0:1282635:0:(events.c:479:server_bulk_callback()) event #0/0 type 3, status 0, desc 00000000cfc64279/ffff99f286ddf000
+00000100:00000200:3.0:1748973892.152225:0:1289282:0:(niobuf.c:87:ptl_send_buf()) Sending 416 bytes to portal 4, xid 1833930112602240, offset 0
+00000100:00100000:3.0:1748973892.152239:0:1289282:0:(service.c:2656:ptlrpc_server_handle_request()) Handled RPC req@00000000e53e5fee pname:cluuid+ref:pid:xid:nid:opc:job ll_ost01_000:b52f721c-4ac2-4d28-bd7f-7cdac8443543+14:10848:x1833930112602240:12345-0@kfi:8: Request processed in 27801us (28715us total) trans 0 rc 0/0
+00010000:00020000:4.0:1748973892.155467:0:1290482:0:(ldlm_lib.c:3569:target_bulk_io()) @@@ Reconnect on bulk WRITE  req@000000005edf1981 x1833930112600320/t0(0) o4->b52f721c-4ac2-4d28-bd7f-7cdac8443543@0@kfi:632/0 lens 488/448 e 0 to 0 dl 1748973987 ref 1 fl Interpret:/200/0 rc 0/0 job:'' uid:0 gid:0
+00000100:00100000:3.0:1748973892.166112:0:1290438:0:(service.c:2360:ptlrpc_server_handle_req_in()) unwrap req x1833930112600320
+00000100:00100000:3.0:1748973892.166120:0:1290438:0:(service.c:2425:ptlrpc_server_handle_req_in()) got req x1833930112600320
+00000100:00080000:3.0:1748973892.166176:0:1290438:0:(service.c:2125:ptlrpc_server_request_add()) @@@ Found duplicate req in processing  req@000000000514c0dd x1833930112600320/t0(0) o4->b52f721c-4ac2-4d28-bd7f-7cdac8443543@0@kfi:632/0 lens 488/0 e 0 to 0 dl 1748973987 ref 1 fl New:/202/ffffffff rc 0/-1 job:'' uid:0 gid:0
+00000100:00080000:3.0:1748973892.166214:0:1290438:0:(service.c:2126:ptlrpc_server_request_add()) @@@ Request being processed  req@000000005edf1981 x1833930112600320/t0(0) o4->b52f721c-4ac2-4d28-bd7f-7cdac8443543@0@kfi:632/0 lens 488/448 e 0 to 0 dl 1748973987 ref 2 fl Interpret:/200/0 rc 0/0 job:'' uid:0 gid:0
+00000100:00100000:3.0:1748973892.166240:0:1290438:0:(service.c:2507:ptlrpc_server_handle_req_in()) finish req x1833930112600320
+00000100:00100000:4.0:1748973892.190674:0:1290482:0:(service.c:2656:ptlrpc_server_handle_request()) Handled RPC req@000000005edf1981 pname:cluuid+ref:pid:xid:nid:opc:job ll_ost_io01_052:b52f721c-4ac2-4d28-bd7f-7cdac8443543+81:10877:x1833930112600320:12345-0@kfi:4: Request processed in 66888us (67217us total) trans 0 rc -110/-999
+
+--- Comment (bzzz, Tue, 3 Jun 2025 08:23:16 +0000) ---
+in general a new xid means another execution which we try to avoid to preserve execute-once logic.
+
+also, iirc, we should not let a client to reconnect as long as it's export still has in-progress RPCs.
+
+--- Comment (gerrit, Mon, 2 Jun 2025 21:02:33 +0000) ---
+"Chris Horn " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/59534
+
+Subject: LU-19083 ptlrpc: Skip duplicate check for BRW
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: b0f319bb5306e8ee934d11074313932baf7fce60

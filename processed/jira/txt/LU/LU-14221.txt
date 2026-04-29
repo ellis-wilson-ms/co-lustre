@@ -1,0 +1,243 @@
+Key:        LU-14221
+Summary:    Client hangs when using DoM with a fixed mdc lru_size
+Link:       https://jira.whamcloud.com/browse/LU-14221
+Type:       Bug
+Priority:   Major
+Status:     Closed
+Resolution: Won't Do
+Assignee:   Mikhail Pershin
+Reporter:   Jeff Niles
+Created:    Tue, 15 Dec 2020 19:37:14 +0000
+Updated:    Wed, 28 Feb 2024 14:41:16 +0000
+Resolved:   Wed, 28 Feb 2024 14:41:16 +0000
+Labels:     ORNL
+Links:      Related: is related to  LU-7266; Related: is related to  LU-11518; Related: is related to  LU-13413; Related: is related to  LU-6529; Related: is related to LU-11509
+
+--- Description ---
+After enabling DoM and beginning to use one of our file systems more heavily recently, we discovered a bug seemingly related to locking.
+
+Basically, with any fixed `lru_size`, everything will work normally until the number of locks hit the `lru_size`. From that point, everything will hang until the `lru_max_age` is hit, at which point it will clear the locks and move on, until filling again. We confirmed this by setting the number of locks pretty low, then setting a low (10s) `lru_max_age`, and kicking off a tar extraction. The tar would extract until the `lock_count` hit our `lru_size` value (basically 1 for 1 with number of files), then hang for 10s, then continue with another batch after the locks had been cleared. The same behavior can be replicated by letting it hang and then running `lctl set_param ldlm.namespaces.mdc.lru_size=clear`, which will free up the process temporarily as well.
+
+ 
+
+Our current workaround is to set `lru_size` to 0 and set the `lru_max_age` to 30s to keep the number of locks to a manageable level.
+
+ 
+
+This appears to only occur on our SLES clients. RHEL clients running the same Lustre version encounter no such problems. This may be due to the kernel version on SLES (4.12.14-197) vs RHEL (3.10.0-1160)
+
+ 
+
+James believes this may be related to LU-11518.
+
+ 
+
+lru_size and lock_count while it's stuck:
+
+lctl get_param ldlm.namespaces.*.lru_size
+
+ldlm.namespaces.cyclone-MDT0000-mdc-ffff88078946d800.lru_size=200
+
+lctl get_param ldlm.namespaces.*.lock_count
+
+ldlm.namespaces.cyclone-MDT0000-mdc-ffff88078946d800.lock_count=201
+
+ 
+
+Process stack while it's stuck:
+
+[] ptlrpc_set_wait+0x362/0x700 [ptlrpc]
+
+[] ptlrpc_queue_wait+0x87/0x230 [ptlrpc]
+
+[] ldlm_cli_enqueue+0x417/0x8f0 [ptlrpc]
+
+[] mdc_enqueue_base+0x3ad/0x1990 [mdc]
+
+[] mdc_intent_lock+0x288/0x4c0 [mdc]
+
+[] lmv_intent_lock+0x9ca/0x1670 [lmv]
+
+[] ll_layout_intent+0x319/0x660 [lustre]
+
+[] ll_layout_refresh+0x282/0x11d0 [lustre]
+
+[] vvp_io_init+0x233/0x370 [lustre]
+
+[] cl_io_init0.isra.15+0xa1/0x150 [obdclass]
+
+[] cl_io_init+0x41/0x80 [obdclass]
+
+[] cl_io_rw_init+0x104/0x200 [obdclass]
+
+[] ll_file_io_generic+0x2cb/0xb70 [lustre]
+
+[] ll_file_write_iter+0x125/0x530 [lustre]
+
+[] __vfs_write+0xdb/0x130
+
+[] vfs_write+0xb1/0x1a0
+
+[] SyS_write+0x46/0xa0
+
+[] do_syscall_64+0x75/0xf0
+
+[] entry_SYSCALL_64_after_hwframe+0x42/0xb7
+
+[] 0xffffffffffffffff
+
+I can reproduce and provide any other debug data as necessary.
+
+--- Comment (simmonsja, Wed, 28 Feb 2024 14:41:16 +0000) ---
+Moved to Lustre 2.15 which has DoM working natively.
+
+--- Comment (simmonsja, Tue, 1 Feb 2022 19:43:41 +0000) ---
+Patch 41008 is ready to land.
+
+--- Comment (adilger, Fri, 5 Feb 2021 22:49:40 +0000) ---
+Cory previously asked:
+
+May I ask what harm there is with the large (default) lru_max_age? You say that it is bad that lots of clients may have lots of locks. Is the server not able to handle the lock pressure? Does back pressure not get applied to the clients? Are the servers unable to revoke locks upon client request in a timely manner? I guess I just don't understand why it is inherently bad to use the defaults. Could you explain more? Thanks!
+
+I think there are two things going on here.  Having a large lru_max_age means that unused locks (and potentially data cached under those locks) may linger on the client for a long time.  That consumes memory on the MDS and OSS for every lock that every client holds, which could probably be better used somewhere else.  Also, there is more work needed at recovery time if the MDS/OSS crashes to recover those locks.  Also, having a large number of locks on the client or server adds some overhead to all lock processing due to having more locks to deal with because of longer hash collision chains.
+
+There is the "dynamic LRU" code that has existed for many years to try an balance MDS lock memory usage vs. client lock requests, but I've never really been convinced that it works properly (see e.g. LU-7266 and related tickets).  I also think that when clients have so much RAM these days, it can cause a large number of locks to stay in memory for a long time until there is a sudden shortage of memory on the server, and the server only has limited mechanisms to revoke locks from the clients.  It can reduce the "lock volume" (part of the dynamic LRU" functionality) but this is at best a "slow burn" that is intended (if working properly) to keep the steady-state locking traffic in check.  More recently, there was work done under LU-6529 "Server side lock limits to avoid unnecessary memory exhaustion" to allow more direct reclaim of DLM memory on the server when it is under pressure.  We want to avoid the server cancelling locks that are actively in use by the client, but the server has no real idea about which locks the client is reusing, and which ones were only used once, so it does the best job it can with the information it has, but it is better if the client does a better job of keeping the number of locks under control.
+
+So there is definitely a balance between being able to cache locks and data on the client vs. sending more RPCs to the server and reducing memory usage on both sides.    That is why having a shorter lru_max_age is useful, but longer term LU-11509 "LDLM: replace lock LRU with improved cache algorithm" would improve the selection of which locks to keep cached on the client, and which (possibly newer, but use-once locks) should be dropped.  That is as much a research task as a development effort.
+
+--- Comment (tappro, Thu, 24 Dec 2020 11:14:03 +0000) ---
+For anyone interested, patch from LU-11518 https://review.whamcloud.com/41008 is the one solving problem in 2.12.6 for me. After it untar is not freezing anymore when lru_size has fixed size.
+
+--- Comment (simmonsja, Wed, 23 Dec 2020 18:12:24 +0000) ---
+I think the LU-11518 work should resolve the rest of the problems.
+
+--- Comment (nilesj, Wed, 23 Dec 2020 15:29:28 +0000) ---
+Glad you're able to reproduce on 2.12.5. I do find it a bit odd that we experience problems with 2.12.6 while you don't; perhaps it's the larger dataset, like you mention. I think it would be beneficial to figure out what code changed to fix the issue for you in 2.12.6, as it may reveal why we still see issues. Probably not the highest priority work though.
+
+--- Comment (tappro, Wed, 23 Dec 2020 15:10:39 +0000) ---
+I am able to reproduce that issue on initial 2.12.5 release with 3.10 kernel RHEL client and also checked that all works with the latest 2.12.6 version. It seems there is patch in the middle that fixed the issue. I will run git bisect to find it, if that is what we need.
+
+With latest 2.12.6 I have no problems with fixes lru_size=100 but maybe my testset is not just big
+
+--- Comment (nilesj, Fri, 18 Dec 2020 21:06:26 +0000) ---
+Unfortunately that's where my knowledge ends. I do know that a large number of locks puts memory pressure on the MDSs, but from Andreas' comment above, it seems like it should start applying back pressure to the clients at some point?
+
+Historically, on our large systems we've had to limit the lru_size to prevent overload issues with the MDS. This was the info that we were operating off of, but maybe that's not the case any more.
+
+--- Comment (spitzcor, Fri, 18 Dec 2020 20:27:30 +0000) ---
+Thanks for the clarification.  Good sleuthing too!
+
+May I ask what harm there is with the large (default) lru_max_age?  You say that it is bad that lots of clients may have lots of locks.  Is the server not able to handle the lock pressure?  Does back pressure not get applied to the clients?  Are the servers unable to revoke locks upon client request in a timely manner?  I guess I just don't understand why it is inherently bad to use the defaults.  Could you explain more?  Thanks!
+
+--- Comment (nilesj, Fri, 18 Dec 2020 19:48:32 +0000) ---
+Hey Cory,
+
+When set to a fixed LRU size, a 2.12.6 client will complete write actions in a DoM directory in a time about equal to: (number of files to process / lru_size) * lru_max_age). Essentially it completes work as the max age is hit, 200 (or whatever number) tasks at a time.
+
+When set to a dynamic LRU size (0), a 2.12.6 client will work as expected, except that it will leave every single lock open until they hit the max_age limit (by default 65 minutes). Obviously this is less than idea for a large scale system with a bunch of clients all at 50k locks. This is the basis of our workaround. Set a dynamic LRU size and set a max_age of 30s or so to time them out quickly. Not ideal, but it'll work for now.
+
+ 
+
+The determination on something being fixed between 2.12.6 and 2.14 was based on our reproducer finishing in a normal amount of time with a fixed LRU size (2000) on 2.14, rather than in (number of files to process / lru_size) * lru_max_age), as we were seeing with 2.12.6. Since I don't think I said it above, even with lru_size=2000 on 2.12.6, we were still seeing issues where it would process about 2000 files, hang until those 2000 locks hit the max_age value, and then proceed. The issue isn't just limited to low lru_size settings.
+
+ 
+
+To be clear, have you run the experiment with default lru_size and lru_max_age? Does the LTS client behave poorly? Or, does it match the non-DoM performance?
+
+Yes. A 2.12.6 LTS client works great with default (0) lru_size, except that it keeps all the locks open until max_age. This LU is specifically about the bug as it relates to fixed mdc lru_size settings.
+
+--- Comment (spitzcor, Fri, 18 Dec 2020 18:58:42 +0000) ---
+Hi, nilesj.  Could you please clarify something.  You said:
+
+ With the 2.12.5 and 2.12.6 clients in a DoM directory, that reproducer would never finish when left overnight (12+ hours) at an `lru_size` of 200 (our tunable from an older system).
+
+But also,
+
+ Bottom line: something between 2.12.6 and 2.14 fixed the issue at least
+
+But, I don't quite see how you made that determination (that something was wrong with 2.12 LTS).
+
+It actually sounds to me that it was fine because you also said:
+
+I wanted to baseline against performance with `lru_size=0`, so I ran that, and it mirrors the same 20 minute result with a peak lock count around 36,000
+
+To be clear, have you run the experiment with default lru_size and lru_max_age?  Does the LTS client behave poorly?  Or, does it match the non-DoM performance?
+
+--- Comment (nilesj, Fri, 18 Dec 2020 17:55:15 +0000) ---
+Thanks for the info. Yeah, I don't think it would affect the case we saw the issue with. Do you think it's a good idea to turn on anyway for different workloads maybe?
+
+I believe the "SLES only" issue was more that we had some tunings that we didn't have mirrored on the SLES clients. I've since updated the RHEL clients, so I may not be able to confirm.
+
+--- Comment (tappro, Fri, 18 Dec 2020 16:06:56 +0000) ---
+Jeff, with DoM file, server can return DOM IO lock in open reply, in advance. Default option is 'always' which means file open will always take that lock, other options are 'trylock' - take DoM lock only if it has no conflicting locks and 'never' - no DoM lock at open, i.e. the same behavior as for OST files.
+
+That 'trylock' can be helpful with shared file access I was thinking of, because it prevents ping-ping lock taking for the same file from different clients, but that doesn't look helpful for untar case.
+
+Is that still true that problem exists with SLES client only?
+
+--- Comment (nilesj, Fri, 18 Dec 2020 15:39:41 +0000) ---
+Small file creates; you can probably reproduce locally with a Linux Kernel source tarball extract or similar. We were seeing it on tar extracts here. This is many small files rather than shared file. We can reproduce with a single client. The MDS itself never hangs, only the client.
+
+Do you mind going into a bit more detail as to what dom_lock=trylock does? I can't seem to find much info on it.
+
+--- Comment (tappro, Fri, 18 Dec 2020 13:08:56 +0000) ---
+What sort of test or IO pattern was used when MDT hang? Is there a shared file being accessed or many files, how many clients and so on. I'd try to run it locally
+
+ In current state you can try to decrease lock contention it is possible by that command:
+
+ lctl set_param mdt.*.dom_lock=trylock
+
+which will takes DoM lock at open optionally. And as mentioned by Andreas, patch from LU-10664 is helpful, though it may not apply cleanly, I will check
+
+--- Comment (adilger, Wed, 16 Dec 2020 20:37:36 +0000) ---
+If we were to use dynamic lru size, is there a sane default there, or is the typical 65 minutes okay?
+
+The 65 minute lock timeout was chosen because this allows locks to remain on the client across hourly checkpoints.  However, it isn't clear if that is worthwhile for a small number of locks vs. flushing the unused locks more quickly.  I think anything around 5-10 minutes would allow active locks to be reused, and would keep the client from accumulating too many unused locks, but it depends heavily on your workflows.  The dynamic LRU will expire old locks when the sum(lock_ages) gets too large, so it should keep this in check.
+
+--- Comment (nilesj, Wed, 16 Dec 2020 16:49:30 +0000) ---
+It would be useful/interesting to know how quickly the number of locks on the client(s) dropped after the job completed?
+
+Agreed. I didn't have this data, so I just ran a test. On the unpatched 2.12.6 client (the broken one) with `lru_size=0`, it seems like it's not releasing them at all. This was checked at 1, 5, and 10 minutes post-job. I guess this was expected and tracks with the issues seen while trying to run a job (locks not clearing, ever). Running on the 2.14 client that James built, I see the same thing as well though, which is a bit odd.
+
+As part of our workaround, we've set the `lru_max_age` rather low (30s in this case). This is doing what we'd expect and helping to clear things up faster. Once we're patched and running, we were planning on adjusting this upward, but I'm not sure what a good setting is here. If we were to use dynamic lru size, is there a sane default there, or is the typical 65 minutes okay?
+
+As for performance, it would be useful to calculate what the file_size * count / runtime = bandwidth is for the file IO, and how that compares to the MDS bandwidth.
+
+We've done this calculation in the past with some benchmarks, and it always seems like we run out of IOPS before we run out of bandwidth. As an example, at a 256k DoM size (and writing the entire DoM size), 50,000 operations/second should only be in the ~12GB/s bandwidth range.
+
+--- Comment (adilger, Wed, 16 Dec 2020 09:49:38 +0000) ---
+I'm pretty sure I wrote the 100 locks/core recommendation many years ago, when there were 2-4 cores in compute nodes...  I agree that lru_size=2000 is pretty reasonable even if you have a large number of clients (e.g. 10k), as long as the MDS nodes have enough RAM, since it is unlikely that every client will have that many locks on every MDT at the same time.
+
+Using dynamic LRU size (lru_size=0) is possible, and the MDS should provide back-pressure on the clients when it is getting low on memory, but since it is a dynamic system it may not always work in the optimal way.  Having 36k locks on a single client for a short time is not unreasonable, so long as all clients don't do this at the same time.  It would be useful/interesting to know how quickly the number of locks on the client(s) dropped after the job completed?
+
+As for performance, it would be useful to calculate what the file_size * count / runtime = bandwidth is for the file IO, and how that compares to the MDS bandwidth.  While DoM can speed small file IO to some extent, often the aggregate bandwidth of the OSSes is equivalent to the bandwidth of the MDSes.  That said, one of the significant, but often unseen, benefits of DoM is that shifting the small file IOPS off of the HDD OSTs will avoid contention with large file IO. That reduce access latency for small files when there is a concurrent large-file IO workload, and can also improve the performance of the large-file IO because of reduced HDD OSTs seeking and RPCs (see e.g. DoM presentation at previous LUG).
+
+--- Comment (nilesj, Wed, 16 Dec 2020 04:13:02 +0000) ---
+Hey Andreas, thanks for the response!
+
+Wanted to provide some more details after testing today. We have a reproducer (small file based workload) that we've been running to easily trigger this issue. In a non-DoM directory, it takes right about 20 minutes to complete. With the 2.12.5 and 2.12.6 clients in a DoM directory, that reproducer would never finish when left overnight (12+ hours) at an `lru_size` of 200 (our tunable from an older system).
+
+After building a 2.14 client, that same reproducer with an `lru_size` of 200 actually completed, but with a time of 223 minutes. Pretty rough for performance, but this isn't a benchmark, and it at least completed. After this, I set the `lru_size` to 2000, which we're using on some other clients that we have. I would consider this a more reasonable tuning anyway. With this, the reproducer completes in 20 minutes, identical to the non-DoM directory. Since it's a small file workload, a speedup would be ideal, but this at least isn't a failure or loss of performance. After the success of the `lru_size=2000`, I wanted to baseline against performance with `lru_size=0`, so I ran that, and it mirrors the same 20 minute result with a peak lock count around 36,000. S
+
+Bottom line: something between 2.12.6 and 2.14 fixed the issue at least; I guess we will need to work backward to identify what that something is now. I'll talk with James about pulling the patches you identified into our 2.12.6 build.
+
+You mention issues when the LRU size is small; what do you consider small in current Lustre? The manual states that 100/core is a good starting point for tuning it, but at 128 cores/node, we're looking at an LRU size of 12,800, which across a large number of clients seems like it'll put a large memory strain on the MDSs. Would love to hear your thoughts on tuning LRU size.
+
+--- Comment (adilger, Wed, 16 Dec 2020 01:11:00 +0000) ---
+There was a recent landing of patch https://review.whamcloud.com/36903 "LU-10664 dom: non-blocking enqueue for DOM locks" and patch https://review.whamcloud.com/34858 "LU-12296 llite: improve ll_dom_lock_cancel" to master which may help this situation, but I'm not sure.  
+
+That said, it is possible that the MDT DLM LRU is getting full while there are still dirty pages under the MDT locks, and the next lock enqueue has to block while the dirty data is flushed to the MDS before a new lock can be granted.  That would definitely be more likely if the LRU size is small, and that isn't something that we have been testing.
+
+As for possible causes of dirty data under the locks, it seems possible that the usage pattern of DoM (i.e. small files that are below a single RPC in size) means that the RPC generation engine does not submit the writes to the MDT in a timely manner, preferring to wait in case more data is written to the file.  It might be better to more aggressively generate the write RPC for DoM files shortly after at close time so that the DLM locks do not linger on the client with dirty data in memory.
+
+--- Comment (nilesj, Tue, 15 Dec 2020 19:39:06 +0000) ---
+Forgot to mention that James is currently building a 2.14 based client (incorporates the patches from LU-11518) to test with. I'll update with results once that's complete.
+
+--- Comment (pjones, Tue, 15 Dec 2020 19:38:59 +0000) ---
+Mike
+
+Could you please advise?
+
+Thanks
+
+Peter

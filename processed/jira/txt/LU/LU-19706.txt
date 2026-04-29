@@ -1,0 +1,218 @@
+Key:        LU-19706
+Summary:    data races in changelog code
+Link:       https://jira.whamcloud.com/browse/LU-19706
+Type:       Improvement
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Thomas Bertschinger
+Reporter:   Thomas Bertschinger
+Created:    Fri, 12 Dec 2025 22:36:40 +0000
+Updated:    Mon, 15 Dec 2025 18:29:41 +0000
+
+--- Description ---
+The current changelogs code has some (seemingly harmless) data races in accessing fields of struct mdd_changelog. Generally, spinlocks are used to protect fields of struct mdd_changelog that are updated in RMW operations. But the use of spinlocks is somewhat inconsistent, both for reads, and in some cases, for updates.
+
+There are a few RMW operations during the initialization routines that are not protected with spinlocks, to both mc_current_mask and mc_flags. I suspect this is probably fine because initialization cannot occur concurrently with user/admin driven actions like writing to debugfs files or client metadata requests being serviced. But if this is the case, it seems inconsistent that some of the RMW ops in the initialization routines are protected by spinlocks.
+
+I’m proposing to use the atomic_t API for a few of the fields of struct mdd_changelog. This should provide (slightly) more efficient code, should resolve the data races, and hopefully make the code clearer and more consistent.
+
+mc_flags
+
+For example, mc_flags is accessed racily in mdd_changelog_on():
+
+static int
+mdd_changelog_on(const struct lu_env *env, struct mdd_device *mdd)
+{
+        ...
+        if ((mdd->mdd_cl.mc_flags & CLM_ON) != 0)
+                return rc;
+        ...
+                spin_lock(&mdd->mdd_cl.mc_lock);
+                mdd->mdd_cl.mc_flags |= CLM_ON;
+                spin_unlock(&mdd->mdd_cl.mc_lock);
+        ...
+}
+
+and mdd_changelog_enabled():
+
+static inline bool mdd_changelog_enabled(const struct lu_env *env,
+                                        struct mdd_device *mdd,
+                                        enum changelog_rec_type type)
+{
+        const struct lu_ucred *uc;
+        if ((mdd->mdd_cl.mc_flags & CLM_ON) &&
+        ...
+} 
+
+To the extent that such a thing is possible, this seems like a fairly clear example of a "benign" data race. It's hard to imagine how the compiler could possibly generate code that would break here.
+
+But I still think atomic_t can help. Since the racing operations consist only of bitwise-OR and loads, they can be done with atomic_or() and atomic_read().
+
+This makes the mc_lock spinlock unnecessary. The spinlock currently protects three fields–mc_index, mc_gc_task, and gc_flags–but the documentation only mentions mc_index. This will help align the code with the documentation.
+
+mc_current_mask
+
+It should also be possible to update mc_current_mask to be an atomic_t. Currently it is protected by mc_user_lock.
+
+However, mc_current_mask is updated in a RMW without the lock held in mdd_changelog_llog_init():
+
+static int mdd_changelog_llog_init(const struct lu_env *env,
+				   struct mdd_device *mdd)
+{
+    ....
+    /* Finally apply per-server mask */
+    mdd->mdd_cl.mc_current_mask |= mdd->mdd_cl.mc_proc_mask;
+    ...
+ 
+
+As mentioned above, I think this is fine because I suspect/hope that user-driven updates to mc_current_mask cannot run concurrently with this code. If that is the case, though, it seems inconsistent that it is updated with the lock held during other parts of the initialization, like in changelog_user_init_cb().
+
+Whether or not other RMWs to this field can run concurrently with this code, it seems using atomic_t and atomic_or() will make the updates safe while making the code more consistent.
+
+mc_index
+
+mc_index is also a candidate for being an atomic_t. Unlike the other fields, mc_index actually is protected for reads in some locations, like mdd_changelog_users_seq_show(). But reads are unprotected in other spots, like in mdd_chlg_garbage_collect().
+
+Using an atomic_t for mc_index seems a little more complicated because of this code in changelog_user_init_cb():
+
+    spin_lock(&mdd->mdd_cl.mc_lock);
+    if (rec->cur_endrec > mdd->mdd_cl.mc_index)
+        mdd->mdd_cl.mc_index = rec->cur_endrec;
+    spin_unlock(&mdd->mdd_cl.mc_lock); 
+
+I don't think that can be done atomically, so it would require a loop like...
+
+int index;
+do (index = atomic_read(&mdd->mdd_cl.mc_index)) while {
+    rec->cur_endrec > index &&
+        (atomic_cmpxchg(&mdd->mdd_cl.mc_index, index, rec->cur_endrec) != index)
+} 
+
+...or would it?
+
+Again, if it's not actually possible for the init routines to run concurrently with code that updates the field (i.e. mdd_changelog_write_rec()), then that seems unnecessary.
+
+But if it is possible for mdd_changelog_write_rec() to run concurrently with changelog_user_init_cb(), then I think things are broken regardless of the locking, because mdd_changelog_write_rec() could read a value for mc_index before that field is "fully initialized" and produce a changelog record with an incorrect index that is too low.
+
+ 
+
+When much of this code was written back in 2008 (0e660eab787c), I suspect the kernel's atomic API was considerably more primitive and it didn't make sense to use it over spinlocks. Now that the atomics API is more mature, I think it makes more sense to use it for these kinds of simple cases.
+
+--- Comment (paf0186, Mon, 15 Dec 2025 18:29:41 +0000) ---
+"I do understand your concerns about it, though, so I'd be OK with resolving this using spinlocks consistently, if that's what's preferred for this sort of code."
+
+Yes, I think so - I agree it's not perfect, it's far too easy to write incorrect code in absence of the kind of checking that Rust provides, I just think atomics here aren't a net improvement.  I'm excited for a future where we can start using something better, 'just remember to do it right' is not a good answer.  We'll have to see over the next few years how soon we can start integrating Rust, it will depend heavily on the choices made by the LTS distributions (and how long we hold onto some of them).
+
+RE: API.
+
+That warning is... frightening.  I was only aware of the current sane semantics - thanks for pointing that out.  I've only been in this game formally since 2012 or so, so apologies - I was wrong about the old API.  That said, I don't think that's why it wasn't used here - it's just there's a spinlock and it got ignored.
+
+Thanks for taking an interest - these kind of data races are not a good thing and having them in corners is one reason why there's a steady trickle of "oh, that's weird" bugs we get to fix when something changes and we start hitting it.
+
+--- Comment (JIRAUSER18444, Mon, 15 Dec 2025 17:48:31 +0000) ---
+I see your point about how using different strategies for different fields of the struct would be confusing, and how atomic_t could make it easy to overlook places where multiple fields need to be updated together. That makes sense as a downside of atomic_t.
+
+On the other hand, I think the spinlocks in some ways encourage introducing data races.
+
+It's much easier to write 
+
+if (*mc_flags & VAL) { ... }
+
+than
+
+int flags;
+
+spin_lock();
+flags = *mc_flags;
+spin_unlock();
+
+if (flags & VAL)  { ... }
+
+which will encourage people to use the former (as has happened many times in this code). The former also looks entirely reasonable in isolation, so it can be easy to miss in code review. It also seems like someone could easily convince themselves that the former is correct–"because 32-bit loads are naturally atomic on my architecture"–even though it isn't, due to the data race.
+
+With atomic_t, however, the former is a compile-time error. You have to use the methods like atomic_read(). It reminds me of Rust in this way: it catches this programming error at compile time. (OK, since C doesn't have private struct members, there's nothing stopping someone from writing
+
+if (mc_flags->counter & VAL) { ... }
+
+but you can't really do that accidentally...)
+
+I do understand your concerns about it, though, so I'd be OK with resolving this using spinlocks consistently, if that's what's preferred for this sort of code.
+
+ 
+
+> FWIW, the atomics API was present and reasonable in 2008
+
+My take on the atomics API was based on seeing a big warning in earlier kernel versions that stated:
+
+all users of atomic_t should treat atomic_read() and atomic_set() as simple C assignment statements that may be reordered or optimized away entirely by the compiler
+
+I found a very long thread from 2007 that discussed trying to clarify the semantics of atomic_read() and in particular make it guaranteed to actually perform a read. That thread appears to have resulted in applying this patch which introduced the above warning. When I saw that warning, I found it to be quite surprising, and I certainly would have shied away from using an atomics API where the expected semantics were that unclear that people at the time seemingly weren't comfortable with guaranteeing atomic_read() behave atomically (with relaxed ordering).
+
+At some point that decision was changed; I wasn't able to find a specific thread on lore where consensus was reached, but nowadays atomic_read() is defined as READ_ONCE() for most architectures and that warning has long since been removed.
+
+I wasn't around back then so I don't know how things actually happened; I'm just basing this off of lore threads, git commit logs, and LWN articles. I find this stuff really interesting though, so if you or anyone else has historical insight to share I'd definitely like to learn more about how things evolved.
+
+--- Comment (paf0186, Sat, 13 Dec 2025 00:41:20 +0000) ---
+Right, that rearrangement is valid, which is why the read side needs the spinlock. You have probably gotten the details of these ones right and they can be switched to atomics, but it’s much better to switch to using the spinlock for all uses of the fields in the struct. It’s very easy to have some code paths that access the now-atomic field under the lock (required if they’re also touching other fields), and then other code paths that access it without the lock because “it’s atomic now” - this risks subtle bugs where the spinlock was actually needed.
+
+ 
+
+Using the spinlock  keeps the synchronization strategy clear - anyone working with the structure knows that the spinlock protects its state, period. Mixed atomic/spinlock protection makes the code much harder to reason about.
+
+--- Comment (JIRAUSER18444, Fri, 12 Dec 2025 23:45:42 +0000) ---
+> The purpose of a spinlock vs an atomic is to allow consistency across multiple actions.  If that is ever needed, a spinlock is required.
+
+Agreed - but I don't believe any of the fields above have such a requirement. The only places where spinlocks protect anything other thing a single RMW is during the initialization routines. But as noted in the description, if the initialization routines can run concurrently with actions like the server processing a client metadata operation, things are already broken regardless of the locks.
+
+(Let me know if you have a specific counterexample, I looked pretty closely at how all of these fields are used, but of course I could have missed something.)
+
+ 
+
+> Also, in general it's dangerous to have some stuff protected by a spinlock in a structure and some stuff as atomics - better to just use the spinlock.
+
+Sure - but in that case the spinlock should consistently be protecting the reads, too - which is not currently the case. Using the example mc_flags data race from above: unless I'm mistaken it is legal for the compiler to do a transformation like:
+
+static int
+mdd_changelog_on(const struct lu_env *env, struct mdd_device *mdd)
+{
+        int tmp;
+
+        ...
+                spin_lock(&mdd->mdd_cl.mc_lock);
+                tmp = mdd->mdd_cl.mc_flags;
+                tmp |= CLM_ON;
+                mdd->mdd_cl.mc_flags = 42;
+                mdd->mdd_cl.mc_flags = tmp;
+                spin_unlock(&mdd->mdd_cl.mc_lock);
+        ...
+} 
+
+and then the read:
+
+static inline bool mdd_changelog_enabled(const struct lu_env *env,
+                                        struct mdd_device *mdd,
+                                        enum changelog_rec_type type)
+{
+        ...
+        if ((mdd->mdd_cl.mc_flags & CLM_ON) && 
+
+can pick up an invalid value.
+
+Is that likely? No, not at all, which is why I labeled this as a "benign" data race. But it is technically UB, and I've read plenty of literature lately about how there is no such thing as a benign data race, which is why it caught my eye.
+
+IMO, either the spinlocks should be used consistently - which they are not right now - or atomics should be used. I think the atomics are nicer in that the code is less cluttered, (very slightly) more efficient, and it will make it harder to accidentally introduce a data race in the future.
+
+Of course it will require being careful to ensure that the spinlocks aren't providing additional synchronization beyond only making the RMWs atomic. I didn't think they were from my inspection of the code, but again, if you have examples that I missed, do let me know!
+
+--- Comment (paf0186, Fri, 12 Dec 2025 23:43:39 +0000) ---
+mdd->mdd_cl.mc_current_mask |= mdd->mdd_cl.mc_proc_mask;
+
+This RMW is a great example of where multiple things may need to be atomic together - if there's no consistency requirement, then there's no need for an atomic either, since an individual write like this can't get torn.  But if you need the read and the write to be atomic together, then you can't achieve that by using atomic types, you have to use a spinlock.
+
+--- Comment (paf0186, Fri, 12 Dec 2025 23:25:34 +0000) ---
+The purpose of a spinlock vs an atomic is to allow consistency across multiple actions.  If that is ever needed, a spinlock is required.
+
+FWIW, the atomics API was present and reasonable in 2008.
+
+Also, in general it's dangerous to have some stuff protected by a spinlock in a structure and some stuff as atomics - better to just use the spinlock.

@@ -1,0 +1,144 @@
+Key:        LU-5836
+Summary:    Error "Device or resource busy" after attempting release of file cleared from 'dirty'
+Link:       https://jira.whamcloud.com/browse/LU-5836
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Andrew Moe
+Created:    Fri, 31 Oct 2014 18:57:18 +0000
+Updated:    Mon, 14 Sep 2015 16:36:25 +0000
+Labels:     HSM, patch
+
+--- Environment ---
+CentOS 6
+
+--- Description ---
+I can consistently replicate this error message.
+
+# Write a file
+$ dd if=/dev/zero of=file01 bs=1M count=1
+1+0 records in
+1+0 records out
+1048576 bytes (1.0 MB) copied, 0.00335841 s, 312 MB/s
+
+# Archive the file
+$ sudo lfs hsm_archive file01
+
+# Wait for file to archive 
+
+# Write to file to make it 'dirty'
+$ echo "0" >> file01
+
+# Clear the dirty state
+$ lfs hsm_clear --dirty file01
+
+# Attempt to release the file
+$ sudo lfs hsm_release file02
+Cannot send HSM request (use of file02): Device or resource busy
+
+I suppose it might make sense that a file should not be released if it is truly dirty.  But the error message does not seem to be appropriate.  Perhaps it should not even be possible to clear a 'dirty' state
+
+This is a comment from another person I've consulted on this:
+
+The error comes from  the MDT:
+
+00000004:20000000:0.0:1414607590.182318:0:1585:0:(mdt_open.c:2042:mdt_hsm_release()) [0x2000013c2:0x116c3:0x0] data_version mismatches: packed=4313503196 and on-disk=4313503194
+
+so it doesn't set the OBD_MD_FLRELEASED bit, and the client in turn returns EBUSY.
+
+No idea what that means though.
+
+--- Comment (moea, Mon, 14 Sep 2015 16:36:25 +0000) ---
+It's been a while since this bug has been reported, so it may take some time to rebuild our test environment.
+
+--- Comment (panditadityashreesh, Fri, 11 Sep 2015 04:47:05 +0000) ---
+If you archive the file again. Releasing the file works. I have added that in the test script. Can someone from design team review and post what should be the ideal behavior?
+
+--- Comment (moea, Thu, 10 Sep 2015 16:54:44 +0000) ---
+This bug was not preventing me from accomplishing anything in particular.  I reported this bug because I performed a sequence of valid operations and experienced an error message that did not seem appropriate for situation.  I'm not asserting that the file should be released or not released; I agree that this would be a design level question.
+
+--- Comment (paf, Thu, 10 Sep 2015 15:09:39 +0000) ---
+This looks like an OK way to get the result Ulka explains in the comment above, but I'm not sure it's the correct result.  -EPERM is also not a correct error here, is it?
+
+This is a design level question I don't have an answer for:
+
+Shouldn't clearing the dirty flag, even manually, result in being able to release the file?  It seems like checking the file version like this does is voiding the intended effect of clearing the dirty flag.  If not, how could a user escape the situation, short of deleting the file?
+
+Actually, as I think further, perhaps this is not a bug: I think the ability to clear the dirty flag manually is a debug/emergency recovery option?  Use of such a manual intervention tool could be expected to cause problems if it is not used in exactly the right situation.  So less than perfect handling of this case may not be something we need to fix.
+
+What were you trying to accomplish by clearing the dirty flag manually?
+
+--- Comment (panditadityashreesh, Thu, 10 Sep 2015 12:43:34 +0000) ---
+Can you please review it?
+
+--- Comment (uvaze, Wed, 20 May 2015 09:33:50 +0000) ---
+Here is Analysis of this issue-
+
+1. Since dirty flag is cleared request goes to coordinator.
+
+2. However coordinator check the version of requested file  and version of archived copy. and throws following error 
+
+00000004:20000000:0.0:1432012500.276456:0:14313:0:(mdt_open.c:1638:mdt_hsm_release()) [0x200000400:0x1:0x0] data_version mismatches: packed=120259085297 and on-disk=68719476768
+
+Here it finds version is mismatched so returns request with error  EPERM
+
+3. However for any error we do not set OBD_MD_FLRELEASED 
+
+4. So when we return call to agent it throws error EBUSY
+
+Following  is code snippet from ll_close_inode_openhandle (llite/file.c)
+
+if (rc == 0 && op_data->op_bias & MDS_HSM_RELEASE) {
+        struct mdt_body *body;
+        body = req_capsule_server_get(&req->rq_pill, &RMF_MDT_BODY);
+       
+        if (!(body->mbo_valid & OBD_MD_FLRELEASED)) {
+                            rc = -EBUSY;
+           
+        }
+
+4. EBUSY is misleading message and we  should propagate EPERM message coming from coordinator
+
+So proposed solution is -
+
+1.Added one more flag OBD_MD_FLDIRTY which will be set on EPERM.
+
+This is because there might be cases when we need to return EBUSY. So this will distinguish the case
+
+2.in llite above function check for this flag is added and return EPERM
+
+Code is pushed for review.
+
+Test logs -
+
+[root@cli-3 ~]# echo "test" >> /mnt/lustre2/testfile2
+[root@cli-3 ~]# lfs hsm_state /mnt/lustre2/testfile2
+/mnt/lustre2/testfile2: (0x00000000)
+[root@cli-3 ~]# lfs hsm_archive /mnt/lustre2/testfile2
+***** FD =  3 PATH = /mnt/lustre2/testfile2 *****
+[root@cli-3 ~]# lfs hsm_state   /mnt/lustre2/testfile2
+/mnt/lustre2/testfile2: (0x00000009) exists archived, archive_id:1
+[root@cli-3 ~]# echo xxx >> /mnt/lustre2/testfile2
+[root@cli-3 ~]# lfs hsm_state   /mnt/lustre2/testfile2
+/mnt/lustre2/testfile2: (0x0000000b) exists dirty archived, archive_id:1
+[root@cli-3 ~]# lfs hsm_clear --dirty /mnt/lustre2/testfile2
+[root@cli-3 ~]# lfs hsm_state   /mnt/lustre2/testfile2
+/mnt/lustre2/testfile2: (0x00000009) exists archived, archive_id:1
+[root@cli-3 ~]# lfs hsm_release /mnt/lustre2/testfile2
+***** FD =  3 PATH = /mnt/lustre2/testfile2 *****
+Cannot send HSM request (use of /mnt/lustre2/testfile2): Operation not permitted
+
+--- Comment (gerrit, Wed, 20 May 2015 09:07:58 +0000) ---
+Ulka Vaze (ulka.vaze@yahoo.in) uploaded a new patch: http://review.whamcloud.com/14874
+
+Subject: LU-5836 hsm: Error "Device or resource busy"
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: e5add76876f45e3a64c0af0af1ecd288ca2cffc3

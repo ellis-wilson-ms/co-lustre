@@ -1,0 +1,163 @@
+Key:        LU-13606
+Summary:    Poor performance with routed clients to multi-rail servers when single server interface fails
+Link:       https://jira.whamcloud.com/browse/LU-13606
+Type:       Bug
+Priority:   Critical
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Chris Horn
+Reporter:   Chris Horn
+Created:    Wed, 27 May 2020 19:55:22 +0000
+Updated:    Wed, 17 Feb 2021 22:48:27 +0000
+Resolved:   Sat, 11 Jul 2020 15:56:51 +0000
+
+--- Description ---
+I'm opening this as a critical because in my testing (mix of IOR & mdtest) this issue causes serious I/O performance problems and occasionally client evictions.
+
+The problem is that routed clients do not have a view of the health of remote server interfaces, but clients are responsible for selecting the server interface a message will be sent to. Since clients don't have credits or health tracking of remote interfaces they simply round-robin across all available interfaces. Thus, if a server has two interfaces, and one of them fail, then approximately half of all messages sent by the client to the server will be destined for failure.
+
+This can cause all progress on jobs to basically halt as clients get into a reconnection loop with targets.
+
+1. Some rpc sent to bad interface.
+
+ 2. RPC timeout.
+
+ 3. Connect RPC sent to good interface.
+
+ 4. Connection re-established.
+
+ 5. Repeat step 1.
+
+I think you can get unlucky with reconnects if you have failover partners.
+
+ 1. First reconnect sent to bad interface -> fails.
+
+ 2. Next reconnect goes to failover partner -> target not mounted there.
+
+ 3. Next reconnect sent to good interface.
+
+This has also unsurprisingly resulted in client evictions which we know can often lead to job loss as many programs do not check for EIO and re-try.
+
+I discussed this issue with Amir and he proposed the following solution:
+
+[T]he edge routers [ought] to advertise the health of the final destination upon change, to the relevant peers. The peers can then make proper health selection. I'm gonna summarise the approach on a wiki page.
+
+This is a non-trivial solution. There will be scalability concerns with having routers push updates to all peers. We'll also need to account for many routers pushing the same information.
+
+I have an alternative proposal with its own downsides, but the major upside is it is very easy to implement (I already have patch in hand for it). My proposal is to allow routers to perform what I'll call multi-rail forwarding.
+
+As mentioned earlier, clients currently have the responsibility for selecting the server interface a message will be sent to. MR forwarding would allow edge routers to make this decision instead. Edge routers, a.k.a. the final hop gateway, are able to leverage LNet health to determine the health of their local peers' interfaces. Thus, if we allow them to select the destination interface then we can avoid sending traffic to interfaces that have failed once the failure has been registered by the edge routers.
+
+The problem is that an edge router may not know whether the originator of a message has discovered the destination. As such, the router may forward the message to an interface the originator does not know about. When a response is sent back it can arrive from an unknown NID and be dropped.
+
+This limitation can be solved by allowing edge routers to queue a message while it performs discovery on the message originator. At that point, the router has all the information it needs to determine whether it can perform MR forwarding.
+
+ 1. If both originator and destination are multi-rail capable with discovery enabled, then it can perform MR forwarding.
+
+ 2. If not, fallback to the normal forwarding.
+
+Another limitation was noted by Amir:
+
+It's not going to be a good idea to put the "power" back in the hands of the routers. The routers should continue honouring the selection made by the peers. If not, it'll break at least one important UDSP use case, where you add a policy to prefer a specific interface on the final destination.
+
+We could address this limitation by:
+
+ 1. Making MR forwarding tunable and documenting its incompatibility with this particular UDSP policy (really not ideal).
+
+ 2. Creating a new policy that could be enacted on routers to accomplish the same goal. i.e. when forwarding a message from peerA to peerB, prefer peerB's NIDs X, Y, ..., etc.
+
+Another solution would be to require ACKs on all PUTs. With the response tracking code, if every message was ACK'd then messages sent to a failed interface would eventually experience a response timeout. This causes health of the remote peer NI to lower, and the client should then be able to select the health interface for future sends. This is certainly the easiest solution to implement, just a few lines of code, but obviously increases the load on the network.
+
+To recap:
+
+ Routed peers have no view of remote peer interface health. Failure of a remote interface causes serious performance problems. Three possible solutions (so far) in increasing order of difficulty:
+
+1. ACK all messages and rely on response tracking to manage remote interface health.
+
+2. Partial MR-forwarding - Allow routers to choose healthier interface, but otherwise do not modify destination.
+
+3. Full MR-forwarding - Allow routers to use full MR selection criteria in choosing destination.
+
+4. Have routers return "negative ACK" when host is unreachable.
+
+5. Have routers propagate health information of their local peer's to remote peers.
+
+6. Gossip protocol?
+
+Other ideas for solutions are of course welcome. I'd like us to use this ticket to decide on the path forward.
+
+--- Comment (pjones, Sat, 11 Jul 2020 15:56:51 +0000) ---
+Landed for 2.14
+
+--- Comment (gerrit, Fri, 10 Jul 2020 16:51:34 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/38798/
+
+Subject: LU-13606 lnet: Allow router to forward to healthier NID
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: b0e8ab1a5f6f8d4a7c01241fec192ed50ad0b896
+
+--- Comment (gerrit, Mon, 1 Jun 2020 20:36:05 +0000) ---
+Chris Horn (chris.horn@hpe.com) uploaded a new patch: https://review.whamcloud.com/38798
+
+Subject: LU-13606 lnet: Allow router to forward to healthier NID
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 47107994adce2973c68265aed163fb5851cbb423
+
+--- Comment (hornc, Mon, 1 Jun 2020 18:57:03 +0000) ---
+I'd like Amir to comment on why it makes sense to have UDSP force sending to a bad destination interface on the router that it has no health information about?
+
+My quoted comments in the ticket description are out of context.
+
+I think I did a poor job of relating Amir's ideas and insights in the context of my MR forwarding proposal. Amir certainly was not suggesting that we should force sending to a bad destination. I apologize for the confusion.
+
+Likelyhood is that the clients and the servers MR status will be known to the routers during mount time anyway, so the window where the router will not select a healthy interface during a workload is not there.
+
+This is a good point. There is indeed a very narrow window where a router cannot safely select a health interface. The discovery messages between client and server will not trigger discovery on the router as it forwards those messages, but subsequent traffic will, so the router should, in short order, be able to choose interfaces appropriately based on health.
+
+There may be additional benefits w.r.t. load balancing in allowing routers to choose new destination NIDs based on other criteria, credits, etc., but perhaps that benefit is minimal and not worth the potential headache it causes for UDSP.
+
+why don't return an just "negative ACK" or special message when host is in unreachable? lnet message is routable - so any number hops not a problem in this case.
+
+I think this is another good idea and I've added it to the list. shadow I know this is something you've been thinking about for along time. Do you have a patch or code you can share? Can you estimate how much work is involved?
+
+I think in the short-term, modifying the router forwarding logic in the manner described by Amir, is a relatively easy fix. I propose we move forward with that approach while other enhancements in this area, e.g. negative ack, more robust health info sharing, etc., can be explored.
+
+--- Comment (shadow, Fri, 29 May 2020 16:31:42 +0000) ---
+> nother solution would be to require ACKs on all PUTs. 
+
+why don't return an just "negative ACK" or special message when host is in unreachable? lnet message is routable - so any number hops not a problem in this case.
+
+--- Comment (ashehata, Fri, 29 May 2020 02:35:21 +0000) ---
+My quoted comments in the ticket description are out of context. Initially when Chris and I were discussing this, the proposal I understood was to allow the gateway to do MR Routing all the time. Hence my note about breaking UDSP policy. The other concern I had with this approach is we don't have a consistent rule in LNet. With the mr forwarding parameter on, the originator will look like it's selecting the interface, but that selection will be over written by the edge gateway. And in case of policies, they'll look like they are working but they wouldn't be really. I'm not in support of having inconsistent behavior.
+
+I'm with Andreas, that we allow the edge gateways to overwrite the decision made by the originator only if the there exists a healthier interface on the final destination, then that would be ok. I wouldn't add a parameter at all in this case.
+
+This would be LNet's default behavior. IE: edge gateways will always honor the final destination in the message except when there exists an interface which is healthier. And in this case it has to log the change in behavior
+
+The issue with this is if the originator is non-MR. The edge gateway might not have discovered that the originator of the message is Non-MR. Let's take the situation when this is the first message the gateway is forwarding from the originator. The gateway doesn't know that the originator is Non-MR. If it ends up forwarding it to a different interface other than the one specified in the message, the entire RPC will fail.
+
+In this case I'm not convinced it is a better solution to introduce another path where we discover in the reverse direction - IE discover a node which we received from. We only discover nodes we're sending to. Why not simply look at the current state of the peer. A peer on the edge router is created for the originator as non-MR. However, when the edge router forwards messages to it, it'll discover it, at which point it will know whether it's MR or Non-MR. This way we err on the side of caution. I'm trying to avoid another special case in the code.
+
+Likelyhood is that the clients and the servers MR status will be known to the routers during mount time anyway, so the window where the router will not select a healthy interface during a workload is not there.
+
+--- Comment (adilger, Fri, 29 May 2020 00:11:32 +0000) ---
+I'd like Amir to comment on why it makes sense to have UDSP force sending to a bad destination interface on the router that it has no health information about? 
+
+It seems to me that if "MR routing" was only used when the router detected a bad destination interface, then UDSP would be happy 99% of the time because the (working) destination interface would be selected as it desires, and if the destination interface is bad then it doesn't make sense to send the traffic there, regardless of what UDSP wanted?  In that case, the router should instead send to the working server interface and we accept that the performance is not going to be as good when one interface is down?  That keeps the health information within the subnet where the router and the destination have a direct communication channel, and avoids the need to propagate this to every peer in the network.  In the end, UDSP would have had to been informed about the bad destination interface, and make the same decision, so waiting for that to happen seems sub-optimal.
+
+Even with the Gossip implementation prototype, it was only monitoring health status between direct peers on the same LNet, and then forwarding server state to remote clients, rather than trying to account for all of the possible combinations of routes between every client and every server.  I'm not against reviving the LNet Gossip implementation that was used in the original DAOS prototype to improve server/client health monitoring, but I don't think it makes sense to require the clients be omniscient to make every decision about the route.
+
+--- Comment (hornc, Wed, 27 May 2020 20:43:43 +0000) ---
+MR forwarding proof of concept - https://review.whamcloud.com/#/c/38734/

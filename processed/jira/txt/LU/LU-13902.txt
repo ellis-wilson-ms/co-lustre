@@ -1,0 +1,188 @@
+Key:        LU-13902
+Summary:    Merging 2 filesystems into 1.
+Link:       https://jira.whamcloud.com/browse/LU-13902
+Type:       Question/Request
+Priority:   Minor
+Status:     Resolved
+Resolution: Done
+Assignee:   Peter Jones
+Reporter:   Mahmoud Hanafi
+Created:    Tue, 11 Aug 2020 22:03:34 +0000
+Updated:    Wed, 17 Feb 2021 23:26:47 +0000
+Resolved:   Sun, 13 Sep 2020 02:21:52 +0000
+
+--- Description ---
+We want to combine two filesystem into a single larger one.
+
+We can copy the data off and add the empty OSTs to the first. Then copy the data back.
+
+But is there a special way we can merging the OSTs and MDTs without copying the data?
+
+--- Comment (gerrit, Sat, 12 Sep 2020 15:46:28 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/39749/
+
+Subject: LU-13902 config: add test for /usr/include/libiberty/
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set:
+
+Commit: e5923357b4ec5177e8cc540c5603f0f9df41de1e
+
+--- Comment (gerrit, Fri, 28 Aug 2020 05:31:34 +0000) ---
+Not sure why the following patch was attributed to this ticket, but it belongs in LU-13855
+
+Neil Brown (neilb@suse.de) uploaded a new patch: https://review.whamcloud.com/39749
+
+Subject: LU-13902 config: add test for /usr/include/libiberty/
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 94a354ff732eaa94d351ee2c4f45d3f61c8834a4
+
+--- Comment (mhanafi, Wed, 12 Aug 2020 04:49:45 +0000) ---
+Thank you for the detailed explanation.
+
+--- Comment (adilger, Wed, 12 Aug 2020 00:50:08 +0000) ---
+Mahmoud,
+
+there is no way to merge two separate Lustre filesystems together today.  This is the first time that someone has made this kind of request so there hasn't really been any planning in this direction, so while I might have some ideas on how this might be implemented in the future, it would be several years before it might be implemented.  The main obstacle is that the MDT and OST FIDs are only unique within a single filesystem, so any kind of operation that might "merge" the two filesystems (e.g. renumber one filesystem's MDTs to be MDT000m+M and add them as remote MDTs of the original filesystem, and renumber the corresponding OSTs to be OST000n+N and add them to the filesystem), this would currently also require rewriting all of the metadata in the filesystem, which doesn't seem like a small effort.
+
+Presumably you want to minimize data movement and system downtime, so it makes sense to keep the larger filesystem (target) and migrate files from the smaller filesystem (source).  Having users delete unnecessary files from the source and target filesystems in advance would minimize data copied from the source filesystem, and provide the maximum amount of free space on the target filesystem to move more data at once.  Ideally, you would make a full backup of the source filesystem's data as a precaution, but that may not always be practical at large scales.
+
+Of course, if you had enough space to just copy everything at once, that would be easiest.  However, it sounds like you need to migrate the data between filesystems incrementally over at least several days (depending on their size and interconnect bandwidth), in order to have enough space to store the data and to minimize system downtime.  I've written a proposed high-level process to copy user data incrementally from the source filesystem to the target (at a rate of your choosing to minimize system impact), and uses the OST removal process described in http://doc.lustre.org/lustre_manual.xhtml#lustremaint.remove_ost to remove OSTs incrementally from the source filesystem before they are added to the target filesystem to add more space.
+
+This process assumes that the target filesystem has enough free MDT space to hold all of the files in the source filesystem, as incremental MDT migration would be quite complex, unless the filesystem only used DNE1 remote MDTs, and migration was ordered to empty whole MDTs of their directories first.  If that is necessary, then additional steps (not listed here) would be needed.
+
+You would need to select the granularity of directory trees in the source filesystem to be moved (e.g. move one user, project, or subdirectory at a time), depending on how much free space is available in the target filesystem, and how much space is used by OSTs in the source filesystem.  There would need to be at least one OST's worth of used space moved from the source to the target in each full iteration, in order to be able to remove the OST(s) from the source filesystem and add it to the target filesystem.  It would be better to allow migrating multiple OSTs at one time (e.g. a whole OSS failover pair's worth) to avoid the need to make physical changes to the OSS nodes (e.g. recabling OSTs from source OSTs to target OSTs).  This would also minimize the imbalance in the target filesystem, as otherwise all new data would be copied to the same new/empty OST added to the target.  You would also need to ensure that enough space is available in both the source and the target filesystems so they do not get filled completely during normal usage, since the migration is incremental.
+
+The high-level (untested) process would be something like:
+
+	have users delete unnecessary files and directories on the source filesystem
+
+	create symlinks for all source directories in the final location of the target filesystem pointing to their corresponding source directory
+
+	have users/applications start using the "new" pathnames (this may take some time, but is not critical if migration also takes time)
+
+Repeat the following process until all OSTs in the source filesystem have been removed:
+
+	on the source MGS, mark one OSS (pair) worth of OSTs in the source filesystem to permanently not create new objects
+
+	prefer to remove OSTs from higher numbers first to lower numbers last
+
+	"lctl set_param osp.-OST000n-osc-MDT*.max_create_count=0"
+
+	verify on the MDS(es) that this has taken effect with "lctl get_param osp.-*.max_create_count" (should be =0)
+
+Repeat the following process until enough space has been freed on the source filesystem to remove the deactivated OSS (pair), with some margin of free space:
+
+	select one or more source subdirectory trees to migrate
+	
+		this does not have to be the whole OST worth of space moved at once
+
+		this depends on running user jobs, how much space is on the target filesystem, etc.
+
+	
+	
+
+	if using DNE on the target filesystem, use "lfs mkdir -i" and/or "lfs mkdir -c" appropriately on top-level target directories to use MDTs with the most free inodes
+
+	copy files from the source tree into a temporary directory tree on the target using one of the MPI parallel data movement tools like dsync/dcp
+	
+		this could be done in parallel for multiple subdirectories if enough space is available in the target, and performance impact is not a concern
+
+	
+	
+
+	when all of those files have initially been copied, you may need to completely block that user/project's filesystem access for some time
+	
+		re-sync the source directory tree to the target to catch any files that were modified
+
+	
+	
+
+	remove the symlink for that directory on the target filesystem
+
+	rename the copied directory tree to the final location in the target filesystem
+
+	delete the directory tree on the source filesystem
+
+	create a symlink from the old location on the source to reference the new directory on the target, in case applications are still using it
+
+	repeat for next set of source subdirectories
+
+Once enough space is available to remove the OSTs of an OSS (pair) migrate files off of them:
+
+	it is better to move the source OSTs to the target filesystem as soon as there is enough free space to remove them
+
+	don't wait until all of the free space on the target has been filled before moving OSTs to the target filesystem
+
+	depending on how much free space exists in the source filesystem after initial file deletion by users it may be possible to move multiple OSS worth of space the first time
+	
+		that allows copied files and newly created files in the target to start using those OSTs right away
+
+		having more free space on the target filesystem minimizes the space imbalance across OSTs there
+
+	
+	
+
+	find files on the source OST(s) and migrate them onto the remaining OSTs in the source filesystem
+	
+		there shouldn't be any files being modified on those OSTs, since the OSTs have been skipped by the MDT since the start of migration
+
+		it is possible that applications that are writing to files during migration will prevent the files being migrated
+
+		"lfs find /source -type f -ost M,N,O,P -print0 | lfs_migrate -0 -y"
+
+	
+	
+
+Verify the source OSTs are unused and remove them from the :
+
+	the source OSTs should now be mostly empty (per "lfs df") except for the journal and possibly some precreated files
+
+	mount the OSTs as type ldiskfs to check for remaining files (no need to unmount from Lustre first in this case)
+	
+		there may still be some objects in O/*/d*, but are likely just orphans from files that were previously deleted
+
+		"find /mnt/ost/O//d -type f -size +0 | xargs ll_decode_filter_fid" will print the parent (MDT) FID of any remaining objects
+
+		use "lfs fid2path /source " to see if any of those files still exist
+
+	
+	
+
+	possibly kill the applications using those files
+	
+		check "lctl get_param mdt.*.exports.*.open_files" for which clients are holding the files open
+
+		run "lsof" to find which process is using those files
+
+		kill the processes, or let the job finish
+
+		run lfs_migrate on those files again
+
+		verify OST objects have been removed
+
+	
+	
+
+	unmount the OSTs from ldiskfs
+
+	deactivate the OSTs permanently on the MGS with "lctl conf_param -OST000n.osc.active=0"
+
+	unmount the OSTs from Lustre
+
+	recable the OSTs into the target filesystem's network, if needed
+
+	reformat the OSTs to be part of the target filesystem (need to add "--reformat" since they were already formatted once)
+
+	repeat process for next set of OSTs
+
+MDT(s) should be empty at this point and could be reformatted and added to target filesystem

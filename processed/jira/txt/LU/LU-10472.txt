@@ -1,0 +1,470 @@
+Key:        LU-10472
+Summary:    Data Integrity(T10PI) support for Lustre
+Link:       https://jira.whamcloud.com/browse/LU-10472
+Type:       New Feature
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Qian Yingjin
+Reporter:   Li Xi
+Created:    Tue, 9 Jan 2018 04:48:37 +0000
+Updated:    Tue, 9 Sep 2025 04:00:02 +0000
+Resolved:   Tue, 6 Nov 2018 13:47:59 +0000
+Labels:     patch
+Links:      Related: is related to  LU-11697; Related: is related to  LU-2584; Related: is related to LU-11770; Related: is related to LU-14912
+Attachments: random_write.c
+
+--- Description ---
+Data integrity(T10PI) support for hard disk is common now which raises the need for adding the support into Lustre. This is not the first attempt to implement T10PI support for Lustre, but the former work has been stopped for years (LU-2584). Instead of implementing end-to-end data integrity in one shot, we are trying to implement data integrity step by step. Because of this difference, we feel it would be better to create a different ticket.
+
+The first step would be adding support for pretecting data integrity from Lustre OSD to disk, i.e. OSD-to-Storage T10PI.
+
+Given the fact that checksum are already supported for Lustre RPCs, the data are already protected when transfering through the network. By using both network checksum and OSD-to-Storage T10PI together, the time window with no data protection will be decreased a lot. The only danger would be the page cache in memory on OSD are changed somehow between RPC checksum check and OSD T10PI checksum calculation. It would be a doubt whether it is really necessary to implement end-to-end T10PI support. However, convincing the concerned users to accept this small probability is still difficult, especially when we do not have a quantitative estimation of the probability.
+
+But, even Lustre supports OSC-to-storage T10PI feature, the data are not fully protected in theory, unless some kind of APIs of T10PI are provided for applications, e.g. https://lwn.net/Articles/592113. Suporting that kind of APIs would be even more difficult, because stripe of LOV needs to be taken care of, or unless we limit the end-to-end T10PI to one-stripe files.
+
+One major difficulty of implementing OSC-to-storage T10PI feature for Lustre is, a single bulk RPC can be splitted into server I/Os on disk, which means, the checkum is needed to be re-calculated again.
+
+In order to avoid this problem, Lustre client need to start smaller bulk RPC so as to make sure the RPC can always be written/readed in one I/O. This will eliminate the need to recalculate the T10PI protection data on OSD side.
+
+--- Comment (nrutman, Wed, 6 Feb 2019 18:10:56 +0000) ---
+To avoid reading through this ticket again, here is the final conclusion:
+
+In summary, the current T10-PI checksum support in 2.12 is no worse than the existing bulk RPC checksums (with separate T10-PI checksums at the kernel bio level), and with the 32266 patch it is better still due to reduced CPU overhead. With that patch, reads can use the GRD tags straight from the hardware to compute the RPC checksum without any bulk data checksums on the OSS.
+
+32266 includes a series of server-side kernel patches for RHEL7. These patches allow for overlapping protection domains from Lustre client to disk. Without the patches, there is a protection hole (no worse than older network checksums).
+
+--- Comment (adilger, Thu, 22 Nov 2018 01:43:42 +0000) ---
+Correct, ZFS does not implement T10-PI support.  There is the old design for integrated end-to-end checksums from the client, which would use a similar, but more sophisticated, checksum method as the current T10 mechanism.
+
+--- Comment (nrutman, Wed, 21 Nov 2018 23:13:05 +0000) ---
+Thanks Andreas for the response. The T10-PI checks (end therefore end-to-end) only apply to ldiskfs, not ZFS, correct?
+
+--- Comment (pjones, Tue, 6 Nov 2018 13:47:59 +0000) ---
+Landed for 2.12
+
+--- Comment (gerrit, Tue, 6 Nov 2018 07:13:26 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/32266/
+
+Subject: LU-10472 osd-ldiskfs: T10PI between RPC and BIO
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: ccf3674c9ca3ed8918c49163007708d1ae5db6f5
+
+--- Comment (adilger, Mon, 22 Oct 2018 06:58:27 +0000) ---
+Nathan, the patch https://review.whamcloud.com/32266 "osd-ldiskfs: T10PI between RPC and BIO" will allow passing the GRD tags from Lustre down to the storage, if the hardware supports it.  The benefit of the integration with Lustre is indeed, as you wrote, to reduce the duplicate checksum CPU overhead on the server.  Using the checksum-of-checksums avoids increasing the request size for GRD tags as the RPC size grows (and will help ZFS in the future since it is doing a Merkle tree for its checksums).
+
+To respond to your #2, Lustre has always computed the network checksums in an "overlapping" manner.  It will verify the RPC checksum after the data checksums are computed on the OSS, so if they don't match, the client will re-send the RPC.  This ensures that the T10-PI checksums that the OSS is computing (and the pages they represent) are the same as the ones computed at the client (up to the limit of the 16-bit GRD checksum itself, which is IMHO fairly weak).  At least the 16-bit GRD checksum is only on the 4096-byte sector, and we have a somewhat stronger 32-bit checksum for the 2KB of GRD tags (for 4MB RPC).
+
+In summary, the current T10-PI checksum support in 2.12 is no worse than the existing bulk RPC checksums (with separate T10-PI checksums at the kernel bio level), and with the 32266 patch it is better still due to reduced CPU overhead.  With that patch, reads can use the GRD tags straight from the hardware to compute the RPC checksum without any bulk data checksums on the OSS.
+
+--- Comment (nrutman, Wed, 17 Oct 2018 00:37:46 +0000) ---
+There are a few things I still don't understand about this design.
+
+	Any over-the-wire checksum can be used, as long as you calculate the final GRD tags before the network checksum is verified. Yes, I suppose you might save some work on the server calculating both wire and T10 csums if they are related to each other, but this makes assumptions about the efficiency of various checksum types. It seems like T10 verification on the OSS should work with any wire checksum.
+
+	As hinted at by Andrew's and Li Xi's latest comments, there's some problems with Linux T10 support. To Li Xi's last comment in particular, as I stated back in Feb, you CAN'T allow the OS to recalculate GRD tags at write (or read) time. This completely breaks the end-to-end guarantee, because the data may have changed between the first check and the second re-calculation, and there is no way to catch that. Without the end-to-end guarantee, I don't see how this is any better than what we have today - separate network checksum and T10 calculated/verified in HBA hardware.
+
+If the answer to #2 is to patch the kernel, then it seems that is required not just for performance, but for correctness (of the end-to-end claim).
+
+--- Comment (gerrit, Thu, 7 Jun 2018 20:07:36 +0000) ---
+Oleg Drokin (oleg.drokin@intel.com) merged in patch https://review.whamcloud.com/30980/
+
+Subject: LU-10472 osc: add T10PI support for RPC checksum
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: b1e7be00cb6e1e7b3e35877cf8b8a209e456a2ea
+
+--- Comment (lixi, Wed, 23 May 2018 02:40:18 +0000) ---
+I am working on combining the T10PI RPC checksum with BIO layer. And I figured out that without patching Linux kernel it might be impossible to avoid recalculation of T10PI guard tags, which is bad for performance. But if we apply a small Linux kernel patch, thing will be much easier.
+
+The modification to Linux kernel would be (note all the following discussion will be based on Linux master branch):
+
+Add a new argument “struct bio *” to the following method:
+
+typedef blk_status_t (integrity_processing_fn) (struct blk_integrity_iter *);
+
+It becomes:
+
+typedef blk_status_t (integrity_processing_fn) (struct bio *, struct blk_integrity_iter *);
+
+This doesn’t need much change to the Linux kernel, since integrity_processing_fn is only used in following places:
+
+	bio_integrity_process() will call integrity_processing_fn, and bio_integrity_process() itself has “struct bio *bio”as an argument.
+
+	Function t10_pi_type[1|3][generate|verify][ip|crc] functions defined in T10-pi.c will need to be modified slightly.“struct bio *bio”can be added as an argument, but not used.
+
+Doing that change to Linux kernel enables Lustre (and other file systems) to integrate with BIO for integrity verification/generation. Following is the design:
+
+	When Lustre OSD starts, it will first backup the default template of “struct blk_integrity_profile” registered by the disk, and then replace the profile with Lustre native one.
+
+	When Lustre OSD umounts, it will change the“struct blk_integrity_profile”to the original one.
+
+	Private information can be attached to bio->bi_private. Existing T10PI guard tags of calculated by Lustre RPC checksum codes can be put into bio->bi_private in osd_do_bio().
+
+	When doing write, bio_integrity_process() needs to calls bi->profile->generate_fn(). In that case, the native method of Lustre will copy the guard tags rather than calculate it.
+
+	When doing read, bio_integrity_process() needs to calls bi->profile->verify_fn(). In that case, the native method of Lustre will verify (optional) and then copy the guard tags to “struct osd_iobuf *iobuf”and used them later for RPC checksum.
+
+I investigated other ways to do similar thing. However, it seems impossible, because bio_end() will call bio_integrity_endio() before calling bi->bi_end_io() method. That means, the integrity data of BIO will be cleaned up before Lustre has any chance to copy to its own buffer. 
+
+I know adding Linux kernel patch is the last thing we want to do, since the community have spent so much effort into patch-less server. But it seems there is no other choice. And since the Linux kernel patch is small, I think it would be relatively easy to persuade Linux kernel community to merge it to mainline.
+
+Any comment is welcome!
+
+--- Comment (lixi, Mon, 21 May 2018 09:26:15 +0000) ---
+random_write.c
+
+--- Comment (lixi, Mon, 21 May 2018 09:25:16 +0000) ---
+I am running the attached random_write.c on a Lustre file system with OSTs that has T10PI support. T10PI RPC checksum is enabled with following patch series:
+
+ 
+
+https://review.whamcloud.com/#/c/30980/36
+
+https://review.whamcloud.com/#/c/32266/7
+
+ 
+
+So far, no problem has been found by the verification code of https://review.whamcloud.com/#/c/32266/7.
+
+--- Comment (gerrit, Thu, 17 May 2018 02:07:49 +0000) ---
+Oleg Drokin (oleg.drokin@intel.com) merged in patch https://review.whamcloud.com/30792/
+
+Subject: LU-10472 osd-ldiskfs: add T10PI support for BIO
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: be30c0d71e75d3e24674edcc7e02d005d2a9f5c2
+
+--- Comment (panda, Wed, 9 May 2018 18:22:36 +0000) ---
+Li, Andreas, thank you, I'll take a look.
+
+--- Comment (lixi, Wed, 9 May 2018 10:31:31 +0000) ---
+Hi Andrew,
+
+Please check the presentation of Shuichi Ihara in LUG'18 (http://wiki.lustre.org/images/d/d1/LUG2018-T10PI_EndToEnd_Data_Integrity-Ihara.pdf) for some benchmark numbers with T10PI checksum types.
+
+--- Comment (lixi, Wed, 9 May 2018 10:28:14 +0000) ---
+Following test results might be different on different server, but still useful. On the virtual machine on a machine with CPU Intel Xeon E312xx (Sandy Bridge), got following number of checksum speed:
+
+OBD_CKSUM_T10IP512: 4215 MB/s
+
+OBD_CKSUM_T10IP4K: 6503 MB/s
+
+OBD_CKSUM_T10CRC512: 1171 MB/s
+
+OBD_CKSUM_T10CRC4K: 2187 MB/s
+
+OBD_CKSUM_ADLER: 1186 MB/s
+
+--- Comment (panda, Tue, 8 May 2018 11:42:46 +0000) ---
+Development of 5993 was stopped because of multiple issues in the area:
+
+1) very few hardware with DIF/DIX support at that time
+
+2) DIX-related bugs in Linux drivers, rewrite or extensive fixing was required
+
+3) bad design of T10 DIX support in Linux, e.g. lack of zero-copy in blk integrity functions
+
+4) incomplete integrity support in MDRAID
+
+5) Intel (Whamcloud?) was not happy with the design, based on discussion in email [which I don't have access to anymore since I'm not a Seagate engineer] Intel wanted Merkle tree support or at least a framework which allows to add Merkle tree support in the future.
+
+ 
+
+Li Xi, can you please tell me what hardware you are using for testing? Have you done any performance testing? If you are using disk arrays, is md/dm fully T10-compatible?
+
+--- Comment (panda, Tue, 8 May 2018 11:16:18 +0000) ---
+What is important is that the client needs to know the sector size, in order to compute the correct T10PI checksum. Otherwise, if the client computes checksums at 4KB, but the disk splits the writes into 512-byte sectors the checksum will be wrong.
+
+It does not look a major difficulty either, it took maybe a few dozen LOC in the original patch to pass T10 sector sizes from the OSS to the client (as ocd_ichunk_size, IRRC). And it did not require artificial split of BRW RPCs independent of striping since most T10 client-side handling was in the OSC.
+
+--- Comment (adilger, Tue, 8 May 2018 10:59:29 +0000) ---
+Either there's an important design bit missing or this statement does not make sense. T10 PI is per-sector and does not depend on how you split your I/O request.
+
+What is important is that the client needs to know the sector size, in order to compute the correct T10PI checksum.  Otherwise, if the client computes checksums at 4KB, but the disk splits the writes into 512-byte sectors the checksum will be wrong.
+
+It have no advantages over generate a T10 tags on server side where OSC <> OFD transfer is covered by network or OSC checksums.
+
+The main advantage over existing OSC RPC checksums is that the server does not need to compute both the T10PI checksums and the OSC RPC checksums when it is writing to disk.  On read, it would be possible for the OSS to use the GRD tags directly from disk and only compute the checksum-of-GRD (COG?), which definitely reduces sever-side overhead compared to separate OSC RPC checksums.
+
+as provide a hole while data can be changed silence. Simple example if we calculate a checksum over checksums array you can have some kind errors can be hide(it possible but not a trivial and depend of checksum algo used).
+
+That is incorrect.  The checksum-of-GRD is computed and verified against the COG sent in the RPC, and then the T10 hardware will verify the GRD checksums directly.  Yes, it is possible for some types of corruption to fool the COG, but it is a stronger CRC32C checksum on only a small amount of data, so the most likely cause of corruption would be if the data was corrupted and the GRD tags were recomputed to the same values, which is impossible to detect even if the GRD tags were sent directly.  In comparison, the GRD tags themselves are only 16-bit values, so it is 2^16 times more likely that one of them will be silently corrupted compared to the 32-bit CRC in the RPC.  If you can't trust the 32-bit CRC over 4-16KB of data, how can you trust a 16-bit IP/CRC checksum over 4KB of data?
+
+Note that I was not totally against the approach in https://review.whamcloud.com/5993 with sending the GRD tags directly over the network (prefer via bulk instead of request) or I wouldn't have spent time on reviewing that patch.  My main objection was with the implementation that was adding a large amount of duplicate code rather than integrating with the existing checksum implementation.  Also, the patch was never refreshed after my last review, so to me that implied you are not very interested in getting it landed.
+
+--- Comment (shadow, Tue, 8 May 2018 06:43:47 +0000) ---
+I prefere to stop FAKE T10PI and have name it is T10PI support in lustre. It have no advantages over generate a T10 tags on server side where OSC <> OFD transfer is covered by network or OSC checksums.
+
+T10 idea - we have a cross checking from client to client with additional verification on disk driver, but this patch series fake it idea as provide a hole while data can be changed silence. Simple example if we calculate a checksum over checksums array you can have some kind errors can be hide(it possible but not a trivial and depend of checksum algo used).
+
+as pointed Andrew, it can be caused a performance drop as it avoid a zero copy and server need to read all data before write to disk.
+
+Current memory BW is near of 20Gb/s-50Gb/s so each 4mb rpc will add a 1/10000s additional delay with 100% RAM BW used.
+
+with typical network BW - 8Gb/s-10Gb/s (and 20Gb/s with IB HDR adapter) it mean noticeable decrease a speed.
+
+--- Comment (panda, Tue, 8 May 2018 06:42:02 +0000) ---
+sending the T10PI checksums over the network significantly increases the size of each BRW RPC (up to 256KB of additional T10 data added for a 16MB RPC with 512-byte sectors and 8 bytes for the GRD/APP/REF tags), and didn't deal with the possible difference in sector size of the disks.
+
+The original patch negotiated integrity chunk sizes on per OSC/OST level. Indeed, if the OST is an array of disks (such as a software RAID) with different T10 sector sizes, then this information cannot be used by the client. I'm pretty certain such software RAIDs will not properly work with Linux T10 API anyway since it does not support the concept of multiple sector sizes for a single block device.
+
+--- Comment (panda, Tue, 8 May 2018 06:24:06 +0000) ---
+The actual T10PI checksums need to be computed on both the client and server in any case
+
+No, they do not have to be computed on the server side at least in software. The checks are performed in hardware (DIF/DIX) anyway.
+
+Regenerating T10 PI on the server side will cause performance drop, probably comparable to the one associated with reducing max brw size by 1.5% or increasing RPC buffers.
+
+--- Comment (panda, Tue, 8 May 2018 05:05:14 +0000) ---
+One major difficulty of implementing OSC-to-storage T10PI feature for Lustre is, a single bulk RPC can be splitted into server I/Os on disk, which means, the checkum is needed to be re-calculated again.
+
+Either there's an important design bit missing or this statement does not make sense. T10 PI is per-sector and does not depend on how you split your I/O request.
+
+--- Comment (gerrit, Tue, 8 May 2018 04:04:20 +0000) ---
+Li Xi (lixi@ddn.com) uploaded a new patch: https://review.whamcloud.com/32319
+
+Subject: LU-10472 ptlrpc: enable T10PI by default
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 6a39db0620e5f20f465f3f01599730b2b813fda7
+
+--- Comment (gerrit, Thu, 3 May 2018 09:07:44 +0000) ---
+Li Xi (lixi@ddn.com) uploaded a new patch: https://review.whamcloud.com/32269
+
+Subject: LU-10472 obd: reserve OBD_CONNECT2_T10PI
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 185fb7dc4d28e6ab8f2abdf33cc53bbe5b1fe095
+
+--- Comment (gerrit, Thu, 3 May 2018 02:24:19 +0000) ---
+Li Xi (lixi@ddn.com) uploaded a new patch: https://review.whamcloud.com/32266
+
+Subject: LU-10472 osd-ldiskfs: add T10PI verification for BIO
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 39a356ca49717c1a9edc27e7f60289570f7f714b
+
+--- Comment (gerrit, Mon, 5 Mar 2018 12:21:35 +0000) ---
+Li Xi (lixi@ddn.com) uploaded a new patch: https://review.whamcloud.com/31513
+
+Subject: LU-10472 osd-ldiskfs: add T10PI support for page cache
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 2ce7293277034a67463916bfda6aa18a05e934fa
+
+--- Comment (panda, Thu, 8 Feb 2018 09:04:58 +0000) ---
+Note that LU-2584 not only has a patch attached to it, but also a document which mentions PI data handling by user applications, contains analysis on how to transfer protection data through the network and also lists a few dependent components such as the MDRAID. The upstream kernel still seems to have incomplete integrity support in drivers/md even from the perspective of checksumming let alone REF tag handling and other "smart" features.
+
+--- Comment (nrutman, Thu, 8 Feb 2018 01:09:10 +0000) ---
+Sorry guys, coming to this ticket late. I'll throw in my two cents.
+
+1. There is no need to calculate per-block PI information on the client. The key is overlapping protection regimes. Existing over-the-wire checksums can be used, as long as T10PI information is calculated on the OSS before the over-the-wire checksum is verified. For reads, over-the-wire checksum must be calculated before the T10 checksums are verified on the OSS. If you used the current over-the-wire checksums, you don't have to mess with the client code at all, and don't have to worry about sector sizes there, and can use a stronger or faster checksum calculation.
+
+Having said that, it may still make sense to trade off the code required for the checksum-of-checksums change for the calculation savings over two wholly different checksums. The checksum-of-checksum method meets the overlapping protection criteria, except for the following.
+
+2. You may not calculate the T10 checksums twice on the OSS:
+
+W4) When preparing the BIO, OSS need to avoid re-calculate the T10PI checksums again, instead, it copy the existing T10PI checksums to BIO.
+
+ In order to avoid unncessary calculation of checksum for twice on OSS in step W4), BIO interfaces need to be hacked in some way, which will be tricky. Step W4) can be considered as an performance improvement if it is too hard.
+
+W4 cannot be skipped as "too hard". The reason is that if you calculate the PI twice, without verifying the checksum-of-checksums again, is that the data in the OSS buffers might change (bad memory, bad pointer, stray gamma ray). Calculating the T10 info on bad data leaves the system open to silent data corruption.
+
+ Similarly, R1 also cannot be skipped.
+
+3. Similarly, calculating checksums at dirty time vs send time - you're better protected at dirty time, but there's still a vulnerability window if the app doesn't calculate the parity itself (and there is no existing interface for an app to pass PI info). So this one is a bit more of a gray area, and we may be fine saying "guaranteed safe from client send time to on-disk" and stick with calculating late on the client. If there's already a tunable then even better.
+
+--- Comment (adilger, Thu, 1 Feb 2018 07:26:52 +0000) ---
+My recommendation would be to always use sector size = 4096 on the client, regardless of what the sector size is on the disk.  This will match the sector size on most modern disks, and avoided the need for the client to know what the actual sector size is.  That also avoids further complexity if the sector size is different between different OSTs.
+
+--- Comment (lixi, Thu, 25 Jan 2018 08:15:33 +0000) ---
+> In order to reduce the overhead of storing the T10PI information on each page, we might consider to shrink struct cl_page a bit from where it is now. Looking at this structure, I see enum cp_state is only using 5 values, and enum cp_type is only using 2 values, but each consume 4 bytes per page. It would be possible to put these enums into 1 or 2 bytes, and store the 2-byte GRD checksum adjacent in the page without any overhead. If we wanted to have a counter for the checksum age, we could have a 16-bit seconds counter (65536s ~= 20h), or something like an 8-bit counter of 256s units to give us the same range but lower granularity.
+
+There are two variables here. First, the page size could be larger then 4096. Second, the sector size of T10PI could be 512. That means, the protection data for each page could be PAGE_SIZE / sector_size * 2 Bytes, which is usually 2 Bytes, but also could be 16Bytes (for 4K PAGE_SIZE and 512Byte sector size), or even larger...
+
+--- Comment (gerrit, Tue, 23 Jan 2018 07:25:47 +0000) ---
+Li Xi (lixi@ddn.com) uploaded a new patch: https://review.whamcloud.com/30980
+
+Subject: LU-10472 osd-ldiskfs: debug T10pi
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: d9ed570098550fce9f6297ff1f5b887387710dfe
+
+--- Comment (lixi, Tue, 23 Jan 2018 02:08:59 +0000) ---
+MDT to disk T10PI support is much harder to implement than OST. Most of the MDT operations (settattr, etc.) call the operations on ldiskfs, and no direct BIO is submitted. That means, in order to support T10PI from MDT to disk, need to add support inside ldiskfs...
+
+--- Comment (ihara, Sun, 21 Jan 2018 02:33:30 +0000) ---
+Andreas, I agreed that client -> MDS is much risks of "data corruption", but I'm still concerned on "silent" data corruton between MDS and MDT(either storage contoller or disks) or even between HBA and OS layer. 
+
+Even just enabling T10PI/DIX will help a lot to defect such corruptions and prevent keep going without awareness of corruptions. I wonder if we still should have T10PI/DIX on MDS and MDT as a scope of this feature. But we don't want checksum or checksum of checksum for MDC and MDS.
+
+--- Comment (adilger, Sat, 20 Jan 2018 17:57:03 +0000) ---
+Ihara, for Data-on-MDT, the client->MDS BRW RPCs use the same format as client->OSS so the same data integrity is used.  For other metadata RPCs we do not do bulk data read/write except for readdir.  Since the metadata RPCs (including the readdir bulk operation) have internal structure (e.g. known fields and values), it is much less likely that any corruption will go undetected, since the structure and values are verified.
+
+That said, it is also possible to have integrity checking on all RPCs by enabling SSK or Kerberos with "integrity" mode (for the RPC portion and/or the bulk portion).  That will generate a strong checksum for every RPC that is verified before the RPC is processed.
+
+--- Comment (ihara, Fri, 19 Jan 2018 04:55:54 +0000) ---
+Li Xi, Andreas,
+
+what do we consider data Integrity for MDS-MDT and also client and MDS if we are going to implement checksum of checksum with T10PI?
+
+currently, we don't have any lustre checksum on MDC-MDS, but we definitely need End-to-End data integrity for metadata as well.
+
+--- Comment (lixi, Fri, 19 Jan 2018 00:47:49 +0000) ---
+Thank you Andreas for the detailed comment. I will start with the fundamental functionality first, and then add improvements. This is going to be a big project, but data integrity of Lustre will be improved a lot with it.
+
+--- Comment (adilger, Thu, 18 Jan 2018 21:28:38 +0000) ---
+I think the proposed plan is reasonable, with some minor changes and clarifications.
+
+W1, D2) Keeping the checksums updated on each page can add some overhead if the page is updated multiple times.  In Lustre 1.8 the llite.*.checksum_pages tunable controlled whether the checksums were computed at page dirty time, or whether the checksum is deferred to OSC RPC generation time (e.g. leave the page checksum == 0 and detect this in the OSC). One optimization if page checksums are being computed would be to determine this by whether a page is fully overwritten or if it is a partial page write.
+
+If checksums are computed at page dirty time, they should be computed on 4096-byte chunks, and in case of PAGE_SIZE > 4096 there should be an array of checksums per page [PAGE_SIZE/4096] to handle PPC, ARM, SPARC, IA64 (if that is still used) clients.
+
+W2) the niobuf_remote and obd_ioobj buffers should also be included into the BRW RPC checksum, since this covers the object number and page offset in the object, which is equivalent to the T10PI {{REF} tag that would normally be used.
+
+W3) again, checksums should be computed on the 4096-chunk size rather than PAGE_SIZE, though on servers this will normally be the same
+
+W4,R1) it might be possible to hook into the bi->profile->verify_fn() to have it copy the checksums from the pages into the bio_integrity_payload at BRW RPC generation time, rather than recomputing them on the client.  If the page checksum has not been computed then it would still need to be computed at this time
+
+R1) it would be a good optimization to keep the T10PI checksums with the pages in the OSS read cache, so they do not need to be recomputed for each read.  In the common case, if the checksums already are attached to the pages they could be used directly when generating the RPC. If the client has a bad checksum on read, the resent read RPC should be marked with a new OBD_BRW_CHECKSUM flag (or similar) that verifies the page checksums on the pages, and if the page checksum is bad then the pages are dropped from cache and read them from disk and the BIO checksums are verified before being put into the RPC.  This would handle the case where the pages in cache on the OSS have become corrupted in memory or out of sync with the page checksums.
+
+R4) if llite.*.checksum_pages is set, then we should consider whether reads from page cache should verify the per-page checksums, since they won't have just been verified by the OSC, or do we consider ECC RAM enough in this case?  An optimization would be to make a time-based check so that we don't recompute the checksum too frequently (e.g. once per 10 minutes).  Even though the DLM puts a limit on how long pages can stay in the client cache (ldlm.namespaces.*.lru_max_age=3900 seconds) that is only for unused locks, and active locks could allow read-only files to stay in cache forever.
+
+D1) the overhead is slightly different than this, since the 2-byte APP tag and the 4-byte REF tag would not be included in the checksum, only the 2-byte GRD tag per sector, which reduces the overhead to (514-512)/512 = 1/256).  However, the 24-byte {{obd_ioobj and 16-byte niobuf_remote (per extent) should be added to the checksum instead of the REF tag to cover the block (object offset) addresses.  For contiguous writes there would be one 16-byte niobuf_remote added per RPC vs. one 4-byte REF tag per sector, so this is more efficient for writes above 28KB with at least 16KB of contiguous data.  The niobuf_remote also doesn't have the T10PI REF tag limitation of a 32-bit sector address, so the BRW RPC checksum is actually a bit more robust than T10PI.  Since the client has no idea of the final on-disk location of the data, the REF tags for the actual BIO read/write need to be recalculated/mapped at each stage of IO, so there is no loss in integrity vs. strict T10PI if they are derived from the niobuf_remote object offset.
+
+In order to reduce the overhead of storing the T10PI information on each page, we might consider to shrink struct cl_page a bit from where it is now.  Looking at this structure, I see enum cp_state is only using 5 values, and enum cp_type is only using 2 values, but each consume 4 bytes per page.  It would be possible to put these enums into 1 or 2 bytes, and store the 2-byte GRD checksum adjacent in the page without any overhead.  If we wanted to have a counter for the checksum age, we could have a 16-bit seconds counter (65536s ~= 20h), or something like an 8-bit counter of 256s units to give us the same range but lower granularity.
+
+--- Comment (lixi, Wed, 17 Jan 2018 04:00:40 +0000) ---
+Hi Anreas,
+
+I agree that checksum of checksum is a much better idea than sending the checksums through network.
+
+So the basic idea is:
+
+W1) When client changes a page, the T10PI checksum of the page will be updated;
+
+W2) When client sends a write RPC, the RPC checksum will calculate from the T10PI checksums of the pages, rather than the pages itself;
+
+W3) When OSS recieve the write RPC, a T10PI checksum will be calculate for each page of the RPC. And then a total checksum will be calculated from the T10PI checksums, and compared with the RPC checksum to verify the recieved data;
+
+W4) When preparing the BIO, OSS need to avoid re-calculate the T10PI checksums again, instead, it copy the existing T10PI checksums to BIO.
+
+In order to avoid unncessary calculation of checksum for twice on OSS in step W4), BIO interfaces need to be hacked in some way, which will be tricky. Step W4) can be considered as an performance improvement if it is too hard.
+
+And the reading idea is:
+
+R1) When read BIO finishes on OSS, the T10PI checksums will be extracted from BIO directly, rather than re-calculating;
+
+R2) The checksm of T10PI checksums will be sent to client together with the data;
+
+R3) Client re-calculate the T10PI checksums from the data, and compare the checksum of the T10PI checksums together to verify the data.
+
+R4) The T10PI checksums will be appended to the page cache, in case other software levels wants to verify the data.
+
+Step R1) can be also considered as a performance improment, since T10PI checksum can be calculated from data itself.
+
+As far as we can see, in both read and write processes, T10PI checksums will only be calculated twice, once for generating on one peer, and the other for data verifying on the other peer. Comparing with the former RPC checksum, the difference is:
+
+D1) Need to calculate the additional checksum of T10PI checksums, but the total extra data size would only be at most (520-512)/512 = 1/64 of the original data. So the the extra overhead of this part should be minimal.
+
+D2)The orginal RPC checksum need to be calculated right before sending data, but the T10PI checksums of pages could be calculated long time before RPC is sent. And if strict T10PI protection is not needed, the generating of T10PI checksum of a page can be delayed. That means,a page could have no T10PI checksum attached, and the T10PI checksum could be generated in background, unless the page is being sent through RPC. Given the fact that the overhead of the current RPC checksum is still significant, the mechanism of background checksum calculation might bring extra bonus.
+
+--- Comment (adilger, Mon, 15 Jan 2018 23:57:00 +0000) ---
+I think the 1.5% space overhead is only relevant if the T10PI information is sent as part of the bulk RDMA, which it wasn't in the original patch.  Sending the T10PI information with a bulk RDMA would (IMHO) cause more than 1.5% overhead, maybe as much as 100% overhead, because this would require an extra RDMA for only the T10PI information for any 1MB multiple of data, because the IB RDMA is in 1MB units.
+
+Conversely, if the T10PI information is sent as BRW RPC it will also cause significant overhead.  The niobuf_remote is only 16 bytes for as much as 16MB of RDMA, if this is a contiguous read/write.  Conversely, the T10PI for a 16MB BRW is as much as 128KB for 512-byte sectors, 32KB for 16MB BRWof 4096-byte sectors, and typically 8KB for 4MB BRW of 4096-byte sectors.  That would increase the BRW RPC size significantly, causing more memory pressure on the OSS under load from many clients.
+
+Data integrity:
+
+	the T10PI checksums are only 16-bits in size (+ 32-bit address).  If a 16-bit checksum is considered acceptable for 4KB of data (which IMHO is marginal), a 32-bit checksum should be acceptable for the 8KB of T10PI information (checksum of checksums).  The checksum-of-checksums is small, but this size can easily be increased to be much stronger than the actual T10PI checksums themselves.  The actual T10PI checksums need to be computed on both the client and server in any case, and the checksum-of-checksums adds trivial overhead (less than 0.1%).  Some work might needed in the kernel to be able to pass the OSS-computed checksum directly to the BIO routines (I'm not very familiar with those routines).
+
+APP tag:
+
+	As previously mentioned, if/when the ability for userspace to specify APP tags is added to the kernel we can pass this extra information via a separate RPC message buffer.  In the meantime, it is a waste to send 2 bytes per sector (512 bytes/MB for 4KB sectors) over the network for every RPC that provide no value today.
+
+--- Comment (lixi, Mon, 15 Jan 2018 02:12:27 +0000) ---
+I think BRW RPC checksum mechanism is different with what T10PI is trying to do. From the checksum algorithm point of view, some of the checksum algorithms used by T10PI can already be used by BRW RPC checksum (linux.git/crypto/crct10dif_generic.c). However, T10PI is not used to calculate the checksum of a big bulk (upto 16MB), but a small sector (512B or 4KB). That means, integrating T10PI with BRW RPC checksum might not be straightforward. However, if T10PI is enabled, it would be reasonable to disable BRW RPC checksum for reducing overhead, since T10PI should be enought for protecting the data integrity.
+
+--- Comment (lixi, Wed, 10 Jan 2018 03:23:53 +0000) ---
+One problem of the checksum-of-checksums is: an RPC might be submitted into multiuple BIOs. That means, we need to either 1) calculate the T10PI checksums twice, once in tgt_checksum_niobuf() and the other in bio_integrity_prep() or 2) get the T10PI checksums from all BIOs and calculate the total checksum to compare with the RPC's checksum. Neither way is straightforward.
+
+And another problem of the checksum-of-checksums is: we will not be able to get original GRD/APP/REF tags of the sectors in the future. This will not cause immediate problem, but will might cause trouble if T10PI is extended some how in the future (e.g. userspace interfaces are added to set a special APP tag, and at the same time, on the storage, use APP tag to apply some kind of policy, e.g. high priority?), given the fact that network protocal is not supposed to be changed frequently.
+
+T10PI would cost at most 8 Bytes / 512 Bytes = 1 / 64 = 1.56% space in the RPC. I am not sure, but I feel it is safe to estimate the direct performance decline would be only 1.56%, which is also the approximate performance drop on disk caused by T10PI (at least in theory, ignoring the guard verifying overhead). 3.2% is acceptable decline assuming no overhead in other parts except increasing RPC size and disk I/O size. Other parts of overhead introduced by T10PI is generating and verifying guard tag. It would be interesting to check how much performance will be reduced after enabling T10PI, but I feel the most significant overhead would not be the size increasement itself.
+
+The greatest strength of T10PI over the existing checksum/ECC/CRC is, it delivers full end-to-end data integrity from application to disk drive. If we use checksum-of-checksums in the middle, users or most likely the competitors would argue that this not real T10PI, and thus not really end-to-end...
+
+--- Comment (lixi, Wed, 10 Jan 2018 01:39:35 +0000) ---
+Hi Andreas,
+
+Thanks for the advices!
+
+The idea of checksum-of-checksums sounds good. I will check how to implement.
+
+--- Comment (adilger, Tue, 9 Jan 2018 22:45:24 +0000) ---
+IMHO, there were two significant implementation problems with the original LU-2584 patch that should be avoided/fixed if there is a desire to implement end-to-end T10PI support from the client:
+
+	the T10PI checksums were handled totally separately from the existing BRW RPC checksum mechanism, which meant a lot of code duplication.  Instead of having a totally separate checksum mechanism, the T10PI checksums should be implemented as a new type of BRW RPC checksum within the existing OSC/OST framework (and with suitable enhancements to the existing framework as needed).
+
+	sending the T10PI checksums over the network significantly increases the size of each BRW RPC (up to 256KB of additional T10 data added for a 16MB RPC with 512-byte sectors and 8 bytes for the GRD/APP/REF tags), and didn't deal with the possible difference in sector size of the disks.
+
+If we are not sending the T10 16-bit APP tags from the client to the OSS (which I don't think there is any standard userspace interface for anyway), then instead of actually sending 8 bytes of T10 data per sector it would be sufficient to compute the T10PI on the client (use 4KB sector size), then compute a checksum of the T10PI data APP=0, store it in the normal Lustre BRW RPC checksum field.  On the OSS, recompute the per-4KB T10PI checksums, and the (Lustre-specific) BRW checksum-of-checksums and verify that this matches the checksum that the client sent.  If they match, then the OSS-computed T10PI information is correct, and can be passed on down the IO stack if the HDD sector size is also 4KB (which is most common today).  If 16-bit APP tags are required to be sent from the client, they can still be sent in a separate buffer (which should be included in the BRW RPC checksum if present), but are 1/4 of the size of sending full per-sector GRD and REF tags.
+
+If there is a concern that the 32-bit Lustre BRW checksum is not strong enough, then we could consider to increase the BRW RPC checksum size to 64-, 128-, or 256-bit size using existing fields in struct obdo rather than sending a full set of T10 checksums per sector, which would provide better reliability than a series of 16-bit checksums, and would also be useful for passing ZFS checksums from the client to the OSD.  That said, the existing T10PI GRD checksum is only a weaker 16-bit checksum, so it is more likely to miss bit errors compared to the existing 32-bit BRW RPC checksum.
+
+To take this functionality to the logical conclusion, it would also be possible to compute and store a T10 checksum on each page when the page is written, and then combine them to form the RPC checksum, to detect corruption in memory on the client (possibly an I/O forwarding node that may cache data for a longer time).
+
+--- Comment (gerrit, Tue, 9 Jan 2018 04:54:42 +0000) ---
+Li Xi (lixi@ddn.com) uploaded a new patch: https://review.whamcloud.com/30792
+
+Subject: LU-10472 osd-ldiskfs: add T10PI support for BIO
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: b166aeee645a305fdc6c93766d27337401907082

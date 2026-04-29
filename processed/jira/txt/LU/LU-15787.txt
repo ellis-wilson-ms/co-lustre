@@ -1,0 +1,139 @@
+Key:        LU-15787
+Summary:    clients built without encryption support can corrupt encrypted directories
+Link:       https://jira.whamcloud.com/browse/LU-15787
+Type:       Bug
+Priority:   Blocker
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Sebastien Buisson
+Reporter:   John Hammond
+Created:    Tue, 26 Apr 2022 16:49:59 +0000
+Updated:    Fri, 10 Jun 2022 18:01:54 +0000
+Resolved:   Thu, 5 May 2022 19:45:33 +0000
+Links:      Related: is related to LU-15767; Related: is related to LU-13717
+
+--- Description ---
+Clients build without encryption support can create files in encrypted directories. The names of the created files may collide with the names of existing decrypted files.
+
+One way to see this is to build a CentOS 7 (3.10.0) based client and then to mount an encryption enabled FS.
+
+On the old client:
+
+# grep ENCRYPT ex/lustre-release/config.h
+/* #undef CONFIG_LDISKFS_FS_ENCRYPTION */
+/* #undef CONFIG_LL_ENCRYPTION */
+
+new-server# fscrypt setup /mnt/lustre
+Metadata directories created at "/mnt/lustre/.fscrypt".
+new-server# mkdir /mnt/lustre/private
+new-server# fscrypt encrypt --user=root /mnt/lustre/private
+...
+"/mnt/lustre/private" is now encrypted, unlocked, and ready for use.
+new-server# echo XXX > /mnt/lustre/private/f0
+new-server# ls /mnt/lustre/private/
+f0
+
+old-client# mount new-server@tcp:/lustre /mnt/lustre -t lustre
+old-client# mount -t lustre
+192.168.122.63@tcp:/lustre on /mnt/lustre type lustre (rw,flock,lazystatfs,noencrypt)
+old-client# ls /mnt/lustre/private/
+j?"n5? /mnt/lustre/private/f0
+old-client# ls /mnt/lustre/private/
+f0  j?"n5?
+
+Another thing I notice here is that when the old client tries to read the encrypted file, read()  just returns 0.
+
+This seems like a serious issue to me. If a site is running a mix of old and new client kernels then it seems relatively easy to wander into this situation unawares.
+
+As discussed on chat, the MDT should protect against this situation. If the directory is encrypted (has LUSTRE_ENCRYPT_FL set) and the client does not have the encryption connect flag (OBD_CONNECT2_ENCRYPT) then the MDT could disallow creates in the directory. But this needs investigation.
+
+--- Comment (pjones, Thu, 5 May 2022 19:45:33 +0000) ---
+Landed for 2.15
+
+--- Comment (gerrit, Thu, 5 May 2022 19:27:49 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/47182/
+
+Subject: LU-15787 sec: document enc-unaware clients on enc files
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 751a8114ef3afe9abe7692b3974b070db6a705a2
+
+--- Comment (gerrit, Thu, 5 May 2022 18:47:28 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/47156/
+
+Subject: LU-15787 sec: block enc unaware clients on enc files
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: a31db2ec062ccc995527d37f0330edbca9d486a9
+
+--- Comment (gerrit, Mon, 2 May 2022 13:42:06 +0000) ---
+"Sebastien Buisson " uploaded a new patch: https://review.whamcloud.com/47182
+
+Subject: LU-15787 sec: document enc-unaware clients on enc files
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: cabd3955c47543d2193f237918a8204d5532d1f6
+
+--- Comment (adilger, Thu, 28 Apr 2022 22:20:57 +0000) ---
+Colin, definitely without Sebastien's 47156 patch there is a real risk of a user/application without a key or fscrypt inadvertently or maliciously corrupting an encrypted directory.  That is a DOS on the legitimate user of the file.  Even worse, the corruption is in a way that even the user with the key can't fix the problem anymore == service call where we need to do low-level debugfs hacking to delete the bad files.
+
+As for why we would want to add MDS support for base64 encoding filenames for no-key/no-fscrypt clients, that is mainly for manageability and consistency.  It is bad to return "nasty" filenames to old clients that they can't do anything with (or may choke on), acceptable would be to block them outright from accessing these files/directories on the assumption that they must have some newer client with fscrypt support that could at least access the directory and delete the files, even if they don't have the key.
+
+Preferably, the no-key filenames should be consistent for all clients (no-key or without fscrypt support) so that tools that monitor space usage, migrate, etc. can still handle them.  I'm sure users would love a mechanism to lock out admins from their directory trees to prevent purge from cleaning up their old files.  This needs to work for basic directory operations (e.g. "ls -l", "rm -r", etc.) and potentially also Lustre-specific interfaces like "lfs fid2path", "lfs path2fid".  This will need some support on the MDS side to encode the filenames in a consistent way with no-key fscrypt-capable clients.
+
+Separately, it is currently not possible to do backup/restore for fscrypt files (neither at the Lustre level nor the MDT with tar, but dd or e2image would still work).  This is a limitation present in the upstream fscrypt implementation that we've partly worked around for Lustre to allow mirror/migrate for OST management, but it is something that needs to be addressed in the future in order for admins to manage filesystems that have fscrypted directory trees in them.
+
+--- Comment (JIRAUSER17312, Thu, 28 Apr 2022 19:46:36 +0000) ---
+Hm.. why though? If the filenames are encrypted, and the client lacks both key and encryption support, what's the problem? 
+
+The original issue seems to be addressed by sebastien's patch, wouldn't extending this further be feature enhancements so that older non-supported clients have a "more correct" view of a bunch of files that they can't access anyways?
+
+--- Comment (sebastien, Wed, 27 Apr 2022 18:21:10 +0000) ---
+That would require to implement on server side, for the specific encryption unaware client case, a filename processing similar to what is done in ll_setup_filename() and ll_fname_disk_to_usr on client side, in order to handle the digested form. This digested form is imposed by the NAME_MAX limitation (i.e. base64 encoding NAME_MAX long encrypted file names would produce too long names).
+
+--- Comment (adilger, Wed, 27 Apr 2022 17:40:14 +0000) ---
+Hmm, you want the MDS to base64 encode the encrypted filenames before returning them to the client, in all cases, or just to encryption unaware clients?
+
+Ideally the same no-key filenames would be visible userspace for clients w/o encryption support, clients w/o the key, as well as fid2path. That allows userspace to work consistently with these filenames.
+
+--- Comment (gerrit, Wed, 27 Apr 2022 15:50:06 +0000) ---
+"Sebastien Buisson " uploaded a new patch: https://review.whamcloud.com/47156
+
+Subject: LU-15787 sec: block enc unaware clients on enc files
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 2c5d4a99365cea42e6f98be7cafc089fd95283c6
+
+--- Comment (sebastien, Wed, 27 Apr 2022 15:20:45 +0000) ---
+Hmm, you want the MDS to base64 encode the encrypted filenames before returning them to the client, in all cases, or just to encryption unaware clients?
+
+For encryption aware clients, this is not necessary, the client code properly handles this.
+
+For encryption unaware clients, I am not sure it is a good idea. Keeping non printable characters at least has the advantage to show that these files should not be manipulated.
+
+And in all cases, the MDS already escapes a few critical characters (NULL, LF, CR, /, DEL and =) in encrypted file names before sending them to clients, by calling critical_encode(). So the encrypted names received by an encryption unaware client are not that badly formed to break ls for instance.
+
+--- Comment (adilger, Wed, 27 Apr 2022 15:01:34 +0000) ---
+Sebastien, beyond blocking old clients from opening encrypted files (with -ENOKEY), it looks like the MDS also needs to base64 encode the encrypted filenames before returning them to the client on readdir(). 
+
+As a quick fix it could return -ENOKEY for readdir as well. That isn't great because then old clients cannot access these directories at all, but relatively easy to implement and new clients can still access the directory tree.  It wouldn't preclude implementing the return of base64-encoded names to the client.

@@ -1,0 +1,175 @@
+Key:        LU-1396
+Summary:    Test failure on test suite mds-survey, subtest test_2
+Link:       https://jira.whamcloud.com/browse/LU-1396
+Type:       Bug
+Priority:   Blocker
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Di Wang
+Reporter:   Maloo
+Created:    Thu, 10 May 2012 14:03:24 +0000
+Updated:    Mon, 30 Jul 2012 12:28:48 +0000
+Resolved:   Mon, 30 Jul 2012 12:28:48 +0000
+
+--- Description ---
+This issue was created by maloo for sarah 
+
+This issue relates to the following test suite run: https://maloo.whamcloud.com/test_sets/9a890324-9abe-11e1-96af-52540035b04c.
+
+The sub-test test_2 failed with the following error:
+
+mds-survey failed
+
+Info required for matching: mds-survey 2
+
+--- Comment (pjones, Mon, 30 Jul 2012 12:28:48 +0000) ---
+Patch landed for 2.3. Please reopen if further work needed.
+
+--- Comment (di.wang, Fri, 1 Jun 2012 01:56:28 +0000) ---
+Bobi just advised me with this trace from bug 16006
+
+Call Trace:{:osc:osc_destroy+1693} 
+
+{default_wake_function+0} 
+
+       {:lov:lov_prep_destroy_set+1780} 
+
+       {:lov:lov_destroy+1550} {:lov:lov_alloc_memmd+206} 
+
+       {:lov:lsm_unpackmd_plain+28} {:lov:lov_unpackmd+1124} 
+
+       {dput+55} {:mds:mds_osc_destroy_orphan+3672} 
+
+       {_up_read+16} {_down_write+52} 
+
+       {:mds:mds_destroy_export+2090} {:ptlrpc:ptlrpc_put_connection+484} 
+
+       {:obdclass:class_decref+62} {:obdclass:class_export_destroy+381} 
+
+       {:obdclass:obd_zombie_impexp_cull+150} 
+
+       {:ptlrpc:ptlrpcd_check+229} {:ptlrpc:ptlrpcd+810} 
+
+       {default_wake_function+0}
+ {:ptlrpc:ptlrpc_expired_set+0} 
+
+       {:ptlrpc:ptlrpc_expired_set+0} 
+
+{child_rip+8}
+ 
+
+       {:ptlrpc:ptlrpcd+0} 
+
+{child_rip+0}
+[9:42:43 PM PDT] Bobi Jam: osc_destroy()->osc_can_send_destroy()
+
+So osc destroy might be called in the middle of ptlrpcd, and we should not block ptlrpcd thread in this case. I will update my patch. Thanks
+
+--- Comment (di.wang, Thu, 31 May 2012 19:34:08 +0000) ---
+hmm, you mean the same ptlrpcd is responsible for decreasing the cl_destroy_in_flight? Why those threads which already sent out "destroy RPC" will descrease it?  they are blocked too in this situation?
+
+--- Comment (bobijam, Mon, 28 May 2012 07:54:01 +0000) ---
+according to https://bugzilla.lustre.org/show_bug.cgi?id=16006#c93 description
+
+Client evicting could make prlrpcd thread call path go through osc_destroy, and if RPC throttle makes ptlrpcd waiting for old RPCs completion, and while the same ptlrpcd is responsible for interpret reply, the deadlock situation ensues. 
+
+Thus just add OST destroy RPCs throttle is not enough, the above scenario need take care. That's the reason the code has "if (!(cli->cl_import->imp_connect_flags_orig & OBD_CONNECT_MDS))" there.
+
+--- Comment (di.wang, Thu, 24 May 2012 17:29:49 +0000) ---
+http://review.whamcloud.com/#change,2899
+
+--- Comment (di.wang, Tue, 22 May 2012 17:23:02 +0000) ---
+Andreas, I do not understand why destroy RPCs between MDS and OST bypassing that limit control neither. 
+
+osc_destory() 
+
+{
+
+        .....................
+
+       /* don't throttle destroy RPCs for the MDT */
+
+        if (!(cli->cl_import->imp_connect_flags_orig & OBD_CONNECT_MDS)) {
+
+                req->rq_interpret_reply = osc_destroy_interpret;
+
+                if (!osc_can_send_destroy(cli)) 
+
+{
+                        struct l_wait_info lwi = LWI_INTR(LWI_ON_SIGNAL_NOOP,
+                                                          NULL);
+
+                        /*
+                         * Wait until the number of on-going destroy RPCs drops
+                         * under max_rpc_in_flight
+                         */
+                        l_wait_event_exclusive(cli->cl_destroy_waitq,
+                                               osc_can_send_destroy(cli), &lwi);
+                }
+        }
+
+        ....................
+
+}
+
+Hmm, according to the blame log, it seems because if we throttle destroy RPC here, abort recovery will take very long time (bug 18049). But improve max_rpcs_in_flight to 50 might work here. I will cook a patch. Thanks.
+
+--- Comment (adilger, Tue, 22 May 2012 17:10:31 +0000) ---
+Di,
+
+there should be some form of RPC rate limiting for the MDS->OSS communications.  A similar problem was hit in the past, and the MDS OSCs were put under the max_rpcs_in_flight (8) limit at that time.  Is there some reason why this code is bypassing that limit?  I can understand that 8 RPCs in flight is too few, but the solution is to increase the MDS OSC max_rpcs_in_flight limit (e.g. =50) instead of bypassing the limit entirely.
+
+--- Comment (di.wang, Thu, 17 May 2012 17:31:07 +0000) ---
+The problem for this bug is that during mds-survey destory,  MDT suddenly put too much destroy RPC on wire, so it can not send out requests in time, 
+
+Lustre: 31465:0:(client.c:1762:ptlrpc_expire_one_request()) @@@ Request  sent has timed out for sent delay: [sent 1336857426/real 0]  req@ffff88002d402400 x1401789656262897/t0(0) o6->lustre-OST0002-osc-MDT0000@10.10.4.111@tcp:6/4 lens 512/400 e 0 to 1 dl 1336857463 ref 2 fl Rpc:X/0/ffffffff rc 0/-1
+
+Lustre: lustre-OST0002-osc-MDT0000: Connection to lustre-OST0002 (at 10.10.4.111@tcp) was lost; in progress operations using this service will wait for recovery to complete
+
+Lustre: lustre-OST0000-osc-MDT0000: Connection to lustre-OST0000 (at 10.10.4.111@tcp) was lost; in progress operations using this service will wait for recovery to complete
+
+Lustre: 31466:0:(client.c:1762:ptlrpc_expire_one_request()) @@@ Request  sent has timed out for sent delay: [sent 1336857435/real 0]  req@ffff880002103400 x1401789656280716/t0(0) o6->lustre-OST0004-osc-MDT0000@10.10.4.111@tcp:6/4 lens 512/400 e 0 to 1 dl 1336857472 ref 2 fl Rpc:X/0/ffffffff rc 0/-1
+
+Lustre: 31466:0:(client.c:1762:ptlrpc_expire_one_request()) Skipped 659 previous similar messages
+
+Lustre: 31465:0:(client.c:1762:ptlrpc_expire_one_request()) @@@ Request  sent has timed out for sent delay: [sent 1336857434/real 0]  req@ffff880008753c00 x1401789656279001/t0(0) o6->lustre-OST0002-osc-MDT0000@10.10.4.111@tcp:6/4 lens 512/400 e 0 to 1 dl 1336857471 ref 2 fl Rpc:X/0/ffffffff rc 0/-1
+
+Lustre: 31465:0:(client.c:1762:ptlrpc_expire_one_request()) Skipped 5983 previous similar messages
+
+Then MDS reconnect and sync, but failed, because OST is still busy with destory..  So it deactive the import, so we got the failure.
+
+MDS
+
+LustreError: 8319:0:(lov_log.c:158:lov_llog_origin_connect()) error osc_llog_connect tgt 1 (-11)
+
+LustreError: 8320:0:(mds_lov.c:872:__mds_lov_synchronize()) lustre-OST0002_UUID failed at llog_origin_connect: -11
+
+14:20:12:LustreError: 8318:0:(osc_create.c:612:osc_create()) lustre-OST0000-osc-MDT0000: oscc recovery failed: -11
+
+14:20:12:LustreError: 8318:0:(lov_obd.c:1066:lov_clear_orphans()) error in orphan recovery on OST idx 0/7: rc = -11
+
+14:20:12:LustreError: 8318:0:(mds_lov.c:882:__mds_lov_synchronize()) lustre-OST0000_UUID failed at mds_lov_clear_orphans: -11
+
+OST
+
+14:18:39:Lustre: lustre-OST0000: Client lustre-MDT0000-mdtlov_UUID (at 10.10.4.110@tcp) reconnecting
+
+14:18:40:Lustre: lustre-OST0000: Client lustre-MDT0000-mdtlov_UUID (at 10.10.4.110@tcp) refused reconnection, still busy with 59 active RPCs
+
+14:18:40:Lustre: lustre-OST0001: Client lustre-MDT0000-mdtlov_UUID (at 10.10.4.110@tcp) reconnecting
+
+So the root cause of this problem is that we put too much destroy RPC on wire between MDT and OST during mds-survey, but does not control it as we do for client->OST. We probably should do that for mds-survey. But after lod/osp(2.4) is landed, MDT will destroy the objects through llog, instead of adding RPC immediately for each destroy. Or even do multiple destroy in one RPC. the problem will go away at that time.  Maybe we can live with it until then? Andreas, Oleg, what is your idea? 
+
+Thanks
+
+--- Comment (di.wang, Thu, 10 May 2012 16:57:05 +0000) ---
+Sure, I will investigate these mds-survey problems.
+
+--- Comment (pjones, Thu, 10 May 2012 16:52:16 +0000) ---
+Wangdi
+
+Could you please comment on this test failure?
+
+Thanks
+
+Peter

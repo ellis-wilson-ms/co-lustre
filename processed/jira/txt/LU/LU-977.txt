@@ -1,0 +1,646 @@
+Key:        LU-977
+Summary:    incorrect round robin object allocation
+Link:       https://jira.whamcloud.com/browse/LU-977
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Bob Glossman
+Reporter:   Alexey Lyashkov
+Created:    Tue, 10 Jan 2012 01:33:36 +0000
+Updated:    Wed, 19 Oct 2022 01:03:27 +0000
+Resolved:   Fri, 21 Aug 2015 22:10:36 +0000
+Labels:     llnl, patch
+Links:      Related: is related to  LU-9780; Related: is related to  LU-14377; Related: is related to  LU-9
+
+--- Environment ---
+any lustre from a 1.6.0
+
+--- Description ---
+https://bugzilla.lustre.org/show_bug.cgi?id=24194
+
+bug issued due incorrect locking in lov_qos code and can be easy replicated by test
+
+diff --git a/lustre/lov/lov_qos.c b/lustre/lov/lov_qos.c 
+index a101e9c..64ccefb 100644 
+--- a/lustre/lov/lov_qos.c 
++++ b/lustre/lov/lov_qos.c 
+@@ -627,6 +627,8 @@ static int alloc_rr(struct lov_obd *lov, int *idx_arr, int *stripe_cnt, 
+
+ repeat_find: 
+         array_idx = (lqr->lqr_start_idx + lqr->lqr_offset_idx) % osts->op_count; 
++ CFS_FAIL_TIMEOUT_MS(OBD_FAIL_MDS_LOV_CREATE_RACE, 100); 
++ 
+         idx_pos = idx_arr; 
+ #ifdef QOS_DEBUG 
+         CDEBUG(D_QOS, "pool '%s' want %d startidx %d startcnt %d offset %d "
+
+test_51() {
+        local obj1
+        local obj2
+        local old_rr
+
+        mkdir -p $DIR1/$tfile-1/
+        mkdir -p $DIR2/$tfile-2/
+        old_rr=$(do_facet $SINGLEMDS lctl get_param -n 'lov.lustre-MDT*/qos_threshold_rr' | sed -e
+'s/%//')
+        do_facet $SINGLEMDS lctl set_param -n 'lov.lustre-MDT*/qos_threshold_rr' 100
+#define OBD_FAIL_MDS_LOV_CREATE_RACE     0x148
+        do_facet $SINGLEMDS "lctl set_param fail_loc=0x80000148"
+        touch $DIR1/$tfile-1/file1 &
+        PID1=$!
+        touch $DIR2/$tfile-2/file2 &
+        PID2=$!
+        wait $PID2
+        wait $PID1
+        do_facet $SINGLEMDS "lctl set_param fail_loc=0x0"
+        do_facet $SINGLEMDS "lctl set_param -n 'lov.lustre-MDT*/qos_threshold_rr' $old_rr"
+
+        obj1=$($GETSTRIPE -o $DIR1/$tfile-1/file1)
+        obj2=$($GETSTRIPE -o $DIR1/$tfile-2/file2)
+        [ $obj1 -eq $obj2 ] && error "must different ost used"
+}
+run_test 51 "alloc_rr should be allocate on correct order"
+
+bug found in 2.x but should be exist in 1.8 also.
+
+CFS_FAIL_TIMEOUT_MS can be replaced with CFS_RACE()
+
+--- Comment (pjones, Fri, 21 Aug 2015 22:10:36 +0000) ---
+Landed for 2.8
+
+--- Comment (gerrit, Wed, 8 Jul 2015 17:19:50 +0000) ---
+Oleg Drokin (oleg.drokin@intel.com) merged in patch http://review.whamcloud.com/14636/
+
+Subject: LU-977 lod: Patch to protect lqr_start_idx
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: d9b4bc5476c779aaaee6797e5e148b5e0b771980
+
+--- Comment (520557, Tue, 7 Jul 2015 11:56:18 +0000) ---
+Adding testing output demonstrating the fix :
+
+NOTE: The tests were run on real hardware on Lustre 2.5.1 version and with the fix where separate function was not created for the function calls inside the loop. I hope that's fine.
+
+WITHOUT Fix
+
+=============
+
+For reproducing the issue, a cluster with 12 OSTs and 12 client machines where used. Each client is a 24 cpu cores machine.
+
+IOR load is like the first example from CEAP-82 with smaller i/o transfer and block parameters.
+
+number of threads is 12 * 24, 24 threads per each client.
+
+To increase concurrency, each thread was operating through own lustre mount point, so each client had 24 lustre mounts.
+
+the main script:
+
+[CEAP-82]$ cat ceap-82.sh 
+#! /bin/bash
+
+MPIEXEC=/home/bloewe/libs/mpich-3.1/install/bin/mpiexec
+# EXE=/home/bloewe/benchmarks/mdtest-1.9.3/mdtest
+EXE=/home/bloewe/benchmarks/IOR-2.10.3/src/C/IOR
+NPROCS=$((12 * 24))
+TARGET=/mnt/lustre/ceap-82
+MPISCRIPT=/home/bloewe/CEAP-82/mpi-script.sh
+
+HOSTS=$PWD/hostfile
+
+# OPTS="-a POSIX -B -C -E -F -e -g -k -b 4g -t 32m -vvv -o /lustre/crayadm/tmp/testdir.12403/IOR_POSIX"
+# OPTS="-a POSIX -B -C -E -F -e -g -k -b 200m -t 2m -vvv -o /mnt/lustre/ceap-82/IOR_POSIX"
+OPTS="-a POSIX -B -C -E -F -e -g -k -b 200m -t 2m -v"
+
+# mkdir -p distr
+# 
+# for n in {0..100}; do 
+# 	rm -f /mnt/lustre/ceap-82/IOR_POSIX*
+# 	$MPIEXEC -f $HOSTS -np $NPROCS $EXE $OPTS
+# 	for x in /mnt/lustre/ceap-82/IOR_POSIX*; do
+# 		lfs getstripe -i $x
+# 	done | sort -n | uniq -c > distr/d-$n
+# done
+
+rm -f /mnt/lustre/ceap-82/IOR_POSIX*
+$MPIEXEC -f $HOSTS -np $NPROCS $MPISCRIPT $OPTS
+for x in /mnt/lustre/ceap-82/IOR_POSIX*; do
+     lfs getstripe -i $x
+done | sort -n | uniq -c
+[CEAP-82]$ 
+
+and an IOR wrapper, needed to map 24 IOR instances to 24 lustre mount points:
+
+[CEAP-82]$ cat mpi-script.sh 
+#! /bin/bash
+
+LMOUNT=/mnt/lustre$(($PMI_RANK % 24))
+exec /home/bloewe/benchmarks/IOR-2.10.3/src/C/IOR "$@" -o $LMOUNT/ceap-82/IOR_POSIX
+[CEAP-82]$ 
+
+This way we simulate client load from 24 * 12 = 288 clients.
+
+There result should be equal distribution of IOR working files between all OSTs, 24 files per OST, if RR algorithm works correctly.
+
+However , result of the test run shows uneven files distribution:
+
+Max Write: 5988.51 MiB/sec (6279.41 MB/sec)
+
+Max Read:  10008.34 MiB/sec (10494.51 MB/sec)
+
+Run finished: Sat Mar 21 14:10:12 2015
+
+     26 0
+
+     25 1
+
+     24 2
+
+     29 3
+
+     20 4
+
+     23 5
+
+     24 6
+
+     25 7
+
+     25 8
+
+     24 9
+
+     23 10
+
+     20 11
+
+[CEAP-82]$ 
+
+number of files per OST varies from 20 to 29. It cannot be explained by "reseeds" in lod_rr_alloc().
+
+The log from MDS ssh session with setting qos_threshold_rr:
+
+[root@orange00 ~]# pdsh -g mds lctl set_param lod.*.qos_threshold_rr=100
+orange03: error: set_param: /proc/{fs,sys}/{lnet,lustre}/lod/*/qos_threshold_rr: Found no match
+pdsh@orange00: orange03: ssh exited with exit code 3
+orange10: lod.orangefs-MDT0001-mdtlov.qos_threshold_rr=100
+orange12: lod.orangefs-MDT0003-mdtlov.qos_threshold_rr=100
+orange11: lod.orangefs-MDT0002-mdtlov.qos_threshold_rr=100
+orange13: lod.orangefs-MDT0004-mdtlov.qos_threshold_rr=100
+orange02: lod.orangefs-MDT0000-mdtlov.qos_threshold_rr=100
+[root@orange00 ~]# slogin orange02
+Last login: Sat Mar 21 14:07:41 PDT 2015 from 172.16.2.3 on ssh
+[root@orange02 ~]# lctl set_param lctl set_param debug=-1 subsystem_debug=lov debug_mb=1200
+error: set_param: /proc/{fs,sys}/{lnet,lustre}/lctl: Found no match
+debug=-1
+subsystem_debug=lov
+debug_mb=1200
+[root@orange02 ~]# lctl set_param debug=-1 subsystem_debug=lov debug_mb=1200
+debug=-1
+subsystem_debug=lov
+debug_mb=1200
+[root@orange02 ~]# lctl dk > /dev/null
+[root@orange02 ~]# lctl dk /tmp/ceap-82.txt
+Debug log: 5776 lines, 5776 kept, 0 dropped, 0 bad.
+[root@orange02 ~]# lctl get_param lod.*.qos_threshold_rr
+lod.orangefs-MDT0000-mdtlov.qos_threshold_rr=100%
+[root@orange02 ~]# less /tmp/ceap-82.txt 
+[root@orange02 ~]# logout
+
+WITH Fix
+
+=======
+
+Following 5 runs showed equal files distribution across all OSTs:
+ [CEAP-82]$ for n in {1..5} ; do sh ceap-82.sh; done
+IOR-2.10.3: MPI Coordinated Test of Parallel I/O
+
+Run began: Mon Mar 23 02:27:28 2015
+Command line used: /home/bloewe/benchmarks/IOR-2.10.3/src/C/IOR -a POSIX -B -C -E -F -e -g -k -b 200m -t 2m -o /mnt/lustre0/ceap-82/IOR_POSIX
+Machine: Linux sjsc-321
+
+Summary:
+	api                = POSIX
+	test filename      = /mnt/lustre0/ceap-82/IOR_POSIX
+	access             = file-per-process
+	ordering in a file = sequential offsets
+	ordering inter file=constant task offsets = 1
+	clients            = 288 (24 per node)
+	repetitions        = 1
+	xfersize           = 2 MiB
+	blocksize          = 200 MiB
+	aggregate filesize = 56.25 GiB
+
+Operation  Max (MiB)  Min (MiB)  Mean (MiB)   Std Dev  Max (OPs)  Min (OPs)  Mean (OPs)   Std Dev  Mean (s)  
+---------  ---------  ---------  ----------   -------  ---------  ---------  ----------   -------  --------
+write        4310.41    4310.41     4310.41      0.00    2155.21    2155.21     2155.21      0.00  13.36299   EXCEL
+read        10076.77   10076.77    10076.77      0.00    5038.38    5038.38     5038.38      0.00   5.71612   EXCEL
+
+Max Write: 4310.41 MiB/sec (4519.80 MB/sec)
+Max Read:  10076.77 MiB/sec (10566.26 MB/sec)
+
+Run finished: Mon Mar 23 02:27:48 2015
+     24 0
+     24 1
+     24 2
+     24 3
+     24 4
+     24 5
+     24 6
+     24 7
+     24 8
+     24 9
+     24 10
+     24 11
+IOR-2.10.3: MPI Coordinated Test of Parallel I/O
+
+Run began: Mon Mar 23 02:27:50 2015
+Command line used: /home/bloewe/benchmarks/IOR-2.10.3/src/C/IOR -a POSIX -B -C -E -F -e -g -k -b 200m -t 2m -o /mnt/lustre0/ceap-82/IOR_POSIX
+Machine: Linux sjsc-321
+
+Summary:
+	api                = POSIX
+	test filename      = /mnt/lustre0/ceap-82/IOR_POSIX
+	access             = file-per-process
+	ordering in a file = sequential offsets
+	ordering inter file=constant task offsets = 1
+	clients            = 288 (24 per node)
+	repetitions        = 1
+	xfersize           = 2 MiB
+	blocksize          = 200 MiB
+	aggregate filesize = 56.25 GiB
+
+Operation  Max (MiB)  Min (MiB)  Mean (MiB)   Std Dev  Max (OPs)  Min (OPs)  Mean (OPs)   Std Dev  Mean (s)  
+---------  ---------  ---------  ----------   -------  ---------  ---------  ----------   -------  --------
+write        4269.62    4269.62     4269.62      0.00    2134.81    2134.81     2134.81      0.00  13.49066   EXCEL
+read        10078.78   10078.78    10078.78      0.00    5039.39    5039.39     5039.39      0.00   5.71498   EXCEL
+
+Max Write: 4269.62 MiB/sec (4477.02 MB/sec)
+Max Read:  10078.78 MiB/sec (10568.37 MB/sec)
+
+Run finished: Mon Mar 23 02:28:10 2015
+     24 0
+     24 1
+     24 2
+     24 3
+     24 4
+     24 5
+     24 6
+     24 7
+     24 8
+     24 9
+     24 10
+     24 11
+IOR-2.10.3: MPI Coordinated Test of Parallel I/O
+
+Run began: Mon Mar 23 02:28:11 2015
+Command line used: /home/bloewe/benchmarks/IOR-2.10.3/src/C/IOR -a POSIX -B -C -E -F -e -g -k -b 200m -t 2m -o /mnt/lustre0/ceap-82/IOR_POSIX
+Machine: Linux sjsc-321
+
+Summary:
+	api                = POSIX
+	test filename      = /mnt/lustre0/ceap-82/IOR_POSIX
+	access             = file-per-process
+	ordering in a file = sequential offsets
+	ordering inter file=constant task offsets = 1
+	clients            = 288 (24 per node)
+	repetitions        = 1
+	xfersize           = 2 MiB
+	blocksize          = 200 MiB
+	aggregate filesize = 56.25 GiB
+
+Operation  Max (MiB)  Min (MiB)  Mean (MiB)   Std Dev  Max (OPs)  Min (OPs)  Mean (OPs)   Std Dev  Mean (s)  
+---------  ---------  ---------  ----------   -------  ---------  ---------  ----------   -------  --------
+write        4343.86    4343.86     4343.86      0.00    2171.93    2171.93     2171.93      0.00  13.26011   EXCEL
+read        10091.59   10091.59    10091.59      0.00    5045.80    5045.80     5045.80      0.00   5.70772   EXCEL
+
+Max Write: 4343.86 MiB/sec (4554.86 MB/sec)
+Max Read:  10091.59 MiB/sec (10581.80 MB/sec)
+
+Run finished: Mon Mar 23 02:28:31 2015
+     24 0
+     24 1
+     24 2
+     24 3
+     24 4
+     24 5
+     24 6
+     24 7
+     24 8
+     24 9
+     24 10
+     24 11
+IOR-2.10.3: MPI Coordinated Test of Parallel I/O
+
+Run began: Mon Mar 23 02:28:33 2015
+Command line used: /home/bloewe/benchmarks/IOR-2.10.3/src/C/IOR -a POSIX -B -C -E -F -e -g -k -b 200m -t 2m -o /mnt/lustre0/ceap-82/IOR_POSIX
+Machine: Linux sjsc-321
+
+Summary:
+	api                = POSIX
+	test filename      = /mnt/lustre0/ceap-82/IOR_POSIX
+	access             = file-per-process
+	ordering in a file = sequential offsets
+	ordering inter file=constant task offsets = 1
+	clients            = 288 (24 per node)
+	repetitions        = 1
+	xfersize           = 2 MiB
+	blocksize          = 200 MiB
+	aggregate filesize = 56.25 GiB
+
+Operation  Max (MiB)  Min (MiB)  Mean (MiB)   Std Dev  Max (OPs)  Min (OPs)  Mean (OPs)   Std Dev  Mean (s)  
+---------  ---------  ---------  ----------   -------  ---------  ---------  ----------   -------  --------
+write        4169.55    4169.55     4169.55      0.00    2084.78    2084.78     2084.78      0.00  13.81443   EXCEL
+read         9997.98    9997.98     9997.98      0.00    4998.99    4998.99     4998.99      0.00   5.76116   EXCEL
+
+Max Write: 4169.55 MiB/sec (4372.09 MB/sec)
+Max Read:  9997.98 MiB/sec (10483.64 MB/sec)
+
+Run finished: Mon Mar 23 02:28:53 2015
+     24 0
+     24 1
+     24 2
+     24 3
+     24 4
+     24 5
+     24 6
+     24 7
+     24 8
+     24 9
+     24 10
+     24 11
+IOR-2.10.3: MPI Coordinated Test of Parallel I/O
+
+Run began: Mon Mar 23 02:28:56 2015
+Command line used: /home/bloewe/benchmarks/IOR-2.10.3/src/C/IOR -a POSIX -B -C -E -F -e -g -k -b 200m -t 2m -o /mnt/lustre0/ceap-82/IOR_POSIX
+Machine: Linux sjsc-321
+
+Summary:
+	api                = POSIX
+	test filename      = /mnt/lustre0/ceap-82/IOR_POSIX
+	access             = file-per-process
+	ordering in a file = sequential offsets
+	ordering inter file=constant task offsets = 1
+	clients            = 288 (24 per node)
+	repetitions        = 1
+	xfersize           = 2 MiB
+	blocksize          = 200 MiB
+	aggregate filesize = 56.25 GiB
+
+Operation  Max (MiB)  Min (MiB)  Mean (MiB)   Std Dev  Max (OPs)  Min (OPs)  Mean (OPs)   Std Dev  Mean (s)  
+---------  ---------  ---------  ----------   -------  ---------  ---------  ----------   -------  --------
+write        4427.20    4427.20     4427.20      0.00    2213.60    2213.60     2213.60      0.00  13.01049   EXCEL
+read        10026.62   10026.62    10026.62      0.00    5013.31    5013.31     5013.31      0.00   5.74471   EXCEL
+
+Max Write: 4427.20 MiB/sec (4642.25 MB/sec)
+Max Read:  10026.62 MiB/sec (10513.67 MB/sec)
+
+Run finished: Mon Mar 23 02:29:15 2015
+     24 0
+     24 1
+     24 2
+     24 3
+     24 4
+     24 5
+     24 6
+     24 7
+     24 8
+     24 9
+     24 10
+     24 11
+[CEAP-82]$
+
+--- Comment (520557, Wed, 29 Apr 2015 08:12:06 +0000) ---
+Posted the new patch to address this issue. Please review.
+
+--- Comment (gerrit, Wed, 29 Apr 2015 08:08:48 +0000) ---
+Rahul Deshmukh (rahul.deshmukh@seagate.com) uploaded a new patch: http://review.whamcloud.com/14636
+
+Subject: LU-977 lod: Patch to protect lqr_start_idx
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 86aa10e5b8c6b944c10ce224078ba4f6aafbe6eb
+
+--- Comment (bzzz, Mon, 27 May 2013 05:26:24 +0000) ---
+Cory, notice "totally", which is possible only with very strong locking around allocation, IMHO. which is virtually not possible with DNE and not very good on multicore?
+
+--- Comment (shadow, Tue, 21 May 2013 18:39:14 +0000) ---
+If i correctly understand Alex, they mean different MDT may allocate on same OST so OST may have a different allocated objects. But it's false if each MDT have own OST pools assigned.
+
+--- Comment (spitzcor, Tue, 21 May 2013 15:38:19 +0000) ---
+I don't see how 'precise' RR is not possible with DNE.  If an application wants evenly balanced stripe allocation, that should still be possible as the allocators aren't linked in DNE.  So then if the one MDS allocator hasn't switched to the space-based allocator, then round-robin should still be (mostly) 'precise', correct?
+
+--- Comment (bzzz, Wed, 20 Mar 2013 11:01:43 +0000) ---
+totally precise RR is not possible with DNE, for example.
+
+--- Comment (shadow, Tue, 19 Mar 2013 05:38:46 +0000) ---
+Eugene Birkine added a comment - 06/Dec/11 9:05 PM
+Debug log file from MDS with qos_threshold_rr=100 during 16 file writes. The file distribution was:
+testfs-OST0000
+2
+testfs-OST0001
+3
+testfs-OST0002
+2
+testfs-OST0003
+1
+testfs-OST0004
+2
+testfs-OST0005
+3
+testfs-OST0006
+1
+testfs-OST0007
+2
+
+--- Comment (keith, Tue, 19 Mar 2013 00:27:55 +0000) ---
+Alexey,  What is the worst case allocation that you have seen?  It still sounds like you want a "totally precise" client / ost allocation mapping.
+
+--- Comment (shadow, Fri, 15 Mar 2013 07:04:36 +0000) ---
+did you have plans to fix it?
+
+--- Comment (shadow, Mon, 14 Jan 2013 06:23:28 +0000) ---
+Alex,
+
+about second, i mean if we have 20 allocations and 5 ost's - we need to have 4 allocations on each ost's - otherwise that is isn't round-robin allocation. and we have more load to same one or more ost's with same workload pattern.
+
+--- Comment (bzzz, Sun, 13 Jan 2013 04:49:47 +0000) ---
+the 2nd requirement can't be achieved just because object doesn't imply same amount of data and IO pattern. so, I don't think some variation will be that bad.
+
+--- Comment (shadow, Sun, 13 Jan 2013 04:44:06 +0000) ---
+Alex,
+
+we have two requirements
+
+1) MD object should be an allocate objects from different OST's, and avoid situation when two objects from same ost assigned to one MD object (will reduce speed).
+
+2) whole allocation should be distribute ost objects evenly over all ost's - again we need evenly load for a all ost's.
+
+--- Comment (bzzz, Fri, 11 Jan 2013 06:20:52 +0000) ---
+again, I think there is no requirement for the algorithm to be totally precise.. and if for some reason you want serialization, just do not shift - take and increment current lqr_start_idx on the every iteration.
+
+--- Comment (bzzz, Fri, 11 Jan 2013 05:09:16 +0000) ---
+well, statfs() is basically a memcpy() in this case.
+
+--- Comment (shadow, Fri, 11 Jan 2013 05:06:11 +0000) ---
+may be that is solution - because original problem when we have isn't same allocation on whole OST in cluster.
+
+other notices from my view - we may kill a statfs from that loop - because that is too slow operation in fast path.
+
+PS. was wrong. that is not a solution - because we may shift for whole loop when release a spinlock, so will allocate two objects on same ost for one file.
+
+--- Comment (bzzz, Tue, 8 Jan 2013 04:04:40 +0000) ---
+this can not be done easily because lod_alloc_rr() is doing allocation within that loop, so we can't put the whole loop under a spinlock.
+
+but probably we can shift lqr_start_idx to the next OST when another OST is used in the striping:
+
+	We've successfuly declared (reserved) an object
+
+		 */
+
+		lod_qos_ost_in_use(env, stripe_idx, ost_idx);
+
+		lo->ldo_stripe[stripe_idx] = o;
+
+		stripe_idx++;
+
++               spin_lock(...);
+
++               lqr->lqr_start_idx = next(ost_idx);
+
++               spin_lock(...);
+
+I don't think QoS is supposed to be absolutely reliable in terms of "X is used, move to Y". some small "mistakes" and variation should be OK, IMHO.
+
+as for the second problem I'd like to see a bit better description, if possible.
+
+--- Comment (shadow, Tue, 8 Jan 2013 02:32:55 +0000) ---
+Peter,
+
+that patch need rewrites completely because LOV layer is removed and LOD introduced.
+
+May be better to ask LOD author to fix it, anyway that is easy now - because lod/osc introduce creation thread already.
+
+--- Comment (pjones, Mon, 7 Jan 2013 16:35:22 +0000) ---
+Nathan
+
+It is quite possible that Intel can assist in the work necessary to bring this patch up to date if the CDWG thinks that this warrants attention over other competing priorities. To date, the Xyratex representative on the CDWG has not raised this (or any other issue) as warranting more attention than it is presently receiving. There is another call coming up this Wednesday so Xyratex will be able to raise it then if need be.
+
+Peter
+
+--- Comment (nrutman, Mon, 7 Jan 2013 13:15:11 +0000) ---
+I think Shadow was frustrated that he submitted a patch that was ignored for a long time.  If it had been landed, it would have been included in the LOD porting.  Since it was not, new work needs to be done to port it.  He asks if Intel will port (and land) the patch or whether he needs to port it himself and resubmit.
+
+--- Comment (keith, Fri, 4 Jan 2013 21:32:22 +0000) ---
+Is there gong to be forward progress with this issue?
+
+--- Comment (nrutman, Wed, 21 Nov 2012 17:43:30 +0000) ---
+Xyratex-bug-id: MRP-206
+
+--- Comment (pjones, Mon, 8 Oct 2012 10:47:00 +0000) ---
+Shadow
+
+I am not 100% confident that I follow what you are saying but two possible threads seem to be
+
+1) Development work done in parallel has clashed with this particular suggested change since it was initially submitted and this was not caught ahead of time
+
+2) This patch did not receive apparent attention for a long time.
+
+Your initial comment I took to refer to just 2 and I was reluctant to clutter up a ticket with talk of process, but the simple matter is that we have more things we could work on than time and we need to prioritize( and I know that you know about such matters because I note http://review.whamcloud.com/#change,2342 has been waiting similarly long period for your attention). 
+
+This suggested change was reviewed when it first came in and put in a lower priority category because it was not a stability issue
+
+My comment about the CDWG is because that is the agreed forum to work our prioritization of our attention to issues. Making comments on tickets is not helpful because it is easy for those to get missed (I stumbled upon the above by pure chance)
+
+As for 1, I'm afraid that this is a new challenge for us in our growing and more diverse Lustre development community. Things were certainly easier to manage in the CFS days, but I think that the way we are going to overcome these challenges is by good quality communication. Again, I think that the CDWG is a natural forum for that to take place.
+
+Anyway, sorry if I am missing the point altogether but there is a CDWG meeting on Wednesday so hopefully everything can get clarified then.
+
+Regards
+
+Peter
+
+--- Comment (shadow, Mon, 8 Oct 2012 10:06:05 +0000) ---
+Peter,
+
+it's good question - so if someone will don't ping you - you never will look in review queue? don't try to find a dependencies for already submitted fixes. I don't talk about tickets without fixes, but submitted patch should reviewed for half year, in CFS time you never say something similar that.
+
+--- Comment (shadow, Mon, 8 Oct 2012 10:04:05 +0000) ---
+Alex,
+
+I understand it's started by Sun/Oracle - but i think bugfixes should be incorporated before it will pushed in repository. That is not a bug in HLD, but bug in implementation.
+
+currently lov/lod (i see LOD have same bug) internal state 
+
+>>
+
+lqr->lqr_start_idx + lqr->lqr_offset_idx)
+
+>>
+
+isn't protected with any locks in that case we able to start allocate objects for more then one process on same osc target 
+
+        cfs_down_read(&m->lod_qos.lq_rw_sem);  lqr_start_idx;
+
+repeat_find:
+
+        array_idx = (lqr->lqr_start_idx + lqr->lqr_offset_idx) %
+
+                        osts->op_count;
+
+but we was not able to protect it via spinlock (exclusive mutex is bad for fast path)
+
+because obd_prealloc may sleep - so it's introduce a separate thread to create an object as LOD already have.
+
+that is first bug in that area.
+
+second bug, related to data targets pools (sory don't remember after year ago).
+
+and some optimization to avoid find pool again if RR allocation chooses.
+
+--- Comment (bzzz, Mon, 8 Oct 2012 08:36:37 +0000) ---
+Alexey, this work (I mean lod/osp) started in Sun/Oracle, we presented all this internally and for public few times. 
+
+I think it makes sense to write a detailed explanation for what specifically wrong with QoS (which is know to be imperfect)
+
+and how this can be fixed in terms of HLD. then it'll be easier to see how to fit it better into the new model.
+
+--- Comment (pjones, Sat, 6 Oct 2012 15:43:28 +0000) ---
+Shadow
+
+If you ever have any concerns that something has not been given the correct priority then please raise to the CDWG via your representative (Nic Henke)
+
+Thanks
+
+Peter
+
+--- Comment (shadow, Sat, 6 Oct 2012 14:45:49 +0000) ---
+I glad to see, someone from WC look to patches after half year of waiting. Very nice speed.
+
+Can you explain - did you want patches or not?
+
+Now that patch need totally reworked as LOV code moved into LOD, and OSP have different object allocation strategy.
+
+may WC port that patch ourself or i need rework it?
+
+--- Comment (shadow, Fri, 6 Apr 2012 05:38:55 +0000) ---
+remote: New Changes:
+
+remote:   http://review.whamcloud.com/2462
+
+remote:
+
+--- Comment (shadow, Fri, 6 Apr 2012 02:18:57 +0000) ---
+Andreas,
+
+it's not a 1.8 only problem, that problem exist from initial LOV QoS implementation in 1.6.0.

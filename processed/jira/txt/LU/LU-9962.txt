@@ -1,0 +1,83 @@
+Key:        LU-9962
+Summary:    Possible file size glimpse issue
+Link:       https://jira.whamcloud.com/browse/LU-9962
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Low Priority
+Assignee:   Patrick Farrell
+Reporter:   Patrick Farrell
+Created:    Fri, 8 Sep 2017 18:09:09 +0000
+Updated:    Mon, 31 Jan 2022 17:50:34 +0000
+Resolved:   Mon, 31 Jan 2022 17:50:34 +0000
+Links:      Blocker: is blocked by LU-6179
+
+--- Description ---
+In the review for LU-6179 (https://review.whamcloud.com/#/c/13564/, specifically here:
+
+https://review.whamcloud.com/#/c/13564/90/lustre/ofd/ofd_dlm.c ) Jinshan described a possible problem with the current file size glimpsing behavior.
+
+Specifically, the current behavior is to send a glimpse to only the top PW lock on the file, because it controls file size.  Lock ahead introduces some complexity there, creating speculative write locks which may not be used for i/o.  In that case, we must glimpse all speculative locks above the local file size*, to be sure of getting the correct file size.
+
+*(well, all clients holding speculative locks above the local file size - this and other details are covered in comments in ofd_dlm.c in the lockahead patch )
+
+Jinshan noted that in some cases the i/o which created a normal PW lock will not happen.  In that case, a client with a lock earlier in the file may in fact be updating the file size.
+
+He gave this specific example to clarify:
+
+Provided that the local object size is 1M, I would say the typical case is:
+
+1. client A holds lock [2M, EOF), but fails to [write] anything to the object;
+
+2. client B holds [0, 2M) lock, and extends the file size to 1.5M.
+
+In this case, the OST will send glimpse request to client A, which doesn't know the exact file size.
+
+------------------
+
+Andreas noted that since this problem has existed for a long time, fixing it should be considered separately.  He also noted that the problem is very unlikely to be serious, as temporarily incorrect file size in the context of a write error is a pretty small problem and should not ever corrupt data.
+
+However, Andreas asked me to open another ticket and submit a patch to try fixing this issue, so we can discuss it there.  This patch will depend on the infrastructure for glimpsing multiple locks introduced by the LU-6179 patch, so I plan to push it after that patch has landed.
+
+--- Comment (paf0186, Mon, 31 Jan 2022 17:50:34 +0000) ---
+See my last comments - This should be very hard to see in practice and only when there has been a write error.
+
+--- Comment (paf0186, Mon, 31 Jan 2022 17:49:38 +0000) ---
+Yeah, that's probably fine - I'll do that.
+
+--- Comment (adilger, Mon, 31 Jan 2022 17:16:20 +0000) ---
+Should we close this as "Won't fix" or "Low Priority"?
+
+--- Comment (paf0186, Mon, 31 Jan 2022 16:37:47 +0000) ---
+I think yes - it's going to be extremely rare, I think.  We need to have multiple clients updating the file size at the same time, then have a particular one fail and essentially we need to have it be the last one.
+
+Talking through it...
+
+Basically file size issues are only a problem if they persist after writes are complete, since during a write the file size is indeterminate (obviously it must be a valid value, but it's not guaranteed to be either the before or after value at any point before completion).
+
+So if a lock request is made and then the I/O fails, this lock could end up looking it held the file size, but because no write operation occurred, it doesn't actually have the updated file size.  So it could 'hide' a size update made by a lock below it in the file.
+
+(All writes here are assumed to be from different clients.)
+
+eg, we have "write 1" to 6K in the file, then "write 2" to 12K in the file, then "write 3" is attempted to, say, 18K in the file.  (This requires some unusual details of locking behavior but they could occur.)  The lock for write 3 is created, but it's created before write 2 is complete, so the write 3 lock says "file size is 6K".  And then that size is not updated because the write failed.
+
+So now "write 2" is 'hidden' because other clients ask the 'write 3' lock about the file size, so the file size shows up at 6K.  This would last until another write was performed either by the 'write 3' client or by some other client 'further down' in the file.  So for it to persist, that failed write would have to be the last one.  (I suppose it's possible that failed write could cause the application to stop.)
+
+Note all the locks here must be on the same stripe.  (Different stripes are interrogated separately for size and the maximum value is used.)
+
+That makes it extremely likely one or more of these requests would have cancelled another (due to expansion behavior).
+
+So I think it's possible, but it requires some kind of heroic assumptions to get there.  Fixing it would be...  It's non-obvious to me how to do it in a performant manner - always interrogating all locks is a complete non-starter (it would blow up, performance-wise, in some settings).
+
+I guess the server could mark lock locally once a write had been done under it, and until then, the lock could be treated like a speculative lock, ie, if there's not a non-speculative lock after it, it would have to be interrogated for the size.
+
+OK, I've convinced myself there's a solid way to solve the problem, and I've also convinced myself it's extremely unlikely.
+
+Additional reasons it's unlikely:
+
+The opportunity for this is further reduced because the server also has its local idea of the size - So once write 2 has completed, the server knows the size is 12K and that size will go in the mix (the largest is used).  So the write 3 lock is interrogated and says "the size, as I know it, is 6K" and the server says "ok but my local size is 12K, so use that".
+
+So the effect would exist in a brief window (during the flight of write 2, basically) for clients other than client 3 (the one which had the write failure), but it could persist on client 3 (if there were no further writes to the file).  Still, getting there requires a pretty unlikely set of circumstances.
+
+--- Comment (adilger, Sat, 29 Jan 2022 10:44:21 +0000) ---
+Patrick, is this issue still relevant?

@@ -1,0 +1,578 @@
+Key:        LU-14627
+Summary:    Lost ref on lnet_peer in discovery leads to LNetError: 24909:0:(peer.c:292:lnet_destroy_peer_locked()) ASSERTION( list_empty(&lp->lp_peer_nets) ) failed:
+Link:       https://jira.whamcloud.com/browse/LU-14627
+Type:       Bug
+Priority:   Critical
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Chris Horn
+Reporter:   Chris Horn
+Created:    Tue, 20 Apr 2021 20:09:56 +0000
+Updated:    Fri, 11 Oct 2024 13:59:02 +0000
+Resolved:   Mon, 14 Jun 2021 19:33:56 +0000
+Links:      Related: is related to LU-14635; Related: is related to LU-14810; Related: is related to LU-14074; Related: is related to LU-17626; Related: is related to LU-16832
+
+--- Description ---
+I am fairly certain this bug can also result in this assert:
+
+LNetError: 9873:0:(peer.c:305:lnet_destroy_peer_locked()) ASSERTION( lp->lp_rtr_refcount == 0 ) failed:
+
+We saw this bug with HPE's Lustre 2.12 which differs quite a bit from the community 2.12 (namely because we backported the multi-rail routing feature). I'm pretty sure the bug is present in community 2.14+ and it may be present in older versions.
+
+TL;DR - Flaw in discovery logic results in a lost reference on an lnet_peer object which results in it being improperly destroyed.
+
+MDS sends an OST_CONNECT RPC to 10.249.249.206@o2ib. The message is queued for discovery. This adds a reference to the lnet_peer object:
+
+00000100:00000200:9.0:1618858502.715082:0:51842:0:(niobuf.c:85:ptl_send_buf()) Sending 520 bytes to portal 28, xid 1697249298880320, offset 0
+00000400:00000200:9.0:1618858502.715083:0:51842:0:(lib-move.c:4905:LNetPut()) LNetPut -> 12345-10.249.249.206@o2ib
+00000400:00000200:9.0:1618858502.715086:0:51842:0:(peer.c:1937:lnet_peer_queue_for_discovery()) Queue peer 10.249.249.206@o2ib: 0 
+
+Discovery thread wakes and begins processing the peer by sending a discovery ping (NB ping sent to 10.249.249.207@o2ib).
+
+00000400:00000200:22.0:1618858502.715088:0:43692:0:(peer.c:3353:lnet_peer_discovery_wait_for_work()) woken: 0
+00000400:00000200:22.0:1618858502.715091:0:43692:0:(peer.c:3468:lnet_peer_discovery()) peer 10.249.249.206@o2ib(ffff90de2632b800) state 0x6171
+00000400:00000010:22.0:1618858502.715093:0:43692:0:(api-ni.c:1671:lnet_ping_buffer_alloc()) alloc '(pbuf)': 281 at ffff90ddf2942000 (tot 485268226).
+00000400:00000010:22.0:1618858502.715093:0:43692:0:(lib-lnet.h:259:lnet_md_alloc()) slab-alloced 'md' of size 136 at ffff90cd54ed27f8 ) -> 10.249.249.207@o2ib(10.249.249.206@o2ib:10.249.249.207@o2ib)  : GET try# 0
+...
+00000400:00000200:22.0:1618858502.715149:0:43692:0:(peer.c:3107:lnet_peer_send_ping()) peer 10.249.249.206@o2ib
+00000400:00000200:22.0:1618858502.715150:0:43692:0:(peer.c:3487:lnet_peer_discovery()) peer 10.249.249.206@o2ib(ffff90de2632b800) state 0x4371 rc 0
+*hornc@cflosbld08 hornc $ lpst2str.sh 0x4371
+LNET_PEER_MULTI_RAIL
+LNET_PEER_DISCOVERED
+LNET_PEER_REDISCOVER
+LNET_PEER_DISCOVERING
+LNET_PEER_NIDS_UPTODATE
+LNET_PEER_PING_SENT
+LNET_PEER_FORCE_PUSH
+*hornc@cflosbld08 hornc $
+
+With the ping sent, discovery is waiting for either a response or timeout. Meanwhile, an incoming discovery push from 10.249.249.206@o2ib puts the peer back on the discovery queue:
+
+00000400:00000200:27.0:1618858538.614280:0:43825:0:(lib-move.c:4396:lnet_parse()) TRACE: 10.249.248.2@o2ib(10.249.248.2@o2ib) 
+
+Discovery thread wakes and begins processing the peer. It first merges the data in the push buffer:
+
+*hornc@cflosbld08 hornc $ lpst2str.sh 0x42f1
+LNET_PEER_MULTI_RAIL
+LNET_PEER_DISCOVERED
+LNET_PEER_REDISCOVER
+LNET_PEER_DISCOVERING
+LNET_PEER_DATA_PRESENT
+LNET_PEER_PING_SENT
+LNET_PEER_FORCE_PUSH
+*hornc@cflosbld08 hornc $
+00000400:00000200:22.0:1618858538.614308:0:43692:0:(peer.c:3353:lnet_peer_discovery_wait_for_work()) woken: 0
+00000400:00000200:22.0:1618858538.614316:0:43692:0:(peer.c:3468:lnet_peer_discovery()) peer 10.249.249.206@o2ib(ffff90de2632b800) state 0x42f1
+00000400:00000200:22.0:1618858538.614326:0:43692:0:(peer.c:2776:lnet_peer_merge_data()) peer 10.249.249.206@o2ib (ffff90de2632b800): 0
+00000400:00000200:22.0:1618858538.614327:0:43692:0:(peer.c:2985:lnet_peer_data_present()) peer 10.249.249.206@o2ib(ffff90de2632b800): 0. state = 0x4371
+00000400:00000200:22.0:1618858538.614328:0:43692:0:(peer.c:3487:lnet_peer_discovery()) peer 10.249.249.206@o2ib(ffff90de2632b800) state 0x4371 rc 1
+
+Next, it sends a discovery PUSH to the peer (NB push sent to 10.249.249.207@o2ib):
+
+*hornc@cflosbld08 hornc $ lpst2str.sh 0x4371
+LNET_PEER_MULTI_RAIL
+LNET_PEER_DISCOVERED
+LNET_PEER_REDISCOVER
+LNET_PEER_DISCOVERING
+LNET_PEER_NIDS_UPTODATE
+LNET_PEER_PING_SENT
+LNET_PEER_FORCE_PUSH
+*hornc@cflosbld08 hornc $
+00000400:00000200:22.0:1618858538.614329:0:43692:0:(peer.c:3468:lnet_peer_discovery()) peer 10.249.249.206@o2ib(ffff90de2632b800) state 0x4371
+00000400:00000010:22.0:1618858538.614330:0:43692:0:(lib-lnet.h:259:lnet_md_alloc()) slab-alloced 'md' of size 136 at ffff90cd54ed3430 ) -> 10.249.249.207@o2ib(10.249.249.206@o2ib:10.249.249.207@o2ib)  : PUT try# 0
+...
+00000400:00000200:22.0:1618858538.614463:0:43692:0:(peer.c:3241:lnet_peer_send_push()) peer 10.249.249.206@o2ib
+00000400:00000200:22.0:1618858538.614463:0:43692:0:(peer.c:3487:lnet_peer_discovery()) peer 10.249.249.206@o2ib(ffff90de2632b800) state 0x771 rc 0
+*hornc@cflosbld08 hornc $ lpst2str.sh 0x771
+LNET_PEER_MULTI_RAIL
+LNET_PEER_DISCOVERED
+LNET_PEER_REDISCOVER
+LNET_PEER_DISCOVERING
+LNET_PEER_NIDS_UPTODATE
+LNET_PEER_PING_SENT
+LNET_PEER_PUSH_SENT
+*hornc@cflosbld08 hornc $
+
+This is the first potential problem. I am not sure whether it is a valid state for the peer to have both PING_SENT and PUSH_SENT at the same time. I suspect it is not.
+
+The discovery ping eventually fails because o2iblnd cannot establish a connection with .207. The lnet_discovery_event_handler() sets the PING_FAILED state (via lnet_discovery_event_send()), and puts the peer back on the discovery queue.:
+
+00000800:00000100:29.0:1618858552.405824:0:147651:0:(o2iblnd_cb.c:3183:kiblnd_cm_callback()) 10.249.249.207@o2ib: ADDR ERROR -110
+00000800:00000200:29.0:1618858552.405825:0:147651:0:(o2iblnd.c:419:kiblnd_unlink_peer_locked()) peer_ni[ffff90cdedce3e80] -> 10.249.249.207@o2ib (2)--
+00000400:00000200:29.0:1618858552.405830:0:147651:0:(router.c:1720:lnet_notify()) 10.249.248.3@o2ib notifying 10.249.249.207@o2ib: down
+00000800:00000100:29.0:1618858552.405833:0:147651:0:(o2iblnd_cb.c:2294:kiblnd_peer_connect_failed()) Deleting messages for 10.249.249.207@o2ib: connection failed
+00000400:00000200:29.0:1618858552.405834:0:147651:0:(lib-msg.c:1011:lnet_is_health_check()) health check = 1, status = -113, hstatus = 2
+00000400:00000200:29.0:1618858552.405835:0:147651:0:(lib-msg.c:860:lnet_health_check()) health check: 10.249.248.3@o2ib->10.249.249.207@o2ib: GET: LOCAL_DROPPED
+00000400:00000200:29.0:1618858552.405836:0:147651:0:(lib-msg.c:479:lnet_handle_local_failure()) ni 10.249.248.3@o2ib added to recovery queue. Health = 900
+00000400:00000100:29.0:1618858552.405837:0:147651:0:(lib-msg.c:710:lnet_attempt_msg_resend()) msg 0@->10.249.249.207@o2ib exceeded retry count 2
+00000400:00000200:29.0:1618858552.405838:0:147651:0:(peer.c:2556:lnet_discovery_event_handler()) Received event: 5
+00000400:00000200:29.0:1618858552.405839:0:147651:0:(peer.c:2508:lnet_discovery_event_send()) Ping Send to 10.249.249.206@o2ib: 1  
+
+Here we see a second problem. Note the "GET: LOCAL_DROPPED" from lnet_health_check() and subsequent call to lnet_handle_local_failure(). The LOCAL_DROPPED health status will only cause the LNet health value of the local NI to be lowered even though the problem could be with the remote interface. This is why LNet is repeatedly trying to send to .207 even though the interface is not functioning properly. The good news is this is a known issue with a fix. The ticket for this is https://jira.whamcloud.com/browse/LU-13571 .
+
+Discovery thread wakes and processes the ping failure:
+
+*hornc@cflosbld08 hornc $ lpst2str.sh 0x6d71
+LNET_PEER_MULTI_RAIL
+LNET_PEER_DISCOVERED
+LNET_PEER_REDISCOVER
+LNET_PEER_DISCOVERING
+LNET_PEER_NIDS_UPTODATE
+LNET_PEER_PUSH_SENT
+LNET_PEER_PING_FAILED
+LNET_PEER_FORCE_PING
+LNET_PEER_FORCE_PUSH
+*hornc@cflosbld08 hornc $
+00000400:00000200:21.0:1618858552.405845:0:43692:0:(peer.c:3353:lnet_peer_discovery_wait_for_work()) woken: 0
+00000400:00000200:21.0:1618858552.405848:0:43692:0:(peer.c:3468:lnet_peer_discovery()) peer 10.249.249.206@o2ib(ffff90de2632b800) state 0x6d71
+
+The discovery thread is going to process the ping failure. lnet_peer_ping_failed() is called. The lp_ping_mdh is unlinked. The unlink handler sees LNET_PEER_PUSH_SENT so it thinks that the PUSH is what was unlinked:
+
+00000400:00000200:21.0:1618858552.405850:0:43692:0:(peer.c:2556:lnet_discovery_event_handler()) Received event: 6
+00000400:00000200:21.0:1618858552.405851:0:43692:0:(peer.c:2536:lnet_discovery_event_unlink()) Push Unlink for message to peer 10.249.249.206@o2ib 
+
+This is another potential problem. I do not know if it is valid to have a PUSH_FAILED state when discovery completes. Similarly, it seems wrong to have FORCE_PING/FORCE_PUSH set when discovery completes.
+
+As part of lnet_peer_discovery_complete(), any messages that were queued for discovery are sent/finalized (includes our OST_CONNECT that started this all off):
+
+00000100:00000200:21.0:1618858552.405863:0:43692:0:(events.c:63:request_out_callback()) @@@ type 5, status -113  req@ffff90bde43e5a00 x1697249298880320/t0(0) o8->scratch-OST00bc-osc-MDT0000@10.249.249.206@o2ib:28/4 lens 520/544 e 0 to 0 dl 1618858552 ref 2 fl Rpc:N/0/ffffffff rc 0/-1 job:''
+
+An MGS_CONNECT reply results in peer being queued for discovery again in the same manner as the earlier OST_CONNECT:
+
+00010000:00000200:19.0:1618858552.405884:0:136340:0:(ldlm_lib.c:2986:target_send_reply_msg()) @@@ sending reply  req@ffff90cdf3d8a850 x1697492294959168/t0(0) o250->69523420-f6a9-9da1-ae47-897c569694e9@10.249.249.206@o2ib:0/0 lens 520/416 e 0 to 0 dl 1618858838 ref 1 fl Interpret:/0/0 rc 0/0 job:''
+00000400:00000010:19.0:1618858552.405888:0:136340:0:(lib-lnet.h:259:lnet_md_alloc()) slab-alloced 'md' of size 136 at ffff90cdf451caa0.
+00000100:00000200:19.0:1618858552.405888:0:136340:0:(niobuf.c:85:ptl_send_buf()) Sending 416 bytes to portal 25, xid 1697492294959168, offset 0
+00000400:00000200:19.0:1618858552.405890:0:136340:0:(lib-move.c:4905:LNetPut()) LNetPut -> 12345-10.249.249.206@o2ib
+00000400:00000200:19.0:1618858552.405900:0:136340:0:(peer.c:1937:lnet_peer_queue_for_discovery()) Queue peer 10.249.249.206@o2ib: 0   
+
+*hornc@cflosbld08 hornc $ lpst2str.sh 0x7171
+LNET_PEER_MULTI_RAIL
+LNET_PEER_DISCOVERED
+LNET_PEER_REDISCOVER
+LNET_PEER_DISCOVERING
+LNET_PEER_NIDS_UPTODATE
+LNET_PEER_PUSH_FAILED
+LNET_PEER_FORCE_PING
+LNET_PEER_FORCE_PUSH
+*hornc@cflosbld08 hornc $
+00000400:00000200:21.0:1618858552.405902:0:43692:0:(peer.c:3353:lnet_peer_discovery_wait_for_work()) woken: 0
+00000400:00000200:21.0:1618858552.405906:0:43692:0:(peer.c:3468:lnet_peer_discovery()) peer 10.249.249.206@o2ib(ffff90de2632b800) state 0x7171
+00000400:00000200:21.0:1618858552.405906:0:43692:0:(lib-md.c:65:lnet_md_unlink()) Queueing unlink of md ffff90cd54ed3430
+00000400:00000200:21.0:1618858552.405907:0:43692:0:(peer.c:3146:lnet_peer_push_failed()) peer 10.249.249.206@o2ib
+00000400:00000200:21.0:1618858552.405908:0:43692:0:(peer.c:3487:lnet_peer_discovery()) peer 10.249.249.206@o2ib(ffff90de2632b800) state 0x6171 rc -110
+00000400:00000200:21.0:1618858552.405913:0:43692:0:(peer.c:3270:lnet_peer_discovery_error()) Discovery error 10.249.249.206@o2ib: -110  
+
+Monitor thread attempts to resend PUSH
+
+00000400:00000200:11.0:1618858555.397794:0:43693:0:(lib-move.c:3156:lnet_resend_pending_msgs_locked()) resending ->12345-10.249.249.207@o2ib: PUT recovery 0 try# 1
+00000400:00000200:11.0:1618858555.397796:0:43693:0:(lib-move.c:2677:lnet_handle_send_case_locked()) Source ANY to MR:  10.249.249.207@o2ib local destination
+00000400:00000200:11.0:1618858555.397798:0:43693:0:(lib-move.c:1659:lnet_get_best_ni()) compare ni 10.249.248.2@o2ib [c:509, d:10, s:12279791] with best_ni not seleced [c:-2147483648, d:-1, s:0]
+00000400:00000200:11.0:1618858555.397800:0:43693:0:(lib-move.c:1659:lnet_get_best_ni()) compare ni 10.249.248.3@o2ib [c:509, d:12, s:7451] with best_ni 10.249.248.2@o2ib [c:509, d:10, s:12279791]
+00000400:00000200:11.0:1618858555.397801:0:43693:0:(lib-move.c:1702:lnet_get_best_ni()) selected best_ni 10.249.248.2@o2ib
+00000400:00000200:11.0:1618858555.397803:0:43693:0:(lib-move.c:1410:lnet_select_peer_ni()) n:[10.249.249.207@o2ib, 10.249.249.206@o2ib] h:[1000, 1000] r:[n, n] c:[8, 8] s:[67, 50963]
+00000400:00000200:11.0:1618858555.397804:0:43693:0:(lib-move.c:1460:lnet_select_peer_ni()) sd_best_lpni = 10.249.249.207@o2ib
+00000400:00000100:11.0:1618858555.397807:0:43693:0:(lib-move.c:937:lnet_post_send_locked()) Aborting message for 12345-10.249.249.207@o2ib: LNetM[DE]Unlink() already called on the MD/ME.
+00000400:00020000:11.0:1618858555.414727:0:43693:0:(lib-move.c:3162:lnet_resend_pending_msgs_locked()) Error sending PUT to 12345-10.249.249.207@o2ib: -125
+00000400:00000200:11.0:1618858555.429119:0:43693:0:(lib-msg.c:1011:lnet_is_health_check()) health check = 1, status = -125, hstatus = 5
+00000400:00000200:11.0:1618858555.429120:0:43693:0:(lib-msg.c:860:lnet_health_check()) health check: 10.249.248.2@o2ib->10.249.249.207@o2ib: PUT: LOCAL_ERROR
+00000400:00000200:11.0:1618858555.429121:0:43693:0:(peer.c:2556:lnet_discovery_event_handler()) Received event: 5
+00000400:00000200:11.0:1618858555.429122:0:43693:0:(peer.c:2508:lnet_discovery_event_send()) Push Send to 10.249.249.206@o2ib: 1   
+
+Discovery wakes, processes the failed push. Peer is not in DISCOVERING state, so lnet_peer_discovery_complete() is called. We drop an extra reference and trip the LBUG.
+
+*hornc@cflosbld08 hornc $ lpst2str.sh 0x7131
+LNET_PEER_MULTI_RAIL
+LNET_PEER_DISCOVERED
+LNET_PEER_REDISCOVER
+LNET_PEER_NIDS_UPTODATE
+LNET_PEER_PUSH_FAILED
+LNET_PEER_FORCE_PING
+LNET_PEER_FORCE_PUSH
+*hornc@cflosbld08 hornc $
+00000400:00000200:22.0:1618858555.429128:0:43692:0:(peer.c:3353:lnet_peer_discovery_wait_for_work()) woken: 0
+00000400:00000200:22.0:1618858555.429130:0:43692:0:(peer.c:3468:lnet_peer_discovery()) peer 10.249.249.206@o2ib(ffff90de2632b800) state 0x7131
+00000400:00000200:22.0:1618858555.429131:0:43692:0:(peer.c:3146:lnet_peer_push_failed()) peer 10.249.249.206@o2ib
+00000400:00000200:22.0:1618858555.429132:0:43692:0:(peer.c:3487:lnet_peer_discovery()) peer 10.249.249.206@o2ib(ffff90de2632b800) state 0x6131 rc -125
+00000400:00000200:22.0:1618858555.429134:0:43692:0:(peer.c:3270:lnet_peer_discovery_error()) Discovery error 10.249.249.206@o2ib: -125
+00000400:00000200:22.0:1618858555.429135:0:43692:0:(peer.c:1955:lnet_peer_discovery_complete()) Discovery complete. Dequeue peer 10.249.249.206@o2ib  LBUG
+00000400:00000200:22.0:1618858555.429137:0:43692:0:(peer.c:293:lnet_destroy_peer_locked()) ffff90de2632b800 nid 10.249.249.206@o2ib
+*hornc@cflosbld08 hornc $ lpst2str.sh 0x6131
+LNET_PEER_MULTI_RAIL
+LNET_PEER_DISCOVERED
+LNET_PEER_REDISCOVER
+LNET_PEER_NIDS_UPTODATE
+LNET_PEER_FORCE_PING
+LNET_PEER_FORCE_PUSH
+*hornc@cflosbld08 hornc $
+
+--- Comment (gerrit, Thu, 7 Mar 2024 00:16:44 +0000) ---
+"Gian-Carlo DeFazio " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/54307
+
+Subject: lp_peer_nets) ) failed:" class="issue-link" data-issue-key="LU-14627">LU-14627 lnet: Ensure ref taken when queueing for discovery
+
+Project: fs/lustre-release
+
+Branch: b2_14
+
+Current Patch Set: 1
+
+Commit: 8b04b4fa01b6763991f985b7ec93f11e169a9ba1
+
+--- Comment (gerrit, Thu, 7 Mar 2024 00:16:43 +0000) ---
+"Gian-Carlo DeFazio " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/54306
+
+Subject: lp_peer_nets) ) failed:" class="issue-link" data-issue-key="LU-14627">LU-14627 tests: Create unload_modules_local
+
+Project: fs/lustre-release
+
+Branch: b2_14
+
+Current Patch Set: 1
+
+Commit: 689c05b306ff24dd4f64a31e3d7a5810bcc97b3f
+
+--- Comment (gerrit, Thu, 7 Mar 2024 00:16:43 +0000) ---
+"Gian-Carlo DeFazio " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/54305
+
+Subject: lp_peer_nets) ) failed:" class="issue-link" data-issue-key="LU-14627">LU-14627 lnet: Allow delayed sends
+
+Project: fs/lustre-release
+
+Branch: b2_14
+
+Current Patch Set: 1
+
+Commit: 50998359f4d96d69a8424d1e9e15490a8a60128a
+
+--- Comment (defazio, Thu, 7 Mar 2024 00:15:50 +0000) ---
+I believe we saw this on lustre 2.14.0_24.llnl on kernel 4.18.0-513.9.1.1toss.t4.x86_64.
+
+LNetError: 47959:0:(peer.c:297:lnet_destroy_peer_locked()) ASSERTION( lp->lp_rtr_refcount == 0 ) failed: 
+LNetError: 47959:0:(peer.c:297:lnet_destroy_peer_locked()) LBUG
+Pid: 47959, comm: lnet_discovery 4.18.0-513.9.1.1toss.t4.x86_64 #1 SMP Wed Nov 29 11:04:55 PST 2023
+Call Trace TBD:
+Kernel panic - not syncing: LBUG
+CPU: 4 PID: 47959 Comm: lnet_discovery Kdump: loaded Tainted: P        W  OE  X --------- -  - 4.18.0-513.9.1.1toss.t4.x86_64 #1
+Hardware name: Intel Corporation S2600WTTR/S2600WTTR, BIOS SE5C610.86B.01.01.0024.021320181901 02/13/2018
+Call Trace:
+ dump_stack+0x41/0x60
+ panic+0xe7/0x2ac
+ lbug_with_loc.cold.8+0x18/0x18 [libcfs]
+ lnet_destroy_peer_locked+0x28f/0x380 [lnet]
+ lnet_peer_discovery_complete+0x35e/0x370 [lnet]
+ lnet_peer_discovery+0x9a8/0x1500 [lnet]
+ ? finish_wait+0x90/0x90
+ ? lnet_peer_merge_data+0xfa0/0xfa0 [lnet]
+ kthread+0x14c/0x170
+ ? set_kthread_struct+0x50/0x50
+ ret_from_fork+0x35/0x40
+
+--- Comment (gerrit, Mon, 30 May 2022 19:02:30 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/47116/
+
+Subject: lp_peer_nets) ) failed:" class="issue-link" data-issue-key="LU-14627">LU-14627 utils: quiet spurious lustre_rmmod message
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 581d1afd00fe7d82d3a2be5497f0fcf4fde24a4a
+
+--- Comment (gerrit, Fri, 22 Apr 2022 03:08:08 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/47116
+
+Subject: lp_peer_nets) ) failed:" class="issue-link" data-issue-key="LU-14627">LU-14627 utils: quiet spurious lustre_rmmod message
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: ee7aba2beabbf983ccffe8e4881e792943a15b09
+
+--- Comment (gerrit, Sun, 27 Jun 2021 10:57:33 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/44001/
+
+Subject: lp_peer_nets) ) failed:" class="issue-link" data-issue-key="LU-14627">LU-14627 lnet: Ensure ref taken when queueing for discovery
+
+Project: fs/lustre-release
+
+Branch: b2_12
+
+Current Patch Set: 
+
+Commit: 86bf7454d441bc1322eff68106b1766e2f255e72
+
+--- Comment (gerrit, Sun, 27 Jun 2021 10:57:09 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/43960/
+
+Subject: lp_peer_nets) ) failed:" class="issue-link" data-issue-key="LU-14627">LU-14627 tests: Create unload_modules_local
+
+Project: fs/lustre-release
+
+Branch: b2_12
+
+Current Patch Set: 
+
+Commit: 347bbb765f4dfc509c395da4b2b699586dba7366
+
+--- Comment (gerrit, Sun, 27 Jun 2021 10:56:31 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/43959/
+
+Subject: lp_peer_nets) ) failed:" class="issue-link" data-issue-key="LU-14627">LU-14627 lnet: Allow delayed sends
+
+Project: fs/lustre-release
+
+Branch: b2_12
+
+Current Patch Set: 
+
+Commit: fea5e60b97adef090e8475e6f03101c0c8521203
+
+--- Comment (gerrit, Mon, 14 Jun 2021 19:44:11 +0000) ---
+Minh Diep (mdiep@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/44001
+
+Subject: lp_peer_nets) ) failed:" class="issue-link" data-issue-key="LU-14627">LU-14627 lnet: Ensure ref taken when queueing for discovery
+
+Project: fs/lustre-release
+
+Branch: b2_12
+
+Current Patch Set: 1
+
+Commit: 48df065a516c95259d18482c8c680f14bf0d8ff4
+
+--- Comment (pjones, Mon, 14 Jun 2021 19:33:56 +0000) ---
+Landed for 2.15
+
+--- Comment (gerrit, Mon, 14 Jun 2021 16:44:31 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/43418/
+
+Subject: lp_peer_nets) ) failed:" class="issue-link" data-issue-key="LU-14627">LU-14627 lnet: Ensure ref taken when queueing for discovery
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 2ce6957b69370b0ce75725d1d91866bf55c07fa8
+
+--- Comment (gerrit, Wed, 9 Jun 2021 16:35:03 +0000) ---
+Minh Diep (mdiep@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/43960
+
+Subject: lp_peer_nets) ) failed:" class="issue-link" data-issue-key="LU-14627">LU-14627 tests: Create unload_modules_local
+
+Project: fs/lustre-release
+
+Branch: b2_12
+
+Current Patch Set: 1
+
+Commit: 20118700cb344c92c18d808e96a000acaa097358
+
+--- Comment (gerrit, Wed, 9 Jun 2021 16:35:03 +0000) ---
+Minh Diep (mdiep@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/43959
+
+Subject: lp_peer_nets) ) failed:" class="issue-link" data-issue-key="LU-14627">LU-14627 lnet: Allow delayed sends
+
+Project: fs/lustre-release
+
+Branch: b2_12
+
+Current Patch Set: 1
+
+Commit: 7154ecd2f8faccacdfb697cf1455a904494d910c
+
+--- Comment (hornc, Tue, 8 Jun 2021 15:32:25 +0000) ---
+jpeyrard The fix for this issue is "lp_peer_nets) ) failed:" class="issue-link" data-issue-key="LU-14627">LU-14627 lnet: Ensure ref taken when queueing for discovery" - https://review.whamcloud.com/#/c/43418/
+
+"lp_peer_nets) ) failed:" class="issue-link" data-issue-key="LU-14627">LU-14627 lnet: Allow delayed sends" is testing only change
+
+--- Comment (scadmin, Tue, 1 Jun 2021 10:52:21 +0000) ---
+FYI we encountered something that looks like this with 2.12.6 client and servers.
+
+2021-05-29 12:04:53 [5935871.518144] LNetError: 911:0:(peer.c:282:lnet_destroy_peer_locked()) ASSERTION( list_empty(&lp->lp_peer_nets) ) failed:
+2021-05-29 12:04:53 [5935871.530347] LNetError: 911:0:(peer.c:282:lnet_destroy_peer_locked()) LBUG
+2021-05-29 12:04:53 [5935871.538442] Pid: 911, comm: lnet_discovery 3.10.0-1160.21.1.el7.x86_64 #1 SMP Tue Mar 16 18:28:22 UTC 2021
+2021-05-29 12:04:53 [5935871.549410] Call Trace:
+2021-05-29 12:04:53 [5935871.553213]  [] libcfs_call_trace+0x8c/0xc0 [libcfs]
+2021-05-29 12:04:53 [5935871.561049]  [] lbug_with_loc+0x4c/0xa0 [libcfs]
+2021-05-29 12:04:53 [5935871.568503]  [] lnet_destroy_peer_locked+0x24a/0x350 [lnet]
+2021-05-29 12:04:53 [5935871.576898]  [] lnet_peer_discovery_complete+0x2a5/0x350 [lnet]
+2021-05-29 12:04:53 [5935871.585617]  [] lnet_peer_discovery+0x6c0/0x1140 [lnet]
+2021-05-29 12:04:53 [5935871.593632]  [] kthread+0xd1/0xe0
+2021-05-29 12:04:53 [5935871.599733]  [] ret_from_fork_nospec_end+0x0/0x39
+2021-05-29 12:04:53 [5935871.607198]  [] 0xffffffffffffffff
+2021-05-29 12:04:53 [5935871.613357] Kernel panic - not syncing: LBUG
+2021-05-29 12:04:53 [5935871.618770] CPU: 2 PID: 911 Comm: lnet_discovery Kdump: loaded Tainted: P           OE  ------------ T 3.10.0-1160.21.1.el7.x86_64 #1
+2021-05-29 12:04:53 [5935871.632856] Hardware name: Dell Inc. PowerEdge R740/06G98X, BIOS 2.10.0 11/12/2020
+2021-05-29 12:04:53 [5935871.641552] Call Trace:
+2021-05-29 12:04:53 [5935871.645136]  [] dump_stack+0x19/0x1b
+2021-05-29 12:04:53 [5935871.651390]  [] panic+0xe8/0x21f
+2021-05-29 12:04:53 [5935871.657283]  [] lbug_with_loc+0x9b/0xa0 [libcfs]
+2021-05-29 12:04:53 [5935871.664553]  [] lnet_destroy_peer_locked+0x24a/0x350 [lnet]
+2021-05-29 12:04:53 [5935871.672756]  [] lnet_peer_discovery_complete+0x2a5/0x350 [lnet]
+2021-05-29 12:04:53 [5935871.681295]  [] lnet_peer_discovery+0x6c0/0x1140 [lnet]
+2021-05-29 12:04:53 [5935871.689117]  [] ? wake_up_atomic_t+0x30/0x30
+2021-05-29 12:04:53 [5935871.695985]  [] ? lnet_peer_merge_data+0xe00/0xe00 [lnet]
+2021-05-29 12:04:53 [5935871.703954]  [] kthread+0xd1/0xe0
+2021-05-29 12:04:53 [5935871.709833]  [] ? insert_kthread_work+0x40/0x40
+2021-05-29 12:04:53 [5935871.716901]  [] ret_from_fork_nospec_begin+0x21/0x21
+2021-05-29 12:04:53 [5935871.724393]  [] ? insert_kthread_work+0x40/0x40
+
+it happened when mounting a new filesystem on ~100 nodes at once.
+
+we have a crash dump of the one node that LBUG'd if that would help.
+
+cheers,
+
+robin
+
+--- Comment (gerrit, Tue, 11 May 2021 22:54:23 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/43425/
+
+Subject: lp_peer_nets) ) failed:" class="issue-link" data-issue-key="LU-14627">LU-14627 tests: Create unload_modules_local
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 32304d863ae98c641f541362f54e7b1f24b350a6
+
+--- Comment (gerrit, Wed, 5 May 2021 02:49:06 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/43416/
+
+Subject: lp_peer_nets) ) failed:" class="issue-link" data-issue-key="LU-14627">LU-14627 lnet: Allow delayed sends
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: ab14f3bc852e708100d21770c00235f95841708a
+
+--- Comment (gerrit, Fri, 23 Apr 2021 20:38:11 +0000) ---
+
+
+--- Comment (gerrit, Fri, 23 Apr 2021 20:13:07 +0000) ---
+Chris Horn (chris.horn@hpe.com) uploaded a new patch: https://review.whamcloud.com/43425
+
+Subject: lp_peer_nets) ) failed:" class="issue-link" data-issue-key="LU-14627">LU-14627 tests: Create unload_modules_local
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 9c861d52354a939065a3897ea1cdc539fdd5a513
+
+--- Comment (gerrit, Thu, 22 Apr 2021 21:58:17 +0000) ---
+Chris Horn (chris.horn@hpe.com) uploaded a new patch: https://review.whamcloud.com/43418
+
+Subject: lp_peer_nets) ) failed:" class="issue-link" data-issue-key="LU-14627">LU-14627 lnet: Ensure ref taken when queueing for discovery
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 0ca766281e0099d5ff03944f499d45a8ba7dbcbb
+
+--- Comment (gerrit, Thu, 22 Apr 2021 21:58:16 +0000) ---
+-Chris Horn (chris.horn@hpe.com) uploaded a new patch: https://review.whamcloud.com/43417
+
+Subject: lp_peer_nets) ) failed:" class="issue-link" data-issue-key="LU-14627">LU-14627 tests: Add test for discovery refcount loss
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 807900960972ee5b1a3eba241e2869c731d7e45f-
+
+This patch was squashed with https://review.whamcloud.com/43418
+
+--- Comment (gerrit, Thu, 22 Apr 2021 21:58:16 +0000) ---
+Chris Horn (chris.horn@hpe.com) uploaded a new patch: https://review.whamcloud.com/43416
+
+Subject: lp_peer_nets) ) failed:" class="issue-link" data-issue-key="LU-14627">LU-14627 lnet: Allow delayed sends
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 298b5bfc8defdc684732223bb1d91336d0dae650
+
+--- Comment (hornc, Tue, 20 Apr 2021 21:25:40 +0000) ---
+This is an abridged description of the bug which I will use to try and create a reproducer. May require instrumenting the code to get the timing to line up:
+
+peer queued for discovery
+
+ping sent to peer
+
+incoming push from peer -> peer put on discovery queue
+
+push sent to peer
+
+peer state:
+
+*hornc@cflosbld08 hornc $ lpst2str.sh 0x771
+LNET_PEER_MULTI_RAIL
+LNET_PEER_DISCOVERED
+LNET_PEER_REDISCOVER
+LNET_PEER_DISCOVERING
+LNET_PEER_NIDS_UPTODATE
+LNET_PEER_PING_SENT
+LNET_PEER_PUSH_SENT
+*hornc@cflosbld08 hornc $
+
+ping fails -> PING_SENT cleared
+
+peer state after processing ping failure:
+
+*hornc@cflosbld08 hornc $ lpst2str.sh 0x7131
+LNET_PEER_MULTI_RAIL
+LNET_PEER_DISCOVERED
+LNET_PEER_REDISCOVER
+LNET_PEER_NIDS_UPTODATE
+LNET_PEER_PUSH_FAILED
+LNET_PEER_FORCE_PING
+LNET_PEER_FORCE_PUSH
+*hornc@cflosbld08 hornc $
+
+peer queued for discovery
+
+discovery procceses push "failure" -> unlinks MD
+
+peer state:
+
+*hornc@cflosbld08 hornc $ lpst2str.sh 0x6131
+LNET_PEER_MULTI_RAIL
+LNET_PEER_DISCOVERED
+LNET_PEER_REDISCOVER
+LNET_PEER_NIDS_UPTODATE
+LNET_PEER_FORCE_PING
+LNET_PEER_FORCE_PUSH
+*hornc@cflosbld08 hornc $
+
+monitor thread:
+
+tries to resend push
+
+fails because MD already unlinked
+
+reference lost when peer put back on discovery queue
+
+discovery thread processes peer and we hit lbug

@@ -1,0 +1,206 @@
+Key:        LU-6654
+Summary:    Race condition in osd_thread_info/osd_iobuf freeing causes GPF/null pointers when running obdfilter-survey
+Link:       https://jira.whamcloud.com/browse/LU-6654
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Hongchao Zhang
+Reporter:   Patrick Farrell
+Created:    Wed, 27 May 2015 16:01:37 +0000
+Updated:    Thu, 12 Oct 2017 07:46:45 +0000
+Labels:     patch
+Attachments: logs_dmesg.tar.gz
+
+--- Environment ---
+CentOS 6.5, current master or 2.7.0.  Probably earlier versions as well.
+
+--- Description ---
+Running obdfilter-survey causes GPF/null pointers
+
+Current master on CentOS 6.5 crashes when obdfilter is run on RAM disks with GPF or null pointers, always in the same spot.  If I've diagnosed this correctly, the RAM disk only matters because it makes the race condition more likely, and is not directly related.
+
+The stack trace of the crash is always like this:
+
+RIP: 0010:[]  [] __wake_up_common+0x31/0x90
+
+RSP: 0018:ffff88082f285d60  EFLAGS: 00010096
+
+RAX: 5a5a5a5a5a5a5a42 RBX: ffff880780bcb9b8 RCX: 0000000000000000
+
+RDX: 5a5a5a5a5a5a5a5a RSI: 0000000000000003 RDI: ffff880780bcb9b8
+
+RBP: ffff88082f285da0 R08: 0000000000000000 R09: 0000000000000000
+
+R10: 0000000000000001 R11: 000000000000000f R12: 0000000000000282
+
+R13: ffff880780bcb9c0 R14: 0000000000000000 R15: 0000000000000000
+
+FS:  0000000000000000(0000) GS:ffff880028380000(0000) knlGS:0000000000000000
+
+CS:  0010 DS: 0018 ES: 0018 CR0: 000000008005003b
+
+CR2: 00007f4a594a0060 CR3: 0000000784c0d000 CR4: 00000000000407e0
+
+DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+
+DR3: 0000000000000000 DR6: 00000000ffff0ff0 DR7: 0000000000000400
+
+Process loop2 (pid: 1677, threadinfo ffff88082f284000, task ffff880831376080)
+
+Stack:
+
+ ffff880780bcb9b8 0000000300000001 ffff88082e570f58 ffff880780bcb9b8
+
+ 0000000000000282 0000000000000003 0000000000000001 0000000000000000
+
+ ffff88082f285de0 ffffffff81058bc8 ffff88082d851cc0 ffff880833361800
+
+Call Trace:
+
+ [] __wake_up+0x48/0x70
+
+ [] dio_complete_routine+0x1a0/0x380 [osd_ldiskfs]
+
+ [] bio_endio+0x1d/0x40
+
+ [] loop_thread+0xdf/0x270
+
+ [] ? autoremove_wake_function+0x0/0x40
+
+ [] ? loop_thread+0x0/0x270
+
+ [] kthread+0x96/0xa0
+
+ [] child_rip+0xa/0x20
+
+ [] ? kthread+0x0/0xa0
+
+ [] ? child_rip+0x0/0x20
+
+Note the freed memory in RAX/RDX.  These are sometimes other invalid pointers, rather than freed memory.
+
+Here's the race that's causing this.
+
+In dio_complete_routine, which is called in one the 'loop' threads, we have this sequence:
+
+        if (atomic_dec_and_test(&iobuf->dr_numreqs))
+
+                wake_up(&iobuf->dr_wait);
+
+The corresponding wait (for one of the 'lctl' threads) is this:
+
+        wait_event(iobuf->dr_wait,
+
+                       atomic_read(&iobuf->dr_numreqs) == 0);
+
+Once this wait has completed, things roll up, and, eventually, the struct 'osd_thread_info' containing this 'iobuf' is freed.
+
+The bug (which is easily repeatable) is this:
+
+'loop', in dio_complete_routine, arrives at 'atomic_dec_and_test' and succesfull reduces numreqs to 0.  The thread is then delayed for some reason or another.
+
+'lctl', the other thread, arrives at the 'wait_event', and passes the condition, because dr_numreqs is already 0.
+
+'lctl' then continues on and, eventually, the osd_thread_info containing the iobuf is freed.
+
+Then the first thread goes and 'wake_up' is called, except that the wait queue has been freed.
+
+This very quickly leads to a GPF/null pointer exception.
+
+I've given a fair bit of thought to this, and I don't see a terribly clean way to fix this.  The fundamental problem, I think, is that the osd_thread_info is supposed to be thread specific information & it's being used to hold a wait queue that's used by another thread.
+
+I've created a patch which allocates the iobuf separately from the osd_thread_info, and uses a spinlock in the thread info to prevent the race condition.
+
+We've confirmed this fixes the problem in our testing, but I'm not sure I like the approach.  I am very open to suggestions for different fixes.
+
+I will also attach logs and a dmesg showing the crash (with some extra debug info the logs).  I can provide a dump if requested.
+
+In the case in the attached logs, the two racing threads are 1677 - loop2 - and 5188, one of the lctl threads.
+
+In the attached logs, thread 1677 logs "wakeup", which is printed before the wakeup call, then for whatever reason it is delayed.  When it starts up again, it is in the actual wakeup call and causes the kernel panic.  (As 5188 has freed the osd_thread_info struct containing the iobuf & wait queue.)
+
+--- Comment (hongchao.zhang, Thu, 12 Oct 2017 07:46:45 +0000) ---
+the patch https://review.whamcloud.com/#/c/14963/ has been updated.
+
+--- Comment (spitzcor, Thu, 12 Oct 2017 01:42:55 +0000) ---
+Patrick, you have me confused.  You contributed PS1 of #14963 and Hongchao Zhang uploaded PS1 of #18257.  You say that yours shouldn't land and that RCU should stay out of it, but #18257 is the one with RCU.
+
+I think you want to land #14963, which was your patch originally.  Hongchao, will you take that over and refresh it again?  If we all agree, #18257 should be abandoned.
+
+--- Comment (paf, Wed, 11 Oct 2017 16:03:52 +0000) ---
+Sure.
+
+I think we should probably just land https://review.whamcloud.com/#/c/14963/, which is the first patch from Hongchao.  (Mine definitely shouldn't land.)  RCU is more efficient, sure, but it's also more complex.  I'd leave RCU out unless we're sure we need it.
+
+--- Comment (adilger, Wed, 11 Oct 2017 02:34:15 +0000) ---
+Patrick's patch is outdated and no longer applies cleanly.  It would need to be updated to land.
+
+Hongchao, can you and Patrick please come to a conclusion about your patches, and get at least one of them landed.
+
+--- Comment (spitzcor, Thu, 5 Oct 2017 18:48:17 +0000) ---
+We let this one sit for a year.  Does Patrick need to refresh his original patch or what?
+
+--- Comment (paf, Wed, 23 Nov 2016 16:57:49 +0000) ---
+I'm just posting to 'bump' this and repeat the question from Andreas:
+
+"Hongchao, how does your patch relate to http://review.whamcloud.com/14963 ? "
+
+It would be nice to get one of these patches landed.  They seem to achieve the same thing, though RCU is probably more efficient.
+
+--- Comment (adilger, Fri, 3 Jun 2016 08:48:13 +0000) ---
+Hongchao, how does your patch relate to  http://review.whamcloud.com/14963 ?
+
+--- Comment (gerrit, Tue, 2 Feb 2016 11:02:43 +0000) ---
+Hongchao Zhang (hongchao.zhang@intel.com) uploaded a new patch: http://review.whamcloud.com/18257
+
+Subject: LU-6654 osd: add RCU lock on osd_thread_info
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 280c9392bebb4407bd4c61d0675d62772134c743
+
+--- Comment (bzzz, Thu, 21 Jan 2016 13:37:39 +0000) ---
+I'd think that using RCU (i.e. late deallocation) could make the patch a bit simpler.
+
+--- Comment (jaylan, Wed, 13 Jan 2016 23:43:08 +0000) ---
+Oops, my bad! I tried to apply to wrong repo. No need back port to b2_5_fe.
+
+What I need the patch for is b2_7_fe. I noticed that the osd_key_fini() in b2_7_fe missed the codes related to idc. Not sure if your patch depends on earlier patches that added chunk of codes related toe idc. Please advise or provide me a patch for b2_7_fe. 
+
+Thanks!
+
+--- Comment (jaylan, Wed, 13 Jan 2016 01:26:22 +0000) ---
+Could you port your patch to b2_5_fe please? The difference are not trivial. Thank!
+
+--- Comment (jaylan, Tue, 12 Jan 2016 19:06:12 +0000) ---
+Thanks!
+
+--- Comment (paf, Tue, 12 Jan 2016 16:03:26 +0000) ---
+Jay - Hongchao wrote a new patch (and took the time to do it right, unlike me  ).
+
+--- Comment (jaylan, Mon, 11 Jan 2016 19:41:52 +0000) ---
+Would there be a newer update given Patrick Farrell's comment on patchset #2 on Jan 7th?
+
+--- Comment (hongchao.zhang, Thu, 7 Jan 2016 14:51:13 +0000) ---
+The patch http://review.whamcloud.com/14963 has been updated.
+
+--- Comment (cfaber, Mon, 23 Nov 2015 16:47:32 +0000) ---
+Has this patch been abandoned? I see no activity on it for a long time.
+
+--- Comment (gerrit, Wed, 27 May 2015 16:31:54 +0000) ---
+Patrick Farrell (paf@cray.com) uploaded a new patch: http://review.whamcloud.com/14963
+
+Subject: LU-6654 osd: Add osd_iobuf concurrency control
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 38fea9ef2c27f82ed3aec54843d2367a3847c687

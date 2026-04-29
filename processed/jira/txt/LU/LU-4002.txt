@@ -1,0 +1,75 @@
+Key:        LU-4002
+Summary:    HSM restore vs unlink deadlock
+Link:       https://jira.whamcloud.com/browse/LU-4002
+Type:       Technical task
+Priority:   Blocker
+Status:     Resolved
+Resolution: Fixed
+Assignee:   John Hammond
+Reporter:   John Hammond
+Created:    Tue, 24 Sep 2013 18:41:24 +0000
+Updated:    Tue, 25 Jan 2022 20:56:30 +0000
+Resolved:   Wed, 9 Oct 2013 08:22:39 +0000
+Labels:     HSM
+Links:      Related: is related to  LU-4053; Related: is related to  LU-4727
+
+--- Description ---
+In 23c197908902183d5f88d3f431da6cde9c290e07 LU-3811 hsm: handle file ownership and timestamps, I added a stat() of the file being restored to the CT's restore path. This is to ensure that the volatile file is given the correct ownership and timestamps before the restore, and is required for the layout swap to succeed. However this introduces a potential for deadlock vs unlink() and other operations. Consider the following sequence of operations on a single file:
+
+	Client sends restore, CDT takes and holds EX LAYOUT lock.
+
+	Client sends unlink, handler sleeps on EX FULL lock.
+
+	CDT sends restore action to CT.
+
+	CT begins restore, sends getattr (from stat()), handler sleeps on PR LOOKUP,UPDATE,PERM lock.
+
+We have a similar deadlock with rename-onto.
+
+I think the simplest way out of this mess would be to lock fewer bits in the unlink handler. Can anyone say why unlink should invalidate cached layout? An open unlinked file is still valid for IO.
+
+--- Comment (jhammond, Tue, 25 Jan 2022 20:56:30 +0000) ---
+Note to self. After http://review.whamcloud.com/13750 (LU-4727 hsm: use IOC_MDC_GETFILEINFO in restore) the copytool uses IOC_MDC_GETFILEINFO/MDS_GETATTR_NAME to get the attributes of the released file which bypasses LLDM and does not have the issue described above.
+
+--- Comment (jhammond, Fri, 11 Oct 2013 15:47:18 +0000) ---
+Please see http://review.whamcloud.com/7927 for a sketch of this approach.
+
+--- Comment (jhammond, Wed, 9 Oct 2013 17:26:28 +0000) ---
+I believe that we could revert this patch if the HSM coordinator would send the ownership and timestamps to use on the volatile file along with the restore action. Then the copytool will not need to stat() the original file. The restoring layout swap will check that the ownerships agree protecting us from a TOCTTOU issue.
+
+--- Comment (jay, Wed, 9 Oct 2013 17:17:06 +0000) ---
+Hi Andreas, this is a known issue but we still decided to land the patch because the deadlock issue is more severe.
+
+The problem is that when the LOOKUP lock is revoked, we don't know if this is because the file is being unlinked or renamed. However, leaving some locks in cache may not be a problem because if the system is active, the locks will be discarded by LRU soon or later.
+
+--- Comment (adilger, Wed, 9 Oct 2013 08:22:39 +0000) ---
+Might have jumped the gun on this. Closing it again until we know it is the culprit.
+
+--- Comment (adilger, Wed, 9 Oct 2013 08:03:26 +0000) ---
+Per recent comments in LU-4053, this is causing a lot of layout locks to be left on the client after an inode is unlinked.  Ideally, the layout lock would be revoked if this is the last reference to the inode (last link and file is not opened).  The main question is whether it is possible to know this in advance?  Unlike the open-unlinked handling, at worst this will revoke an extra lock if there is a race and another thread opens the file just before it is unlinked, so I think it is better to handle the common case more efficiently.
+
+Is there any way to know in advance if HSM is processing this file and not try to revoke the layout lock in this case?
+
+--- Comment (jlevi, Thu, 3 Oct 2013 12:52:10 +0000) ---
+Patch landed to Master. If more work is needed in this ticket, please let me know and I will reopen this ticket.
+
+--- Comment (jhammond, Tue, 1 Oct 2013 15:26:14 +0000) ---
+I suggest that this be considered a blocker for 2.5.0. It is easy to imagine situations where users will trigger this deadlock. Faced with a long running restore on a file (which to the user may just seem like an unresponsive console or FS) the user may logout, login, and unlink the released file (since perhaps it is easy to regenerate anyway).
+
+--- Comment (jhammond, Sat, 28 Sep 2013 00:05:30 +0000) ---
+Please see http://review.whamcloud.com/7792.
+
+--- Comment (jhammond, Wed, 25 Sep 2013 20:05:27 +0000) ---
+In general it won't be enough just to remove LAYOUT from unlink.Assume restore takes EX LAYOUT, some other operation tries to take PR LAYOUT | LOOKUP | ... and waits. Then unlink tries to take EX LOOKUP | .... Then stat (from the CT) tries to take LOOKUP | UPDATE | ... and deadlocks.
+
+As I keep saying, any operation that requires two lock is dangerous.
+
+Note that unlink (and rename onto) should take more than just LOOKUP, since it modifies link count and timestamps.
+
+Could we do something sane seeming like having the MDT send the attributes that the CT is getting from stat?
+
+--- Comment (jay, Wed, 25 Sep 2013 16:32:29 +0000) ---
+Is it possible for unlink to grab LOOKUP only? The only side effect I can think of now is that there are some caching locks on the client side won't be revoked. But this can be easily fixed.
+
+--- Comment (green, Wed, 25 Sep 2013 16:14:24 +0000) ---
+I wouldagree that unlink does not need to invalidate the layout

@@ -1,0 +1,197 @@
+Key:        LU-12916
+Summary:    allow small/unaligned writes into writeback cache if not O_SYNC
+Link:       https://jira.whamcloud.com/browse/LU-12916
+Type:       Improvement
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Alex Zhuravlev
+Reporter:   Andreas Dilger
+Created:    Tue, 29 Oct 2019 23:03:20 +0000
+Updated:    Mon, 22 Jan 2024 15:49:53 +0000
+Links:      Related: is related to LU-13786
+
+--- Description ---
+Allow small/unaligned writes to be placed directly into pagecache on the OST without starting IO.  This should help IOPS for small writes where we are not limited by pagecache performance as is the case for large writes (where patch https://review.whamcloud.com/34422 "LU-12071 osd-ldiskfs: bypass pagecache if requested" is trying to do the opposite and avoid page cache for large writes).
+
+A reasonable starting point would be 64KiB writes, since this is the upper limit for short writes (data embedded into the BRW RPC request), and beyond this we get good performance for larger writes already (per testing of flash at different io sizes, page 8).
+
+--- Comment (adilger, Sat, 18 Nov 2023 06:48:25 +0000) ---
+i wrote in email:
+
+I was thinking that it would be possible to drop the pages from page cache right after a large IO was submitted. That would leave more RAM available to aggregate small writes in cache until they can form a complete write, and avoid memory pressure. 
+
+We might be able to do this at the osd-ldiskfs level, but it might need to patch the write completion callback to drop the pages from cache? That should be conditional on some flag on the inode or something so that we can control whether the writes are cached or not (eg. by size or tunable parameter).
+
+Yingjin replied:
+
+We have already implemented this for full stripe write in the patch (https://review.whamcloud.com/51159/):
+
+osd_da_full_write_workfn()
+       if (osd->od_range_delalloc_drop_cache && rc == 0 &&
+          nr_pages == mpd.locked_index + 1) {
+            pgoff_t end = gstart + nr_pages - 1;
+            int err;
+
+            rc = filemap_fdatawait_range(mapping, gstart if (rc "Wait writeback range failed: rc = %d\n", rc);
+                  GOTO(out_iput, rc);
+            }
+
+            err = invalidate_inode_pages2_range(mapping, gstart, end);
+            if (err "failed to invalidate pages: rc = %d\n", err);
+      }
+
+We use Ext4 extent_status tree to track the delayed allocation extents for a file.
+
+When a write in the I/O service thread with delayed allocation can form a good full stripe extent I/O, which means the extent_status extent after merge contains a full I/O extent where the offset and size in this full I/O extent are all 1MiB aligned, then we will launch a extra work queue thread to do dirty page flush in this I/O range.
+
+In this work queue thread, it will first flush this full stripe I/O. And if the osd-ldiskfs.*.range_delalloc_drop_cache=1, then it will wait the full stripe I/O to finish and discard the pages from cache.
+
+However, under memory pressure with writeback enabled on OSD, the kernel will trigger page reclaim. It will call ext4|ldiskfs_writepages() to write out the dirty page, which may destroy the full extent I/O, resulting in lots of small I/O to the RAID disk system.
+
+Thus I think we may still need to patch the ldiskfs in ext4/ldiskfs_writepages(), add a flag to the inode with delalloc to indicate that it needs to wait for writeback finished and drop the cache to mitigate the memroy pressure,  thus avoid the small I/O casued by kernel page reclaim mechanism as much as possible, reduce its impact on the performance.
+
+--- Comment (sihara, Fri, 17 Nov 2023 10:51:47 +0000) ---
+master
+
+[RESULT] ior-hard-write 5.368100 GiB/s : time 313.086 seconds
+
+master + https://review.whamcloud.com/#/c/fs/lustre-release/+/51159/ (patch set6)
+
+[RESULT] ior-hard-write 8.027850 GiB/s : time 319.704 seconds
+
+the patch demonstrated 50% performance improvements today. After patch, we are seeing very good aligned 1M IOs to disks, but it causes memory pressures on OSSs. When it happens, no more  aligned IOs, and the performance down in the end.
+
+I will give more detail stats to compare memory pressure vs performance, but patch still needs to release and reclaim after flsuh dirty data to disks. it should be able to keep nice aligned IOs to disks as much as possible.
+
+--- Comment (gerrit, Tue, 30 May 2023 09:31:04 +0000) ---
+"Qian Yingjin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/51159
+
+Subject: LU-12916 osd-ldiskfs: use workqueue to write good extent
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 5f1f2e1dfbd5a18233302fdc7254649c461f5dfc
+
+--- Comment (gerrit, Fri, 19 May 2023 15:43:05 +0000) ---
+"Qian Yingjin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/51063
+
+Subject: LU-12916 osd-ldiskfs: detect good extent via extent tree
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 8365ad9fec435b712d61469102b6f52261898a1e
+
+--- Comment (gerrit, Wed, 17 May 2023 08:54:21 +0000) ---
+"Qian Yingjin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/51033
+
+Subject: LU-12916 osd-ldiskfs: add delayed allocation support
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: a3eae66329bc90bf6b00a1ba45b69ac63c1157f7
+
+--- Comment (gerrit, Thu, 11 May 2023 09:47:35 +0000) ---
+"Qian Yingjin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/50940
+
+Subject: LU-12916 osd-ldiskfs: check and submit good full write
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: a4f26530367f040ba148acecd198a6ea13541701
+
+--- Comment (gerrit, Wed, 19 Apr 2023 07:43:49 +0000) ---
+"Qian Yingjin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/50687
+
+Subject: LU-12916 osd: use writeback for small writes in ldiskfs
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: b6c208f1bd2c220e926f555ad78d4331b911231c
+
+--- Comment (qian_wc, Mon, 17 Apr 2023 14:40:08 +0000) ---
+Hi Alex,
+
+I am studying your patch (https://review.whamcloud.com/36596) recently. It seems that your patch used delayed allocation with write-back in order to obtain better performance.
+
+According to the description in URL: https://lwn.net/Articles/322823/
+
+"Delayed allocation" means that the filesystem tries to delay the allocation of physical disk blocks for written data for as long as possible. This policy brings some important performance benefits. Many files are short-lived; delayed allocation can keep the system from writing fleeting temporary files to disk at all. And, for longer-lived files, delayed allocation allows the kernel to accumulate more data and to allocate the blocks for data contiguously, speeding up both the write and any subsequent reads of that data. It's an important optimization which is found in most contemporary filesystems.
+
+But, if blocks have not been allocated for a file, there is no need to write them quickly as a security measure. Since the blocks do not yet exist, it is not possible to read somebody else's data from them. So ext4 will not (cannot) write out unallocated blocks as part of the next journal commit cycle. Those blocks will, instead, wait until the kernel decides to flush them out; at that point, physical blocks will be allocated on disk and the data will be made persistent. The kernel doesn't like to let file data sit unwritten for too long, but it can still take a minute or so (with the default settings) for that data to be flushed - far longer than the five seconds normally seen with ext3. And that is why a crash can cause the loss of quite a bit more data when ext4 is being used.
+
+Delayed allocation is a good feature: "delayed allocation allows the kernel to accumulate more data and to allocate the blocks for data contiguously, speeding up both the write"
+
+But I am afraid we can not use delayed allocation in write-back support for our OSD-ldiskfs...
+
+"Ext4 will not (cannot) write out unallocated blocks as part of the next journal commit cycle..."
+
+Thus during the journal commit, the page with unallocated blocks is not committed into the stable disk...
+
+If the last_committed > transno of the bulk write on the client, we may wrongly release the unstable page of the write RPC on the client which may be not stable on the storage on the server...
+
+So I think we still need to allocate blocks for each write page on OST, after that we can write each page in write-back way with ordered-journal mode.
+
+I have no idea how it will help with the performance.
+
+But I expect it can improve the performance of ior-hard-write (combined with Partick's unaligned DIO patch) and mdtest-hard-write(combined with my patch https://review.whamcloud.com/#/c/fs/lustre-release/+/49342/).
+
+I could help to refine your patch if you are busy. However, I am not very familiar with Ext4, you are the expert in ldiskfs, could you please give your professional opinion?
+
+Thanks,
+
+Qian
+
+--- Comment (adilger, Wed, 15 Jul 2020 03:12:27 +0000) ---
+Patrick, there are two different goals/needs here. There is a need to write directly into page cache for poorly formed workloads like IO500 ior-hard-write, because the writes are not page aligned, and doing synchronous read-modify-write for sub-page IO size is very expensive, even with a block-level write cache in front of NVMe. 
+
+We've already instituted a dynamic cache at the OST level, where large aligned writes are never cached, and page cache is disabled for non-rotational devices, but we need to re-enable page cache for those badly-formed writes.
+
+--- Comment (paf0186, Tue, 14 Jul 2020 22:53:55 +0000) ---
+I thought the original driver for turning off the page cache was maximum IOPS.  I can't tag him (Only WC users can tag people in WC Jira, for some reason...), but I think Ihara did the benchmarking at the time.  Can someone tag him here?
+
+--- Comment (gerrit, Thu, 28 May 2020 13:44:46 +0000) ---
+Alex Zhuravlev (bzzz@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/38747
+
+Subject: LU-12916 osd: send data to journal
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: f767bc5689bbdd53ae6ef03e660c7ac18bb4e5a7
+
+--- Comment (adilger, Sat, 18 Apr 2020 04:36:24 +0000) ---
+Alex Zhuravlev (bzzz@whamcloud.com) uploaded a patch: https://review.whamcloud.com/36596
+
+Subject: LU-12916 osd: use writeback cache in ldiskfs
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 18
+
+Commit: eb24c28a61953800c5dd9f382620d573e99f1f43

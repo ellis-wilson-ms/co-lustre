@@ -1,0 +1,265 @@
+Key:        LU-3421
+Summary:    (ost_handler.c:1762:ost_blocking_ast()) Error -2 syncing data on lock cancel causes first ENOSPC client issues then MDS server locks up
+Link:       https://jira.whamcloud.com/browse/LU-3421
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Zhenyu Xu
+Reporter:   James A Simmons
+Created:    Thu, 30 May 2013 16:50:26 +0000
+Updated:    Thu, 18 Sep 2014 21:00:51 +0000
+Resolved:   Tue, 3 Sep 2013 13:11:54 +0000
+Labels:     llnl
+Links:      Related: is related to LU-1947
+Attachments: mds-kern.log, oss11a4-kern.log
+
+--- Environment ---
+RHEL6.4 running with Lutsre 2.4-rc2 and cray clients running [2.4.0-rc1 SLES11 SP1 / 2.4.0-rc2 SLES11 SP2] clients
+
+--- Description ---
+Several times during our test shot we would encounter a situation where OSTs would report ENOSPC even tho there was enough space and inodes available. In time the MDS would become pinned and it would have to be rebooted to get a working file system again. I have attached the console logs for the MDS and OSS.
+
+--- Comment (pjones, Tue, 3 Sep 2013 13:11:55 +0000) ---
+Thanks James!
+
+--- Comment (simmonsja, Tue, 3 Sep 2013 13:08:47 +0000) ---
+I haven't seen this bug in some time. You can close it.
+
+--- Comment (pjones, Tue, 3 Sep 2013 03:46:39 +0000) ---
+James
+
+This patch landed has landed both for 2.4.1 and 2.5. Has the issue reproduced in any test runs featuring this patch? If not, then perhaps we can close the ticket and reopen if it ever does reappear...
+
+Peter
+
+--- Comment (simmonsja, Fri, 7 Jun 2013 16:08:21 +0000) ---
+Looks like the end of July for our next test shot. I will see if I can duplicate it at a smaller scale in the mean time.
+
+--- Comment (pjones, Thu, 6 Jun 2013 12:55:27 +0000) ---
+ok James. Do you have a timeframe for your next testshot yet?
+
+--- Comment (simmonsja, Thu, 6 Jun 2013 12:51:06 +0000) ---
+I tested your patch at small scale and it works fine. I like to keep this ticket open until our next test shot to ensure this addresses the problem. Andreas point out other issues as well.
+
+--- Comment (johann, Tue, 4 Jun 2013 15:27:25 +0000) ---
+While running some tests locally, i found out that the space reserved for precreation always decreases, eventually reaches 0 and stays there. It seems that we exit from ofd_grant() at line 641:
+
+ 637         /* align grant on block size */
+ 638         grant &= ~((1ULL ofd_blockbits) - 1);
+ 639 
+ 640         if (!grant)
+ 641                 RETURN(0);
+
+I think there are two issues:
+
+	ofd_grant_create() is not aggressive enough in reserving space for precreation and ends up requesting an amount of grant space smaller than a block
+
+	the rounding in ofd_grant() turns the 
+
+I will provide a patch.
+
+--- Comment (johann, Tue, 4 Jun 2013 08:32:58 +0000) ---
+This is subtracting the granted space from the available space returned to the MDS,
+
+This is actually only subtracting the space reserved for pre-creation for which we use the self export.
+
+ but I think it should be adding the granted space back into os_bavail so that the MDS does not consider the grant space as "used". Otherwise, if the clients have reserved a lot of space on the OSTs they may not actually get to use it because the MDS will never allocate space there.
+
+I think there is nothing to add back, since only tot_dirty and tot_pending are taken into account here. Please note that tot_granted is not withdrawn anywhere.
+
+A secondary issue is that there is no coordination between the space granted to a specific client and the objects that the MDS allocates to that client, which would become more important as the free space is running out.
+
+I would agree if we were taking tot_granted out in statfs reply, however i don't think this is the case.
+
+There could be some kind of (IMHO complex) coordination here between the MDS and clients/OSTs, but I think it would be easier if we just got the grant shrinking code to work again, as there is no guarantee that (a) clients doing IO will have any grant at all, and (b) the clients have grant on the OSTs for which they have been asked to write on. Returning unused grant to the OSTs as the free space shrinks is the best way to ensure that there is some left for the clients actually doing IO.
+
+I am all for resurrecting grant shrinking, although i haven't had the opportunity to do it yet by lack of time. In fact, we might as well just disconnect (and therefore release grants) from OSTs when idle and when the replay list is empty. We could then reconnect on demand. IMHO, such a scheme would have other benefits: less clients to wait for during recovery and less PING requests.
+
+As for the original problem, it seems that precreate requests fails with ENOSPC on the OST:
+
+May 29 09:00:06 widow-oss11a4 kernel: [79146.403713] LustreError: 25344:0:(ofd_obd.c:1338:ofd_create()) routed1-OST016b: unable to precreate: rc = -28
+
+James, could you please dump the grant state on the OST by running "lctl get_param obdfilter..tot obdfilter..grant"?
+
+--- Comment (adilger, Mon, 3 Jun 2013 22:56:22 +0000) ---
+James, how many clients were mounting this filesystem?  If each OST is 250GB, and each client gets a 32MB grant, that means 32 clients/GB of free space, so 8000 clients would essentially pin all of the available space on each client.  I see something a bit strange in the code that might be causing a problem here:
+
+static int ofd_statfs(...)
+{
+        osfs->os_bavail -= min_t(obd_size, osfs->os_bavail,
+                                 ((ofd->ofd_tot_dirty + ofd->ofd_tot_pending +
+                                   osfs->os_bsize - 1) >> ofd->ofd_blockbits));
+        :
+        :
+        /* The QoS code on the MDS does not care about space reserved for
+         * precreate, so take it out. */
+        if (exp_connect_flags(exp) & OBD_CONNECT_MDS) {
+                struct filter_export_data *fed;
+
+                fed = &obd->obd_self_export->exp_filter_data;
+                osfs->os_bavail -= min_t(obd_size, osfs->os_bavail,
+                                         fed->fed_grant >> ofd->ofd_blockbits);
+        }
+
+This is subtracting the granted space from the available space returned to the MDS, but I think it should be adding the granted space back into os_bavail so that the MDS does not consider the grant space as "used".  Otherwise, if the clients have reserved a lot of space on the OSTs they may not actually get to use it because the MDS will never allocate space there.
+
+A secondary issue is that there is no coordination between the space granted to a specific client and the objects that the MDS allocates to that client, which would become more important as the free space is running out.  There could be some kind of (IMHO complex) coordination here between the MDS and clients/OSTs, but I think it would be easier if we just got the grant shrinking code to work again, as there is no guarantee that (a) clients doing IO will have any grant at all, and (b) the clients have grant on the OSTs for which they have been asked to write on.  Returning unused grant to the OSTs as the free space shrinks is the best way to ensure that there is some left for the clients actually doing IO.
+
+--- Comment (simmonsja, Fri, 31 May 2013 11:49:37 +0000) ---
+The only OSS logs I have are like the one I posted here.
+
+--- Comment (bobijam, Fri, 31 May 2013 08:45:39 +0000) ---
+James, 
+
+Do you have OSS debug log? Want to check the reason why it reports ENOSPC while it seems there are plenty.
+
+--- Comment (bzzz, Fri, 31 May 2013 08:04:06 +0000) ---
+I agree that osp_pre_update_status() should not be setting the status to 0 first. though I think that check to limit time we spent in osp_precreate_reserve() does not depend on the status, it's a hardlimit. and in the worst case when osp_precreate_ready_condition() missed -ENOSPC due to the race we still should leave osp_pre_update_status() up on expiration? notice the expiration point is not reset in the loop.
+
+--- Comment (simmonsja, Thu, 30 May 2013 23:36:42 +0000) ---
+Andreas the lfs df -i output was pretty much what you seen below. The lfs df results were basically the same. In the last test shot we saw issues with 4 ost becoming very full but this was not the case this time.
+
+/lustre/routed1-OST0130_UUID     3872000       86598     3785402   2% /lustre/routed1[OST:304]
+
+/lustre/routed1-OST00ac_UUID     3872000       86584     3785416   2% /lustre/routed1[OST:172]
+
+/lustre/routed1-OST0047_UUID     3872000       86539     3785461   2% /lustre/routed1[OST:71]
+
+/lustre/routed1-OST01c2_UUID     3872000       85067     3786933   2% /lustre/routed1[OST:450]
+
+UUID                              Inodes       IUsed       IFree IUse% Mounted on
+
+Talking with Oleg he didn't believe it was due to grants. Each OST is 250GB in size. I also expected the real issue is happening on the OSS rather than the MDS but the admins only gathered a vmcore from the MDS.
+
+--- Comment (simmonsja, Thu, 30 May 2013 22:20:33 +0000) ---
+I uploaded the vmcore to ftp.whamcloud.com/uploads/LU-3421
+
+--- Comment (adilger, Thu, 30 May 2013 20:51:43 +0000) ---
+James, I expect the stack trace you pointed out is not a primary cause of this problem.  That looks just to be an MDS thread that is blocked waiting for a DLM lock that is held by another thread.  My guess is that there is something wrong in the precreate code at ENOSPC time that is keeping the MDS threads blocked for too long a time, and this is caused by either really being out of space on the OSTs (either inodes or blocks is the same, since there is no point allocating objects on an OST with no space) or maybe false ENOSPC caused by a problem with the space grants or similar.
+
+It does point out that we have something wrong with the usage of the DLM locks, or similar, because we should never be blocked for such a long time holding a spinlock.
+
+--- Comment (adilger, Thu, 30 May 2013 20:47:28 +0000) ---
+It looks like there are a couple of different bugs being hit here:
+
+	the OSTs are apparently reporting -ENOSPC when there is space available on them.  Is this possibly a case where the OST is reporting ENOSPC during precreate when there are free inodes, but there are no free blocks?  What is the lfs df and lfs df -i output from the filesystem?  If this state hits again, please also collect the output from lctl get_param osp..sync_ osp.*.create_count on the MDS
+
+	the MDS goes into a busy loop trying to create objects on the OSTs, rather than returning -ENOSPC to the client.  While it is good to ensure that the OSTs have been tried for creates, it doesn't make sense to try precreate so often if the OST is already out of space.
+
+May 29 08:18:40 widow-mds1 kernel: [76013.652071] Lustre: routed1-OST0015-osc-MDT0000: slow creates, last=[0x100150000:0x22041:0x0], next=[0x100150000:0x22041:0x0], reserved=0, syn_changes=2061, syn_rpc_in_progress=1, status=-19
+May 29 08:19:32 widow-mds1 kernel: [76065.440057] Lustre: routed1-OST00f0-osc-MDT0000: slow creates, last=[0x100f00000:0x25e93:0x0], next=[0x100f00000:0x25e93:0x0], reserved=0, syn_changes=0, syn_rpc_in_progress=1, status=-19
+May 29 08:23:37 widow-mds1 kernel: [76310.325026] LustreError: 6065:0:(osp_precreate.c:484:osp_precreate_send()) routed1-OST002a-osc-MDT0000: can't precreate: rc = -28
+May 29 08:23:37 widow-mds1 kernel: [76310.367372] LustreError: 6065:0:(osp_precreate.c:484:osp_precreate_send()) Skipped 70657 previous similar messages
+
+There was previously debugging code in osp_precreate_reserve() because I was worried about exactly this kind of situation, but my recent patch http://review.whamcloud.com/6219 (commit dc2bcafd2a0b) removed it before the 2.4.0 release because it would have LBUG'd in this case:
+
+@@ -1062,17 +1061,6 @@ int osp_precreate_reserve(const struct lu_env *env, struct osp_device *d)
+        while ((rc = d->opd_pre_status) == 0 || rc == -ENOSPC ||
+                rc == -ENODEV || rc == -EAGAIN) {
+ 
+-#if LUSTRE_VERSION_CODE this thread and osp_precreate_send()
+-                */
+-               if (unlikely(count++ == 1000)) {
+-                       osp_precreate_timeout_condition(d);
+-                       LBUG();
+-               }
+-#endif
+-
+                /*
+                 * increase number of precreations
+                 */
+
+It probably makes sense to reinstate this if it loops only, say, twice for -ENOSPC, since there are other OSTs that could be used and it doesn't make sense to block the MDS thread for such a long time.
+
+It seems to me that the update of osp_pre_status at the start of osp_pre_update_status() is racy.  If rc == 0 (i.e. the statfs succeeded) then osp_pre_status = 0, even though it is set to -ENOSPC again later on.  It would be better to have something like:
+
+        if (rc != 0) {
+                d->opd_pre_status = rc;
+                goto out;
+        }
+
+Otherwise, opd_pre_status can be changed to 0 and break osp_precreate_ready_condition() checking of -ENOSPC.
+
+It also seems like the -ENOSPC hysteresis that is so well described in the comment in osp_pre_update_status() is not actually implemented.  When the free space is opd_pre_status = -ENOSPC, but it is immediately cleared if free space is >= 0.1%.  It also seems that there is a longstanding bug in the code, with min(used blocks vs. 1 GByte).  It seems something like the following is needed:
+
+         * On very large disk, say 16TB 0.1% will be 16 GB. We don't want to
+         * lose that amount of space so in those cases we report no space left
+         * if their is less than 1 GB left, and clear it at 2GB. 
+        if (likely(msfs->os_type != 0)) { /* msfs contains valid data */
+                used = min((msfs->os_blocks - msfs->os_bfree) >> 10,
+                           1ULL os_bsize);
+                if (d->opd_pre_status == 0 &&
+                    msfs->os_ffree os_bavail opd_pre_status = -ENOSPC;
+                        :
+                        :
+                } else if (d->opd_pre_status == -ENOSPC &&
+                           msgs->os_ffree > 64 && msfs->os_bavail > used * 2) {
+                        d->opd_pre_status = 0;
+                        :
+                        :
+                }
+
+The opd_pre_status = 0 state should only be set if there is enough space, not only if the STATFS RPC succeeded.
+
+--- Comment (simmonsja, Thu, 30 May 2013 18:07:21 +0000) ---
+backtrace from the vmcore which will be uploaded soon:
+
+PID: 4814   TASK: ffff880e23333500  CPU: 15  COMMAND: "mdt03_140"
+
+ #0 [ffff8800607e7e90] crash_nmi_callback at ffffffff8102d316
+
+ #1 [ffff8800607e7ea0] notifier_call_chain at ffffffff81513a85
+
+ #2 [ffff8800607e7ee0] atomic_notifier_call_chain at ffffffff81513aea
+
+ #3 [ffff8800607e7ef0] notify_die at ffffffff8109cc1e
+
+ #4 [ffff8800607e7f20] do_nmi at ffffffff8151174b
+
+ #5 [ffff8800607e7f50] nmi at ffffffff81511010
+
+    [exception RIP: _spin_lock+30]
+
+    RIP: ffffffff8151087e  RSP: ffff880e23335c40  RFLAGS: 00000293
+
+    RAX: 00000000000014a6  RBX: ffff88099a82c200  RCX: ffff880e23335cf8
+
+    RDX: 00000000000014a3  RSI: ffff880e23335cf0  RDI: ffff880ac63c35d8
+
+    RBP: ffff880e23335c40   R8: 0000000000000000   R9: ffff8800b6c1dc00
+
+    R10: 0000000000000009  R11: ffffffffa08dd5a0  R12: ffff88099a82c200
+
+    R13: ffff880ac63c35c0  R14: ffff880e23335cf8  R15: 0000000000000000
+
+    ORIG_RAX: ffffffffffffffff  CS: 0010  SS: 0018
+
+—  —
+
+ #6 [ffff880e23335c40] _spin_lock at ffffffff8151087e
+
+ #7 [ffff880e23335c48] lock_res_and_lock at ffffffffa07e3070 [ptlrpc]
+
+ #8 [ffff880e23335c68] ldlm_lock_enqueue at ffffffffa07e859d [ptlrpc]
+
+ #9 [ffff880e23335cc8] ldlm_handle_enqueue0 at ffffffffa080f1bf [ptlrpc]
+
+#10 [ffff880e23335d38] mdt_enqueue at ffffffffa0e6e3c6 [mdt]
+
+#11 [ffff8#12 [ffff880e23335da8] mds_regular_handle at ffffffffa0eae165 [mdt]
+
+#13 [ffff880e23335db8] ptlrpc_server_handle_request at ffffffffa0841388 [ptlrpc]
+
+#14 [ffff880e23335eb8] ptlrpc_main at ffffffffa084271e [ptlrpc]
+
+#15 [ffff880e23335f48] kernel_thread at ffffffff8100c0ca80e23335d58]
+
+--- Comment (pjones, Thu, 30 May 2013 18:02:59 +0000) ---
+Bobijam
+
+Could you please look into this one?
+
+Thanks
+
+Peter

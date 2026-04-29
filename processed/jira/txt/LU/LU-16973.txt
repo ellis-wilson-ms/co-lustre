@@ -1,0 +1,236 @@
+Key:        LU-16973
+Summary:    Busy device after successful umount
+Link:       https://jira.whamcloud.com/browse/LU-16973
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Alexander Boyko
+Reporter:   Alexander Boyko
+Created:    Fri, 21 Jul 2023 11:18:15 +0000
+Updated:    Wed, 15 Jan 2025 13:02:22 +0000
+Resolved:   Wed, 6 Sep 2023 13:09:15 +0000
+Labels:     patch
+Links:      Related: is related to  LU-15404; Related: is related to LU-16982; Related: is related to LU-18463
+
+--- Description ---
+We have a script that checks failover process and if it is delayed the node is crashed. Usually 30seconds after umount complete are enough to finish all working stuff and have a zero reference for a raid device. But with high IO and two MDTs on a node makes things worse. Delayed works takes much time, we have seen 20+ minutes after umount complete.
+
+The umount jobs are divided on
+
+1) umount syscall
+
+2) mntput() is delayed and processing by kworker
+
+3) iputs, LU-15404 made it works at separate super block work queue and mntput waits it
+
+4) fputs() using delayed and shares global kernel list with others MDTs and list are processed with a single kworker
+
+md65 mount has 1747359 references and 2387523 files at fput list.
+
+[353410.384294] Lustre: server umount kjcf04-MDT0000 complete
+[353454.532032] sysrq: SysRq : Trigger a crash
+[0]: ffffd193c1a1f584
+struct mnt_pcp {
+  mnt_count = 436042, 
+  mnt_writers = 0
+}
+crash> mnt_pcp 0x3a1fd1e1f584:1
+[1]: ffffd193c1a5f584
+struct mnt_pcp {
+  mnt_count = 436156, 
+  mnt_writers = 0
+}
+crash> mnt_pcp 0x3a1fd1e1f584:a
+[0]: ffffd193c1a1f584
+struct mnt_pcp {
+  mnt_count = 436042, 
+  mnt_writers = 0
+}
+cat mount_count.pcp | tr -d ,|grep mnt_count|awk '{ sum += $3 } END { print sum }'
+1747359
+
+crash> file ffff978de3176300
+struct file {
+  f_u = {
+    fu_llist = {
+      next = 0xffff9794e4529e00
+    }, 
+    fu_rcuhead = {
+      next = 0xffff9794e4529e00, 
+      func = 0x0
+    }
+  }, 
+  f_path = {
+    mnt = 0xffff9793b5200da0, 
+    dentry = 0xffff97912a254a80
+  }, 
+  f_inode = 0xffff979ddd8351c0, 
+  f_op = 0xffffffffc1c2b640 , 
+
+ list 0xffff9794e4529e00 | wc -l
+
+2387523
+ 
+
+ 
+
+So in such situation the total umount time is unpredictable. Let's fix it.
+
+--- Comment (gerrit, Wed, 15 Jan 2025 13:02:22 +0000) ---
+"Etienne AUJAMES " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/57768
+
+Subject: LU-16973 osd: adds SB_KERNMOUNT flag
+
+Project: fs/lustre-release
+
+Branch: b2_15
+
+Current Patch Set: 1
+
+Commit: 13314ed47bb026b150dff0c3a3bbba17ab75936e
+
+--- Comment (gerrit, Wed, 15 Jan 2025 13:02:21 +0000) ---
+"Etienne AUJAMES " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/57767
+
+Subject: LU-16973 ptlrpc: flush delayed file desc if idle
+
+Project: fs/lustre-release
+
+Branch: b2_15
+
+Current Patch Set: 1
+
+Commit: 55231b2b135f10839759c14e8f20ecfccfa43ea7
+
+--- Comment (pjones, Wed, 6 Sep 2023 13:09:15 +0000) ---
+Landed for 2.16
+
+--- Comment (gerrit, Wed, 6 Sep 2023 06:15:29 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/51731/
+
+Subject: LU-16973 osd: adds SB_KERNMOUNT flag
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: eff11c8ce1f89f30dcc5af88b67b3d6c15a631a6
+
+--- Comment (gerrit, Sat, 19 Aug 2023 05:35:05 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/51805/
+
+Subject: LU-16973 ptlrpc: flush delayed file desc if idle
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 2feb4a7bb01c5e98763a62fb0bd64edf933c95de
+
+--- Comment (gerrit, Sat, 29 Jul 2023 16:34:00 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/51805
+
+Subject: LU-16973 ptlrpc: flush delayed file desc if idle
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 6c7327812230cc149ec75de6ea604b4a7740e0f6
+
+--- Comment (adilger, Wed, 26 Jul 2023 21:38:26 +0000) ---
+fput is designed to be delayed until exit from the syscall or as a separate work.
+
+This is clearly a problem since the Lustre service threads never "exit from a syscall", so it looks like all fput() operations are being delayed.  The "__fput_sync()" function was added in commit v3.5-rc6-284-g4a9d4b024a31 when delayed fput() was added, but was not exported until commit v5.17-rc5-285-gf00432063db1.  We could convert (some/all?) users to use __fput_sync() (with a configure check):
+
+/*
+ * synchronous analog of fput(); for kernel threads that might be needed
+ * in some umount() (and thus can't use flush_delayed_fput() without
+ * risking deadlocks), need to wait for completion of __fput() and know
+ * for this specific struct file it won't involve anything that would
+ * need them.  Use only if you really need it - at the very least,
+ * don't blindly convert fput() by kernel thread to that.
+ */
+void __fput_sync(struct file *file)
+
+For kernels where this is not exported, we could use kallsyms_lookup_symbol() to access __fput_sync(). 
+
+There is also a way to force delayed fput() calls to be flushed immediately:
+
+/*
+ * If kernel thread really needs to have the final fput() it has done
+ * to complete, call this.  Please, don't add more callers without
+ * very good reasons; in particular, never call that with locks
+ * held and never call that from a thread that might need to do
+ * some work on any kind of umount.
+ */
+void flush_delayed_fput(void)
+{
+        delayed_fput(NULL);
+}
+EXPORT_SYMBOL_GPL(flush_delayed_fput);
+
+This could be called from ptlrpc_main() before the thread goes to sleep, when there are no more RPCs to process.  That will delay the fput work until the system is not totally overloaded, but should make RPC processing a tiny bit more efficient to do this in the background by an idle thread:
+
+                if (ptlrpc_server_request_pending(svcpt, false)) {
+                        lu_context_enter(&env->le_ctx);
+                        ptlrpc_server_handle_request(svcpt, thread);
+                        lu_context_exit(&env->le_ctx);
+-               }
++               } else {
++                        flush_delayed_fput();
++               }
+
+--- Comment (panda, Wed, 26 Jul 2023 10:26:32 +0000) ---
+Andreas, delayed fput is not related to the delayed iput hack in the xattr removal path. fput is designed to be delayed until exit from the syscall or as a separate work.
+
+I'm not sure if there's a need for fput to be delayed in Lustre and maybe can just call the postponed version ___fput() instead of fput(). I think one of the problems with this approach is that the postponed call is not exported.
+
+--- Comment (adilger, Wed, 26 Jul 2023 04:46:37 +0000) ---
+The use of alloc_file_pseudo() was added for upstream kernel compatibility/cleanliness, but if this is causing problems by causing millions of delayed fput() calls at unmount time, I would rather fix the core problem rather than making "clean up 2M file descriptors at unmount" work better.  Previously we just allocated "struct file" on the stack and filled in the required fields directly for the few interfaces that were needing a "struct file" argument to ioctl() or {{iterate_dir() where it is needed.
+
+In most cases, the struct file returned by alloc_file_pseudo() is only used for the duration of a single function.  Rather than allocating and (delayed) freeing millions of file descriptors for handling these temporary calls, it would be much more efficient to avoid allocating these file descriptors entirely, if possible.
+
+Do you know from which function most of the file handles are coming from?  Is it mostly the delayed xattr handling?  Could we add something to the MDT service threads that is calling flush_workqueue(sbi->s_misc_wq) every 5s (or 60s or similar) to avoid accumulating so much delayed work?
+
+Looking through the callers of alloc_file_pseudo() I think some things can be done to improve this:
+
+	we should always be passing FMODE_NONOTIFY to these file descriptors to avoid overhead.  That was done internally for the compat code via OPEN_FMODE() for pre-4.18 kernels but should instead be explicitly done by all the callers
+
+	osd_lseek() looks like this is only using f_lock, f_mode, and f_pos for files, and doesn't really need a "proper" file descriptor.  For ext4_dir_llseek() on directories it is also using f_mapping.
+
+	osd_execute_punch() looks like it is only using f_inode and f_mode (should have S_NOCMTIME set to skip file_modified_flags() and S_NOSEC to skip __file_remove_privs()).
+
+	server_ioctl() could use a single file descriptor saved in struct lustre_sb_info across all calls, as it is always for the root inode
+
+	osd_check_lmv() could potentially do a lookup instead of iterate_dir(), but I think this should be called only rarely.
+
+	osd_object_sync() could just call inode->i_fop->fsync() directly, but that still needs filp and does a lot of messy stuff which we probably don't need, but I don't think this would be easily handled.
+
+--- Comment (aboyko, Mon, 24 Jul 2023 12:08:40 +0000) ---
+Unfortunately kernel is designed with a single delayed_fput_list, and delayed_fput() does not divide the list to kworker threads. Probably the reason is small amount of files at kernel level. The best approach is having percpu delayed list, by default kernel has two kworker thread per cpu already. adilger Is it possible to minimize call of alloc_file_pseudo()?
+
+--- Comment (adilger, Sat, 22 Jul 2023 02:29:21 +0000) ---
+Instead of deferring all of this work to unmount, does it make sense to (somehow) schedule this work more aggressively during runtime, so that it doesn't get backlogged?  Having 2.7M files to clean up seems like it is getting benhind and unable to keep up with the workload. 
+
+Can we put more threads to process the workqueue, or increase the thread priority?
+
+--- Comment (gerrit, Fri, 21 Jul 2023 11:27:45 +0000) ---
+"Alexander Boyko " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/51731
+
+Subject: LU-16973 osd: adds SB_KERNMOUNT flag
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 0792975beb025cd6ff497f12b01351e02f13d2ed

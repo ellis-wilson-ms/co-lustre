@@ -1,0 +1,112 @@
+Key:        LU-5341
+Summary:    Intermittent hangs waiting for RPCs in unregistering phase to timeout
+Link:       https://jira.whamcloud.com/browse/LU-5341
+Type:       Bug
+Priority:   Major
+Status:     Closed
+Resolution: Fixed
+Assignee:   Bob Glossman
+Reporter:   Ann Koehler
+Created:    Mon, 14 Jul 2014 16:51:27 +0000
+Updated:    Thu, 28 Jul 2016 15:08:37 +0000
+Resolved:   Thu, 28 Jul 2016 15:08:37 +0000
+Labels:     patch
+Links:      Related: is related to  LU-5259; Related: is related to  LU-5073
+
+--- Description ---
+Regression introduced by the patch for LU-5073, http://review.whamcloud.com/10353
+
+See also LU-5259,  http://review.whamcloud.com/10846
+
+When reply_in_callback executes before request_out_callback,  the task sending the rpc can hang in ptlrpc_set_wait  until the request times out. An example is a call to mdc_close; in this example the mdc_close takes 55 seconds to complete even though the server handles the request promptly.
+
+Client:
+> 00000002:00000001:18.0:1403799444.471726:0:14636:0:(mdc_request.c:829:mdc_close()) Process entered
+...
+> 00000100:00000001:18.0:1403799444.848775:0:14636:0:(client.c:1382:ptlrpc_send_new_req()) Process entered
+> 00000100:00000040:18.0:1403799444.848776:0:14636:0:(lustre_net.h:3250:ptlrpc_rqphase_move()) @@@ move req "New" -> "Rpc"  req@ffff880fffb10c00 x1471331744844100/t0(0) o35->snx11063-MDT0000-mdc-ffff880835a8a400@10.149.150.4@o2ib4000:23/10 lens 392/15080 e 0 to 0 dl 0 ref 2 fl New:/0/ffffffff rc 0/-1
+...
+> 00000100:00000200:18.0:1403799444.852847:0:14636:0:(events.c:100:reply_in_callback()) @@@ type 6, status 0  req@ffff880fffb10c00 x1471331744844100/t0(0) o35->snx11063-MDT0000-mdc-ffff880835a8a400@10.149.150.4@o2ib4000:23/10 lens 392/15080 e 0 to 0 dl 1403799539 ref 3 fl Rpc:R/0/ffffffff rc 0/-1
+...
+> 00000100:00000040:18.0:1403799444.852858:0:14636:0:(lustre_net.h:3250:ptlrpc_rqphase_move()) @@@ move req "Rpc" -> "Unregistering"  req@ffff880fffb10c00 x1471331744844100/t0(0) o35->snx11063-MDT0000-mdc-ffff880835a8a400@10.149.150.4@o2ib4000:23/10 lens 392/15080 e 0 to 0 dl 1403799539 ref 3 fl Rpc:R/0/ffffffff rc 0/-1
+...
+> 00000100:00000001:18.0:1403799499.847659:0:14636:0:(client.c:1929:ptlrpc_expired_set()) Process entered
+> 00000100:00000001:18.0:1403799499.847661:0:14636:0:(client.c:1965:ptlrpc_expired_set()) Process leaving (rc=1 : 1 : 1)
+...
+> 00000100:00000040:18.0:1403799499.847669:0:14636:0:(lustre_net.h:3250:ptlrpc_rqphase_move()) @@@ move req "Unregistering" -> "Rpc"  req@ffff880fffb10c00 x1471331744844100/t0(0) o35->snx11063-MDT0000-mdc-ffff880835a8a400@10.149.150.4@o2ib4000:23/10 lens 392/15080 e 0 to 0 dl 1403799539 ref 2 fl Unregistering:R/0/ffffffff rc 0/-1
+...
+> 00000002:00000001:18.0:1403799444.472256:0:14636:0:(mdc_request.c:922:mdc_close()) Process leaving (rc=0 : 0 : 0)
+
+MDS:
+> 00000100:00100000:14.0:1403799444.858578:0:20307:0:(service.c:1886:ptlrpc_server_handle_request()) Handling RPC pname:cluuid+ref:pid:xid:nid:opc mdt_rdpg_178:0a613492-ed84-267d-d415-d0983ee768af+19:14636:x1471331744844100:12345-253@gni1:35
+> 00000100:00100000:14.0:1403799444.858660:0:20307:0:(service.c:1930:ptlrpc_server_handle_request()) Handled RPC pname:cluuid+ref:pid:xid:nid:opc mdt_rdpg_178:0a613492-ed84-267d-d415-d0983ee768af+19:14636:x1471331744844100:12345-253@gni1:35 Request procesed in 89us (129us total) trans 193287303580 rc  0/0
+
+When reply_in_callback executes, rq_req_unlink is still set so the rpc is moved to the unregistering phase until request_out_callback has a chance to reset the flag. But when request_out_callback is finally invoked it is with an LNET_EVENT_SEND event:
+
+ 00000100:00000200:2:1404844097.216045:0:5109:0:(events.c:68:request_out_callback()) @@@ type 5, status 0  req@ffff8801fb962c00 x1473065104065052/t0(0) o35->snx11014-MDT0000-mdc-ffff88040f1a6000@10.10.100.4@o2ib6000:23/10 lens 392/2536 e 0 to 0 dl 1404844281 ref 3 fl Unregistering:R/0/ffffffff rc 0/-1
+
+/* Note: trace is from a different dump but shows the event type and rpc state.  Apologies for mixing data from different dumps but I don't have a single debug log that shows the whole story.) */
+
+With a send event, request_out_callback does not call ptlrpc_client_wake_req, so the mdc_close task waiting in ptlrpc_set_wait is not woken up, ptlrpc_check_set is not invoked, and mdc_close waits until the rpc times out before continuing. 
+
+void request_out_callback(lnet_event_t *ev)
+{
+...
+        DEBUG_REQ(D_NET, req, "type %d, status %d", ev->type, ev->status);
+....
+        if (ev->unlinked)
+                req->rq_req_unlink = 0;
+
+        if (ev->type == LNET_EVENT_UNLINK || ev->status != 0) {
+
+                /* Failed send: make it seem like the reply timed out, just
+                 * like failing sends in client.c does currently...  */
+
+                req->rq_net_err = 1;
+                ptlrpc_client_wake_req(req);
+        }   
+
+Note, waiting for the rpc timeout does not appear to cause any functional errors but the performance penalty is significant.
+
+--- Comment (amk, Thu, 28 Jul 2016 15:08:37 +0000) ---
+Closing since the mod was superceded by LU-5696.
+
+--- Comment (hornc, Fri, 5 Dec 2014 23:12:15 +0000) ---
+Looks like this was addressed in LU-5696
+
+--- Comment (cliffw, Fri, 19 Sep 2014 17:14:43 +0000) ---
+The patch has a negative review, can you address those concerns?
+
+--- Comment (amk, Mon, 14 Jul 2014 17:39:01 +0000) ---
+Patch available at http://review.whamcloud.com/11090
+
+This patch is an expedient fix to the bug that minimizes perturbations to the ptlrpc state machine.  In the longer term,  the whole set of issues associated with LU-5073 warrant an architectural review.
+
+--- Comment (jhammond, Mon, 14 Jul 2014 16:57:26 +0000) ---
+I've noticed that insanity tests 0 and 1 (and possibly others) fail about 50% of the time when run locally. I bisected that to the landing of http://review.whamcloud.com/10846.
+
+== insanity test 1: MDS/MDS failure == 11:51:49 (1404751909)
+Stopping /mnt/mds1 (opts:) on t
+Failover mds1 to t
+Stopping /mnt/mds2 (opts:) on t
+Reintegrating MDS2
+11:52:26 (1404751946) waiting for t network 900 secs ...
+11:52:26 (1404751946) network interface is UP
+Starting mds2:   -o loop /tmp/lustre-mdt2 /mnt/mds2
+Started lustre-MDT0001
+11:52:41 (1404751961) waiting for t network 900 secs ...
+11:52:41 (1404751961) network interface is UP
+Starting mds1:   -o loop /tmp/lustre-mdt1 /mnt/mds1
+mount.lustre: mount /dev/loop1 at /mnt/mds1 failed: Input/output error
+Is the MGS running?
+Start of /tmp/lustre-mdt1 on mds1 failed 5
+ insanity test_1: @@@@@@ FAIL: test_1 failed with 5
+  Trace dump:
+  = lustre/tests/../tests/test-framework.sh:4504:error_noexit()
+  = lustre/tests/../tests/test-framework.sh:4535:error()
+  = lustre/tests/../tests/test-framework.sh:4781:run_one()
+  = lustre/tests/../tests/test-framework.sh:4816:run_one_logged()
+  = lustre/tests/../tests/test-framework.sh:4636:run_test()
+  = lustre/tests/insanity.sh:207:main()
+Dumping lctl log to /tmp/test_logs/1404751907/insanity.test_1.*.1404751982.log
+Dumping logs only on local client.

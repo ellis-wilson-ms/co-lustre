@@ -1,0 +1,736 @@
+Key:        LU-1128
+Summary:    Complete investigation of the LDLM pool shrinker and SLV handling
+Link:       https://jira.whamcloud.com/browse/LU-1128
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Niu Yawei
+Reporter:   Christopher Morrone
+Created:    Wed, 22 Feb 2012 18:41:48 +0000
+Updated:    Fri, 17 Oct 2025 16:23:52 +0000
+Resolved:   Thu, 8 Oct 2015 08:08:46 +0000
+Labels:     llnl
+Links:      Related: is related to  LU-6529; Related: is related to  LU-19264; Related: is related to LU-7266; Related: is related to LU-2924
+Attachments: diff_between_before_and_after.txt, ldlm_pools_shrink2.stp, servers_pool_state_and_stats.txt, servers_pool_state_and_stats2.txt, stap_script_output.txt.gz
+
+--- Environment ---
+lustre 2.1.0-21chaos (github.com/chaos/lustre)
+
+--- Description ---
+We have an OSS where two OST threads are using significant CPU time, and I suspect not making real progress:
+
+29703 root      20   0     0    0    0 R 40.7  0.0 309:55.91 ll_ost_io_375
+14028 root      20   0     0    0    0 R 39.7  0.0 311:25.93 ll_ost_io_75
+
+When I can catch them between active cycles on the CPU, they show the following backtraces from "crash":
+
+crash> foreach 14028 29703 bt
+PID: 14028  TASK: ffff88041345ab00  CPU: 7   COMMAND: "ll_ost_io_75"
+ #0 [ffff88041270f390] schedule at ffffffff814ee380
+ #1 [ffff88041270f458] schedule_timeout at ffffffff814ef235
+ #2 [ffff88041270f508] __down at ffffffff814f0152
+ #3 [ffff88041270f558] down at ffffffff810968b1
+ #4 [ffff88041270f588] ldlm_pools_shrink at ffffffffa05c9fd8 [ptlrpc]
+ #5 [ffff88041270f5d8] ldlm_pools_srv_shrink at ffffffffa05ca213 [ptlrpc]
+ #6 [ffff88041270f5e8] shrink_slab at ffffffff81129cba
+ #7 [ffff88041270f648] zone_reclaim at ffffffff8112c364
+ #8 [ffff88041270f728] get_page_from_freelist at ffffffff81122934
+ #9 [ffff88041270f848] __alloc_pages_nodemask at ffffffff81123bb1
+#10 [ffff88041270f968] kmem_getpages at ffffffff8115e0d2
+#11 [ffff88041270f998] cache_grow at ffffffff8115e73f
+#12 [ffff88041270fa08] cache_alloc_refill at ffffffff8115e992
+#13 [ffff88041270fa78] __kmalloc at ffffffff8115f6b9
+#14 [ffff88041270fac8] cfs_alloc at ffffffffa032a863 [libcfs]
+#15 [ffff88041270faf8] ptlrpc_prep_bulk_exp at ffffffffa05d286d [ptlrpc]
+#16 [ffff88041270fb58] ost_brw_write at ffffffffa0a459c1 [ost]
+#17 [ffff88041270fcc8] ost_handle at ffffffffa0a49a19 [ost]
+#18 [ffff88041270fdf8] ptlrpc_main at ffffffffa05eb181 [ptlrpc]
+#19 [ffff88041270ff48] kernel_thread at ffffffff8100c14a
+
+PID: 29703  TASK: ffff88030b1be100  CPU: 5   COMMAND: "ll_ost_io_375"
+ #0 [ffff8802e04771f0] schedule at ffffffff814ee380
+ #1 [ffff8802e04772b8] schedule_timeout at ffffffff814ef235
+ #2 [ffff8802e0477368] __down at ffffffff814f0152
+ #3 [ffff8802e04773b8] down at ffffffff810968b1
+ #4 [ffff8802e04773e8] ldlm_pools_shrink at ffffffffa05c9fd8 [ptlrpc]
+ #5 [ffff8802e0477438] ldlm_pools_srv_shrink at ffffffffa05ca213 [ptlrpc]
+ #6 [ffff8802e0477448] shrink_slab at ffffffff81129cba
+ #7 [ffff8802e04774a8] zone_reclaim at ffffffff8112c364
+ #8 [ffff8802e0477588] get_page_from_freelist at ffffffff81122934
+ #9 [ffff8802e04776a8] __alloc_pages_nodemask at ffffffff81123bb1
+#10 [ffff8802e04777c8] kmem_getpages at ffffffff8115e0d2
+#11 [ffff8802e04777f8] cache_grow at ffffffff8115e73f
+#12 [ffff8802e0477868] cache_alloc_refill at ffffffff8115e992
+#13 [ffff8802e04778d8] __kmalloc at ffffffff8115f6b9
+#14 [ffff8802e0477928] cfs_alloc at ffffffffa032a863 [libcfs]
+#15 [ffff8802e0477958] filter_alloc_iobuf at ffffffffa0aa799e [obdfilter]
+#16 [ffff8802e04779a8] filter_iobuf_get at ffffffffa0a89c0e [obdfilter]
+#17 [ffff8802e04779c8] filter_preprw_read at ffffffffa0a9ff7e [obdfilter]
+#18 [ffff8802e0477af8] filter_preprw at ffffffffa0aa09b0 [obdfilter]
+#19 [ffff8802e0477b38] obd_preprw at ffffffffa0a3e33e [ost]
+#20 [ffff8802e0477ba8] ost_brw_read at ffffffffa0a44315 [ost]
+#21 [ffff8802e0477cc8] ost_handle at ffffffffa0a48d27 [ost]
+#22 [ffff8802e0477df8] ptlrpc_main at ffffffffa05eb181 [ptlrpc]
+#23 [ffff8802e0477f48] kernel_thread at ffffffff8100c14a
+
+So it appears that they are failing to make progress in the shrinker code.
+
+The immediate symptom that users see is a client that is unable to reconnect to an OST on this OSS:
+
+Lustre: 15630:0:(ldlm_lib.c:852:target_handle_connect()) lsd-OST01bb: refuse reconnection from 59381921-e835-2c32-ab83-d3f9e3fbad7f@192.168.120.181@o2ib3 to 0xffff88040d93ec00/1
+
+(As an aside, we really need to improve these console messages.  Brian had a set of patches that greatly improved them attached to bugzilla bug 16909 and that LLNL carried for quite a while.  But Sun/Oracle never landed them.  I'll work on porting them forward and get them into gerrit when I have a chance).
+
+That message means that one RPC is outstanding for that export, and the client will not be allowed to reconnect until it is removed.  We can see the refused connections for hours, and I suspect that it will never fix itself without intervention.  My assumption is that one of the  runaway ll_ost_io threads is to blame for the outstanding RPC.
+
+Memory is not really too tight on the node at this time.
+
+> cat /proc/meminfo 
+MemTotal:       16202948 kB
+MemFree:         2805328 kB
+Buffers:         7522692 kB
+Cached:          1631292 kB
+SwapCached:            0 kB
+Active:          6426516 kB
+Inactive:        2743512 kB
+Active(anon):      58184 kB
+Inactive(anon):   331836 kB
+Active(file):    6368332 kB
+Inactive(file):  2411676 kB
+Unevictable:       31840 kB
+Mlocked:           31840 kB
+SwapTotal:             0 kB
+SwapFree:              0 kB
+Dirty:              7844 kB
+Writeback:           344 kB
+AnonPages:         48572 kB
+Mapped:            12160 kB
+Shmem:            367384 kB
+Slab:            3405396 kB
+SReclaimable:     965160 kB
+SUnreclaim:      2440236 kB
+KernelStack:       13216 kB
+PageTables:         4556 kB
+NFS_Unstable:          0 kB
+Bounce:                0 kB
+WritebackTmp:          0 kB
+CommitLimit:     8101472 kB
+Committed_AS:     584152 kB
+VmallocTotal:   34359738367 kB
+VmallocUsed:      360960 kB
+VmallocChunk:   34350502472 kB
+HardwareCorrupted:     0 kB
+AnonHugePages:         0 kB
+HugePages_Total:       0
+HugePages_Free:        0
+HugePages_Rsvd:        0
+HugePages_Surp:        0
+Hugepagesize:       2048 kB
+DirectMap4k:        9856 kB
+DirectMap2M:     2086912 kB
+DirectMap1G:    14680064 kB
+
+--- Comment (niu, Thu, 8 Oct 2015 08:08:46 +0000) ---
+opened LU-7266 to track the problems in LDLM pool.
+
+--- Comment (hudson, Wed, 2 May 2012 15:37:30 +0000) ---
+Integrated in  lustre-dev » x86_64,client,el6,inkernel #340
+
+     LU-1128 ldlm: return -1 for server pool shrinker (Revision 8775fe0a40706b6999aa737fba1c162ce08b8ade)
+
+     Result = SUCCESS
+
+Oleg Drokin : 8775fe0a40706b6999aa737fba1c162ce08b8ade
+
+Files : 
+
+	lustre/ldlm/ldlm_pool.c
+
+--- Comment (hudson, Wed, 2 May 2012 15:19:43 +0000) ---
+Integrated in  lustre-dev » x86_64,server,el5,inkernel #340
+
+     LU-1128 ldlm: return -1 for server pool shrinker (Revision 8775fe0a40706b6999aa737fba1c162ce08b8ade)
+
+     Result = SUCCESS
+
+Oleg Drokin : 8775fe0a40706b6999aa737fba1c162ce08b8ade
+
+Files : 
+
+	lustre/ldlm/ldlm_pool.c
+
+--- Comment (hudson, Wed, 2 May 2012 15:14:47 +0000) ---
+Integrated in  lustre-dev » i686,client,el5,inkernel #340
+
+     LU-1128 ldlm: return -1 for server pool shrinker (Revision 8775fe0a40706b6999aa737fba1c162ce08b8ade)
+
+     Result = SUCCESS
+
+Oleg Drokin : 8775fe0a40706b6999aa737fba1c162ce08b8ade
+
+Files : 
+
+	lustre/ldlm/ldlm_pool.c
+
+--- Comment (hudson, Wed, 2 May 2012 15:13:56 +0000) ---
+Integrated in  lustre-dev » x86_64,server,el6,inkernel #340
+
+     LU-1128 ldlm: return -1 for server pool shrinker (Revision 8775fe0a40706b6999aa737fba1c162ce08b8ade)
+
+     Result = SUCCESS
+
+Oleg Drokin : 8775fe0a40706b6999aa737fba1c162ce08b8ade
+
+Files : 
+
+	lustre/ldlm/ldlm_pool.c
+
+--- Comment (hudson, Wed, 2 May 2012 14:58:17 +0000) ---
+Integrated in  lustre-dev » i686,server,el5,inkernel #340
+
+     LU-1128 ldlm: return -1 for server pool shrinker (Revision 8775fe0a40706b6999aa737fba1c162ce08b8ade)
+
+     Result = SUCCESS
+
+Oleg Drokin : 8775fe0a40706b6999aa737fba1c162ce08b8ade
+
+Files : 
+
+	lustre/ldlm/ldlm_pool.c
+
+--- Comment (hudson, Wed, 2 May 2012 14:55:05 +0000) ---
+Integrated in  lustre-dev » i686,client,el6,inkernel #340
+
+     LU-1128 ldlm: return -1 for server pool shrinker (Revision 8775fe0a40706b6999aa737fba1c162ce08b8ade)
+
+     Result = SUCCESS
+
+Oleg Drokin : 8775fe0a40706b6999aa737fba1c162ce08b8ade
+
+Files : 
+
+	lustre/ldlm/ldlm_pool.c
+
+--- Comment (hudson, Wed, 2 May 2012 14:53:06 +0000) ---
+Integrated in  lustre-dev » x86_64,client,el5,inkernel #340
+
+     LU-1128 ldlm: return -1 for server pool shrinker (Revision 8775fe0a40706b6999aa737fba1c162ce08b8ade)
+
+     Result = SUCCESS
+
+Oleg Drokin : 8775fe0a40706b6999aa737fba1c162ce08b8ade
+
+Files : 
+
+	lustre/ldlm/ldlm_pool.c
+
+--- Comment (morrone, Tue, 10 Apr 2012 14:37:04 +0000) ---
+Please either reopen this, or open a new bug to track the SLV issue.  Broken SLV is probably causing all kinds of problems.  While we've supplied a work-around for the hang, the shrinker code is basically worthless at the moment.
+
+--- Comment (pjones, Mon, 9 Apr 2012 11:22:40 +0000) ---
+Landed for 2.1.2 and 2.2
+
+--- Comment (hudson, Mon, 5 Mar 2012 05:47:10 +0000) ---
+Integrated in  lustre-master » x86_64,server,el6,inkernel #504
+
+     LU-1128 ldlm: return -1 for server pool shrinker (Revision 8775fe0a40706b6999aa737fba1c162ce08b8ade)
+
+     Result = SUCCESS
+
+Oleg Drokin : 8775fe0a40706b6999aa737fba1c162ce08b8ade
+
+Files : 
+
+	lustre/ldlm/ldlm_pool.c
+
+--- Comment (hudson, Mon, 5 Mar 2012 05:45:47 +0000) ---
+Integrated in  lustre-master » x86_64,client,el6,inkernel #504
+
+     LU-1128 ldlm: return -1 for server pool shrinker (Revision 8775fe0a40706b6999aa737fba1c162ce08b8ade)
+
+     Result = SUCCESS
+
+Oleg Drokin : 8775fe0a40706b6999aa737fba1c162ce08b8ade
+
+Files : 
+
+	lustre/ldlm/ldlm_pool.c
+
+--- Comment (hudson, Mon, 5 Mar 2012 05:30:54 +0000) ---
+Integrated in  lustre-master » i686,client,el6,ofa #504
+
+     LU-1128 ldlm: return -1 for server pool shrinker (Revision 8775fe0a40706b6999aa737fba1c162ce08b8ade)
+
+     Result = SUCCESS
+
+Oleg Drokin : 8775fe0a40706b6999aa737fba1c162ce08b8ade
+
+Files : 
+
+	lustre/ldlm/ldlm_pool.c
+
+--- Comment (hudson, Mon, 5 Mar 2012 05:30:04 +0000) ---
+Integrated in  lustre-master » i686,server,el6,ofa #504
+
+     LU-1128 ldlm: return -1 for server pool shrinker (Revision 8775fe0a40706b6999aa737fba1c162ce08b8ade)
+
+     Result = SUCCESS
+
+Oleg Drokin : 8775fe0a40706b6999aa737fba1c162ce08b8ade
+
+Files : 
+
+	lustre/ldlm/ldlm_pool.c
+
+--- Comment (hudson, Mon, 5 Mar 2012 05:21:31 +0000) ---
+Integrated in  lustre-master » x86_64,server,el6,ofa #504
+
+     LU-1128 ldlm: return -1 for server pool shrinker (Revision 8775fe0a40706b6999aa737fba1c162ce08b8ade)
+
+     Result = SUCCESS
+
+Oleg Drokin : 8775fe0a40706b6999aa737fba1c162ce08b8ade
+
+Files : 
+
+	lustre/ldlm/ldlm_pool.c
+
+--- Comment (hudson, Mon, 5 Mar 2012 05:17:52 +0000) ---
+Integrated in  lustre-master » x86_64,client,el6,ofa #504
+
+     LU-1128 ldlm: return -1 for server pool shrinker (Revision 8775fe0a40706b6999aa737fba1c162ce08b8ade)
+
+     Result = SUCCESS
+
+Oleg Drokin : 8775fe0a40706b6999aa737fba1c162ce08b8ade
+
+Files : 
+
+	lustre/ldlm/ldlm_pool.c
+
+--- Comment (hudson, Mon, 5 Mar 2012 05:00:09 +0000) ---
+Integrated in  lustre-master » i686,server,el6,inkernel #504
+
+     LU-1128 ldlm: return -1 for server pool shrinker (Revision 8775fe0a40706b6999aa737fba1c162ce08b8ade)
+
+     Result = SUCCESS
+
+Oleg Drokin : 8775fe0a40706b6999aa737fba1c162ce08b8ade
+
+Files : 
+
+	lustre/ldlm/ldlm_pool.c
+
+--- Comment (hudson, Mon, 5 Mar 2012 04:56:51 +0000) ---
+Integrated in  lustre-master » i686,client,el5,inkernel #504
+
+     LU-1128 ldlm: return -1 for server pool shrinker (Revision 8775fe0a40706b6999aa737fba1c162ce08b8ade)
+
+     Result = SUCCESS
+
+Oleg Drokin : 8775fe0a40706b6999aa737fba1c162ce08b8ade
+
+Files : 
+
+	lustre/ldlm/ldlm_pool.c
+
+--- Comment (hudson, Mon, 5 Mar 2012 04:56:08 +0000) ---
+Integrated in  lustre-master » i686,client,el6,inkernel #504
+
+     LU-1128 ldlm: return -1 for server pool shrinker (Revision 8775fe0a40706b6999aa737fba1c162ce08b8ade)
+
+     Result = SUCCESS
+
+Oleg Drokin : 8775fe0a40706b6999aa737fba1c162ce08b8ade
+
+Files : 
+
+	lustre/ldlm/ldlm_pool.c
+
+--- Comment (hudson, Mon, 5 Mar 2012 04:55:33 +0000) ---
+Integrated in  lustre-master » i686,server,el5,inkernel #504
+
+     LU-1128 ldlm: return -1 for server pool shrinker (Revision 8775fe0a40706b6999aa737fba1c162ce08b8ade)
+
+     Result = SUCCESS
+
+Oleg Drokin : 8775fe0a40706b6999aa737fba1c162ce08b8ade
+
+Files : 
+
+	lustre/ldlm/ldlm_pool.c
+
+--- Comment (hudson, Mon, 5 Mar 2012 04:53:41 +0000) ---
+Integrated in  lustre-master » x86_64,client,el5,inkernel #504
+
+     LU-1128 ldlm: return -1 for server pool shrinker (Revision 8775fe0a40706b6999aa737fba1c162ce08b8ade)
+
+     Result = SUCCESS
+
+Oleg Drokin : 8775fe0a40706b6999aa737fba1c162ce08b8ade
+
+Files : 
+
+	lustre/ldlm/ldlm_pool.c
+
+--- Comment (hudson, Mon, 5 Mar 2012 04:41:37 +0000) ---
+Integrated in  lustre-master » x86_64,client,sles11,inkernel #504
+
+     LU-1128 ldlm: return -1 for server pool shrinker (Revision 8775fe0a40706b6999aa737fba1c162ce08b8ade)
+
+     Result = SUCCESS
+
+Oleg Drokin : 8775fe0a40706b6999aa737fba1c162ce08b8ade
+
+Files : 
+
+	lustre/ldlm/ldlm_pool.c
+
+--- Comment (hudson, Mon, 5 Mar 2012 04:40:30 +0000) ---
+Integrated in  lustre-master » i686,server,el5,ofa #504
+
+     LU-1128 ldlm: return -1 for server pool shrinker (Revision 8775fe0a40706b6999aa737fba1c162ce08b8ade)
+
+     Result = SUCCESS
+
+Oleg Drokin : 8775fe0a40706b6999aa737fba1c162ce08b8ade
+
+Files : 
+
+	lustre/ldlm/ldlm_pool.c
+
+--- Comment (hudson, Mon, 5 Mar 2012 04:38:02 +0000) ---
+Integrated in  lustre-master » i686,client,el5,ofa #504
+
+     LU-1128 ldlm: return -1 for server pool shrinker (Revision 8775fe0a40706b6999aa737fba1c162ce08b8ade)
+
+     Result = SUCCESS
+
+Oleg Drokin : 8775fe0a40706b6999aa737fba1c162ce08b8ade
+
+Files : 
+
+	lustre/ldlm/ldlm_pool.c
+
+--- Comment (hudson, Mon, 5 Mar 2012 04:37:16 +0000) ---
+Integrated in  lustre-master » x86_64,client,el5,ofa #504
+
+     LU-1128 ldlm: return -1 for server pool shrinker (Revision 8775fe0a40706b6999aa737fba1c162ce08b8ade)
+
+     Result = SUCCESS
+
+Oleg Drokin : 8775fe0a40706b6999aa737fba1c162ce08b8ade
+
+Files : 
+
+	lustre/ldlm/ldlm_pool.c
+
+--- Comment (hudson, Mon, 5 Mar 2012 04:36:53 +0000) ---
+Integrated in  lustre-master » x86_64,client,ubuntu1004,inkernel #504
+
+     LU-1128 ldlm: return -1 for server pool shrinker (Revision 8775fe0a40706b6999aa737fba1c162ce08b8ade)
+
+     Result = SUCCESS
+
+Oleg Drokin : 8775fe0a40706b6999aa737fba1c162ce08b8ade
+
+Files : 
+
+	lustre/ldlm/ldlm_pool.c
+
+--- Comment (hudson, Mon, 5 Mar 2012 04:31:45 +0000) ---
+Integrated in  lustre-master » x86_64,server,el5,inkernel #504
+
+     LU-1128 ldlm: return -1 for server pool shrinker (Revision 8775fe0a40706b6999aa737fba1c162ce08b8ade)
+
+     Result = SUCCESS
+
+Oleg Drokin : 8775fe0a40706b6999aa737fba1c162ce08b8ade
+
+Files : 
+
+	lustre/ldlm/ldlm_pool.c
+
+--- Comment (hudson, Mon, 5 Mar 2012 04:24:57 +0000) ---
+Integrated in  lustre-master » x86_64,server,el5,ofa #504
+
+     LU-1128 ldlm: return -1 for server pool shrinker (Revision 8775fe0a40706b6999aa737fba1c162ce08b8ade)
+
+     Result = SUCCESS
+
+Oleg Drokin : 8775fe0a40706b6999aa737fba1c162ce08b8ade
+
+Files : 
+
+	lustre/ldlm/ldlm_pool.c
+
+--- Comment (adilger, Thu, 1 Mar 2012 14:32:48 +0000) ---
+Niu, can you please update the patch with just the "-1" change.  This bug (or a new one linked to this) should stay open until we have done a more complete investigation of the LDLM pool shrinker and SLV handling.
+
+--- Comment (niu, Wed, 29 Feb 2012 00:03:14 +0000) ---
+I agree with Andreas too. We need to reconsider if the current SLV calculation is proper.
+
+Actually, I don't quite see why we want to control the grant speed at the very beginning, I think it's really hard to make it correct & efficient. To my understanding, the major purpose of LRU resize is to eliminate the fixed LRU size on client, and the only thing we need to care about is the limited memory on server and client, so we probably can use some simpler solution to control the total granted locks on server or unused locks on client (it should be easier than the grant flow control). That's just my initial thinking, and I'm not sure if miss anything important.
+
+Anyway, it's good to hear that returnning -1 resloved your immediate problem, to improve the SLV calculation, I think we need more eyes and time-slot.
+
+--- Comment (morrone, Tue, 28 Feb 2012 19:06:18 +0000) ---
+Andreas's review in gerrit matches my own thinking.
+
+I applied version 1 of your patch to our tree, since reducing SLV by nr is unlikely to have much effect, but returning -1 will help us avoid our immediate production problems.
+
+But like Andreas said, we need to take a broader look into how SLV is calculated.
+
+--- Comment (niu, Mon, 27 Feb 2012 23:26:17 +0000) ---
+Hi, Chris, I update the patch in http://review.whamcloud.com/#change,2184
+
+For ldlm server pool shrinker, we just use it to decrease SLV,
+but never reclaim any memory directly, so it should always return
+-1 to inform the kernel to break the shrink loop.
+
+For ldlm client pool shrinker, we should just return remaining
+unused locks as per the kernel's expectation.
+
+The ldlm server pool shrinker should drop SLV to a small enough
+value to trigger the lock cancellation from clients, we choose
+(granted_locks * 100) in this patch.
+
+Could you try the patchset two after it's verified by auto-test? Thanks.
+
+--- Comment (niu, Mon, 27 Feb 2012 22:11:00 +0000) ---
+Thank you, Chris. Looks the SLV of each OST is still equal to the initial value: SLV == L * 36000 (which means grant speed was almost same as the planned speed), and I'm afraid that CLV will be much less than SLV, since CLV of each lock is calculated as: CLV = seconds_of_lock_age * unused_locks_on_client.
+
+To trigger lock cancel on client under server memory pressure, I think we have to drop the SLV to a much smaller value in the shrinker, for example: SLV = granted_locks * 100 (allow all granted locks on 1 client for 100 seconds?).
+
+--- Comment (morrone, Mon, 27 Feb 2012 16:31:03 +0000) ---
+Whoops, last file only had stats.  This one (servers_pool_state_and_stats2.txt) has both.
+
+--- Comment (morrone, Mon, 27 Feb 2012 16:28:00 +0000) ---
+We only have 2.1 servers at this point.  Attached is the output of teh state and stats files.  CLV is 0, but I assume that is normal on a server.
+
+--- Comment (niu, Sat, 25 Feb 2012 00:19:42 +0000) ---
+Chris, I think you are right, seems subtracting nr_granted in server shrinker isn't enough, maybe we should try to divide the SLV by two (or make it even small). Could you check both the SLV & CLV in proc? I think we should at least decrease the SLV smaller CLV in the shrinker.
+
+Could you check the other values for your 2.1 cluster, they are all in the /proc/fs/lustre/ldlm/namespaces/*/pool/state & stats. Thank you.
+
+--- Comment (morrone, Fri, 24 Feb 2012 19:02:20 +0000) ---
+Niu, I don't understand why you want to do this in the patch:
+
+nr = cfs_atomic_read(&pl->pl_granted);
+
+Well, I suspect that you are trying to just use a larger number for the reduction that happens here:
+
+pl->pl_server_lock_volume = pl->pl_server_lock_volume - nr;
+
+But since pl_server_lock_volume is a essentially locks*time (and maybe other stuff that I don't completely understand yet), subtracting a discrete lock number from SLV seems fundamentally flawed.  If we want to reduce the lock count and free memory, I think we have to apply a scaling factor.
+
+Also, SLV may be just plain broken in 2.1.  I see that server_lock_volume is 2073600000 for every OST on every OSS of one of our 2.1 clusters right now.  Granted, I don't know too much about the details of SLV yet, but I would not have expected them all to have the exact same number within an OSS, let alone across all OSS.
+
+--- Comment (morrone, Fri, 24 Feb 2012 18:14:56 +0000) ---
+I tested returning -1 using this simple systemtap script, and as expected it got the stuck threads out of their loop.  I'll try the patch on our test system soon.
+
+#!/usr/bin/stap -gF
+
+probe module("ptlrpc").function("ldlm_pools_srv_shrink").return
+{
+        if ($nr_to_scan != 0) {
+                $return = -1;
+        }
+}
+
+--- Comment (niu, Fri, 24 Feb 2012 00:30:50 +0000) ---
+Hi, Chris
+
+Yes, the "total_scan" is about 2 * granted_locks, and according to the granted_locks and return value of shrink_slab(), the average diff is ~770, it's reasonable.
+
+I made a patch which returning -1 for the server shrinker and decreasing SLV more in the shrinker. Could you take a try on it once it pass the auto-test? Thanks.
+
+http://review.whamcloud.com/#change,2184
+
+--- Comment (niu, Thu, 23 Feb 2012 23:59:29 +0000) ---
+SLV stands for Server Lock Volume. There is large piece of comment in the head of ldlm_pool.c to explain it, in general, SLV is used to inform client how many locks it should cache, if server decreases SLV, client will release cached locks when it's aware of the SLV change.
+
+So the shrinker on server doesn't reclaim any memory directly, it just decrease the SLV, then client will cancel the cached locks to alleviate the server's memory pressure. I think this mechanism should work, however, we must make sure that:
+
+	server shrinker should decrease the SLV significantly, and the SLV should not be increased back by the recalc thread immediately;
+
+	client can response the decreased SLV quickly;
+
+	the server shriner should be only called once, instead of many times like current implementation;
+
+--- Comment (morrone, Thu, 23 Feb 2012 23:54:21 +0000) ---
+One thing confused me is that why shrink_slab() return such large value?
+
+I am a bit confused there too.  See the new attached file "diff_between_before_and_after.txt".
+
+Each number in that file is essentially the result of doing "nr_before - shrink_ret" by using the numbers for a single thread that got from a run of my systemtap script.
+
+shrink_slab() probably has a large "total_scan" number, and needs to loop many times.  shrink_ret is always a large positive number.
+
+The difference, as you can see in the file, is wildly variable.  But it is rarely 0, and when it is, it is not 0 repeatedly.
+
+For calculating "ret", shrink_slab only considers the positive differences, and only increases "ret".
+
+So I guess that explains it.
+
+Which just brings me back to my suspicion that having ldlm_pools_shring return the summed value from ldlm_pool_granted() does not make sense.
+
+--- Comment (morrone, Thu, 23 Feb 2012 23:37:30 +0000) ---
+Niu Yawei, the kernel is RHEL6.2-based, 2.6.32-220.4.1.1chaos.  shrink_slab() is pretty much the same in the section that you quote, except for a new "struct shrinker *" that is passed as the first argument tot he (*shrinker->shrinker) callback.
+
+--- Comment (niu, Thu, 23 Feb 2012 23:35:15 +0000) ---
+Conversely, why are we failing to ever reduce the zone_page_state()?
+
+I suspect that each time shrinker doesn't reduce the SLV much (only 9 ~ 10), and since we have a thread which recacluates the SLV every second, then SLV might be kept around a certain high value, so lock cancel wasn't triggered on client.
+
+I think we need to drop the SLV to small value, then client could be aware of this change and start lock cancel.
+
+--- Comment (morrone, Thu, 23 Feb 2012 23:30:54 +0000) ---
+What does "SLV" stand for?
+
+ldlm_srv_pool_shrink really appears to make no attempt to actually reduce slab usage.  At least it is honest and returns 0. (and has a comment to that effect).  It seems like it should at least signal some other thread to asynchronously attempt to shrink the cache.  Maybe I am reading the code wrong (I don't really have a clear idea of everything that is going on), but the comments seem to imply that we are just hoping that clients will be nicer because of the SLV change, and eventually, some day, they will use fewer locks.
+
+What am I missing?
+
+So it seems to me like ldlm_pools_shrink() is doing the Wrong Thing by ignoring the return code and looking at ldlm_pool_granted().
+
+Is ldlm_pools_shrink() EVER right?  Would it be right for LDLM_NAMESPACE_CLIENT?
+
+--- Comment (niu, Thu, 23 Feb 2012 23:19:11 +0000) ---
+Thank you for the nice data and analysis, Chris.
+
+One thing confused me is that why shrink_slab() return such large value? The shrink_slab() in my kernel looks like:
+
+                while (total_scan >= SHRINK_BATCH) {
+                        long this_scan = SHRINK_BATCH;
+                        int shrink_ret;
+                        int nr_before;
+
+                        nr_before = (*shrinker->shrinker)(0, gfp_mask);
+                        shrink_ret = (*shrinker->shrinker)(this_scan, gfp_mask);
+                        if (shrink_ret == -1)
+                                break;
+                        if (shrink_ret return ret
+
+Since the number of granted locks didn't change much, the 'ret' should be a relative small value. Could you check your shrink_slab() or could you tell me what's your kernel version? Thanks.
+
+--- Comment (morrone, Thu, 23 Feb 2012 23:15:55 +0000) ---
+I aggree that returning -1 from our shrinker will probably avoid this problem, because eventually shrink_slab() will be able to return 0 and jump out of the while() loop.
+
+But I would like to understand better what is going on here.  The use of the lock grant number in the lustre shrinker seems pretty far divorced from where the actual slab allocations happen.  Why is it then using the grant number?
+
+Conversely, why are we failing to ever reduce the zone_page_state()?
+
+--- Comment (morrone, Thu, 23 Feb 2012 23:06:04 +0000) ---
+According to systemtap, shrink_slab was called with order=0x1.  And in __zone_reclaim(), nr_pages is set to "1 systemtap also shows shink_slab returning rather large numbers (0x4fa9cf, 0x529d2d, 0x53ac3f, etc.).  And I don't see any sign that the granted locks are reducing in number.  They've grown to over 400,000 since yesterday, and seem to be hovering there.  Other OSS nodes in this filesystem have similar lock totals.
+
+--- Comment (morrone, Thu, 23 Feb 2012 22:06:18 +0000) ---
+So I suspect that Niu Yawei is correct about were we are hung up.  Although in our kernel the loop in __zone_reclaim() looks like this:
+
+	slab_reclaimable = zone_page_state(zone, NR_SLAB_RECLAIMABLE);
+	if (slab_reclaimable > zone->min_slab_pages) {
+[cut]
+		while (shrink_slab(sc.nr_scanned, gfp_mask, order) &&
+			zone_page_state(zone, NR_SLAB_RECLAIMABLE) >
+				slab_reclaimable - nr_pages)
+			;
+
+--- Comment (morrone, Thu, 23 Feb 2012 21:55:45 +0000) ---
+Attached a systemtap script and its output.  Shows the inputs and outputs of the ldlm_pools_shrink() and shrink_slab() functions when those functions return.  Time is in microseconds.
+
+--- Comment (morrone, Thu, 23 Feb 2012 13:20:17 +0000) ---
+There were 176207 total, more or less evenly distributed among 15 namespaces.   Here are the specific numbers when I retrieved them yesterday:
+
+  11502, 11748, 11411, 11384, 11239, 11745, 12448, 11489, 12016, 11864, 11378, 12215, 12003, 12018, 11747
+
+--- Comment (niu, Wed, 22 Feb 2012 23:59:02 +0000) ---
+Yes, it could be nice if we can get the total granted locks.
+
+It looks like there are only a handful of locks that could be shrunk (9 or 10 in this log)
+
+seems we can't get this conclusion from the log, since kernel always try to shrink SHRINK_BATCH (128) slab items each time, and our shrinker function will distribute this number to each OST by: cancel_for_this_ost = 1 + locks_on_this_ost * 128 / total_locks.
+
+I'm afraid there are lots of granted locks, that's why kernel called shrinker many times (kernel get totoal locks first, then call shrinker to shrink 128 each time, until the number less than 128).
+
+The stack trace shows the shrinker is called from zone_claim():
+
+                while (shrink_slab(sc.nr_scanned, gfp_mask, order) &&
+                        zone_page_state(zone, NR_SLAB) > limit)
+                        ;
+
+Which means if any slab object is shrunk, the shrinker could probably be called repeatedly. So, looks kernel really relies on shrinker returning the exact shrunk count, however, look at the ldlm_pools_shrink(), the return value seems unpredictable because it just account total remain locks from 'nr' OSTs, but not necessarily from each OST. (imagine that there are multiple threads are changing the namespace list, shrinker callers or ldlm poool recalc thread)
+
+I'm wondering our shrinker should just return -1 to kernel, since our ldlm srv pool shrinker just changes SLR, but never reclaim anything directly.
+
+Another problem is the congestion on ldlm_namespace_lock, which could make things worse.
+
+--- Comment (adilger, Wed, 22 Feb 2012 22:10:58 +0000) ---
+How many locks are on this OSS?
+
+$ lctl get_param ldlm.namespaces.*.lock_count
+
+It looks like there are only a handful of locks that could be shrunk (9 or 10 in this log), but they are all busy.  It seems like it is MM cache pressure that is continually calling this shrinker, about 3000 times per second based on the timestamps shown.
+
+I wonder if there is some kind of logic mismatch between the various "shrinker" APIs in different kernels and the return value from our current shrinker?  It could cause an overflow or underflow and result in this thread being stuck in a nearly endless loop.
+
+--- Comment (morrone, Wed, 22 Feb 2012 20:54:48 +0000) ---
+With dlmtrace, it is clear that the two processes are attempting the same shrink over and over again:
+
+0010000:00010000:3.0:1329957745.624184:0:14028:0:(ldlm_pool.c:1091:ldlm_pools_shrink()) Request to shrink 0 server locks from all pools
+00010000:00010000:3.0:1329957745.624297:0:14028:0:(ldlm_pool.c:1091:ldlm_pools_shrink()) Request to shrink 128 server locks from all pools
+00010000:00010000:3.0:1329957745.624425:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01c7_UUID-8: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.624434:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01bf_UUID-6: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.624442:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01b7_UUID-4: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.624451:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01af_UUID-2: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.624460:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01a7_UUID-0: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.624467:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01db_UUID-13: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.624475:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01d3_UUID-11: request to shrink 10 locks, shrunk 0
+00010000:00010000:3.0:1329957745.624483:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01cb_UUID-9: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.624491:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01c3_UUID-7: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.624499:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01bb_UUID-5: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.624507:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01b3_UUID-3: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.624515:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01ab_UUID-1: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.624523:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01df_UUID-14: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.624531:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01d7_UUID-12: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.624539:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01cf_UUID-10: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.624540:0:14028:0:(ldlm_pool.c:1091:ldlm_pools_shrink()) Request to shrink 0 server locks from all pools
+00010000:00010000:3.0:1329957745.624663:0:14028:0:(ldlm_pool.c:1091:ldlm_pools_shrink()) Request to shrink 128 server locks from all pools
+00010000:00010000:3.0:1329957745.624739:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01db_UUID-13: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.624740:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01d7_UUID-12: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.624741:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01d3_UUID-11: request to shrink 10 locks, shrunk 0
+00010000:00010000:3.0:1329957745.624743:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01cf_UUID-10: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.624746:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01b7_UUID-4: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.624755:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01af_UUID-2: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.624762:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01a7_UUID-0: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.624770:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01db_UUID-13: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.624778:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01d3_UUID-11: request to shrink 10 locks, shrunk 0
+00010000:00010000:3.0:1329957745.624786:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01cb_UUID-9: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.624794:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01c3_UUID-7: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.624807:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01bb_UUID-5: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.624815:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01b3_UUID-3: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.624823:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01ab_UUID-1: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.624831:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01df_UUID-14: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.624832:0:14028:0:(ldlm_pool.c:1091:ldlm_pools_shrink()) Request to shrink 0 server locks from all pools
+00010000:00010000:3.0:1329957745.624925:0:14028:0:(ldlm_pool.c:1091:ldlm_pools_shrink()) Request to shrink 128 server locks from all pools
+00010000:00010000:3.0:1329957745.625013:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01ab_UUID-1: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.625022:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01df_UUID-14: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.625031:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01d7_UUID-12: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.625039:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01cf_UUID-10: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.625047:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01c7_UUID-8: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.625055:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01bf_UUID-6: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.625062:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01b7_UUID-4: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.625070:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01af_UUID-2: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.625078:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01a7_UUID-0: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.625086:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01db_UUID-13: request to shrink 9 locks, shrunk 0
+00010000:00010000:3.0:1329957745.625095:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01d3_UUID-11: request to shrink 10 locks, shrunk 0
+00010000:00010000:3.0:1329957745.625103:0:14028:0:(ldlm_pool.c:641:ldlm_pool_shrink()) ldlm-pool-filter-lsd-OST01cb_UUID-9: request to shrink 9 locks, shrunk 0
+
+--- Comment (pjones, Wed, 22 Feb 2012 19:43:22 +0000) ---
+Niu
+
+Could you please look into this one?
+
+Thanks
+
+Peter

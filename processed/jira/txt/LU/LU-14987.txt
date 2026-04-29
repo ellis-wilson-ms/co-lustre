@@ -1,0 +1,1817 @@
+Key:        LU-14987
+Summary:    LNET routers becoming stuck, RDMA timeout, large numbers of messages processing
+Link:       https://jira.whamcloud.com/browse/LU-14987
+Type:       Bug
+Priority:   Critical
+Status:     Resolved
+Resolution: Cannot Reproduce
+Assignee:   Serguei Smirnov
+Reporter:   Matt Rásó-Barnett
+Created:    Mon, 6 Sep 2021 11:10:41 +0000
+Updated:    Sun, 10 Dec 2023 19:28:24 +0000
+Resolved:   Sun, 10 Dec 2023 19:28:24 +0000
+Attachments: client.mount.debug.log, lnet-routers.png, lustre-log.1630947202.26758.gz, mds.log, rds-d2-MDT0000.2021-09-15.llog, rds-d2-OST0000.2021-09-15.llog, rds-d2-client.2021-09-15.llog, router.log, screenshot-1.png
+
+--- Description ---
+Hello, 
+
+The past few days we've been suffering a lot of LNET and LNET routing related issues across our filesystems, and it's currently affecting large numbers of users who are seeing frequent hangs and timeouts attempting to use our storage across an LNET router.
+
+The LNET environment is as follows:
+
+                                                               
+Clients and Servers                                                      
+===============                                                          
+o2ib1 (10.47.0.0/16)   : ~1000 Intel OPA clients                         
+o2ib2 (10.44.0.0/16)   : ~1200 HDR IB clients                            
+                       : All servers are now on HDR IB also              
+                                                                         
+o2ib0 (10.144.0.0/16)  : ~10 FDR IB clients                              
+tcp2   (10.43.0.0/16)  : ~100 Ethernet clients                           
+                                                                         
+Routers                                                                  
+======                                                                   
+8x LNET routers, in 2 groups of 4:                                       
+                                                                         
+lnet1...lnet4:  Routes between o2ib1, o2ib2 and tcp2                     
+lnet5...lnet8:  Routes all LNET networks, o2ib0, o2ib1, o2ib2 and tcp2   
+                                                                         
+There is only a single level of LNET routers, there is no multi-hop routing. This is achieved by simply having all necessary interfaces present on the routers.
+                                                                         
+Software Environment                                                     
+=================                                                        
+We recently completed updating all of our environment to 2.12.7, with a single additional patch on top from: https://jira.whamcloud.com/browse/LU-13356 as discussed on a separate issue of ours: https://jira.whamcloud.com/browse/LU-14802
+                                                                         
+All o2ib2 nodes are using Mellanox MOFED 5.4-1.0.3.0, with a mixture of EDR and HDR IB cards. All storage is on HDR IB.
+                                                                         
+All o2ib1 nodes are using OPA version 10.11.0.1.                         
+                                                                         
+All o2ib0 nodes are using MOFED 4.9-2.2.4.0.                                     
+
+I will document all LNET tunables used and module parameters at the bottom of the description along with system logs from the routers and MDS servers particularly.
+
+What we observe during these periods is clients becoming unresponsive to simple operations on the filesystem, 'lfs df', 'ls' etc will hang for many seconds or even minutes and then eventually complete.
+
+Looking around in Jira, I noticed a ticket from Stefan that has broadly similar sounding symptoms to what we see: https://jira.whamcloud.com/browse/LU-14652
+
+In the system logs of servers and routers I see lots of 'Timed out RDMA' messages, particularly between the servers and routers (router IPs are all in the range: 10.44.240.16[1-8]@o2ib2):
+
+Snippet from MDS server logs
+
+                           
+Sep 03 15:38:39 csd3-mds1 kernel: LustreError: 3021:0:(events.c:455:server_bulk_callback()) event type 5, status -103, desc ffff91725b6e6800 
+Sep 03 15:42:55 csd3-mds1 kernel: Lustre: rds-d3-MDT0000: haven't heard from client 2a643e36-e76e-f73b-a766-559148ad8494 (at 10.43.240.199@tcp2) in 227 seconds. I think it's dead, and I am evicting it. exp ffff9171c959c000, cur 1630680175 expire 163068002
+Sep 03 15:44:49 csd3-mds1 kernel: LustreError: 9254:0:(ldlm_lockd.c:256:expired_lock_main()) ### lock callback timer expired after 151s: evicting client at 10.43.240.198@tcp2  ns: mdt-rds-d3-MDT0000_UUID lock: ffff915555524d80/0xb4757f1f0b0182be lrc: 3/0,
+Sep 03 15:44:49 csd3-mds1 kernel: LustreError: 6246:0:(client.c:1210:ptlrpc_import_delay_req()) @@@ IMP_CLOSED   req@ffff917249503a80 x1705934796555264/t0(0) o104->rds-d3-MDT0000@10.43.240.198@tcp2:15/16 lens 296/224 e 0 to 0 dl 0 ref 1 fl Rpc:/0/ffffffff
+Sep 03 15:44:49 csd3-mds1 kernel: LustreError: 6246:0:(client.c:1210:ptlrpc_import_delay_req()) Skipped 2 previous similar messages
+Sep 03 15:45:13 csd3-mds1 kernel: LustreError: 137-5: rds-d5-MDT0000_UUID: not available for connect from 10.43.240.198@tcp2 (no target). If you are running an HA pair check that the target is mounted on the other server.
+Sep 03 15:45:13 csd3-mds1 kernel: LustreError: Skipped 32 previous similar messages 
+Sep 03 15:47:43 csd3-mds1 kernel: LNetError: 3021:0:(o2iblnd_cb.c:3383:kiblnd_check_txs_locked()) Timed out tx: active_txs, 1 seconds
+Sep 03 15:47:43 csd3-mds1 kernel: LNetError: 3021:0:(o2iblnd_cb.c:3383:kiblnd_check_txs_locked()) Skipped 65 previous similar messages
+Sep 03 15:47:43 csd3-mds1 kernel: LNetError: 3021:0:(o2iblnd_cb.c:3458:kiblnd_check_conns()) Timed out RDMA with 10.44.240.167@o2ib2 (0): c: 21, oc: 11, rc: 31
+Sep 03 15:47:43 csd3-mds1 kernel: LNetError: 3021:0:(o2iblnd_cb.c:3458:kiblnd_check_conns()) Skipped 65 previous similar messages
+Sep 03 15:47:43 csd3-mds1 kernel: LustreError: 3021:0:(events.c:455:server_bulk_callback()) event type 5, status -103, desc ffff916f74d60800
+Sep 03 15:47:48 csd3-mds1 kernel: LustreError: 3021:0:(events.c:455:server_bulk_callback()) event type 5, status -103, desc ffff917278f2a400
+
+Snippet from LNET router log
+
+                           
+Sep 03 15:32:24 lnet7 kernel: LNetError: 13129:0:(lib-move.c:3903:lnet_parse_get()) 10.43.240.167@tcp2: Unable to send REPLY for GET from 12345-10.43.101.11@tcp2: -113
+Sep 03 15:32:24 lnet7 kernel: LNetError: 13129:0:(lib-move.c:3903:lnet_parse_get()) Skipped 1 previous similar message
+Sep 03 15:33:21 lnet7 kernel: LNetError: 13123:0:(socklnd.c:1665:ksocknal_destroy_conn()) Completing partial receive from 12345-10.43.240.198@tcp2[1], ip 10.43.240.198:1023, with error, wanted: 520, left: 520, last alive is 52 secs ago
+Sep 03 15:33:21 lnet7 kernel: LNetError: 13123:0:(socklnd.c:1665:ksocknal_destroy_conn()) Skipped 80 previous similar messages
+Sep 03 15:34:15 lnet7 kernel: LNet: There was an unexpected network error while writing to 10.43.101.11: -32.
+Sep 03 15:35:05 lnet7 kernel: LNetError: 13129:0:(lib-move.c:3903:lnet_parse_get()) 10.43.240.167@tcp2: Unable to send REPLY for GET from 12345-10.43.102.226@tcp2: -113
+Sep 03 15:35:05 lnet7 kernel: LNetError: 13129:0:(lib-move.c:3903:lnet_parse_get()) Skipped 1 previous similar message 
+Sep 03 15:41:15 lnet7 kernel: LNetError: 13126:0:(lib-move.c:3903:lnet_parse_get()) 10.43.240.167@tcp2: Unable to send REPLY for GET from 12345-10.43.102.60@tcp2: -113
+Sep 03 15:41:15 lnet7 kernel: LNetError: 13126:0:(lib-move.c:3903:lnet_parse_get()) Skipped 1 previous similar message
+Sep 03 15:45:11 lnet7 kernel: LNetError: 13123:0:(socklnd.c:1665:ksocknal_destroy_conn()) Completing partial receive from 12345-10.43.240.199@tcp2[1], ip 10.43.240.199:1023, with error, wanted: 520, left: 520, last alive is 339 secs ago
+Sep 03 15:45:11 lnet7 kernel: LNetError: 13123:0:(socklnd.c:1665:ksocknal_destroy_conn()) Skipped 24 previous similar messages
+Sep 03 15:45:56 lnet7 kernel: LNet: 13111:0:(o2iblnd_cb.c:413:kiblnd_handle_rx()) PUT_NACK from 10.44.240.96@o2ib2
+Sep 03 15:47:20 lnet7 kernel: LNet: There was an unexpected network error while writing to 10.43.102.60: -32.
+Sep 03 15:49:29 lnet7 kernel: LNet: There was an unexpected network error while writing to 10.43.101.11: -32.
+Sep 03 15:50:03 lnet7 kernel: LNet: There was an unexpected network error while writing to 10.43.102.226: -32.
+
+Overall it doesn't look very healthy of a network, with many clients being timed out continually.
+
+Another symptom I noticed similar to what Stefan reported is looking at the 'peers' counters from an MDS node, many of the LNET routers will show large values in 'queue' at times, and the 'min' value is usually very large and negative.
+
+sys/kernel/debug/lnet/peers table of LNET routers as seen on MDS server
+
+10.44.240.161@o2ib2         6    up    -1    32    32    32    32 -157885 0 
+10.44.240.166@o2ib2         7    up    -1    32    32    32    32 -11445 0
+10.44.240.163@o2ib2         6    up    -1    32    32    32    32 -157911 0
+10.44.240.168@o2ib2         7    up    -1    32    32    32    32 -11480 0
+10.44.240.165@o2ib2        21    up    -1    32    32    32    18 -11478 20808
+10.44.240.162@o2ib2         6    up    -1    32    32    32    32 -157755 0
+10.44.240.167@o2ib2        21    up    -1    32    32    32    18 -11403 20576
+10.44.240.164@o2ib2         6    up    -1    32    32    32    32 -157786 0
+
+Generally I've been restarting LNET routers that develop into a state of having persistently very large values in the 'queue' column on servers, that isn't going down. This has so far been bringing the system into a temporary period of stability, but it's not fixing the underlying problem and the issues return after a while.
+
+Another observation is watching 'routerstat' on the LNET routers, and noticing very large numbers in the 'M' column, for messages being processed. We have occassionally seen this spike up to extremely large values before the whole LNET router runs out of memory and panics, similar to as described in this ticket: https://jira.whamcloud.com/browse/CAM-82
+
+However this is less frequent now since we have removed nearly all of our FDR servers/clients from the environment.
+
+On the fabric side, we don't see any obvious issues from the fabric manager - all nodes are reachable and respond to LNET ping except in periods when we experience the above symptoms.
+
+I will attach all the LNET configurations, LND parameters, observed counters and log messages to the ticket.
+
+I was hoping that an expert eye could do a sanity check of the configuration listed and offer any insight into why we might be experiencing these timeouts suddenly, and if there is any configuration changes we could do to eliminate the problem?
+
+Kind regards, 
+
+Matt
+
+--- Comment (eaujames, Mon, 27 Sep 2021 19:39:58 +0000) ---
+"[...]. We see this on all the MDS in the system and they all progressively get locked up, repeating this kind of stack trace repeatedly until they crash or are killed by pacemaker for being unresponsive.[...]"
+
+We have seen this kind of behavior with asymmetrical routes set client but not on server: clients can communicate with servers but not the opposite (see LU-14566).
+
+All the available thread became progressively pending discovery for the unreachable clients.
+
+On our filesystem MR is disabled so we backport the https://review.whamcloud.com/43537 ("LU-14566 lnet: Skip discovery in LNetPrimaryNID if DD disabled").
+
+And we activate the LNET option "drop_asym_route" to prevent this kind of situation.
+
+--- Comment (mrb, Wed, 22 Sep 2021 12:56:07 +0000) ---
+Hi Serguei, sorry for delay in your last questions.
+
+Yes essentially our whole environment is running 2.12.7 with a single patch on top which is from LU-13356. So yes we should have LU-13972 already in that case. There may be a small handful of clients running slightly older versions, possibly 2.12.6 or around that, but not significantly older.
+
+Since we last updated a week ago, we haven't seen the issue return again - likely we will not any more since we have finished removing the o2ib0 network completely from the environment, including the routers, so there are no longer any peers on this network trying to talk to the servers.
+
+On reflection it does appear to be the case that by attempting to remove the NIDs for this network from the LNET routers originally, we triggered this problem, however I still don't feel that we've quite got to the bottom of why this caused the issue, since I don't believe we had any NIDs on o2ib0 in the llog for these servers (we did post these earlier and I don't see why the llog would have changed since before we removed the o2ib0 NIDs from the routers).
+
+Therefore unfortunately it's very unlikely that we will be able to capture another debug log of the issue at this point.
+
+Before we close this issue - is there any thinking at your end that there is a bug in the code at this point still to be worked on, or will we not know without fully tracing the call chain in debug logs to properly see the sequence of events triggering the issue?
+
+My main concerns at this point are:
+
+	I'm not sure whether I did something wrong in the steps I took to shutdown the o2ib0 network originally. We have a few LNET networks in our environment, and it's going to be the case that we will be removing a network from the routers as a fabric is decommissioned from time to time. So after this experience, I feel uneasy about whether there is something we should have done to prevent us hitting this issue?
+
+	On top of this, we had plans to have small private LNET networks added/removed from the routers more dynamically in future as part of creating small groups of clients on isolated VLANs in our environment, to which we could provide more secure, locked-down mount points via the nodemap capabilities. So a big part of this would be clients and LNET networks appearing and disappearing regularly. So again, perhaps we are missing something in the precise way that we go about removing a set of peers and associated LNET network to not trigger this problem.
+
+What is your opinion right now? Is this a procedural error on our part, or is there a bug here to be found?
+
+Thanks,
+
+Matt
+
+--- Comment (ssmirnov, Wed, 15 Sep 2021 17:11:44 +0000) ---
+LU-13972 addressed the problem with getting stuck indefinitely on an unreachable NID, the fix should be in 2.12.7-RC1
+
+ "Stuck" clients may also be having similar issue. You can check where they are stuck by 
+
+echo l > /proc/sysrq-trigger 
+
+(provided sysrq is enabled). Please do this on the clients and the servers that are having the issue and provide the output.
+
+Are all of your clients/servers upgraded and using the same lustre version? 
+
+So far I don't understand how client trying to connect to an unreachable peer can cause the server to get stuck with the trace you're seeing. The debug logs I have seen don't have this captured, so if there's a way to reproduce, please try capturing another debug log.
+
+Thanks,
+
+Serguei.
+
+--- Comment (wjt27, Wed, 15 Sep 2021 16:35:21 +0000) ---
+That was my observation too yesterday. I have seen MDS and also OSS servers locking up in this manner. I have also observed that this bug was being triggered as soon as we enabled lnet routers and clients were able to communicate with the servers. While servers had been rebooted and had clean peer information, many of the clients had peer information with NIDs that were no longer reachable. After effectively rebooting all clients and therefore cleaning old peer information on them the situation has much improved. I suspect that there is a bug that causes LNetPrimaryNID lock up and it appears that it could be triggered by a clients having unreachable NIDs in their peer information. We would like to put more effort and work with you to get to the bottom of this and find a resolution if there is no existing patch that addresses this issue. 
+
+Best regards,
+
+Wojciech
+
+--- Comment (ssmirnov, Wed, 15 Sep 2021 15:34:41 +0000) ---
+Matt, 
+
+My understanding is that any unreachable NID in llog (on a remote network for which there's no route or on the local network but belonging to a node that's down) will cause this problem.  I'm not sure if "nosquash_nids" are treated differently.
+
+--- Comment (mrb, Wed, 15 Sep 2021 15:07:43 +0000) ---
+Hi Serguei - just an update after the last 24hrs experiences.
+
+The issue we saw in our last call with the stuck mount hasn't re-appeared since. I don't know what that was caused by, but we've had no trouble mounting the filesystems on other clients.
+
+Since our call, we re-added routing configuration to a number of previously stuck (non-rebooted) clients - mostly important login nodes or other such infrastructure. We didn't see any issues after doing this and as the day wore on yesterday, we started feeling more confident to add more of the OPA compute nodes (the bulk of the routed clients) back by adding routing configuration to these too.
+
+This last action did cause another large outage as all the servers started locking up with the LNetPrimaryNID stack trace previously mentioned. As we observed in the last call, many of these clients would have had old 'peer' information at this time, that we couldn't clear with lnetctl as we observed together. I don't have any more debug traces from yesterday's crashes, so we can't verify exactly what NID the servers are trying to 'discover' here unfortunately.
+
+Did any of the previous debug logs provided have any indication of what it's trying to look up in the LNetPrimaryNID routine?
+
+Otherwise, since yesterday's lockup, we have rebooted all the OPA clients, so they all have cleaned up peer information now. Today we have been cautiously bringing up these OPA clients and so far we haven't seen any issues - we still have about half still to do though, so it's too early to give the all clear, but it's looking positive so far.
+
+I think if it stays this way and we don't see any other router-related issues (such as at the start of this ticket), then our focus right now is really going to be on the LNetPrimaryNID lockup issue - what the cause of that is, and if it's seen as a bug that we could perhaps get a patch on or not? Is there anything in the debug logs provided up to now that give a clear cause of why this stack trace is being produced? Is it clear at the moment that what precipitated this is me removing an LNET network (o2ib0) from our routers - and thus from the overall routed environment?
+
+Cheers,
+
+Matt
+
+--- Comment (mrb, Wed, 15 Sep 2021 08:33:35 +0000) ---
+Hi Serguei, here are the llogs requested for one of the filesystems involved:
+
+ rds-d2-client.2021-09-15.llog  rds-d2-OST0000.2021-09-15.llog  rds-d2-MDT0000.2021-09-15.llog 
+
+I had a quick look through these and the only NIDs present in these that are not from the same LNET network that the servers are on (o2ib2), are the NIDs present in the 'nosquash_nids' parameter. This is only present in the MDT log and the client log.
+
+Would Lustre try to get the primary NID even for these - particularly on the MDT I suppose, since that's where we observe the crash/lockup?
+
+--- Comment (ssmirnov, Wed, 15 Sep 2021 04:10:11 +0000) ---
+Amir pointed out that not only the client llog may contain bad NIDs, but server llogs as well, so they all need to be examined:
+
+lctl --device MGS llog_print $fsname-client
+lctl --device MGS llog_print $fsname-OSTxxxx
+lctl --device MGS llog_print $fsnmae-MDTxxxx
+
+If unreachable NIDs are listed, it is likely the cause of the "stuck discovery" trace that was observed, as Lustre will try to get the "primary NID" for these regardless of the discovery setting. If unreachable NIDs are listed in the client llog, it is likely the cause of the mount operation getting stuck.
+
+If this is the case, my understanding is that the llogs will need to be regenerated: https://doc.lustre.org/lustre_manual.xhtml#lustremaint.regenerateConfigLogs
+
+Thanks,
+
+Serguei.
+
+--- Comment (ssmirnov, Tue, 14 Sep 2021 04:07:08 +0000) ---
+During the call, discovery was turned off on the routers. The following procedure was used:
+
+1) Delete the routes from clients and servers. Delete router peers from clients and servers.
+
+2) Bring down the routers, reconfigure (disable discovery)
+
+3) Bring up the routers.
+
+4) Add back routes on the servers
+
+5) Add back routes on the clients.
+
+One of the clients was rebooted, then was brought up and failed to mount. The debug trace from the client is attached. client.mount.debug.log
+
+"lnetctl ping" to the nids used by the mount command was successful. lnet_selftest was also successful.
+
+Clients that were not unmounted appear to be able to access the FS via the reconfigured routers.
+
+Please provide the MGS client config log. I thought it was captured, but couldn't find it on the sftp server.
+
+--- Comment (sthiell, Mon, 13 Sep 2021 15:47:23 +0000) ---
+@Matt: I've only disabled Discovery on the routers. It is still enabled on all servers and clients. Nothing more, no need to manually define peer information either (I've been wondering about that but apparently, having it enabled on servers + clients seems to work for MR nodes – unless I missed something).
+
+--- Comment (mrb, Mon, 13 Sep 2021 08:53:13 +0000) ---
+Hi Serguei, thanks, best time for me is going to be from 11:30 PST onwards. I'll send you an email with a calendar invite.
+
+@Stephane - Thanks, I will try this out. Do you disable discovery anywhere else, such as servers for example? Or even on clients too? Do you have to manually define peer information if you do this?
+
+I've never really thought of our routers as MR, even though the peer information for a router marks it as that - 
+
+[root@csd3-oss1 ~]# lnetctl peer show --nid 10.44.240.161@o2ib2
+peer:
+    - primary nid: 10.144.240.161@o2ib
+      Multi-Rail: True
+      peer ni:
+        - nid: 10.44.240.161@o2ib2
+          state: down
+        - nid: 10.47.240.161@o2ib1
+          state: NA
+        - nid: 10.43.240.161@tcp2
+          state: NA
+        - nid: 10.40.240.161@tcp4
+          state: NA
+
+since each of these NIDs connects a different network, so they aren't redundant/dual connections in any way (what I usually think of as MR in lustre).
+
+I have noticed some oddities in the peer definition for the routers across hosts, so I have been suspicious about this discovery mechanism - particularly with this new lockup on the MDS we are seeing inside 'lnet_discover_peer_locked'.
+
+So I may try to statically define the router peer configuration next on the servers at least, and try with discovery = 0 on the routers and servers to begin with.
+
+--- Comment (wjt27, Mon, 13 Sep 2021 08:51:56 +0000) ---
+Hi Serguei, 
+
+This has become critical for our HPC service, over last week we had many disruption to production services, while this weekend we had to completely drain the jobs from the production clusters due to this issue. We had many customer complaining and need to find resolution quickly. As Matt said we have focused last week to make the configuration of LNET routing less complex by eliminating old unsupported hardware but so far things have not improved. Matt will arrange a call but I would appreciate if you bring appropriate engineering resource to help to resolve this very urgent issue for us.
+
+Many thanks
+
+Best regards,
+
+Wojciech
+
+--- Comment (ssmirnov, Mon, 13 Sep 2021 03:47:42 +0000) ---
+Hi Matt,
+
+I haven't finished going through the logs yet: I haven't seen any distinct signs of the problem in what I've seen there so far. We can schedule another call tomorrow. If the problem is more apparent now, at least we can collect more logs with the issue happening. I should be available from around 8:30 PST tomorrow (Monday). Please let me know here or via email which time works for you.
+
+Thanks,
+
+Serguei.
+
+--- Comment (sthiell, Sun, 12 Sep 2021 23:26:22 +0000) ---
+Hi Matt,
+
+According to the router settings above you have discovery enabled. Have you tried to disable LNet discovery just on the routers? 
+
+I suspect LNet discovery to do some ping or message flooding. Our routers are not MR, only some compute nodes are. By disabling discovery on routers (discovery: 0 in lnet.conf), they are not getting completely overwhelmed and delaying traffic too much.  This was a recommendation from Serguei for a problem I reported in LU-14652.  We still often have queued messages though, but less.
+
+--- Comment (mrb, Sun, 12 Sep 2021 12:33:12 +0000) ---
+Hi Serguei,
+
+Unfortunately the situation for us has degraded fairly substantially over the last two days and we are now in a state where all clients are being affected at times due to LNET router-related instability.
+
+During the last few days I was working to eliminate the remaining FDR based servers and clients from the network, so that we could reduce our routing configuration down to just: OPA (o2ib1)  EDR/HDR IB (o2ib2) and Ethernet (tcp2)  EDR/HDR IB (o2ib2).
+
+This was completed on thursday with the last FDR servers moving to ethernet (tcp2), and we have just 5 remaining FDR (o2ib0) clients remaining, which we are working to also convert to ethernet in the upcoming days.
+
+With this change, I took the opportunity on friday to change our LNET router configuration to the following setup:
+
+Routers                                                                  
+======                                                                   
+8x LNET routers, in 2 groups:                                      
+                                                                         
+6x routers: lnet1...lnet6:  Routes between OPA (o2ib1)  EDR/HDR IB (o2ib2) and Ethernet (tcp2)  EDR/HDR IB (o2ib2)
+                     
+2x routers: lnet7...lnet8:  Routes *only* between FDR (o2ib0)  EDR/HDR IB (o2ib2)
+
+So the thinking was to try to compartmentalize the configuration more, since previously we saw the message 'queuing' problems only on the routers dealing with FDR (o2ib0) in addition to the other networks, so I drew the hypothesis that this network was in some way responsible for the problem.
+
+However we are now seeing the same problem on lnet[1-6] as of yesterday, attached here is a graph from yesterday evening showing the 'msgs_alloc' counter from 'lnetctl stats show' from these routers:
+
+ 
+
+ On the MDS servers at this time we see the following in the logs:
+
+Sep 11 19:31:33 rds-mds9 kernel: LNetError: 2931:0:(o2iblnd_cb.c:3383:kiblnd_check_txs_locked()) Timed out tx: tx_queue, 3 seconds
+Sep 11 19:31:33 rds-mds9 kernel: LNetError: 2931:0:(o2iblnd_cb.c:3458:kiblnd_check_conns()) Timed out RDMA with 10.44.240.163@o2ib2 (0): c: 0, oc: 5, rc: 32
+Sep 11 19:33:18 rds-mds9 kernel: Lustre: rds-d7-MDT0003: haven't heard from client d7904fee-b265-8f63-cef5-ce2749a22276 (at 10.44.162.44@o2ib2) in 227 seconds. I think it's dead, and I am evicting it. exp ffff88b6f2247c00, cur 1631385198 expire 1631385048 last 1631384971
+Sep 11 19:33:34 rds-mds9 kernel: LustreError: 31386:0:(ldlm_lib.c:3356:target_bulk_io()) @@@ Reconnect on bulk READ  req@ffff88868f1b9050 x1710621172107904/t0(0) o256->7f786114-cb97-20a3-6ba1-586d17d44fbe@10.47.1.83@o2ib1:94/0 lens 304/240 e 0 to 0 dl 1631385219 ref 1 fl Interpret:/
+Sep 11 19:33:48 rds-mds9 kernel: LustreError: 30807:0:(ldlm_lib.c:3356:target_bulk_io()) @@@ Reconnect on bulk READ  req@ffff88868f1b2050 x1708240978582848/t0(0) o256->3507eee5-15fb-83c3-4fe9-b3507fcbf69e@10.47.20.107@o2ib1:122/0 lens 304/240 e 1 to 0 dl 1631385247 ref 1 fl Interpre
+Sep 11 19:34:05 rds-mds9 kernel: Lustre: MGS: Received new LWP connection from 10.43.240.201@tcp2, removing former export from same NID
+Sep 11 19:34:17 rds-mds9 kernel: Lustre: MGS: Export ffff88b6e2a6d800 already connecting from 10.47.1.125@o2ib1
+Sep 11 19:34:52 rds-mds9 kernel: LustreError: 2935:0:(events.c:455:server_bulk_callback()) event type 5, status -125, desc ffff88b6df785400
+Sep 11 19:35:06 rds-mds9 kernel: LustreError: 2934:0:(events.c:455:server_bulk_callback()) event type 5, status -125, desc ffff88b6dfbcbc00
+Sep 11 19:35:08 rds-mds9 kernel: Lustre: MGS: Received new LWP connection from 10.43.240.201@tcp2, removing former export from same NID
+Sep 11 19:36:34 rds-mds9 kernel: Lustre: rds-d7-MDT0001: haven't heard from client 4f9f09be-30f1-6fcf-60fd-04aca0403faa (at 10.47.1.151@o2ib1) in 227 seconds. I think it's dead, and I am evicting it. exp ffff8886be343400, cur 1631385394 expire 1631385244 last 1631385167
+Sep 11 19:36:34 rds-mds9 kernel: Lustre: Skipped 34 previous similar messages
+Sep 11 19:37:10 rds-mds9 kernel: LustreError: 37258:0:(ldlm_lib.c:3356:target_bulk_io()) @@@ Reconnect on bulk READ  req@ffff8886bc635050 x1710623250676288/t0(0) o256->03591d26-1922-48c5-1caa-54f825a51b90@10.47.1.8@o2ib1:410/0 lens 304/240 e 0 to 0 dl 1631385535 ref 1 fl Interpret:/
+Sep 11 19:37:30 rds-mds9 kernel: LustreError: 30807:0:(ldlm_lib.c:3356:target_bulk_io()) @@@ Reconnect on bulk READ  req@ffff88868f1b0850 x1708574438096896/t0(0) o256->4b26074e-3ab8-72a9-dc5a-d2b180295968@10.47.2.92@o2ib1:409/0 lens 304/240 e 0 to 0 dl 1631385534 ref 1 fl Interpret:
+Sep 11 19:37:49 rds-mds9 kernel: LustreError: 2933:0:(events.c:455:server_bulk_callback()) event type 5, status -125, desc ffff88b6dd19f400
+Sep 11 19:37:52 rds-mds9 kernel: Lustre: rds-d7-MDT0000: haven't heard from client d7033ccf-14b6-e6cc-19c1-15b722b44ead (at 10.47.1.229@o2ib1) in 227 seconds. I think it's dead, and I am evicting it. exp ffff88867d13cc00, cur 1631385472 expire 1631385322 last 1631385245
+Sep 11 19:37:52 rds-mds9 kernel: Lustre: Skipped 31 previous similar messages
+Sep 11 19:37:57 rds-mds9 kernel: Lustre: 32114:0:(client.c:2169:ptlrpc_expire_one_request()) @@@ Request sent has timed out for sent delay: [sent 1631385466/real 0]  req@ffff888672919b00 x1710629380688448/t0(0) o104->rds-d7-MDT0001@10.47.7.15@o2ib1:15/16 lens 296/224 e 0 to 1 dl 163
+Sep 11 19:37:57 rds-mds9 kernel: Lustre: 32114:0:(client.c:2169:ptlrpc_expire_one_request()) Skipped 2 previous similar messages
+Sep 11 19:38:19 rds-mds9 kernel: Lustre: MGS: Export ffff88b6dd450800 already connecting from 10.47.1.191@o2ib1
+Sep 11 19:38:19 rds-mds9 kernel: Lustre: Skipped 1 previous similar message
+Sep 11 19:38:24 rds-mds9 kernel: Lustre: rds-d7-MDT0000: Export ffff88867d643400 already connecting from 10.47.0.195@o2ib1
+Sep 11 19:38:24 rds-mds9 kernel: Lustre: Skipped 2 previous similar messages
+Sep 11 19:38:27 rds-mds9 kernel: Lustre: rds-d7-MDT0000: Export ffff88867ee85400 already connecting from 10.47.1.35@o2ib1
+Sep 11 19:38:27 rds-mds9 kernel: Lustre: Skipped 3 previous similar messages
+Sep 11 19:38:36 rds-mds9 kernel: Lustre: rds-d7-MDT0001: Export ffff88b6db794800 already connecting from 10.47.1.37@o2ib1
+Sep 11 19:38:36 rds-mds9 kernel: Lustre: Skipped 10 previous similar messages
+Sep 11 19:38:55 rds-mds9 kernel: Lustre: MGS: Export ffff8889383cd400 already connecting from 10.47.1.140@o2ib1
+Sep 11 19:39:16 rds-mds9 kernel: Lustre: MGS: Export ffff88b6df16a000 already connecting from 10.47.0.186@o2ib1
+Sep 11 19:39:16 rds-mds9 kernel: Lustre: Skipped 4 previous similar messages
+Sep 11 19:39:40 rds-mds9 kernel: LustreError: 28681:0:(ldlm_lib.c:3356:target_bulk_io()) @@@ Reconnect on bulk READ  req@ffff8889d57c6050 x1708505751241152/t0(0) o256->d4790db3-af37-ccc2-f735-1de0cd88a791@10.47.1.177@o2ib1:522/0 lens 304/240 e 0 to 0 dl 1631385647 ref 1 fl Interpret
+Sep 11 19:39:45 rds-mds9 kernel: Lustre: MGS: Received new LWP connection from 10.43.240.201@tcp2, removing former export from same NID
+Sep 11 19:39:49 rds-mds9 kernel: Lustre: rds-d7-MDT0001: Connection restored to 55a21a9f-4f6c-9629-80d8-0a0ff41da80e (at 10.43.12.30@tcp2)
+Sep 11 19:39:49 rds-mds9 kernel: Lustre: Skipped 17125 previous similar messages
+Sep 11 19:39:50 rds-mds9 kernel: LNet: Service thread pid 32076 was inactive for 200.15s. The thread might be hung, or it might only be slow and will resume later. Dumping the stack trace for debugging purposes:
+Sep 11 19:39:50 rds-mds9 kernel: Pid: 32076, comm: mdt00_178 3.10.0-1160.25.1.el7_lustre.x86_64 #1 SMP Wed Jul 21 12:53:32 UTC 2021
+Sep 11 19:39:50 rds-mds9 kernel: Call Trace:
+Sep 11 19:39:50 rds-mds9 kernel:  [] lnet_discover_peer_locked+0x190/0x430 [lnet]
+Sep 11 19:39:50 rds-mds9 kernel:  [] LNetPrimaryNID+0xb5/0x1f0 [lnet]
+Sep 11 19:39:50 rds-mds9 kernel:  [] ptlrpc_connection_get+0x3e/0x450 [ptlrpc]
+Sep 11 19:39:50 rds-mds9 kernel:  [] target_handle_connect+0x14a2/0x2bf0 [ptlrpc]
+Sep 11 19:39:50 rds-mds9 kernel:  [] tgt_request_handle+0x4fa/0x1570 [ptlrpc]
+Sep 11 19:39:50 rds-mds9 kernel:  [] ptlrpc_server_handle_request+0x24b/0xab0 [ptlrpc]
+Sep 11 19:39:50 rds-mds9 kernel:  [] ptlrpc_main+0xb34/0x1470 [ptlrpc]
+Sep 11 19:39:50 rds-mds9 kernel:  [] kthread+0xd1/0xe0
+Sep 11 19:39:50 rds-mds9 kernel:  [] ret_from_fork_nospec_begin+0x7/0x21
+Sep 11 19:39:50 rds-mds9 kernel:  [] 0xffffffffffffffff
+Sep 11 19:39:50 rds-mds9 kernel: LustreError: dumping log to /tmp/lustre-log.1631385590.32076
+Sep 11 19:39:50 rds-mds9 kernel: LNet: Service thread pid 32011 was inactive for 200.88s. The thread might be hung, or it might only be slow and will resume later. Dumping the stack trace for debugging purposes:
+
+So this is starting shortly before the message queue spike on the LNET routers. We see this on all the MDS in the system and they all progressively get locked up, repeating this kind of stack trace repeatedly until they crash or are killed by pacemaker for being unresponsive.
+
+Another similar looking stack trace from slightly later:
+
+Sep 11 19:55:28 rds-mds9 kernel: Modules linked in: osp(OE) mdd(OE) lod(OE) mdt(OE) lfsck(OE) mgs(OE) mgc(OE) osd_ldiskfs(OE) ldiskfs(OE) lquota(OE) fid(OE) fld(OE) ptlrpc(OE) obdclass(OE) binfmt_misc ip6table_filter ip6_tables ko2iblnd(OE) lnet(OE) libcfs(OE) rdma_ucm(OE) rdma_cm(O
+Sep 11 19:55:28 rds-mds9 kernel:  acpi_pad dm_multipath ip_tables xfs libcrc32c sd_mod crc_t10dif crct10dif_generic mlx5_ib(OE) ib_uverbs(OE) ib_core(OE) mgag200 drm_kms_helper syscopyarea sysfillrect sysimgblt fb_sys_fops ttm ahci drm mlx5_core(OE) crct10dif_pclmul mpt3sas crct10di
+Sep 11 19:55:28 rds-mds9 kernel: CPU: 6 PID: 30791 Comm: mdt00_009 Kdump: loaded Tainted: G           OE  ------------   3.10.0-1160.25.1.el7_lustre.x86_64 #1
+Sep 11 19:55:28 rds-mds9 kernel: Hardware name: Dell Inc. PowerEdge R640/06DKY5, BIOS 2.11.2 004/21/2021
+Sep 11 19:55:28 rds-mds9 kernel: task: ffff8889c67aa100 ti: ffff8888ccf90000 task.ti: ffff8888ccf90000
+Sep 11 19:55:28 rds-mds9 kernel: RIP: 0010:[]  [] native_queued_spin_lock_slowpath+0x122/0x200
+Sep 11 19:55:28 rds-mds9 kernel: RSP: 0018:ffff8888ccf93ad8  EFLAGS: 00000246
+Sep 11 19:55:28 rds-mds9 kernel: RAX: 0000000000000000 RBX: ffff8888ccf93a68 RCX: 0000000000310000
+Sep 11 19:55:28 rds-mds9 kernel: RDX: ffff8887bf0db8c0 RSI: 0000000000b10000 RDI: ffff885a18799f80
+Sep 11 19:55:28 rds-mds9 kernel: RBP: ffff8888ccf93ad8 R08: ffff8887beedb8c0 R09: 0000000000000000
+Sep 11 19:55:28 rds-mds9 kernel: R10: 0000000000000001 R11: 0000000000000005 R12: 0000000000000010
+Sep 11 19:55:28 rds-mds9 kernel: R13: ffffffff8d2d4b19 R14: ffffffffffffff02 R15: ffff8887beedacc0
+Sep 11 19:55:28 rds-mds9 kernel: FS:  0000000000000000(0000) GS:ffff8887beec0000(0000) knlGS:0000000000000000
+Sep 11 19:55:28 rds-mds9 kernel: CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+Sep 11 19:55:28 rds-mds9 kernel: CR2: 00000000025ef000 CR3: 000000071ae10000 CR4: 00000000007607e0
+Sep 11 19:55:28 rds-mds9 kernel: DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+Sep 11 19:55:28 rds-mds9 kernel: DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+Sep 11 19:55:28 rds-mds9 kernel: PKRU: 00000000
+Sep 11 19:55:28 rds-mds9 kernel: Call Trace:
+Sep 11 19:55:28 rds-mds9 kernel:  [] queued_spin_lock_slowpath+0xb/0xf
+Sep 11 19:55:28 rds-mds9 kernel:  [] _raw_spin_lock+0x20/0x30
+Sep 11 19:55:28 rds-mds9 kernel:  [] cfs_percpt_lock+0x58/0x110 [libcfs]
+Sep 11 19:55:28 rds-mds9 kernel:  [] ? cfs_percpt_unlock+0x1a/0xb0 [libcfs]
+Sep 11 19:55:28 rds-mds9 kernel:  [] lnet_discover_peer_locked+0x232/0x430 [lnet]
+Sep 11 19:55:28 rds-mds9 kernel:  [] ? wake_up_atomic_t+0x30/0x30
+Sep 11 19:55:28 rds-mds9 kernel:  [] LNetPrimaryNID+0xb5/0x1f0 [lnet]
+Sep 11 19:55:28 rds-mds9 kernel:  [] ptlrpc_connection_get+0x3e/0x450 [ptlrpc]
+Sep 11 19:55:28 rds-mds9 kernel:  [] ptlrpc_send_reply+0x394/0x840 [ptlrpc]
+Sep 11 19:55:28 rds-mds9 kernel:  [] ? ttwu_do_activate+0x6f/0x80
+Sep 11 19:55:28 rds-mds9 kernel:  [] ptlrpc_send_error+0x9b/0x1b0 [ptlrpc]
+Sep 11 19:55:28 rds-mds9 kernel:  [] ptlrpc_error+0x10/0x20 [ptlrpc]
+Sep 11 19:55:28 rds-mds9 kernel:  [] tgt_request_handle+0x988/0x1570 [ptlrpc]
+Sep 11 19:55:28 rds-mds9 kernel:  [] ? ptlrpc_nrs_req_get_nolock0+0xd1/0x170 [ptlrpc]
+Sep 11 19:55:28 rds-mds9 kernel:  [] ? __getnstimeofday64+0x3f/0xd0
+Sep 11 19:55:28 rds-mds9 kernel:  [] ptlrpc_server_handle_request+0x24b/0xab0 [ptlrpc]
+Sep 11 19:55:28 rds-mds9 kernel:  [] ? ptlrpc_wait_event+0xa5/0x360 [ptlrpc]
+Sep 11 19:55:28 rds-mds9 kernel:  [] ? __wake_up+0x13/0x20
+Sep 11 19:55:28 rds-mds9 kernel:  [] ptlrpc_main+0xb34/0x1470 [ptlrpc]
+Sep 11 19:55:28 rds-mds9 kernel:  [] ? __schedule+0x3c7/0x870
+Sep 11 19:55:28 rds-mds9 kernel:  [] ? ptlrpc_register_service+0xf80/0xf80 [ptlrpc]
+Sep 11 19:55:28 rds-mds9 kernel:  [] kthread+0xd1/0xe0
+Sep 11 19:55:28 rds-mds9 kernel:  [] ? insert_kthread_work+0x40/0x40
+Sep 11 19:55:28 rds-mds9 kernel:  [] ret_from_fork_nospec_begin+0x7/0x21
+Sep 11 19:55:28 rds-mds9 kernel:  [] ? insert_kthread_work+0x40/0x40
+
+This is where we are at the moment. I've had to take all the routers offline for the moment to try and keep the MDS servers stable and allow our IB (o2ib2) clients at least access to the filesystems while I try to understand this latest development.
+
+Have you had a chance to review the logs taken from our previous session at all? Do you have any time to have another call perhaps to look at this latest problem?
+
+Thanks,
+
+Matt
+
+--- Comment (mrb, Tue, 7 Sep 2021 21:38:45 +0000) ---
+Hi Serguei, thanks again for your time today. The log files that we generated should be fetchable from our sftp gateway here using the key you sent me:
+
+$ sftp whamcloud@vendor-gw01.hpc.cam.ac.uk
+sftp> ls -1
+cpu-f-1.debugging.20210907.log.gz
+csd3-oss13.debugging.20210907.log.gz
+csd3-oss14.debugging.20210907.log.gz
+csd3-oss15.debugging.20210907.log.gz
+csd3-oss16.debugging.20210907.log.gz
+lnet1.debugging.20210907.log.gz
+lnet2.debugging.20210907.log.gz
+lnet3.debugging.20210907.log.gz
+lnet4.debugging.20210907.log.gz
+lnet5.debugging.20210907.log.gz
+lnet6.debugging.20210907.log.gz
+lnet7.debugging.20210907.log.gz
+lnet8.debugging.20210907.log.gz
+rds-oss31.debugging.20210907.log.gz
+rds-oss32.debugging.20210907.log.gz
+
+Let me know if you have any problems.
+
+The client is 'cpu-f-1', all 8 routers are listed above, an interesting one to look at would be lnet6 perhaps, since that one is showing the odd message queuing behaviour at the moment. The 'fio' testing wrote to an OST on rds-oss31 above, so those three will hopefully contain a whole transaction to follow?
+
+Kind regards,
+
+Matt
+
+--- Comment (mrb, Tue, 7 Sep 2021 18:50:40 +0000) ---
+Routing information:
+
+MDS routes
+
+route:
+    - net: tcp2
+      gateway: 10.44.240.167@o2ib2
+      hop: 1
+      priority: 0
+      state: down
+    - net: tcp2
+      gateway: 10.44.240.166@o2ib2
+      hop: 1
+      priority: 0
+      state: up
+    - net: tcp2
+      gateway: 10.44.240.161@o2ib2
+      hop: 1
+      priority: 0
+      state: down
+    - net: tcp2
+      gateway: 10.44.240.164@o2ib2
+      hop: 1
+      priority: 0
+      state: up
+    - net: tcp2
+      gateway: 10.44.240.165@o2ib2
+      hop: 1
+      priority: 0
+      state: down
+    - net: tcp2
+      gateway: 10.44.240.163@o2ib2
+      hop: 1
+      priority: 0
+      state: down
+    - net: tcp2
+      gateway: 10.44.240.162@o2ib2
+      hop: 1
+      priority: 0
+      state: up
+    - net: tcp2
+      gateway: 10.44.240.168@o2ib2
+      hop: 1
+      priority: 0
+      state: up
+    - net: o2ib
+      gateway: 10.44.240.167@o2ib2
+      hop: 1
+      priority: 0
+      state: down
+    - net: o2ib
+      gateway: 10.44.240.166@o2ib2
+      hop: 1
+      priority: 0
+      state: up
+    - net: o2ib
+      gateway: 10.44.240.165@o2ib2
+      hop: 1
+      priority: 0
+      state: down
+    - net: o2ib
+      gateway: 10.44.240.168@o2ib2
+      hop: 1
+      priority: 0
+      state: up
+    - net: o2ib1
+      gateway: 10.44.240.163@o2ib2
+      hop: 1
+      priority: 0
+      state: down
+- net: o2ib1
+      gateway: 10.44.240.162@o2ib2
+      hop: 1
+      priority: 0
+      state: up
+    - net: o2ib1
+      gateway: 10.44.240.166@o2ib2
+      hop: 1
+      priority: 0
+      state: up
+    - net: o2ib1
+      gateway: 10.44.240.165@o2ib2
+      hop: 1
+      priority: 0
+      state: down
+    - net: o2ib1
+      gateway: 10.44.240.167@o2ib2
+      hop: 1
+      priority: 0
+      state: down
+    - net: o2ib1
+      gateway: 10.44.240.168@o2ib2
+      hop: 1
+      priority: 0
+      state: up
+    - net: o2ib1
+      gateway: 10.44.240.161@o2ib2
+      hop: 1
+      priority: 0
+      state: down
+    - net: o2ib1
+      gateway: 10.44.240.164@o2ib2
+      hop: 1
+      priority: 0
+      state: up
+    - net: tcp4
+      gateway: 10.44.240.162@o2ib2
+      hop: 1
+      priority: 0
+      state: down
+    - net: tcp4
+      gateway: 10.44.240.166@o2ib2
+      hop: 1
+      priority: 0
+      state: down
+    - net: tcp4
+      gateway: 10.44.240.167@o2ib2
+      hop: 1
+      priority: 0
+      state: down
+    - net: tcp4
+      gateway: 10.44.240.163@o2ib2
+      hop: 1
+      priority: 0
+      state: down
+    - net: tcp4
+      gateway: 10.44.240.164@o2ib2
+      hop: 1
+      priority: 0
+      state: down
+    - net: tcp4
+      gateway: 10.44.240.165@o2ib2
+      hop: 1
+      priority: 0
+      state: down
+    - net: tcp4
+      gateway: 10.44.240.161@o2ib2
+      hop: 1
+      priority: 0
+      state: down
+    - net: tcp4
+      gateway: 10.44.240.168@o2ib2
+      hop: 1
+      priority: 0
+      state: down
+
+client o2ib2 routes
+
+[root@cpu-p-350 ~]# lnetctl route show -v
+route:
+    - net: o2ib
+      gateway: 10.44.240.165@o2ib2
+      hop: -1
+      priority: 0
+      state: down
+    - net: o2ib
+      gateway: 10.44.240.166@o2ib2
+      hop: -1
+      priority: 0
+      state: up
+    - net: o2ib
+      gateway: 10.44.240.167@o2ib2
+      hop: -1
+      priority: 0
+      state: down
+    - net: o2ib
+      gateway: 10.44.240.168@o2ib2
+      hop: -1
+      priority: 0
+      state: up
+    - net: o2ib1
+      gateway: 10.44.240.168@o2ib2
+      hop: -1
+      priority: 0
+      state: up
+    - net: o2ib1
+      gateway: 10.44.240.165@o2ib2
+      hop: -1
+      priority: 0
+      state: down
+    - net: o2ib1
+      gateway: 10.44.240.164@o2ib2
+      hop: -1
+      priority: 0
+      state: up
+    - net: o2ib1
+      gateway: 10.44.240.163@o2ib2
+      hop: -1
+      priority: 0
+      state: down
+    - net: o2ib1
+      gateway: 10.44.240.162@o2ib2
+      hop: -1
+      priority: 0
+      state: up
+    - net: o2ib1
+      gateway: 10.44.240.167@o2ib2
+      hop: -1
+      priority: 0
+      state: down
+    - net: o2ib1
+      gateway: 10.44.240.166@o2ib2
+      hop: -1
+      priority: 0
+      state: up
+    - net: o2ib1
+      gateway: 10.44.240.161@o2ib2
+      hop: -1
+      priority: 0
+      state: down
+
+client o2ib1 routes
+
+[root@cpu-e-451 ~]# lnetctl route show -v
+route:
+    - net: o2ib
+      gateway: 10.47.240.166@o2ib1
+      hop: 1
+      priority: 0
+      state: up
+    - net: o2ib
+      gateway: 10.47.240.167@o2ib1
+      hop: 1
+      priority: 0
+      state: down
+    - net: o2ib
+      gateway: 10.47.240.168@o2ib1
+      hop: 1
+      priority: 0
+      state: up
+    - net: o2ib
+      gateway: 10.47.240.165@o2ib1
+      hop: 1
+      priority: 0
+      state: down
+    - net: o2ib2
+      gateway: 10.47.240.168@o2ib1
+      hop: 1
+      priority: 0
+      state: up
+    - net: o2ib2
+      gateway: 10.47.240.167@o2ib1
+      hop: 1
+      priority: 0
+      state: down
+    - net: o2ib2
+      gateway: 10.47.240.161@o2ib1
+      hop: 1
+      priority: 0
+      state: down
+    - net: o2ib2
+      gateway: 10.47.240.162@o2ib1
+      hop: 1
+      priority: 0
+      state: up
+    - net: o2ib2
+      gateway: 10.47.240.163@o2ib1
+      hop: 1
+      priority: 0
+      state: down
+    - net: o2ib2
+      gateway: 10.47.240.166@o2ib1
+      hop: 1
+      priority: 0
+      state: up
+    - net: o2ib2
+      gateway: 10.47.240.165@o2ib1
+      hop: 1
+      priority: 0
+      state: down
+    - net: o2ib2
+      gateway: 10.47.240.164@o2ib1
+      hop: 1
+      priority: 0
+      state: up
+
+client o2ib0 routes
+
+[root@cpu-f-1 ~]# lnetctl route show -v
+route:
+    - net: o2ib1
+      gateway: 10.144.240.165@o2ib
+      hop: 1
+      priority: 0
+      state: down
+    - net: o2ib1
+      gateway: 10.144.240.167@o2ib
+      hop: 1
+      priority: 0
+      state: down
+    - net: o2ib1
+      gateway: 10.144.240.168@o2ib
+      hop: 1
+      priority: 0
+      state: up
+    - net: o2ib1
+      gateway: 10.144.240.166@o2ib
+      hop: 1
+      priority: 0
+      state: up
+    - net: o2ib2
+      gateway: 10.144.240.166@o2ib
+      hop: 1
+      priority: 0
+      state: up
+    - net: o2ib2
+      gateway: 10.144.240.168@o2ib
+      hop: 1
+      priority: 0
+      state: up
+    - net: o2ib2
+      gateway: 10.144.240.165@o2ib
+      hop: 1
+      priority: 0
+      state: down
+    - net: o2ib2
+      gateway: 10.144.240.167@o2ib
+      hop: 1
+      priority: 0
+      state: down
+
+client tcp2 routes
+
+[root@rds-gate1 ~]# lnetctl route show -v 4
+route:
+    - net: o2ib
+      gateway: 10.43.240.167@tcp2
+      hop: 1
+      priority: 0
+      state: down
+    - net: o2ib
+      gateway: 10.43.240.166@tcp2
+      hop: 1
+      priority: 0
+      state: up
+    - net: o2ib
+      gateway: 10.43.240.168@tcp2
+      hop: 1
+      priority: 0
+      state: up
+    - net: o2ib
+      gateway: 10.43.240.165@tcp2
+      hop: 1
+      priority: 0
+      state: down
+    - net: o2ib1
+      gateway: 10.43.240.163@tcp2
+      hop: 1
+      priority: 0
+      state: down
+    - net: o2ib1
+      gateway: 10.43.240.166@tcp2
+      hop: 1
+      priority: 0
+      state: up
+    - net: o2ib1
+      gateway: 10.43.240.167@tcp2
+      hop: 1
+      priority: 0
+      state: down
+    - net: o2ib1
+      gateway: 10.43.240.162@tcp2
+      hop: 1
+      priority: 0
+      state: up
+    - net: o2ib1
+      gateway: 10.43.240.168@tcp2
+      hop: 1
+      priority: 0
+      state: up
+    - net: o2ib1
+      gateway: 10.43.240.165@tcp2
+      hop: 1
+      priority: 0
+      state: down
+    - net: o2ib1
+      gateway: 10.43.240.161@tcp2
+      hop: 1
+      priority: 0
+      state: down
+    - net: o2ib1
+      gateway: 10.43.240.164@tcp2
+      hop: 1
+      priority: 0
+      state: up
+    - net: o2ib2
+      gateway: 10.43.240.162@tcp2
+      hop: 1
+      priority: 0
+      state: up
+    - net: o2ib2
+      gateway: 10.43.240.165@tcp2
+      hop: 1
+      priority: 0
+      state: down
+    - net: o2ib2
+      gateway: 10.43.240.164@tcp2
+      hop: 1
+      priority: 0
+      state: up
+    - net: o2ib2
+      gateway: 10.43.240.168@tcp2
+      hop: 1
+      priority: 0
+      state: up
+    - net: o2ib2
+      gateway: 10.43.240.167@tcp2
+      hop: 1
+      priority: 0
+      state: down
+    - net: o2ib2
+      gateway: 10.43.240.163@tcp2
+      hop: 1
+      priority: 0
+      state: down
+    - net: o2ib2
+      gateway: 10.43.240.166@tcp2
+      hop: 1
+      priority: 0
+      state: up
+    - net: o2ib2
+      gateway: 10.43.240.161@tcp2
+      hop: 1
+      priority: 0
+      state: down
+
+--- Comment (mrb, Tue, 7 Sep 2021 18:45:00 +0000) ---
+Thanks - I've just sent an email to you with the invitation link in it.
+
+--- Comment (ssmirnov, Tue, 7 Sep 2021 18:10:17 +0000) ---
+Matt,
+
+Yes, transaction_timeout setting needs to be the same across nodes in the system.
+
+We can have the call at 20:00 BST (I believe it is noon PST?) Please post the meeting link here or send it to ssmirnov@whamcloud.com
+
+Thanks,
+
+Serguei.
+
+--- Comment (mrb, Tue, 7 Sep 2021 17:50:08 +0000) ---
+Thanks Serguei - the retry_count issue came up in another ticket recently actually - I went into this issue with the servers, only, using transaction_timeout: 150 and retry_count: 3, but I reset those back to the defaults early on in a fruitless attempt to standardise settings everywhere to try to get a handle on things.
+
+Is the transaction_timout specific only to LNET messages sent by each peer - so only changing one end of a transaction isn't helpful, as it will only impact messages sent by one end of the interaction?
+
+I'll work to standardising with the larger transaction timeout everywhere as recommended.
+
+Regarding the zoom call - yes this would be very helpful, I can do anytime between 20:00-00:00 BST if you have time then?
+
+I will gather the routing configuration shortly and post in a separate comment.
+
+Kind regards,
+
+Matt
+
+--- Comment (ssmirnov, Tue, 7 Sep 2021 16:55:24 +0000) ---
+Hi,
+
+I can't comment on the MDS issue with logging, maybe Peter can get someone to look at it.
+
+The combination of
+
+retry_count: 2
+transaction_timeout: 50
+
+may result in transaction timeout being too short: 50/(2+1) per attempt. This can cause the nodes to give up on the transaction and retry too early, thus generating extra traffic in an already busy system.
+
+I'd recommend increasing transaction_timeout to 150 on all nodes. You can change it without rebooting the nodes via lnetctl, but to make the setting persistent, it would have to be added via the conf files.
+
+In order to check the routing configuration, could you please provide the output of 
+
+lnetctl route show -v 4 
+
+from a typical client from each of the networks (opa, mlnx, tcp) and the server?
+
+We can setup a zoom call today at any time that works for you, it will be useful for collecting debug logs and verifying configuration at this point. 
+
+Thanks,
+
+Serguei.
+
+--- Comment (pjones, Tue, 7 Sep 2021 14:24:46 +0000) ---
+Serguei
+
+Can you please advise?
+
+Thanks
+
+Peter
+
+--- Comment (mrb, Mon, 6 Sep 2021 19:50:36 +0000) ---
+Attached are kernel logs from one of the MDS servers and one of the LNET routers from today. Both have shown multiple signs of the symptoms mentioned earlier today. One particular timeperiod of such problems were between 10:00 and 12:00.
+
+ mds.log  router.log 
+
+Not sure if related, but I also noticed the following crash on one the same MDS I've taken the logs above from, multiple times a day at the moment:
+
+Sep 06 17:53:22 csd3-mds2 kernel: LustreError: dumping log to /tmp/lustre-log.1630947202.26758
+Sep 06 17:53:22 csd3-mds2 kernel:  [] 0xffffffffffffffff
+Sep 06 17:53:22 csd3-mds2 kernel:  [] ret_from_fork_nospec_end+0x0/0x39
+Sep 06 17:53:22 csd3-mds2 kernel:  [] kthread+0xd1/0xe0
+Sep 06 17:53:22 csd3-mds2 kernel:  [] ptlrpc_main+0xb34/0x1470 [ptlrpc]
+Sep 06 17:53:22 csd3-mds2 kernel:  [] ptlrpc_server_handle_request+0x24b/0xab0 [ptlrpc]
+Sep 06 17:53:22 csd3-mds2 kernel:  [] tgt_request_handle+0xada/0x1570 [ptlrpc]
+Sep 06 17:53:22 csd3-mds2 kernel:  [] mdt_set_info+0x484/0x490 [mdt]
+Sep 06 17:53:22 csd3-mds2 kernel:  [] mdt_iocontrol+0x5ec/0xb00 [mdt]
+Sep 06 17:53:22 csd3-mds2 kernel:  [] mdd_iocontrol+0x163/0x540 [mdd]
+Sep 06 17:53:22 csd3-mds2 kernel:  [] mdd_changelog_clear+0x653/0x7d0 [mdd]
+Sep 06 17:53:22 csd3-mds2 kernel:  [] mdd_changelog_llog_cancel+0xd0/0x270 [mdd]
+Sep 06 17:53:22 csd3-mds2 kernel:  [] llog_changelog_cancel.isra.16+0x54/0x1c0 [mdd]
+Sep 06 17:53:22 csd3-mds2 kernel:  [] llog_cat_process+0x2e/0x30 [obdclass]
+Sep 06 17:53:22 csd3-mds2 kernel:  [] llog_cat_process_or_fork+0x17e/0x360 [obdclass]
+Sep 06 17:53:22 csd3-mds2 kernel:  [] llog_process_or_fork+0xbc/0x450 [obdclass]
+Sep 06 17:53:22 csd3-mds2 kernel:  [] llog_process_thread+0x85f/0x1a10 [obdclass]
+Sep 06 17:53:22 csd3-mds2 kernel:  [] llog_cat_process_cb+0x239/0x250 [obdclass]
+Sep 06 17:53:22 csd3-mds2 kernel:  [] llog_process_or_fork+0xbc/0x450 [obdclass]
+Sep 06 17:53:22 csd3-mds2 kernel:  [] llog_process_thread+0x85f/0x1a10 [obdclass]
+Sep 06 17:53:22 csd3-mds2 kernel:  [] llog_changelog_cancel_cb+0x104/0x2a0 [mdd]
+Sep 06 17:53:22 csd3-mds2 kernel:  [] llog_cat_cancel_records+0x128/0x3d0 [obdclass]
+Sep 06 17:53:22 csd3-mds2 kernel:  [] llog_cat_id2handle+0x7f/0x620 [obdclass]
+Sep 06 17:53:22 csd3-mds2 kernel:  [] call_rwsem_down_write_failed+0x17/0x30
+Sep 06 17:53:22 csd3-mds2 kernel: Call Trace:
+Sep 06 17:53:22 csd3-mds2 kernel: Pid: 26758, comm: mdt00_020 3.10.0-1160.25.1.el7_lustre.x86_64 #1 SMP Wed Jul 7 09:59:46 UTC 2021
+Sep 06 17:53:22 csd3-mds2 kernel: LNet: Service thread pid 26758 was inactive for 341.20s. The thread might be hung, or it might only be slow and will resume later. Dumping the stack trace for debugging purposes:
+Sep 06 17:51:08 csd3-mds2 kernel: Lustre: Skipped 58 previous similar messages
+Sep 06 17:51:08 csd3-mds2 kernel: Lustre: rds-d5-MDT0000: Client a2647704-cc85-a7e0-0bf2-95d98f0c7b96 (at 10.43.240.198@tcp2) reconnecting
+Sep 06 17:48:32 csd3-mds2 kernel: Lustre: 5451:0:(client.c:2169:ptlrpc_expire_one_request()) Skipped 67 previous similar messages
+Sep 06 17:48:32 csd3-mds2 kernel: Lustre: 5451:0:(client.c:2169:ptlrpc_expire_one_request()) @@@ Request sent has timed out for sent delay: [sent 1630946905/real 0]  req@ffff9f705fb3d100 x1709807842907456/t0(0) o
+Sep 06 17:47:40 csd3-mds2 kernel: Lustre: 26758:0:(llog_cat.c:899:llog_cat_process_or_fork()) rds-d5-MDD0000: catlog [0x7:0xa:0x0] crosses index zero
+Sep 06 17:47:40 csd3-mds2 kernel: LustreError: 26843:0:(mdd_device.c:374:llog_changelog_cancel()) rds-d5-MDD0000: cancel idx 8989 of catalog [0x7:0xa:0x0]: rc = -2
+Sep 06 17:47:40 csd3-mds2 kernel: LustreError: 26843:0:(llog_cat.c:767:llog_cat_cancel_records()) rds-d5-MDD0000: fail to cancel 1 of 1 llog-records: rc = -2
+
+Am I right in relating this to changelog records filling up/overflowing on that MDT? I will try clearing them and see if the error goes away.
+
+The lustre log dump from this event is here:
+
+ lustre-log.1630947202.26758.gz
+
+--- Comment (mrb, Mon, 6 Sep 2021 12:09:34 +0000) ---
+Just to add to this - although the filesystem isn't completely 'down' it is interrupting filesystem access to a large portion of our clients so I marked this as priority '2' instead of '1'. However it is now a serious problem for us as the issue keeps reoccurring, so if it's possible at all to get time with anyone to look at this together, it would be greatly appreciated? I can offer a shared remote session via SSH if that's useful at all, or available for zoom/teams call too.
+
+--- Comment (mrb, Mon, 6 Sep 2021 11:12:07 +0000) ---
+Configuations
+
+ ==========
+
+servers
+
+[root@csd3-mds1 ~]# lfs --version
+lfs 2.12.7_1_g170c1c7
+[root@csd3-mds1 ~]# ofed_info -n
+5.4-1.0.3.0.202107071045
+[root@csd3-mds1 ~]# uname -r
+3.10.0-1160.25.1.el7_lustre.x86_64
+
+[root@csd3-mds1 ~]# lnetctl net show -v 4 --net o2ib2
+net:
+    - net type: o2ib2
+      local NI(s):
+        - nid: 10.44.240.68@o2ib2
+          status: up
+          interfaces:
+              0: ib0
+          statistics:
+              send_count: 1817939732
+              recv_count: 2824770669
+              drop_count: 563652
+          sent_stats:
+              put: 1817362033
+              get: 577699
+              reply: 0
+              ack: 0
+              hello: 0
+          received_stats:
+              put: 1727217034
+              get: 35523
+              reply: 535088
+              ack: 1096983024
+              hello: 0
+          dropped_stats:
+              put: 25621
+              get: 0
+              reply: 1
+              ack: 538030
+              hello: 0
+          health stats:
+              health value: 1000
+              interrupts: 0
+              dropped: 77648
+              aborted: 0
+              no route: 0
+              timeouts: 341145
+              error: 0
+          tunables:
+              peer_timeout: 0
+              peer_credits: 32
+              peer_buffer_credits: 0
+              credits: 2048
+              peercredits_hiw: 16
+              map_on_demand: 256
+              concurrent_sends: 64
+              fmr_pool_size: 512
+              fmr_flush_trigger: 384
+              fmr_cache: 1
+              ntx: 2048
+              conns_per_peer: 1
+          lnd tunables:
+          dev cpt: 0
+          tcp bonding: 0
+          CPT: "[0,1]"
+
+[root@csd3-mds1 ~]# lnetctl global show
+global:
+    numa_range: 0
+    max_intf: 200
+    discovery: 1
+    drop_asym_route: 0
+    retry_count: 2
+    transaction_timeout: 50
+    health_sensitivity: 100
+    recovery_interval: 1
+
+[root@csd3-mds1 ~]# grep . /sys/module/lnet/parameters/*
+/sys/module/lnet/parameters/accept:secure
+/sys/module/lnet/parameters/accept_backlog:127
+/sys/module/lnet/parameters/accept_port:988
+/sys/module/lnet/parameters/accept_timeout:5
+/sys/module/lnet/parameters/auto_down:1
+/sys/module/lnet/parameters/avoid_asym_router_failure:1
+/sys/module/lnet/parameters/check_routers_before_use:1
+/sys/module/lnet/parameters/config_on_load:0
+/sys/module/lnet/parameters/dead_router_check_interval:60
+/sys/module/lnet/parameters/large_router_buffers:0
+/sys/module/lnet/parameters/live_router_check_interval:60
+/sys/module/lnet/parameters/lnet_drop_asym_route:0
+/sys/module/lnet/parameters/lnet_health_sensitivity:100
+/sys/module/lnet/parameters/lnet_interfaces_max:200
+/sys/module/lnet/parameters/lnet_numa_range:0
+/sys/module/lnet/parameters/lnet_peer_discovery_disabled:0
+/sys/module/lnet/parameters/lnet_recovery_interval:1
+/sys/module/lnet/parameters/lnet_retry_count:2
+/sys/module/lnet/parameters/lnet_transaction_timeout:50
+/sys/module/lnet/parameters/local_nid_dist_zero:1
+/sys/module/lnet/parameters/networks:o2ib2(ib0)
+/sys/module/lnet/parameters/peer_buffer_credits:0
+/sys/module/lnet/parameters/portal_rotor:3
+/sys/module/lnet/parameters/rnet_htable_size:128
+/sys/module/lnet/parameters/router_ping_timeout:60
+/sys/module/lnet/parameters/small_router_buffers:0
+/sys/module/lnet/parameters/tiny_router_buffers:0
+/sys/module/lnet/parameters/use_tcp_bonding:0
+
+[root@csd3-mds1 ~]# grep . /sys/module/ko2iblnd/parameters/*
+/sys/module/ko2iblnd/parameters/cksum:0
+/sys/module/ko2iblnd/parameters/concurrent_sends:0
+/sys/module/ko2iblnd/parameters/conns_per_peer:1
+/sys/module/ko2iblnd/parameters/credits:256
+/sys/module/ko2iblnd/parameters/dev_failover:0
+/sys/module/ko2iblnd/parameters/fmr_cache:1
+/sys/module/ko2iblnd/parameters/fmr_flush_trigger:384
+/sys/module/ko2iblnd/parameters/fmr_pool_size:512
+/sys/module/ko2iblnd/parameters/ib_mtu:0
+/sys/module/ko2iblnd/parameters/ipif_name:ib0
+/sys/module/ko2iblnd/parameters/keepalive:100
+/sys/module/ko2iblnd/parameters/map_on_demand:0
+/sys/module/ko2iblnd/parameters/nscheds:0
+/sys/module/ko2iblnd/parameters/ntx:512
+/sys/module/ko2iblnd/parameters/peer_buffer_credits:0
+/sys/module/ko2iblnd/parameters/peer_credits:8
+/sys/module/ko2iblnd/parameters/peer_credits_hiw:0
+/sys/module/ko2iblnd/parameters/peer_timeout:180
+/sys/module/ko2iblnd/parameters/require_privileged_port:0
+/sys/module/ko2iblnd/parameters/retry_count:5
+/sys/module/ko2iblnd/parameters/rnr_retry_count:6
+/sys/module/ko2iblnd/parameters/service:987
+/sys/module/ko2iblnd/parameters/timeout:50
+/sys/module/ko2iblnd/parameters/use_fastreg_gaps:0
+/sys/module/ko2iblnd/parameters/use_privileged_port:1
+/sys/module/ko2iblnd/parameters/wrq_sge:2
+
+[root@csd3-mds1 ~]# grep . /sys/module/ptlrpc/parameters/*                                                                                                                                                                                                                                 
+/sys/module/ptlrpc/parameters/at_early_margin:5
+/sys/module/ptlrpc/parameters/at_extra:30
+/sys/module/ptlrpc/parameters/at_history:600
+/sys/module/ptlrpc/parameters/at_max:600
+/sys/module/ptlrpc/parameters/at_min:0
+/sys/module/ptlrpc/parameters/enc_pool_max_memory_mb:0
+/sys/module/ptlrpc/parameters/ldlm_cpts:(null)
+/sys/module/ptlrpc/parameters/ldlm_cpu_bind:1
+/sys/module/ptlrpc/parameters/ldlm_enqueue_min:100
+/sys/module/ptlrpc/parameters/ldlm_num_threads:0
+/sys/module/ptlrpc/parameters/max_ptlrpcds:0
+/sys/module/ptlrpc/parameters/ptlrpcd_bind_policy:0
+/sys/module/ptlrpc/parameters/ptlrpcd_cpts:(null)
+/sys/module/ptlrpc/parameters/ptlrpcd_partner_group_size:2
+/sys/module/ptlrpc/parameters/ptlrpcd_per_cpt_max:0
+/sys/module/ptlrpc/parameters/send_sepol:0
+/sys/module/ptlrpc/parameters/suppress_pings:0
+/sys/module/ptlrpc/parameters/tbf_depth:3
+/sys/module/ptlrpc/parameters/tbf_jobid_cache_size:8192
+/sys/module/ptlrpc/parameters/tbf_rate:10000
+/sys/module/ptlrpc/parameters/test_req_buffer_pressure:0
+
+[root@csd3-mds1 ~]# lnetctl stats show
+statistics:
+    msgs_alloc: 381551
+    msgs_max: 414141
+    rst_alloc: 171873
+    errors: 0
+    send_count: 1824600233
+    resend_count: 369232
+    response_timeout_count: 22587
+    local_interrupt_count: 0
+    local_dropped_count: 77675
+    local_aborted_count: 0
+    local_no_route_count: 0
+    local_timeout_count: 341670
+    local_error_count: 0
+    remote_dropped_count: 276
+    remote_error_count: 0
+    remote_timeout_count: 11555
+    network_timeout_count: 13
+    recv_count: 2831438698
+    route_count: 0
+    drop_count: 563679
+    send_length: 43460901382272
+    recv_length: 51195761960696
+    route_length: 0
+    drop_length: 5774792
+
+routers
+
+[root@lnet6 ~]# lfs --version
+lfs 2.12.7_1_g170c1c7
+[root@lnet6 ~]# uname -r
+3.10.0-1160.31.1.el7.x86_64
+# NO MOFED, INBOX RDMA drivers
+
+[root@lnet6 ~]# lnetctl net show -v 4
+net:
+    - net type: o2ib
+      local NI(s):
+        - nid: 10.144.240.166@o2ib
+          status: up
+          interfaces:
+              0: ib2
+          statistics:
+              send_count: 1032111
+              recv_count: 1044239
+              drop_count: 0
+          sent_stats:
+              put: 987524
+              get: 1980
+              reply: 42184
+              ack: 423
+              hello: 0
+          received_stats:
+              put: 997827
+              get: 43510
+              reply: 171
+              ack: 2731
+              hello: 0
+          dropped_stats:
+              put: 0
+              get: 0
+              reply: 0
+              ack: 0
+              hello: 0
+          health stats:
+              health value: 1000
+              interrupts: 0
+              dropped: 0
+              aborted: 0
+              no route: 0
+              timeouts: 0
+              error: 80
+          tunables:
+              peer_timeout: 0
+              peer_credits: 16
+              peer_buffer_credits: 0
+              credits: 2048
+              peercredits_hiw: 15
+              map_on_demand: 256
+              concurrent_sends: 16
+              fmr_pool_size: 2048
+              fmr_flush_trigger: 512
+              fmr_cache: 1
+              ntx: 2048
+              conns_per_peer: 1
+          lnd tunables:
+          dev cpt: 1
+          tcp bonding: 0
+          CPT: "[0,1]"
+    - net type: o2ib2
+      local NI(s):
+        - nid: 10.44.240.166@o2ib2
+          status: up
+          interfaces:
+              0: ib1
+          statistics:
+              send_count: 10118024
+              recv_count: 8773220
+              drop_count: 7
+          sent_stats:
+              put: 8450266
+              get: 434139
+              reply: 307622
+              ack: 925997
+              hello: 0
+          received_stats:
+              put: 8058216
+              get: 714643
+              reply: 140
+              ack: 221
+              hello: 0
+          dropped_stats:
+              put: 0
+              get: 0
+              reply: 7
+              ack: 0
+              hello: 0
+          health stats:
+              health value: 1000
+              interrupts: 0
+              dropped: 0
+              aborted: 0
+              no route: 0
+              timeouts: 0
+              error: 0
+          tunables:
+              peer_timeout: 0
+              peer_credits: 32
+              peer_buffer_credits: 0
+              credits: 2048
+              peercredits_hiw: 16
+              map_on_demand: 256
+              concurrent_sends: 32
+              fmr_pool_size: 2048
+              fmr_flush_trigger: 512
+              fmr_cache: 1
+              ntx: 2048
+              conns_per_peer: 1
+          lnd tunables:
+          dev cpt: 0
+          tcp bonding: 0
+          CPT: "[0,1]"
+    - net type: o2ib1
+      local NI(s):
+        - nid: 10.47.240.166@o2ib1
+          status: up
+          interfaces:
+              0: ib0
+          statistics:
+              send_count: 8019423
+              recv_count: 9337873
+              drop_count: 0
+          sent_stats:
+              put: 7091115
+              get: 928308
+              reply: 0
+              ack: 0
+              hello: 0
+          received_stats:
+              put: 7481616
+              get: 646913
+              reply: 308366
+              ack: 900978
+              hello: 0
+          dropped_stats:
+              put: 0
+              get: 0
+              reply: 0
+              ack: 0
+              hello: 0
+          health stats:
+              health value: 1000
+              interrupts: 0
+              dropped: 87
+              aborted: 0
+              no route: 0
+              timeouts: 9
+              error: 0
+          tunables:
+              peer_timeout: 0
+              peer_credits: 128
+              peer_buffer_credits: 0
+              credits: 1024
+              peercredits_hiw: 64
+              map_on_demand: 32
+              concurrent_sends: 128
+              fmr_pool_size: 2048
+              fmr_flush_trigger: 512
+              fmr_cache: 1
+              ntx: 2048
+              conns_per_peer: 1
+          lnd tunables:
+          dev cpt: 1
+          tcp bonding: 0
+          CPT: "[0,1]"
+    - net type: tcp2
+      local NI(s):
+        - nid: 10.43.240.166@tcp2
+          status: up
+          interfaces:
+              0: em1.43
+          statistics:
+              send_count: 444195
+              recv_count: 458403
+              drop_count: 13612
+          sent_stats:
+              put: 305081
+              get: 139114
+              reply: 0
+              ack: 0
+              hello: 0
+          received_stats:
+              put: 295109
+              get: 56751
+              reply: 82832
+              ack: 23711
+              hello: 0
+          dropped_stats:
+              put: 10444
+              get: 3155
+              reply: 13
+              ack: 0
+              hello: 0
+          health stats:
+              health value: 1000
+              interrupts: 0
+              dropped: 0
+              aborted: 0
+              no route: 0
+              timeouts: 404
+              error: 4
+          tunables:
+              peer_timeout: 180
+              peer_credits: 8
+              peer_buffer_credits: 0
+              credits: 256
+          dev cpt: -1
+          tcp bonding: 0
+          CPT: "[0,1]"
+
+[root@lnet6 ~]# grep . /sys/module/lnet/parameters/*                                                                                                                                                                                                                                       
+/sys/module/lnet/parameters/accept:secure
+/sys/module/lnet/parameters/accept_backlog:127
+/sys/module/lnet/parameters/accept_port:988
+/sys/module/lnet/parameters/accept_timeout:5
+/sys/module/lnet/parameters/auto_down:1
+/sys/module/lnet/parameters/avoid_asym_router_failure:1
+/sys/module/lnet/parameters/check_routers_before_use:0
+/sys/module/lnet/parameters/config_on_load:0
+/sys/module/lnet/parameters/dead_router_check_interval:60
+/sys/module/lnet/parameters/large_router_buffers:4096
+/sys/module/lnet/parameters/live_router_check_interval:60
+/sys/module/lnet/parameters/lnet_drop_asym_route:0
+/sys/module/lnet/parameters/lnet_health_sensitivity:100
+/sys/module/lnet/parameters/lnet_interfaces_max:200
+/sys/module/lnet/parameters/lnet_numa_range:0
+/sys/module/lnet/parameters/lnet_peer_discovery_disabled:0
+/sys/module/lnet/parameters/lnet_recovery_interval:1
+/sys/module/lnet/parameters/lnet_retry_count:2
+/sys/module/lnet/parameters/lnet_transaction_timeout:150
+/sys/module/lnet/parameters/local_nid_dist_zero:1
+/sys/module/lnet/parameters/networks:o2ib0(ib2), o2ib1(ib0), o2ib2(ib1), tcp2(em1.43), tcp4(em1.40)
+/sys/module/lnet/parameters/peer_buffer_credits:0
+/sys/module/lnet/parameters/portal_rotor:3
+/sys/module/lnet/parameters/rnet_htable_size:128
+/sys/module/lnet/parameters/router_ping_timeout:50
+/sys/module/lnet/parameters/small_router_buffers:65536
+/sys/module/lnet/parameters/tiny_router_buffers:8192
+/sys/module/lnet/parameters/use_tcp_bonding:0
+
+[root@lnet6 ~]# grep . /sys/module/ko2iblnd/parameters/*                                                                                                                                                                                                                                   
+/sys/module/ko2iblnd/parameters/cksum:0
+/sys/module/ko2iblnd/parameters/concurrent_sends:64
+/sys/module/ko2iblnd/parameters/conns_per_peer:4
+/sys/module/ko2iblnd/parameters/credits:1024
+/sys/module/ko2iblnd/parameters/dev_failover:0
+/sys/module/ko2iblnd/parameters/fmr_cache:1
+/sys/module/ko2iblnd/parameters/fmr_flush_trigger:512
+/sys/module/ko2iblnd/parameters/fmr_pool_size:2048
+/sys/module/ko2iblnd/parameters/ib_mtu:0
+/sys/module/ko2iblnd/parameters/ipif_name:ib0
+/sys/module/ko2iblnd/parameters/keepalive:100
+/sys/module/ko2iblnd/parameters/map_on_demand:256
+/sys/module/ko2iblnd/parameters/nscheds:0
+/sys/module/ko2iblnd/parameters/ntx:2048
+/sys/module/ko2iblnd/parameters/peer_buffer_credits:0
+/sys/module/ko2iblnd/parameters/peer_credits:32
+/sys/module/ko2iblnd/parameters/peer_credits_hiw:16
+/sys/module/ko2iblnd/parameters/peer_timeout:180
+/sys/module/ko2iblnd/parameters/require_privileged_port:0
+/sys/module/ko2iblnd/parameters/retry_count:5
+/sys/module/ko2iblnd/parameters/rnr_retry_count:6
+/sys/module/ko2iblnd/parameters/service:987
+/sys/module/ko2iblnd/parameters/timeout:50
+/sys/module/ko2iblnd/parameters/use_fastreg_gaps:0
+/sys/module/ko2iblnd/parameters/use_privileged_port:1
+/sys/module/ko2iblnd/parameters/wrq_sge:2
+
+[root@lnet6 ~]# grep . /sys/module/ptlrpc/parameters/*                                                                                                                                                                                                                                     
+grep: /sys/module/ptlrpc/parameters/*: No such file or directory
+
+IB clients, o2ib2
+
+[root@cpu-p-350 ~]# lfs --version
+lfs 2.12.7_1_g170c1c7
+[root@cpu-p-350 ~]# ofed_info -n
+5.4-1.0.3.0
+[root@cpu-p-350 ~]# uname -r
+3.10.0-1160.36.2.el7.x86_64
+
+[root@cpu-p-350 ~]# lnetctl net show -v 4 --net o2ib2
+net:
+    - net type: o2ib2
+      local NI(s):
+        - nid: 10.44.162.142@o2ib2
+          status: up
+          interfaces:
+              0: ib0
+          statistics:
+              send_count: 535157260
+              recv_count: 468429256
+              drop_count: 590
+          sent_stats:
+              put: 534531414
+              get: 625846
+              reply: 0
+              ack: 0
+              hello: 0
+          received_stats:
+              put: 466451341
+              get: 155260
+              reply: 1822579
+              ack: 76
+              hello: 0
+          dropped_stats:
+              put: 588
+              get: 0
+              reply: 2
+              ack: 0
+              hello: 0
+          health stats:
+              health value: 71
+              interrupts: 0
+              dropped: 43355
+              aborted: 0
+              no route: 0
+              timeouts: 1196
+              error: 0
+          tunables:
+              peer_timeout: 0
+              peer_credits: 32
+              peer_buffer_credits: 0
+              credits: 2048
+              peercredits_hiw: 16
+              map_on_demand: 256
+              concurrent_sends: 32
+              fmr_pool_size: 512
+              fmr_flush_trigger: 384
+              fmr_cache: 1
+              ntx: 2048
+              conns_per_peer: 1
+          lnd tunables:
+          dev cpt: 0
+          tcp bonding: 0
+          CPT: "[0,1]"
+
+[root@cpu-p-350 ~]# grep . /sys/module/lnet/parameters/*
+/sys/module/lnet/parameters/accept:secure
+/sys/module/lnet/parameters/accept_backlog:127
+/sys/module/lnet/parameters/accept_port:988
+/sys/module/lnet/parameters/accept_timeout:5
+/sys/module/lnet/parameters/auto_down:1
+/sys/module/lnet/parameters/avoid_asym_router_failure:1
+/sys/module/lnet/parameters/check_routers_before_use:1
+/sys/module/lnet/parameters/config_on_load:0
+/sys/module/lnet/parameters/dead_router_check_interval:60
+/sys/module/lnet/parameters/large_router_buffers:0
+/sys/module/lnet/parameters/live_router_check_interval:60
+/sys/module/lnet/parameters/lnet_drop_asym_route:0
+/sys/module/lnet/parameters/lnet_health_sensitivity:100
+/sys/module/lnet/parameters/lnet_interfaces_max:200
+/sys/module/lnet/parameters/lnet_numa_range:0
+/sys/module/lnet/parameters/lnet_peer_discovery_disabled:0
+/sys/module/lnet/parameters/lnet_recovery_interval:1
+/sys/module/lnet/parameters/lnet_retry_count:2
+/sys/module/lnet/parameters/lnet_transaction_timeout:50
+/sys/module/lnet/parameters/local_nid_dist_zero:1
+/sys/module/lnet/parameters/networks:tcp2(eth0)
+/sys/module/lnet/parameters/peer_buffer_credits:0
+/sys/module/lnet/parameters/portal_rotor:3
+/sys/module/lnet/parameters/rnet_htable_size:128
+/sys/module/lnet/parameters/router_ping_timeout:60
+/sys/module/lnet/parameters/routes:o2ib0 1 10.43.240.[165-168]@tcp2; o2ib1 1 10.43.240.[161-168]@tcp2
+/sys/module/lnet/parameters/small_router_buffers:0
+/sys/module/lnet/parameters/tiny_router_buffers:0
+/sys/module/lnet/parameters/use_tcp_bonding:0
+
+[root@cpu-p-350 ~]# grep . /sys/module/ko2iblnd/parameters/*                                                                                                                                                                                                                               
+/sys/module/ko2iblnd/parameters/cksum:0
+/sys/module/ko2iblnd/parameters/concurrent_sends:0
+/sys/module/ko2iblnd/parameters/conns_per_peer:1
+/sys/module/ko2iblnd/parameters/credits:256
+/sys/module/ko2iblnd/parameters/dev_failover:0
+/sys/module/ko2iblnd/parameters/fmr_cache:1
+/sys/module/ko2iblnd/parameters/fmr_flush_trigger:384
+/sys/module/ko2iblnd/parameters/fmr_pool_size:512
+/sys/module/ko2iblnd/parameters/ib_mtu:0
+/sys/module/ko2iblnd/parameters/ipif_name:ib0
+/sys/module/ko2iblnd/parameters/keepalive:100
+/sys/module/ko2iblnd/parameters/map_on_demand:0
+/sys/module/ko2iblnd/parameters/nscheds:0
+/sys/module/ko2iblnd/parameters/ntx:512
+/sys/module/ko2iblnd/parameters/peer_buffer_credits:0
+/sys/module/ko2iblnd/parameters/peer_credits:8
+/sys/module/ko2iblnd/parameters/peer_credits_hiw:0
+/sys/module/ko2iblnd/parameters/peer_timeout:180
+/sys/module/ko2iblnd/parameters/require_privileged_port:0
+/sys/module/ko2iblnd/parameters/retry_count:5
+/sys/module/ko2iblnd/parameters/rnr_retry_count:6
+/sys/module/ko2iblnd/parameters/service:987
+/sys/module/ko2iblnd/parameters/timeout:50
+/sys/module/ko2iblnd/parameters/use_fastreg_gaps:0
+/sys/module/ko2iblnd/parameters/use_privileged_port:1
+/sys/module/ko2iblnd/parameters/wrq_sge:2
+
+[root@cpu-p-350 ~]# grep . /sys/module/ptlrpc/parameters/*                                                                                                                                                                                                                                 
+/sys/module/ptlrpc/parameters/at_early_margin:5
+/sys/module/ptlrpc/parameters/at_extra:30
+/sys/module/ptlrpc/parameters/at_history:600
+/sys/module/ptlrpc/parameters/at_max:600
+/sys/module/ptlrpc/parameters/at_min:0
+/sys/module/ptlrpc/parameters/enc_pool_max_memory_mb:0
+/sys/module/ptlrpc/parameters/ldlm_cpts:(null)
+/sys/module/ptlrpc/parameters/ldlm_cpu_bind:1
+/sys/module/ptlrpc/parameters/ldlm_enqueue_min:100
+/sys/module/ptlrpc/parameters/ldlm_num_threads:0
+/sys/module/ptlrpc/parameters/max_ptlrpcds:0
+/sys/module/ptlrpc/parameters/ptlrpcd_bind_policy:0
+/sys/module/ptlrpc/parameters/ptlrpcd_cpts:(null)
+/sys/module/ptlrpc/parameters/ptlrpcd_partner_group_size:2
+/sys/module/ptlrpc/parameters/ptlrpcd_per_cpt_max:0
+/sys/module/ptlrpc/parameters/send_sepol:0
+/sys/module/ptlrpc/parameters/suppress_pings:0
+/sys/module/ptlrpc/parameters/test_req_buffer_pressure:0
+
+OPA clients, o2ib1
+
+[root@cpu-e-451 ~]# lfs --version
+lfs 2.12.7_1_g170c1c7
+[root@cpu-e-451 ~]# modinfo hfi1 | grep -E ^version
+version:        10.11.0.1
+[root@cpu-e-451 ~]# uname -r
+3.10.0-1160.36.2.el7.x86_64
+
+[root@cpu-e-451 ~]# lnetctl net show -v 4 --net o2ib1
+net:
+    - net type: o2ib1
+      local NI(s):
+        - nid: 10.47.1.195@o2ib1
+          status: up
+          interfaces:
+              0: ib0
+          statistics:
+              send_count: 156493025
+              recv_count: 156277314
+              drop_count: 27027
+          sent_stats:
+              put: 153575115
+              get: 2917910
+              reply: 0
+              ack: 0
+              hello: 0
+          received_stats:
+              put: 153359391
+              get: 2141776
+              reply: 776087
+              ack: 60
+              hello: 0
+          dropped_stats:
+              put: 27024
+              get: 3
+              reply: 0
+              ack: 0
+              hello: 0
+          health stats:
+              health value: 91
+              interrupts: 0
+              dropped: 51154
+              aborted: 0
+              no route: 0
+              timeouts: 28703
+              error: 91
+          tunables:
+              peer_timeout: 180
+              peer_credits: 128
+              peer_buffer_credits: 0
+              credits: 1024
+              peercredits_hiw: 64
+              map_on_demand: 32
+              concurrent_sends: 256
+              fmr_pool_size: 2048
+              fmr_flush_trigger: 512
+              fmr_cache: 1
+              ntx: 2048
+              conns_per_peer: 1
+          lnd tunables:
+          dev cpt: 0
+          tcp bonding: 0
+          CPT: "[0,1]"
+
+[root@cpu-e-451 ~]# grep . /sys/module/lnet/parameters/*
+/sys/module/lnet/parameters/accept:secure
+/sys/module/lnet/parameters/accept_backlog:127
+/sys/module/lnet/parameters/accept_port:988
+/sys/module/lnet/parameters/accept_timeout:5
+/sys/module/lnet/parameters/auto_down:1
+/sys/module/lnet/parameters/avoid_asym_router_failure:1
+/sys/module/lnet/parameters/check_routers_before_use:1
+/sys/module/lnet/parameters/config_on_load:0
+/sys/module/lnet/parameters/dead_router_check_interval:60
+/sys/module/lnet/parameters/large_router_buffers:0
+/sys/module/lnet/parameters/live_router_check_interval:60
+/sys/module/lnet/parameters/lnet_drop_asym_route:0
+/sys/module/lnet/parameters/lnet_health_sensitivity:100
+/sys/module/lnet/parameters/lnet_interfaces_max:200
+/sys/module/lnet/parameters/lnet_numa_range:0
+/sys/module/lnet/parameters/lnet_peer_discovery_disabled:0
+/sys/module/lnet/parameters/lnet_recovery_interval:1
+/sys/module/lnet/parameters/lnet_retry_count:2
+/sys/module/lnet/parameters/lnet_transaction_timeout:50
+/sys/module/lnet/parameters/local_nid_dist_zero:1
+/sys/module/lnet/parameters/networks:o2ib1(ib0)
+/sys/module/lnet/parameters/peer_buffer_credits:0
+/sys/module/lnet/parameters/portal_rotor:3
+/sys/module/lnet/parameters/rnet_htable_size:128
+/sys/module/lnet/parameters/router_ping_timeout:60
+/sys/module/lnet/parameters/routes:o2ib2 1 10.47.240.[161-168]@o2ib1; o2ib0 1 10.47.240.[165-168]@o2ib1
+/sys/module/lnet/parameters/small_router_buffers:0
+/sys/module/lnet/parameters/tiny_router_buffers:0
+/sys/module/lnet/parameters/use_tcp_bonding:0
+
+[root@cpu-e-451 ~]# grep . /sys/module/ko2iblnd/parameters/*                                                                                                                                                                                                                               
+/sys/module/ko2iblnd/parameters/cksum:0
+/sys/module/ko2iblnd/parameters/concurrent_sends:256
+/sys/module/ko2iblnd/parameters/conns_per_peer:1
+/sys/module/ko2iblnd/parameters/credits:1024
+/sys/module/ko2iblnd/parameters/dev_failover:0
+/sys/module/ko2iblnd/parameters/fmr_cache:1
+/sys/module/ko2iblnd/parameters/fmr_flush_trigger:512
+/sys/module/ko2iblnd/parameters/fmr_pool_size:2048
+/sys/module/ko2iblnd/parameters/ib_mtu:0
+/sys/module/ko2iblnd/parameters/ipif_name:ib0
+/sys/module/ko2iblnd/parameters/keepalive:100
+/sys/module/ko2iblnd/parameters/map_on_demand:32
+/sys/module/ko2iblnd/parameters/nscheds:0
+/sys/module/ko2iblnd/parameters/ntx:2048
+/sys/module/ko2iblnd/parameters/peer_buffer_credits:0
+/sys/module/ko2iblnd/parameters/peer_credits:128
+/sys/module/ko2iblnd/parameters/peer_credits_hiw:64
+/sys/module/ko2iblnd/parameters/peer_timeout:180
+/sys/module/ko2iblnd/parameters/require_privileged_port:0
+/sys/module/ko2iblnd/parameters/retry_count:5
+/sys/module/ko2iblnd/parameters/rnr_retry_count:6
+/sys/module/ko2iblnd/parameters/service:987
+/sys/module/ko2iblnd/parameters/timeout:50
+/sys/module/ko2iblnd/parameters/use_fastreg_gaps:0
+/sys/module/ko2iblnd/parameters/use_privileged_port:1
+/sys/module/ko2iblnd/parameters/wrq_sge:2
+
+[root@cpu-e-451 ~]# grep . /sys/module/ptlrpc/parameters/*
+/sys/module/ptlrpc/parameters/at_early_margin:5
+/sys/module/ptlrpc/parameters/at_extra:30
+/sys/module/ptlrpc/parameters/at_history:600
+/sys/module/ptlrpc/parameters/at_max:600
+/sys/module/ptlrpc/parameters/at_min:0
+/sys/module/ptlrpc/parameters/enc_pool_max_memory_mb:0
+/sys/module/ptlrpc/parameters/ldlm_cpts:(null)
+/sys/module/ptlrpc/parameters/ldlm_cpu_bind:1
+/sys/module/ptlrpc/parameters/ldlm_enqueue_min:100
+/sys/module/ptlrpc/parameters/ldlm_num_threads:0
+/sys/module/ptlrpc/parameters/max_ptlrpcds:0
+/sys/module/ptlrpc/parameters/ptlrpcd_bind_policy:0
+/sys/module/ptlrpc/parameters/ptlrpcd_cpts:(null)
+/sys/module/ptlrpc/parameters/ptlrpcd_partner_group_size:2
+/sys/module/ptlrpc/parameters/ptlrpcd_per_cpt_max:0
+/sys/module/ptlrpc/parameters/send_sepol:0
+/sys/module/ptlrpc/parameters/suppress_pings:0
+/sys/module/ptlrpc/parameters/test_req_buffer_pressure:0
+
+[root@cpu-e-451 ~]# grep . /sys/module/hfi1/parameters/*                                                                                                                                                                                                                                  
+/sys/module/hfi1/parameters/aspm:0
+/sys/module/hfi1/parameters/cache_size:256
+/sys/module/hfi1/parameters/cap_mask:0x4c09a00cb9a
+/sys/module/hfi1/parameters/cu:1
+/sys/module/hfi1/parameters/desct_intr:64
+/sys/module/hfi1/parameters/eager_buffer_size:8388608
+/sys/module/hfi1/parameters/hdrq_entsize:32
+/sys/module/hfi1/parameters/ipoib_accel:1
+/sys/module/hfi1/parameters/krcvqs:8
+/sys/module/hfi1/parameters/link_crc_mask:3
+/sys/module/hfi1/parameters/lkey_table_size:16
+/sys/module/hfi1/parameters/loopback:0
+/sys/module/hfi1/parameters/max_ahs:65535
+/sys/module/hfi1/parameters/max_cqes:3145727
+/sys/module/hfi1/parameters/max_cqs:131071
+/sys/module/hfi1/parameters/max_mcast_grps:16384
+/sys/module/hfi1/parameters/max_mcast_qp_attached:16
+/sys/module/hfi1/parameters/max_mtu:10240
+/sys/module/hfi1/parameters/max_pds:65535
+/sys/module/hfi1/parameters/max_qps:32768
+/sys/module/hfi1/parameters/max_qp_wrs:16383
+/sys/module/hfi1/parameters/max_sges:96
+/sys/module/hfi1/parameters/max_srqs:1024
+/sys/module/hfi1/parameters/max_srq_sges:128
+/sys/module/hfi1/parameters/max_srq_wrs:131071
+/sys/module/hfi1/parameters/num_sdma:0
+/sys/module/hfi1/parameters/num_user_contexts:-1
+/sys/module/hfi1/parameters/num_vls:8
+/sys/module/hfi1/parameters/pcie_caps:81
+/sys/module/hfi1/parameters/pcie_ctle:3
+/sys/module/hfi1/parameters/pcie_force:0
+/sys/module/hfi1/parameters/pcie_pset:255
+/sys/module/hfi1/parameters/pcie_retry:5
+/sys/module/hfi1/parameters/pcie_target:3
+/sys/module/hfi1/parameters/piothreshold:256
+/sys/module/hfi1/parameters/port_reorder:N
+/sys/module/hfi1/parameters/qp_table_size:256
+/sys/module/hfi1/parameters/rcvarr_split:25
+/sys/module/hfi1/parameters/rcvhdrcnt:8192
+/sys/module/hfi1/parameters/rcv_intr_count:16
+/sys/module/hfi1/parameters/rcv_intr_timeout:840
+/sys/module/hfi1/parameters/sdma_comp_size:128
+/sys/module/hfi1/parameters/sdma_descq_cnt:2048
+/sys/module/hfi1/parameters/sdma_idle_cnt:250
+/sys/module/hfi1/parameters/sge_copy_mode:0
+/sys/module/hfi1/parameters/user_credit_return_threshold:33
+/sys/module/hfi1/parameters/wss_clean_period:256
+/sys/module/hfi1/parameters/wss_threshold:80

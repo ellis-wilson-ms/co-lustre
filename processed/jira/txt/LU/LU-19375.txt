@@ -1,0 +1,77 @@
+Key:        LU-19375
+Summary:    return multiple changelog records via llapi_changelog_recv_many()
+Link:       https://jira.whamcloud.com/browse/LU-19375
+Type:       Improvement
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Andreas Dilger
+Created:    Wed, 17 Sep 2025 00:05:07 +0000
+Updated:    Sun, 21 Sep 2025 12:39:05 +0000
+Labels:     changelog, llapi
+Links:      Related: is related to  LU-19276; Related: is related to  LU-19296
+
+--- Description ---
+It would be more efficient to have a Changelog interface similar to llapi_changelog_recv() that is returning multiple records to the caller at once.
+
+A proposed interface would be like the following:
+
+int llapi_changelog_recv_many(void *priv, struct changelog_rec **rech, int *numrec)
+int llapi_changelog_free_many(struct changelog_rec **rech, int numrec)
+
+where recv_many allocates and returns an array of struct changelog_rec * pointers that reference numrec changelog records, and free_many frees the corresponding number of records (it would be undefined if free_many were called with a different numrec than returned by recv_many).
+
+Instead of returning an array of pointers to each struct changelog_rec (plus packed extensions), an alternative would be that this returns a pointer to the packed array of struct changelog_rec, but this would be very complex to process because it may have multiple extension records and each one would need to be processed and skipped even if the contents are not of interest.
+
+A better alternative would be to have a more comprehensive structure for changelog events to make this easier to process, and return an array pointers to these structures, like:
+
+struct changelog_record {
+        __u16 cr_namelen;
+        __u16 cr_flags; /* enum changelog_rec_flags, CLF_* */
+        __u32 cr_type; /* enum changelog_rec_type */
+        __u64 cr_index; /* changelog record number */
+        __u64 cr_prev; /* last cr_index for this cr_tfid */
+        __u64 cr_time;
+        union {
+            struct lu_fid cr_tfid; /* target fid */
+            __u32 cr_markerflags; /* CL_MARK flags */ };
+        __u64 cr_extra_flags; /* Additional CLFE_* flags */
+        struct lu_fid cr_pfid; /* parent fid */
+        struct changelog_ext_rename   cre_rename;   /* if cr_flags & CLF_RENAME */
+        struct changelog_ext_jobid    cre_jobid;    /* if cr_flags & CLF_JOBID */
+        struct changelog_ext_uidgid   cre_uidgid;   /* if cr_extra_flags & CLFE_UIDGID */
+        struct changelog_ext_nid      cre_nid;      /* if cr_extra_flags & CLFE_NID */
+        struct changelog_ext_openmode cre_openmode; /* if cr_extra_flags & CLFE_OPENMODE */
+        struct changelog_ext_xattr    cre_xattr;    /* if cr_extra_flags & CLFE_XATTR */
+};
+
+The unused extension records would be unpopulated if the corresponding flag is not set.  This would provide a balance between simplifying access to the changelog records, while minimizing the overhead of reprocessing and reformatting every record before it is returned.
+
+It would be possible that the cre_* extension records would be pointers to those fields in a larger buffer, and NULL if they are not present, but in most cases the size of the pointer is similar in size as the record itself, so there would not be much space savings.
+
+--- Comment (adilger, Sun, 21 Sep 2025 12:39:05 +0000) ---
+I'm only suggesting that there be a 1:1 macro that maps llapi_changelog_rec_*() to the corresponding changelog_rec_*() function/macro.  This wouldn't change the functionality.
+
+--- Comment (rread, Fri, 19 Sep 2025 12:29:34 +0000) ---
+The changelog_rec helpers are all called changelog_rec_* so they don't have the llapi prefix even they they are provided as part of llapi in lustre_user.h.  We probably don't want llapi_changelog_rec_size and changelog_rec_size do different things. 
+
+The iterator might be better done in application layer, especially if there is a chance of a partial record at the end the buffer.
+
+--- Comment (adilger, Fri, 19 Sep 2025 05:07:56 +0000) ---
+So adding functions size_t llapi_changelog_rec_size(struct changelog_rec **recs) and an iterator like struct changelog_rec *llapi_changelog_rec_next(struct changelog_rec **recs) or something like this.
+
+--- Comment (rread, Thu, 18 Sep 2025 16:55:22 +0000) ---
+The same helper functions used to parse the original records are also used for the repacked records, so that is the same complexity.  I think the only additional work for the bulk transfer is calculating record size, and that is  changelog_rec_size(rec) + rec->cr_namelen. That should be simplified into a single function, but it's not too complicated.
+
+I do agree this is needs a simpler interface, and that is what I'm doing in Rust. Hopefully new applications won't be built in C/C++ going forward, but if that is needed then a simpler C interface could be built on top of this, too.
+
+--- Comment (adilger, Wed, 17 Sep 2025 17:09:01 +0000) ---
+One option is for the caller to supply the buffer to recv and the packed records are returned in that?  
+
+The main issue with returning packed records is that it puts a lot of burden on the application to understand the exact on-disk format of records. I was thinking that if we are adding a new API then we could simplify the work needed by the application, reducing the chance that they implement unpacking incorrectly, and allowing format changes in the future without adding yet more complexity. 
+
+If there are unknown/new extension(s) when a single record is returned to the application means the extension(s) at the end of the record can be skipped. If returning multiple packed records then we need to copy records anyway, so doing some restructuring at the same time doesn't add significant overhead.
+
+--- Comment (rread, Wed, 17 Sep 2025 16:57:52 +0000) ---
+I would prefer the original packed version, which is not much more complex than reading the repacked changelog records. We can either reuse the internal buffer, or copy it into a buffer provided by the application.  The main thing is to avoid allocating memory and require calling  free() in the api.

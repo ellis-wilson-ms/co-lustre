@@ -1,0 +1,225 @@
+Key:        LU-10602
+Summary:    Add file heat support for Persistent Client Cache
+Link:       https://jira.whamcloud.com/browse/LU-10602
+Type:       New Feature
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Li Xi
+Reporter:   Li Xi
+Created:    Mon, 5 Feb 2018 06:21:06 +0000
+Updated:    Fri, 25 Oct 2024 22:07:31 +0000
+Labels:     PCC2
+Links:      Related: is related to  LU-10530; Related: is related to  LU-10092; Related: is related to  LU-10499; Related: is related to  LU-11509
+
+--- Description ---
+File heat is a relative attribute of files/objects which reflects the access frequency of the files/objects. The file heat can be controlled by two system-level constants, time period and loss percentage. Time is divided into time periods. The access number during each time period is counted. But the file heat is only recalculated at the end of a time period. And at the end of each time period, a percentage of the former file heat is lost according to the loss percentage.
+
+File heat mainly designed for cache management. Cache like PCC could use file heat to determine which files to removed from the cache or which files to fetch into cache.
+
+--- Comment (adilger, Fri, 25 Oct 2024 22:07:31 +0000) ---
+I've had reason to look at this ticket again, and have a potential solution that might allow the "hottest inodes" list maintenance to be efficient without scanning all of the inodes each time (which might be in the 100k-1M range).  It is impossible that all of the inodes on a client are "hottest", so doing a full inode scan would mostly be wasted effort, and we really want time and effort focused on those inodes that are actually "hot".
+
+Instead of doing a periodic scan of all inodes to find "hot" ones, I think it would be better for the inodes to "add themselves" to the list when they become hot.  This can be done easily/efficiently by keeping a "heat threshold" of the minimum file heat needed to be in the "top heat" listing.  As each inode is accumulating its own heat (as normal) it will compare whether its new heat is above "heat threshold".  If yes, and it is not already on the list, then it will insert itself into the "top heat" list so that it is a candidate for the next time that the "lfs heat_top" list is generated for userspace.
+
+My thought is that the "top heat" list (and when I write "list" I mean "some data structure that can resolve to a sorted list when it is accessed by userspace") should only be lazily maintained in the kernel, to keep it efficient and low overhead.  There are a few possible models for how the list could be maintained:
+
+	list maintenance could be done by a periodic background task that walks the list and decays the inode heat for inactive inodes, and removes them from the list if they are no longer above the "heat threshold" (i.e. the heat of the "Nth" item in the sorted list).  This could be done in the background and keeps the list "fresh" so that any access is relatively lightweight.  It would not need to add inodes to the list, since they add themselves during IO if their heat is high enough, it would only remove cold inodes and update the "heat threshold".
+
+	list maintenance could be done whenever it is accessed from userspace, which reduces background maintenance overhead if the list is not accessed frequently (or ever).  However, this potentially also means that the list can grow large/stale if it isn't accessed frequently, and it will not have a good "heat threshold" to make decisions about which inodes should be added to the list.  One (not great) option would be that the "top heat" list isn't maintained at all until it is accessed at least once from userspace?  That has the drawback that there won't be any useful information available on first access, but would be OK for tools that are accessing the list frequently and avoid overhead on the nodes that don't use this feature at all.
+
+	list maintenance could be done incrementally by the thread doing the IO whenever a new inode is added to the list.  That adds a small amount of work to each thread that is adding a hot inode, but it keeps the data fresh without having a large blob of work to be done at one time.
+
+We don't know the "N" that userspace wants the top list for, but this could either be a parameter from the "lfs heat_top" that informs the kernel of "N" for the future (e.g. average of "N" for each access), or it is a tunable parameter (e.g. 500 by default) that can be changed as needed.  We probably also want to have an "lctl get_param" interface to dump the "top heat" list and leave it to userspace to process instead of having to run "lfs heat_top" each time to scrape this information into a monitoring tool.
+
+Depending on the implementation, the thread adding the inode to the "top heat" list could do some some maintenance work each time.
+
+	the "top heat" list shouldn't be strictly limited to "N" entries, as inodes may be moving up and down the list continually.  Having 2N entries on the list at one time is fine, as long as list maintenance doesn't get too much overhead.  The list just needs to give us a small pool of inodes to check when running "lfs heat_top"
+
+	new inodes could be added to the list directly, either a sorted structure/heap/tree, or just at the end of a "holding list" of candidates for future background task processing (or maybe there is only an unsorted LRU list in the kernel, and it is sorted only upon access?)
+
+	if the list has >> "N" inodes on it, then the adding process would find the oldest (LRU) or coldest (few) inode(s) on the list, decay their heat, and drop any from the list if heat update the "heat threshold" based on the N'th item on the list (approximately) to give a lower bound for new inodes being added to the list
+
+	rather than scanning for the N'th item on the list (if this is not easily found) there could just be an incremental adjustment like "increase by n% if the list is getting too large" and "decrease by n% if the list is getting too short"
+
+	I don't think there needs to be list maintenance done on every inode heat update (which is a lot of overhead if trying to keep a sorted list, and active inodes will maintain their own heat).  This only needs to be done when a new inode is added to the list, or after T seconds since the last list update, so that the list does not grow too large or become stale if the list is never read from userspace
+
+	if this is being done incrementally for each new inode added to the list then there may not be a need to have a dedicated background process
+
+This would likely benefit from the improved LDLM LRU handling (e.g. patch https://review.whamcloud.com/56648 "LU-11509 ldlm: Implement LFRU cache eviction") so that we don't just have strict LRU eviction of inodes from the client cache, otherwise clients may have difficulty to accumulate any history of inode usage.  It may be that the file heat can also help inform the DLM LFRU handling to make better choices of what should stay in the client LRU, and which locks should be cancelled.
+
+--- Comment (gerrit, Wed, 8 May 2019 06:05:23 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/34757/
+
+Subject: LU-10602 utils: fix file heat support
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: ac1f97a881019b78ce3289885461259d280562b3
+
+--- Comment (gerrit, Thu, 25 Apr 2019 13:29:07 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/34757
+
+Subject: LU-10602 utils: fix file heat support
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 6a9db0937c5c4ae526d250aff7d11c83fb22bfd0
+
+--- Comment (gerrit, Mon, 1 Apr 2019 07:24:20 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/34399/
+
+Subject: LU-10602 llite: add file heat support
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: ae723cf8161f7af15fb7c2541fa7d4131a816af9
+
+--- Comment (gerrit, Fri, 29 Mar 2019 07:49:26 +0000) ---
+Yingjin Qian (qian@ddn.com) uploaded a new patch: https://review.whamcloud.com/34540
+
+Subject: LU-10602 llite: Add support for file heat TopN listing
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 219ca7222ae12ebf7a1e0bf48adbf199fe041b82
+
+--- Comment (lixi_wc, Fri, 22 Mar 2019 07:54:35 +0000) ---
+> IMHO, we would better to avoid to use a background kernel thread, just need to scan the "s_inodes" list of "superblock" and sort the file heat when the user calls the llapi via IOCTL above in the first version implementation.
+
+Sounds reasonable, Yingjin. This would make the implementation simpler.
+
+--- Comment (qian_wc, Fri, 22 Mar 2019 06:52:35 +0000) ---
+The command to show the TopN heat can be defined as follow:
+
+# lfs heat_top [-p $sample_period] [-i $heat_dimension] [-N $topN]
+
+Where
+
+-$sample_period is the period in second to show the topN heat;
+
+-$heat_dimension is the key value to sort the file heat. Currently Lustre file heat has 4 dimension indicators to measure the file heat: readsample, writesample, readbyte, writebyte. The $heat_dimension could be "readsample", "writesample", "readbyte", "writebyte", or even their combination such "iosample" (it means "readsample" heat value + "writesample" heat value) or "iobyte" (it means sorting according to the key "readbyte" heat value + "writesample" heat value).
+
+-$topN is the topn value.
+
+We also should implement a llapi interface for users to get the TopN file heat value via IOCTL, it could be defined as:
+
+struct lu_heat_item {
+ struct lu_fid lhi_fid;
+ struct lu_heat lhi_heat;
+};
+struct lu_topn_heats {
+ __u32 lth_topn;
+ struct lu_heat_item lth_item[0];
+};
+
+ 
+
+int llapi_heat_topn_get(const char *mntpt, int topn, char *sortkey, sturct lu_topn_heats *heats);
+
+Each time, an adminstrator wants to get the topN file heat information, it can call the llapi above.
+
+As there are so many sorting factors (we have illustrate 6 sort keys above) and the TopN is also a variable,to simply the implementation, IMHO, we would better to avoid to use a background kernel thread, just need to scan the "s_inodes" list of "superblock" and sort the file heat when the user calls the llapi via IOCTL above in the first version implementation.
+
+--- Comment (lixi_wc, Fri, 22 Mar 2019 02:56:19 +0000) ---
+Maybe cfs_binheap_() supports removing from the tail (not the top). Then the binary heap could be implemented as descending order, i.e. the top node has the highest heap.
+
+--- Comment (lixi_wc, Fri, 22 Mar 2019 02:51:24 +0000) ---
+It would be useful to implement TopN list support for file heat.
+
+After an hour discussion with Yingjin and Shilong about the possible designs and their cons and pros, we think the following design might work:
+
+1) In order to avoid any performance impact, the sorting of the TopN will not add anything in the I/O process.
+
+2) TopN sorting will be implemented using binary heap based on cfs_binheap.
+
+3) A background thread scans "s_inodes" list of "struct super_block" and adds each inode into the binary heap. Examples of this are wait_sb_inodes(), add_dquot_ref(), drop_pagecache_sb() etc.
+
+4) The scanning frequency could be a configurable parameter which depends on total inode numbers, heat decay time, resolution ratio (the rate that user-space tool dumps the list), etc.
+
+5) Between handling of each inode, functions like cond_resched() should be called to avoid too high CPU usage or affecting normal I/O or file system access.
+
+6) The binary heap is reverse order, meaning the top node is the file with least heat on the top.
+
+7) Whenever an inode is adding to the binary heap, a new structure (e.g. "struct inode_heat_node") will be allocated for the inode with FIDs, inums and other fields properly set.
+
+8) If the size of binary heap becomes larger than N (i.e. size == N+1) after inserting, an inodes will be removed from the top of the binary heap.
+
+9) optimization: cfs_binheap_copy() will be implemented to copy the binary heap. When a user-space process starts to dump the TopN list, the binary heap will be copied so as to make the dumping quicker. cfs_binheap_copy() essentially copies element arrays, thus should be fast.
+
+10) When user-space tool starts to dump the TopN list, the dumping binary heap shall be removed from the  top to generate the TopN list with ascending order. The user-space tool shall change the list to descending order if needed.
+
+11) Before dumping the TopN list, the administrator should configure which type of file heats (read, write, read sample or write sample) the sorting should be based on. N should also be a configurable parameter. These things could be configured through /sys or /proc interface. If memory is not a limitation, we could maitain four topN list at the same time for each type of file heats.
+
+12) User-space tool shall read the TopN list and show in a proper way flushing the result after each time period (like what command top  does).
+
+--- Comment (gerrit, Tue, 12 Mar 2019 07:58:13 +0000) ---
+Yingjin Qian (qian@ddn.com) uploaded a new patch: https://review.whamcloud.com/34399
+
+Subject: LU-10602 llite: add file heat support
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 9c9e7bf7148fb6322a1ad6451d1c0dca4f3776d1
+
+--- Comment (gerrit, Fri, 10 Aug 2018 02:08:56 +0000) ---
+Yingjin Qian (qian@ddn.com) uploaded a new patch: https://review.whamcloud.com/32975
+
+Subject: LU-10602 pcc: file heat support for PCC
+
+Project: fs/lustre-release
+
+Branch: pcc
+
+Current Patch Set: 1
+
+Commit: bfa9cd8f9323405615b7511b2bfa979243c2449e
+
+--- Comment (gerrit, Thu, 9 Aug 2018 07:32:07 +0000) ---
+Yingjin Qian (qian@ddn.com) uploaded a new patch: https://review.whamcloud.com/32969
+
+Subject: LU-10602 llite: add file heat support
+
+Project: fs/lustre-release
+
+Branch: pcc
+
+Current Patch Set: 1
+
+Commit: 5765bf08fe516ee7fb63207fd374b24904bec71a
+
+--- Comment (pjones, Mon, 5 Feb 2018 12:52:18 +0000) ---
+Thanks Li Xi
+
+--- Comment (gerrit, Mon, 5 Feb 2018 06:39:08 +0000) ---
+Li Xi (lixi@ddn.com) uploaded a new patch: https://review.whamcloud.com/31161
+
+Subject: LU-10602 llite: add file heat support
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 98f1e3c57c695bea4b476c81da731383260dcbad

@@ -1,0 +1,199 @@
+Key:        LU-5722
+Summary:    memory allocation deadlock under lu_cache_shrink()
+Link:       https://jira.whamcloud.com/browse/LU-5722
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Cliff White
+Reporter:   Andreas Dilger
+Created:    Thu, 9 Oct 2014 17:49:04 +0000
+Updated:    Sun, 18 Sep 2016 17:13:50 +0000
+Resolved:   Sun, 8 Feb 2015 04:52:27 +0000
+Labels:     mq414, patch
+Links:      Related: is related to  LU-2468; Related: is related to  LU-14
+
+--- Environment ---
+single-node testing on master (5c4f68be57 + http://review.whamcloud.com/11258 )
+
+kernel: 2.6.32-358.23.2.el6_lustre.gc9be53c.x86_64
+
+combined MDS+MGS+OSS, 2x MDT, 3xOST on LVM
+
+--- Description ---
+While running sanity-benchmark.sh dbench, I hit the following memory allocation deadlock under mdc_read_page_remote():
+
+dbench D 0000000000000001 0 14532 1 0x00000004
+Call Trace:
+resched_task+0x68/0x80
+__mutex_lock_slowpath+0x13e/0x180
+mutex_lock+0x2b/0x50
+lu_cache_shrink+0x203/0x310 [obdclass]
+shrink_slab+0x11a/0x1a0
+do_try_to_free_pages+0x3f7/0x610
+try_to_free_pages+0x92/0x120
+__alloc_pages_nodemask+0x478/0x8d0
+alloc_pages_current+0xaa/0x110
+__page_cache_alloc+0x87/0x90
+mdc_read_page_remote+0x13c/0xd90 [mdc] do_read_cache_page+0x7b/0x180
+read_cache_page_async+0x19/0x20
+read_cache_page+0xe/0x20
+mdc_read_page+0x192/0x950 [mdc]
+lmv_read_page+0x1e0/0x1210 [lmv]
+ll_get_dir_page+0xbc/0x370 [lustre]
+ll_dir_read+0x9e/0x300 [lustre]
+ll_readdir+0x12a/0x4d0 [lustre]
+vfs_readdir+0xc0/0xe0
+sys_getdents+0x89/0xf0
+
+The page allocation is recursing into Lustre and the DLM slab shrinker, which is blocked on a lock that is being held. Presumably it needs to use GFP_NOFS during the allocation? I didn't actually check what locks were held, since the machine hung as I was trying to get more info.
+
+--- Comment (pjones, Sun, 8 Feb 2015 04:52:27 +0000) ---
+Landed for 2.7
+
+--- Comment (gerrit, Sun, 8 Feb 2015 02:26:10 +0000) ---
+Oleg Drokin (oleg.drokin@intel.com) merged in patch http://review.whamcloud.com/12468/
+
+Subject: LU-5722 obdclass: reorganize busy object accounting
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: ff0b34274d4f8754ebba0a5a812bd117cbec37b1
+
+--- Comment (fzago, Wed, 29 Oct 2014 15:57:36 +0000) ---
+I don't know whether it's the same bug or not, but I've seen something that looks similar under 2.5. A lot of processes are stuck in or around lu_cache_shrink. The machine is not really hung, but not usable either, and needs rebooting. I made a patch for it.
+
+Here's a forward ported patch for head of tree, but untested: http://review.whamcloud.com/#/c/12468/
+
+--- Comment (adilger, Thu, 9 Oct 2014 23:15:32 +0000) ---
+It may be that this is a larger problem than just mdc_read_page_local().  Running sanity.sh again I see multiple threads stuck in test_49() calling lu_cache_shrink(), even threads unrelated to Lustre:
+
+kswapd0       D 0000000000000001     0    38      2 0x00000000
+Call Trace:
+__mutex_lock_slowpath+0x13e/0x180
+mutex_lock+0x2b/0x50
+lu_cache_shrink+0x203/0x310 [obdclass]
+shrink_slab+0x11a/0x1a0
+balance_pgdat+0x59a/0x820
+kswapd+0x134/0x3c0
+kthread+0x96/0xa0
+
+This will impact all threads trying to allocate memory.  Some threads also get stuck in direct reclaim if memory is low (this is just one of many threads stuck at lu_cache_shrink+0x203/0x310):
+
+sendmail      D 0000000000000001     0 15730 
+  2260 0x00000000
+Call Trace:
+__mutex_lock_slowpath+0x13e/0x180
+mutex_lock+0x2b/0x50
+lu_cache_shrink+0x203/0x310 [obdclass]
+shrink_slab+0x11a/0x1a0
+do_try_to_free_pages+0x3f7/0x610
+try_to_free_pages+0x92/0x120
+__alloc_pages_nodemask+0x478/0x8d0
+kmem_getpages+0x62/0x170
+fallback_alloc+0x1ba/0x270
+____cache_alloc_node+0x99/0x160
+kmem_cache_alloc_node+0x89/0x1d0
+__alloc_skb+0x4f/0x190
+sk_stream_alloc_skb+0x41/0x110
+tcp_sendmsg+0x350/0xa20
+sock_aio_write+0x19b/0x1c0
+do_sync_write+0xfa/0x140
+vfs_write+0x184/0x1a0
+sys_write+0x51/0x90
+
+Some threads are stuck at lu_cache_shrink+0x144/0x310 instead:
+
+Oct  9 15:43:18 sookie-gig kernel: irqbalance    D 0000000000000000     0  1616     1 0x00000000
+Oct  9 15:43:18 sookie-gig kernel: Call Trace:
+__mutex_lock_slowpath+0x13e/0x180
+mutex_lock+0x2b/0x50
+lu_cache_shrink+0x144/0x310 [obdclass]
+shrink_slab+0x11a/0x1a0
+do_try_to_free_pages+0x3f7/0x610
+try_to_free_pages+0x92/0x120
+__alloc_pages_nodemask+0x478/0x8d0
+alloc_pages_vma+0x9a/0x150
+handle_pte_fault+0x76b/0xb50
+handle_mm_fault+0x23a/0x310
+__do_page_fault+0x139/0x480
+do_page_fault+0x3e/0xa0
+page_fault+0x25/0x30
+proc_reg_read+0x7e/0xc0
+vfs_read+0xb5/0x1a0
+sys_read+0x51/0x90
+
+It seems some of the code has been inlined, but all callers are blocked on getting lu_sites_guard.
+
+(gdb) list *(lu_cache_shrink+0x203)
+0x51c33 is in lu_cache_shrink (/usr/src/lustre-head/lustre/obdclass/lu_object.c:1961).
+1956	
+1957		if (!(sc->gfp_mask & __GFP_FS))
+1958			return 0;
+1959	
+1960		mutex_lock(&lu_sites_guard);
+1961		list_for_each_entry_safe(s, tmp, &lu_sites, ls_linkage) {
+1962			memset(&stats, 0, sizeof(stats));
+1963			lu_site_stats_get(s->ls_obj_hash, &stats, 0);
+1964			cached += stats.lss_total - stats.lss_busy;
+1965		}
+(gdb) list *(lu_cache_shrink+0x144)
+0x51b74 is in lu_cache_shrink (/usr/src/lustre-head/lustre/obdclass/lu_object.c:1996).
+1991                     * anyways.
+1992                     */
+1993                    return SHRINK_STOP;
+1994
+1995            mutex_lock(&lu_sites_guard);
+1996            list_for_each_entry_safe(s, tmp, &lu_sites, ls_linkage) {
+1997                    remain = lu_site_purge(&lu_shrink_env, s, remain);
+1998                    /*
+1999                     * Move just shrunk site to the tail of site list to
+2000                     * assure shrinking fairness.
+
+ It isn't clear which thread is holding the lu_sites_guard mutex. In both hangs so far, it appears there is a running thread that may be holding this mutex.  The stack trace is unclear because it is entirely marked with "?", but that may always be the case for running threads, or this may be leftover garbage on the stack and the process is running in userspace (though I don't see any "cleanup" routines on the stack)?
+
+cpuspeed      R  running task        0  1606      1 0x00000000
+Call Trace:
+? thread_return+0x4e/0x76e
+? apic_timer_interrupt+0xe/0x20
+? mutex_lock+0x1e/0x50
+? cfs_hash_spin_lock+0xe/0x10 [libcfs]
+? lu_site_purge+0x134/0x4e0 [obdclass]
+? _spin_lock+0x12/0x30
+? cfs_hash_spin_lock+0xe/0x10 [libcfs]
+? lu_site_stats_get+0x98/0x170 [obdclass]
+? lu_cache_shrink+0x242/0x310 [obdclass]
+? shrink_slab+0x12a/0x1a0
+? do_try_to_free_pages+0x3f7/0x610
+? try_to_free_pages+0x92/0x120
+? __alloc_pages_nodemask+0x478/0x8d0
+? alloc_pages_vma+0x9a/0x150
+? handle_pte_fault+0x76b/0xb50
+? handle_mm_fault+0x23a/0x310
+? __do_page_fault+0x139/0x480
+? do_page_fault+0x3e/0xa0
+? page_fault+0x25/0x30
+? proc_reg_read+0x7e/0xc0
+? vfs_read+0xb5/0x1a0
+? sys_read+0x51/0x90
+runnable tasks:
+           task   PID         tree-key  switches  prio     exec-runtime         sum-exec        sum-sleep
+----------------------------------------------------------------------------------------------------------
+R       cpuspeed  1606   2735264.028890   1596454   120   2735264.028890   1068807.826562  11067012.338451 /
+
+(gdb) list *(lu_cache_shrink+0x242)
+0x51c72 is in lu_cache_shrink (/usr/src/lustre-head/lustre/obdclass/lu_object.c:1964).
+1959
+1960            mutex_lock(&lu_sites_guard);
+1961            list_for_each_entry_safe(s, tmp, &lu_sites, ls_linkage) {
+1962                    memset(&stats, 0, sizeof(stats));
+1963                    lu_site_stats_get(s->ls_obj_hash, &stats, 0);
+1964                    cached += stats.lss_total - stats.lss_busy;
+1965            }
+1966            mutex_unlock(&lu_sites_guard);
+1967
+1968            cached = (cached / 100) * sysctl_vfs_cache_pressure;

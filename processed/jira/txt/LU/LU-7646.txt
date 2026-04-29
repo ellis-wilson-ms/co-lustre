@@ -1,0 +1,269 @@
+Key:        LU-7646
+Summary:    Infinite CON RACE Condition after rebooting LNet router
+Link:       https://jira.whamcloud.com/browse/LU-7646
+Type:       Bug
+Priority:   Blocker
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Doug Oucharek
+Reporter:   Doug Oucharek
+Created:    Sat, 9 Jan 2016 02:20:31 +0000
+Updated:    Thu, 14 Jun 2018 21:41:17 +0000
+Resolved:   Mon, 15 Aug 2016 22:31:01 +0000
+Labels:     llnl
+Links:      Related: is related to  LU-7569
+
+--- Description ---
+While investigating/working on the fix for LU-7569 we stumbled on another bug when testing on a customer's system.  When an LNet router is rebooted and mlx5-based cards are being used, it is possible for a client's attempt to reconnect to the router to get stuck in a permanent connecting state.  When the router comes up and tries to create a connection back to the client, that connection will be rejected as CON RACE.  This is an infinite loop because the stuck connection is always present on the client triggering the rejection.
+
+This ticket has been opened to create a fix which compliments LU-7569.  I appreciate that the mlx5 driver should be fixed to prevent stuck connection attempts, but at the same time, we need LNet to be immune to such situations as the result is pretty severe.  We need self-healing code here.
+
+--- Comment (pjones, Mon, 15 Aug 2016 22:31:01 +0000) ---
+Landed for 2.9
+
+--- Comment (gerrit, Mon, 15 Aug 2016 21:11:58 +0000) ---
+Oleg Drokin (oleg.drokin@intel.com) merged in patch http://review.whamcloud.com/19430/
+
+Subject: LU-7646 lnet: Stop Infinite CON RACE Condition
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 94f757bf67d58694201b2434f7879974c7abd622
+
+--- Comment (morrone, Wed, 13 Jul 2016 01:46:28 +0000) ---
+It's back!
+
+[ 8866.277966] LNet: 509:0:(o2iblnd_cb.c:2418:kiblnd_passive_connect()) LU-7646 connection attempt to 172.19.1.52@o2ib100 probably stuck (state=2)
+
+state=2 is almost certainly RDMA_CM_EVENT_ROUTE_RESOLVED (if the compiler is not doing something strange with enums).  That would imply that we entered "case RDMA_CM_EVENT_ROUTE_RESOLVED".
+
+And I don't see any error messages from that section.  That would seem to imply that we called rdma_connect successfully and never received an event after that.
+
+--- Comment (morrone, Fri, 1 Jul 2016 22:26:51 +0000) ---
+Annnnd, now I can't get the bug to hit at all.  Sigh.
+
+Well, I've got some debugging in place that might give us some insight into the active connection attempt state...but only if there is a single active connection attempts at a time.  If there are multiple, they'll trample the same state variable that I added to lnet_peer_t.
+
+--- Comment (morrone, Wed, 29 Jun 2016 23:41:07 +0000) ---
+I suspect that a timeout counts as an error and those events are supposed to be generated.
+
+It is unfortunate that there is no easily accessible structure that can give us the current state of the active connection attempt when it is stuck.
+
+--- Comment (doug, Wed, 29 Jun 2016 22:53:33 +0000) ---
+It is interesting that both rdma_resolve_addr() and rdma_resolve_route() have a timeout parameter.  We pass in a default of 50 secs.  The man pages do not say what happens when a timeout occurs.  Do we get an RDMA_CM_EVENT_ADDR_ERROR or RDMA_CM_EVENT_ROUTE_ERROR CM event?  If not, then we could be missing out on a timeout which would allow us to do what you have indicated above.
+
+Where can I find some "real" OFED documentation?
+
+--- Comment (morrone, Wed, 29 Jun 2016 00:54:50 +0000) ---
+Since we are seeing the stuck side rejecting connections indefinitely because of reason  IBLND_REJECT_CONN_RACE, we know that ibp_connecting is non-zero.  There are only two places that make that happen, kiblnd_launch_tx() and kiblnd_reconnect_peer(), both before calling kiblnd_connect_peer().
+
+Since this problem tends to happen when the node with the lower NID is rebooted, it seems likely we are mostly concerned with the kiblnd_reconnect_peer() path.
+
+kiblnd_connect_peer() likely didn't fail, because if it did it would have called kiblnd_peer_connect_failed(), which in turn decrements ibp_connecting, so we wouldn't be in stuck in a single connection attempt.
+
+Hmmm.
+
+Of course, kiblnd_connect_peer() really just starts an asynchronous connection process.  It kicks off the address resolution, and then we have to wait for the RDMA_CM_EVENT_ADDR_RESOLVED callback.  That in turn starts route resolution, and we wait for RDMA_CM_EVENT_ROUTE_RESOLVED.  That callback is where we call kiblnd_active_connect().
+
+And so on.
+
+I think it would be good to know exactly which phase the stuck connect is in.  I can work on a debug patch to reveal that tomorrow.
+
+It is not clear to me why a better approach to a work-around wouldn't be to augment kiblnd_check_conns() to check and time out active connection attempts.  We already put an arbitrary time limit on any lnd queued tx messages.  If any messages have timed out we explicitly close the connection and reconnect.
+
+It would seem like we could add logic there to watch for active connection attempts that have taken too long, abort the attempt, and restart the active connection attempt.
+
+--- Comment (morrone, Tue, 28 Jun 2016 23:08:28 +0000) ---
+Oh, and as for not having a system to test it on...now you do!  If you've got debug patches and things to investigate, we can facilitate that on our testbed.
+
+--- Comment (morrone, Tue, 28 Jun 2016 22:53:33 +0000) ---
+I'm all for starting new tickets for separate problems.  But the connection jam is exactly the problem being dealt with in this ticket.  Why would we start a new one?
+
+--- Comment (doug, Tue, 28 Jun 2016 22:26:03 +0000) ---
+Interesting.  I had hypothesised that this issue is either caused by, or augmented by, MLX5.  We had never seen this until some clusters started using MLX5.  I suspect the connection jam is MLX5-related.
+
+Sadly, I have no access to MLX5 so cannot dig into the nature of the connection lock up.  The current patch, though not perfect, allows systems to move forward and work even if there is a potential of a "leaked" connection structure or two.
+
+I think the connection jam should be a new Jira ticket.  We need to get Mellanox involved to help understand the MLX5-specific change which is triggering this.
+
+--- Comment (morrone, Tue, 28 Jun 2016 20:19:36 +0000) ---
+Yes, we do.  In our testbed we have MDS and OSS nodes on the same mlx5 network.  Probability of getting into this connection race if very high even without significant clients or load.
+
+--- Comment (doug, Tue, 28 Jun 2016 00:50:08 +0000) ---
+Do you have an easy-to-reproduce scenario for this infinite CON RACE?  The original problem involved a router surrounded by thousands of nodes, rebooting triggering a mass of reconnections.  Probability of getting into this infinite CON RACE is very high especially if MLX5 is involved.
+
+--- Comment (morrone, Sat, 25 Jun 2016 01:12:15 +0000) ---
+The IB connection operation is hidden in the o2iblnd below the level of lnet credits.  It would not negatively effect any of the current guarantees to abort the IB connection operation (not the ptlrpc level connection operation) and retry.
+
+Yes, waiting 20 messages that come in on 1 seconds intervals is essentially a strange way to implement a 20 second timeout.  But that would seem to me to be the more complicated solution to understand and maintain in the long run versus an actually timeout.
+
+After all, the current solution basically just goes "oh, you've tried 20 times, sure, you can connect".  It is fine in the normal case of resolving a connection race to do that, because asynchronously elsewhere the other racing connection message is expected to get an error and cleanup whatever resources were associated with it.  But here we already know that is never going to happen, so aren't we leaking resources every time?  Couldn't this potentially cause problems on long running systems?
+
+--- Comment (doug, Sat, 25 Jun 2016 00:44:57 +0000) ---
+That would mean adding something to LNet it currently does not have: a timeout.  LNet depends on two things: 1- that we have a Reliable Connection (RC for IB) and that our own QoS mechanism (credits and peer_credits) saves us from packet drops, and 2- the layers above LNet will let us know that something has taken too long to happen.
+
+I'm not sure a timer will make this work any better than it does with a counter.  Once we bang our head into the CON RACE brick wall 20 times, I think we can be pretty sure the connecting connection which is in our way is stuck and can be abandoned.  I originally had that set to just 2 failures as I'm pretty sure that would be good enough to declare a connection stuck.  But inspectors convinced me to up it to 20.  Simple solutions are usually the best approach.
+
+--- Comment (morrone, Sat, 25 Jun 2016 00:18:59 +0000) ---
+What about just starting a timer on the connection message, and aborting the attempt if the timer is exceeded?  There isn't anything actually racy about this problem, the connection message never gets a reply, and the one side just sits there waiting forever, right?  It should probably timeout eventually instead.
+
+--- Comment (morrone, Sat, 25 Jun 2016 00:13:58 +0000) ---
+Change 17892 landed before Lustre 2.8.0.  So, yes, we have that.
+
+--- Comment (doug, Fri, 24 Jun 2016 23:44:36 +0000) ---
+My mistake.  The first patch which slows down reconnections on CON RACE was done under another ticket: LU-7569, patch http://review.whamcloud.com/#/c/17892.  
+
+This ticket was opened as a follow up to abort what we consider to be a stuck connection.  Originally, Liang wanted that to be done via messages (a change to the protocol).  Inspectors did not favour changing the protocol for this.  So I did a simple counter fix to act as a shield against an infinite looping situation.  That is why this ticket has a reverted patch and then patch 19430.
+
+--- Comment (morrone, Fri, 24 Jun 2016 21:30:36 +0000) ---
+We don't have either of the patches currently.  And which two do you mean?  18037 was landed on master but then was reverted by 18541 before 2.8.0 was tagged because it was faulty.  Are you counting that as one of the two?  Then there is 19430, which is the current workaround patch.  That appear to be the only live patch under way at the moment.  Am I missing anything?
+
+With the MDT and only one message queued for send to that peer, the lnet reconnect rate is much, much slower.  It looks like it is pretty much once per second.  Here is an excerpt:
+
+00000800:00000100:8.0:1466735508.628339:0:434:0:(o2iblnd_cb.c:2621:kiblnd_check_reconnect()) 172.19.1.130@o2ib100: reconnect (conn race), 12, 12, msg_size: 4096, queue_depth: 8/8, max_frags: 256/256
+00000800:00000100:8.0:1466735509.628793:0:434:0:(o2iblnd_cb.c:2621:kiblnd_check_reconnect()) 172.19.1.130@o2ib100: reconnect (conn race), 12, 12, msg_size: 4096, queue_depth: 8/8, max_frags: 256/256
+00000800:00000100:8.0:1466735510.628463:0:434:0:(o2iblnd_cb.c:2621:kiblnd_check_reconnect()) 172.19.1.130@o2ib100: reconnect (conn race), 12, 12, msg_size: 4096, queue_depth: 8/8, max_frags: 256/256
+00000800:00000100:8.0:1466735511.628345:0:434:0:(o2iblnd_cb.c:2621:kiblnd_check_reconnect()) 172.19.1.130@o2ib100: reconnect (conn race), 12, 12, msg_size: 4096, queue_depth: 8/8, max_frags: 256/256
+00000800:00000100:8.0:1466735512.628332:0:434:0:(o2iblnd_cb.c:2621:kiblnd_check_reconnect()) 172.19.1.130@o2ib100: reconnect (conn race), 12, 12, msg_size: 4096, queue_depth: 8/8, max_frags: 256/256
+
+I believe you when you say the router is trying to connect more rapidly, but it looks to me like the rate of reconnect is a factor of load in some way.  With the MDT, there is only a single higher-level ptlprc connect message (I assume) sitting in the queue for that peer.  A router under use will probably have a full lnet tx queue and more messages queuing up behind that all the time.  Perhaps a reconnect happens on every new message arrival.  I didn't look into that yet.
+
+But OOMs and reconnect rates are somewhat orthogonal to the problem of one node sitting on a lost connect message indefinitely.
+
+--- Comment (doug, Fri, 24 Jun 2016 20:53:05 +0000) ---
+This ticket has two patches to it.  It is possible your system has the first and not the second?  The first patch slows down the rate of reconnections so we have time to clean up resources thereby preventing the OOM.  The second patch, 19430, addresses the fact that we can't seem to ever get out of the infinite loop of reconnections.
+
+If you are missing the first patch, then you should be seeing 100's or even 1000's of reconnect attempts per second.  A rate too fast for the connd daemon to clean up resources.  OOM happens in seconds.
+
+--- Comment (morrone, Fri, 24 Jun 2016 19:16:13 +0000) ---
+Connecting state in higher level services like the OSP just means that the connect RPC has been sent down to lnet, and the higher levels are waiting for something to happen, right?  It doesn't say much at all about the state of the LND connections.  You can be connected at the LND level and not be connected at the ptlrpc level.  For instance, and lctl ping would create an LND connection without any higher level services showing connected to services on that node.
+
+The reconnects for us are happening slower.  I didn't look too closely at the times, but probably just a few a second.  There was no OOM after hours sitting there.  It is not clear why an OOM would be a likely side effect  of this condition.  The node attempting the connection gets an error code back and should clean up memory just fine and try again.
+
+Maybe there is something wrong in lnet router code that is allowing an OOM under that situation?  Or lnet buffer settings are too large on the router nodes you have?
+
+The more that I think about it, the more it seems like the OOM should be treated as an additional separate bug.
+
+--- Comment (doug, Fri, 24 Jun 2016 18:35:35 +0000) ---
+Not sure if the connection is timing out.  When investigating this, I know that the active connection was in a permanent "connecting" state (I believe this is associated with one side having been rebooted and the other not).  In just a few seconds (far less than the 50 second timeout), we ended up in an OOM situation.  A high rate of reconnections can quickly use up memory resources since we clean up failed connections with a zombie list and a background process so they are being created at a much faster rate than they are being cleaned up.
+
+Restricting the reconnections to a specific number and then aborting the connection we consider stuck is in lieu of using time to timeout the stuck connection.  The logic goes like this: if both sides are able to participate in rejecting the CON RACE connection multiple times, then there is no reason the other connection should not complete unless it is somehow stuck.  Assuming it is stuck, we need to abandon it and let the racing connection succeed so we can get on with things.
+
+--- Comment (morrone, Fri, 24 Jun 2016 02:57:48 +0000) ---
+I think that we are seeing this in testing 2.8 between an MDT and and OST.  The MDT node is freshly booted, and tries to connect to the OST over and over again.  The MDT has the lower NID.  The OST thinks it has a connection outstanding.
+
+In change 19430 you are aborting the connection when the other side connects 20 times.  That seems a little odd to me.  Why isn't the higher NID timing out on its connection attempt at some point?  Wouldn't it make more sense to time out and abort the connection attempt at some point?  LNET used to abort and tear down the connection after 50 seconds with no progress.  Why isn't that happening here?
+
+--- Comment (gerrit, Fri, 8 Apr 2016 20:06:55 +0000) ---
+Doug Oucharek (doug.s.oucharek@intel.com) uploaded a new patch: http://review.whamcloud.com/19430
+
+Subject: LU-7646 o2iblnd: connrace protocol improvement
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 246d7596a09ad2972b04cafd3f4c06bab1e46657
+
+--- Comment (gerrit, Wed, 24 Feb 2016 06:08:06 +0000) ---
+Oleg Drokin (oleg.drokin@intel.com) merged in patch http://review.whamcloud.com/18541/
+
+Subject: Revert "LU-7646 o2iblnd: connrace protocol improvement"
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 8b2753109a7f284b4aea96cda0207828a0c68515
+
+--- Comment (doug, Sun, 21 Feb 2016 20:49:46 +0000) ---
+Confirmed that this is causing a lot of problems if you ping yourself.  Reverted the patch (as you see above).  Will figure out how to fix the patch.
+
+--- Comment (gerrit, Sun, 21 Feb 2016 20:41:20 +0000) ---
+Doug Oucharek (doug.s.oucharek@intel.com) uploaded a new patch: http://review.whamcloud.com/18541
+
+Subject: Revert "LU-7646 o2iblnd: connrace protocol improvement"
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 948cd615db62687c85f4d870971a19f58299418b
+
+--- Comment (dmiter, Thu, 18 Feb 2016 19:17:53 +0000) ---
+This patch brings deadlock! To reproduce it just ping self network interface:
+
+# modprobe lustre
+# dmesg -c
+[ 6312.087704] LNet: HW CPU cores: 56, npartitions: 8
+[ 6312.089934] alg: No test for adler32 (adler32-zlib)
+[ 6312.090001] alg: No test for crc32 (crc32-table)
+[ 6320.110568] Lustre: Lustre: Build Version: v2_7_12_0-ge1ccc22-CHANGED-3.10.0-327.10.1.el7_lustre.g42b966e.x86_64
+[ 6320.139839] LNet: Using FastReg for registration
+[ 6320.390188] LNet: Added LNI 192.168.3.102@o2ib [128/8192/0/180]
+[ 6320.390275] LNet: Using FMR for registration
+[ 6320.432823] LNet: Added LNI 192.168.5.102@o2ib1 [128/8192/0/180]
+# lctl ping 192.168.5.102@o2ib1
+[1]+  Stopped
+# dmesg -c
+[ 6327.675473] LNet: 689:0:(o2iblnd_cb.c:2422:kiblnd_passive_connect()) Conn race 192.168.5.102@o2ib1
+[ 6329.144189] LNet: 716:0:(o2iblnd_cb.c:2422:kiblnd_passive_connect()) Conn race 192.168.5.102@o2ib1
+[ 6329.144196] LNet: 716:0:(o2iblnd_cb.c:2422:kiblnd_passive_connect()) Skipped 11 previous similar messages
+[ 6331.145394] LNet: 716:0:(o2iblnd_cb.c:2422:kiblnd_passive_connect()) Conn race 192.168.5.102@o2ib1
+[ 6331.145401] LNet: 716:0:(o2iblnd_cb.c:2422:kiblnd_passive_connect()) Skipped 1 previous similar message
+[ 6334.147187] LNet: 716:0:(o2iblnd_cb.c:2422:kiblnd_passive_connect()) Conn race 192.168.5.102@o2ib1
+[ 6334.147194] LNet: 716:0:(o2iblnd_cb.c:2422:kiblnd_passive_connect()) Skipped 2 previous similar messages
+[ 6339.150176] LNet: 716:0:(o2iblnd_cb.c:2422:kiblnd_passive_connect()) Conn race 192.168.5.102@o2ib1
+[ 6339.150183] LNet: 716:0:(o2iblnd_cb.c:2422:kiblnd_passive_connect()) Skipped 4 previous similar messages
+[ 6348.155725] LNet: 716:0:(o2iblnd_cb.c:2422:kiblnd_passive_connect()) Conn race 192.168.5.102@o2ib1
+[ 6348.155732] LNet: 716:0:(o2iblnd_cb.c:2422:kiblnd_passive_connect()) Skipped 8 previous similar messages
+[ 6365.166226] LNet: 716:0:(o2iblnd_cb.c:2422:kiblnd_passive_connect()) Conn race 192.168.5.102@o2ib1
+[ 6365.166233] LNet: 716:0:(o2iblnd_cb.c:2422:kiblnd_passive_connect()) Skipped 16 previous similar messages
+[ 6388.711572] LNet: 64221:0:(api-ni.c:2271:lnet_ping()) ping 12345-192.168.5.102@o2ib1: late network completion
+[ 6398.186384] LNet: 689:0:(o2iblnd_cb.c:2422:kiblnd_passive_connect()) Conn race 192.168.5.102@o2ib1
+[ 6398.186391] LNet: 689:0:(o2iblnd_cb.c:2422:kiblnd_passive_connect()) Skipped 32 previous similar messages
+[ 6448.748400] LNet: 64221:0:(api-ni.c:2271:lnet_ping()) ping 12345-192.168.5.102@o2ib1: late network completion
+[ 6463.226241] LNet: 689:0:(o2iblnd_cb.c:2422:kiblnd_passive_connect()) Conn race 192.168.5.102@o2ib1
+[ 6463.226248] LNet: 689:0:(o2iblnd_cb.c:2422:kiblnd_passive_connect()) Skipped 64 previous similar messages
+[ 6508.785226] LNet: 64221:0:(api-ni.c:2271:lnet_ping()) ping 12345-192.168.5.102@o2ib1: late network completion
+
+The patch http://review.whamcloud.com/18037 should be reverted!
+
+--- Comment (jgmitter, Fri, 5 Feb 2016 15:30:36 +0000) ---
+Patch has landed for 2.8
+
+--- Comment (gerrit, Fri, 5 Feb 2016 14:56:57 +0000) ---
+Oleg Drokin (oleg.drokin@intel.com) merged in patch http://review.whamcloud.com/18037/
+
+Subject: LU-7646 o2iblnd: connrace protocol improvement
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: a62050bbcf70831f3c16b5c61a04816c1296909b
+
+--- Comment (gerrit, Tue, 19 Jan 2016 01:32:46 +0000) ---
+Doug Oucharek (doug.s.oucharek@intel.com) uploaded a new patch: http://review.whamcloud.com/18037
+
+Subject: LU-7646 lnet: Stop Infinite CON RACE Condition
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: a54fe8b8a56e4519e47a8bd272619aced574e6ff

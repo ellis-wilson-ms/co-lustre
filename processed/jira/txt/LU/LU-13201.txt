@@ -1,0 +1,125 @@
+Key:        LU-13201
+Summary:    soft lockup on ldlm_reprocess_all
+Link:       https://jira.whamcloud.com/browse/LU-13201
+Type:       Bug
+Priority:   Critical
+Status:     Open
+Resolution: Unresolved
+Assignee:   Peter Jones
+Reporter:   Dominique Martinet
+Created:    Tue, 4 Feb 2020 17:55:01 +0000
+Updated:    Sun, 13 Dec 2020 08:40:13 +0000
+
+--- Description ---
+We have upgraded to 2.12.3 recently and have been seeing bad soft lockups, going as far as hard lockups, due to ldlm_reprocess_all in two different patterns:
+
+On OSS all active tasks are in either of these:
+
+ #6 [ffff881c93bafbd8] _raw_spin_lock at ffffffff816b6b70
+ #7 [ffff881c93bafbe8] __ldlm_reprocess_all at ffffffffc0e0b79a [ptlrpc]
+ #8 [ffff881c93bafc38] ldlm_reprocess_all at ffffffffc0e0ba30 [ptlrpc]
+ #9 [ffff881c93bafc48] ldlm_handle_enqueue0 at ffffffffc0e33314 [ptlrpc]
+#10 [ffff881c93bafcd8] tgt_enqueue at ffffffffc0eb8572 [ptlrpc]
+#11 [ffff881c93bafcf8] tgt_request_handle at ffffffffc0ebe8ba [ptlrpc]
+#12 [ffff881c93bafd40] ptlrpc_server_handle_request at ffffffffc0e63f13 [ptlrpc]
+#13 [ffff881c93bafde0] ptlrpc_main at ffffffffc0e67862 [ptlrpc]
+#14 [ffff881c93bafec8] kthread at ffffffff810b4031
+#15 [ffff881c93baff50] ret_from_fork at ffffffff816c155d
+
+//
+
+ #4 [ffff881c92687c08] native_queued_spin_lock_slowpath at ffffffff810fdfc2
+ #5 [ffff881c92687c10] queued_spin_lock_slowpath at ffffffff816a8ff4
+ #6 [ffff881c92687c20] _raw_spin_lock at ffffffff816b6b70
+ #7 [ffff881c92687c30] lock_res_and_lock at ffffffffc0e0302c [ptlrpc]
+ #8 [ffff881c92687c48] ldlm_handle_enqueue0 at ffffffffc0e339a8 [ptlrpc]
+(the one at this comment:
+/* We never send a blocking AST until the lock is granted, but
+  * we can tell it right now */
+)
+ #9 [ffff881c92687cd8] tgt_enqueue at ffffffffc0eb8572 [ptlrpc]
+#10 [ffff881c92687cf8] tgt_request_handle at ffffffffc0ebe8ba [ptlrpc]
+#11 [ffff881c92687d40] ptlrpc_server_handle_request at ffffffffc0e63f13 [ptlrpc]
+#12 [ffff881c92687de0] ptlrpc_main at ffffffffc0e67862 [ptlrpc]
+#13 [ffff881c92687ec8] kthread at ffffffff810b4031
+#14 [ffff881c92687f50] ret_from_fork at ffffffff816c155d
+
+On MGS, active tasks are:
+
+ #4 [ffff881d33ff3b80] native_queued_spin_lock_slowpath at ffffffff810fdfc2
+ #5 [ffff881d33ff3b88] queued_spin_lock_slowpath at ffffffff816a8ff4
+ #6 [ffff881d33ff3b98] _raw_spin_lock at ffffffff816b6b70
+ #7 [ffff881d33ff3ba8] ldlm_handle_conflict_lock at ffffffffc0d8fa08 [ptlrpc]
+ #8 [ffff881d33ff3be0] ldlm_lock_enqueue at ffffffffc0d8ff23 [ptlrpc]
+ #9 [ffff881d33ff3c48] ldlm_handle_enqueue0 at ffffffffc0db8843 [ptlrpc]
+#10 [ffff881d33ff3cd8] tgt_enqueue at ffffffffc0e3d572 [ptlrpc]
+#11 [ffff881d33ff3cf8] tgt_request_handle at ffffffffc0e438ba [ptlrpc]
+#12 [ffff881d33ff3d40] ptlrpc_server_handle_request at ffffffffc0de8f13 [ptlrpc]
+#13 [ffff881d33ff3de0] ptlrpc_main at ffffffffc0dec862 [ptlrpc]
+#14 [ffff881d33ff3ec8] kthread at ffffffff810b4031
+#15 [ffff881d33ff3f50] ret_from_fork at ffffffff816c155d
+
+In the OSS case, the resource was an object, we could go back to the file with lr_name and looking for the oid easily.
+
+The resource was had huge lists in lr_granted (23668) and lr_waiting (70074), but I've seen resources with more on other crashes (this one happened quite a few times); all of these are in l_req_mode = LCK_PR and in this case correspond to mmap'd libraries (e.g. mpi dlopen'd stuff used by jobs); they were all cancelled by in this case a rsync updating the mtime on the inode (utimensat) because the source of the rsync has sub-second precisions and lustre does not so rsync faithfully tries to stick these back.
+
+For now I'm making sure these rsyncs don't touch the files anymore but that might not always be possible.
+
+In the MGS case, I've seen some filesystem lock (lr_name = fsname in hex) with either CONFIG_T_RECOVER (0x2) when some OSS reconnected, or with CONFIG_T_CONFIG (0x0) when updating some ost pool (pool_add/remove); from memory we have 300k entries or so in the list. In the case I'm looking at the crash happened with only one entry in lr_granted and 383193 in lr_waiting: all are in LCK_CR except the first lock in lr_waiting in this case.
+
+I've looked at the last granted lock and it's associated to a thread waiting on an alloc:
+
+PID: 22186  TASK: ffff881f4a6f6eb0  CPU: 12  COMMAND: "ll_mgs_0003"
+ #0 [ffff881f1f433a18] __schedule at ffffffff816b3de4
+ #1 [ffff881f1f433aa8] __cond_resched at ffffffff810c4bd6
+ #2 [ffff881f1f433ac0] _cond_resched at ffffffff816b46aa
+ #3 [ffff881f1f433ad0] kmem_cache_alloc at ffffffff811e3f15
+ #4 [ffff881f1f433b10] LNetMDBind at ffffffffc0b3005c [lnet]
+ #5 [ffff881f1f433b50] ptl_send_buf at ffffffffc0dd3c6f [ptlrpc]
+ #6 [ffff881f1f433c08] ptlrpc_send_reply at ffffffffc0dd705b [ptlrpc]
+ #7 [ffff881f1f433c80] target_send_reply_msg at ffffffffc0d9854e [ptlrpc]
+ #8 [ffff881f1f433ca0] target_send_reply at ffffffffc0da2a5e [ptlrpc]
+ #9 [ffff881f1f433cf8] tgt_request_handle at ffffffffc0e43527 [ptlrpc]
+#10 [ffff881f1f433d40] ptlrpc_server_handle_request at ffffffffc0de8f13 [ptlrpc]
+
+just waiting to be scheduled, but it's not easy with spinlocks hogging all the cores. It doesn't even look like a client problem here, but at this point the server was already slow to respond causing more OSTs to reconnect causing more recoveries causing more of these... so hard to tell.
+
+In both cases, the root problem for me is the same: why are we iterating on this list under a spin lock so often?! We shouldn't ever use a spinlock for list traversal in the first place anyway.
+
+I think our setup is especially bad because we have mixed interconnects with different latencies, so by the time the first of the slower half of the clients accept to cancel the lock, the first half of the faster clients already all tried to reconnect so lr_waiting is big and all the rest of the accepted cancels will be horribly slow (because it's the cancels being ok'd that triggers list traversal to check if some waiting locks could be granted at this point)
+
+Anyway, this has become quite problematic for us lately and doesn't look like it is much better on master, so I would be more than open for workarounds or ideas to try out.
+
+--- Comment (martinetd, Thu, 13 Feb 2020 12:03:23 +0000) ---
+I've had a frustrating time trying to reproduce this. I've started with servers, routers and clients in 2.12.3 as our servers are 2.12.3, but downgrading routers/clients to 2.10.8 like we have in production does not seem to change much.
+
+Unsuccessful test setup was full TCP, 4 CPUs per VM, with:
+
+	one VM with just MGT/one MDT
+
+	two VMs with two OSS each
+
+	two groups of ~32 VMs with different @tcpX networks, including two routers (so three networks, one for servers/routers, and two for each client/routers half)
+
+I've tried going as far up as ~3500 mounts on the clients (50 mounts per client, mounted on routers as well), but even that is "just" 10k locks on the MGT which is less than 1/3 of what we have in production.
+
+In that case neither inducing small (perf probe -m ptlrpc _ldlm_reprocess_all:27 res / perf record -e probe:_ldlm_reprocess_all -a I see the function being called quite a few times, I think I just don't have a sufficient scale yet to make the list traversal slow enough to exhibit soft lockups.
+
+Given I had seen >100k locks on a single file on OSTs I assumed it would be simpler to get many locks taken on a file, but mmap()ing a file twice even at different offsets on a client does not take two locks, so I'm not sure how the production codes managed to get ~130k locks on a single file with jobs running on a few hundred of nodes... In our case the locks were all taken on mpi libs e.g. libhcoll or ucx so I assumed a simple mmap in read/exec, shared would do, but that doesn't look like it is that simple :/
+
+So long story short, I think I'm stuck until I can figure out how to artificially blow the list of locks taken on a single resource up, does someone have an idea for that?
+
+Thanks
+
+--- Comment (martinetd, Thu, 6 Feb 2020 11:51:06 +0000) ---
+Unfortunately it looks like we're missing something as configuration updates (ost pool manipulations) are much faster today... We think some router wasn't reliable.
+
+I'll try to see if I can reproduce something similar with less clients on a test cluster if I add some volontarily slow routers... It looks like the lnet fault framework can do something like that if I find how to use it, or systemtap will do 
+
+Will keep this updated.
+
+--- Comment (simmonsja, Wed, 5 Feb 2020 17:39:16 +0000) ---
+Can you reproduce this easily? If so can you try patch https://review.whamcloud.com/#/c/35483.
+
+--- Comment (pjones, Wed, 5 Feb 2020 14:32:11 +0000) ---
+Thanks Dominque

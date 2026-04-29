@@ -1,0 +1,357 @@
+Key:        LU-15742
+Summary:    lockup in LNetMDUnlink during filesystem migration
+Link:       https://jira.whamcloud.com/browse/LU-15742
+Type:       Bug
+Priority:   Critical
+Status:     Open
+Resolution: Unresolved
+Assignee:   Serguei Smirnov
+Reporter:   Gian-Carlo Defazio
+Created:    Thu, 14 Apr 2022 16:35:01 +0000
+Updated:    Fri, 22 Jul 2022 22:43:41 +0000
+Labels:     llnl
+Attachments: call-2022-4-19.tar.gz, console.catalyst153, console.orelic.tar.gz, console.orelic2, console.pascal128, console.zrelic.tar.gz, console.zrelic2, lustre_network_updated.jpg, opensm.orelic.log.gz, opensm.zrelic.log.gz, pascal128-vmcore-dmesg.txt, pfstest-nodes.tar.gz
+
+--- Environment ---
+TOSS 3.7-19 based
+
+RHEL kernel 3.10.0-1160.59.1
+
+lustre 2.12.8_6.llnl
+
+--- Description ---
+We are having significant lnet issues that have caused us to disable lustre on one of our compute clusters (catalyst). We've had to turn off all of the router nodes in that cluster.
+
+When the routers for catalyst are on we see lots of errors and have connectivity problems on multiple clusters.
+
+This ticket may be useful to explain our lnet setup. https://jira.whamcloud.com/browse/LU-15234
+
+UPDATE: The initial issue have been resolved and our clusters and file systems are working and we don't have to turn off clusters and/or routers anymore. This ticket is now focused on the LNetMDUnlink() containing stack trace as a possible root cause. The OS update and underlying network issues we had seem to have been confounders.
+
+Related to https://jira.whamcloud.com/browse/LU-11895
+
+--- Comment (ofaaland, Mon, 11 Jul 2022 18:56:10 +0000) ---
+Limiting lru_size worked around the issue successfully.  Gian removed topllnl.
+
+Gian is working on a reproducer and a debug patch that checks for unintended loops in the hash chains being traversed by lnet_res_lh_lookup(), and determines the length of those chains if no loop is found.
+
+Once we have more information we'll update this ticket.
+
+--- Comment (ssmirnov, Tue, 26 Apr 2022 21:11:52 +0000) ---
+After reviewing the related tickets and discussing with Amir, there's some things we can try.
+
+The previous tickets showed that the md lists were growing so much that it eventually caused issues when looking through the has in LNetMDUnlink
+
+1) If the number of CPTs can be increased on the client, doing so may be able to help avoid collisions
+
+2) As per Andreas' comment in LU-11092: "Another option would be to set a limit on the number of locks on the client and increase the max age to something better like 10 minutes, like lctl set_param ldlm.namespaces..lru_size=100000 ldlm.namespaces..lru_max_age=600000 or similar. ". I'm not sure we have the same issue here as in LU-11092 as this appears to be beyond LNet. Perhaps adilger  can comment if it is relevant.
+
+3) In another instance, similar problem was worked around by a combination of 
+
+ldlm.namespaces.*.lru_max_age=300s
+
+llite.*.inode_cache=0
+
+which may be not good for the client performance, but prevented it from crashing.
+
+Thanks,
+
+Serguei.
+
+--- Comment (behlendorf, Fri, 22 Apr 2022 22:29:49 +0000) ---
+The stack traces from the logs look very similar those from https://jira.whamcloud.com/browse/LU-11100 and several duplicate linked bugs.
+
+There was a comment in LU-11100 asking for additional information about who was holding the lock.  According to the NMI watchdog the holder appears to be executing the list_for_each_entry loop in LNetMDUnlink() -> lnet_handle2md() -> lnet_res_lh_lookup().  We observed this in the stack traces from multiple clients which hit the issue.
+
+struct lnet_libhandle *
+lnet_res_lh_lookup(struct lnet_res_container *rec, __u64 cookie)
+{
+        ...
+
+        list_for_each_entry(lh, head, lh_hash_chain) {
+                if (lh->lh_cookie == cookie)
+                        return lh;
+        }        return NULL;
+}
+
+ 
+
+[1650641425.080626] NMI watchdog: BUG: soft lockup - CPU#7 stuck for 23s! [ptlrpcd_00_34:17033]
+[1650641425.212628] CPU: 7 PID: 17033 Comm: ptlrpcd_00_34 Kdump: loaded Tainted: P           OEL ------------ T 3.10.0-1160.53.1.1chaos.ch6.x86_64 #1
+[1650641425.225628] Hardware name: Penguin Computing Relion X1904GT/MG20-OP0-ZB, BIOS R04 07/31/2017 
+[1650641425.233628] task: ffff8f643be51080 ti: ffff8f641a7e4000 task.ti: ffff8f641a7e4000
+[1650641425.241628] RIP: 0010:[]  [] lnet_res_lh_lookup+0x48/0x70 [lnet]
+[1650641425.251629] RSP: 0018:ffff8f641a7e7ba0  EFLAGS: 00000206
+[1650641425.257629] RAX: 0000000000000000 RBX: ffffffffffffff10 RCX: ffff9dc719aa5cc0
+[1650641425.264629] RDX: ffff8f6327022340 RSI: 000000001ba3d665 RDI: ffff8f64359bff40
+[1650641425.272629] RBP: ffff8f641a7e7ba0 R08: ffff8f443f5db8c0 R09: ffff8f443f85b8c0
+[1650641425.279629] R10: 0000000000000000 R11: 000000000000000f R12: 0000000000090001
+[1650641425.287629] R13: ffff8f443f45b8c0 R14: 0000000000390000 R15: 0000000000000000
+[1650641425.294629] FS:  0000000000000000(0000) GS:ffff8f443f5c0000(0000) knlGS:0000000000000000
+[1650641425.303629] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[1650641425.309629] CR2: 00002aaab320f024 CR3: 0000003ff84b8000 CR4: 00000000003607e0
+[1650641425.317629] DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+[1650641425.324629] DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+[1650641425.332630] Call Trace:
+[1650641425.335630]  [] LNetMDUnlink+0xac/0x180 [lnet]
+[1650641425.341630]  [] ptlrpc_unregister_reply+0x156/0x880 [ptlrpc]
+[1650641425.349630]  [] ptllnet_res_lh_lookuprpc_expire_one_request+0xfe/0x550 [ptlrpc]
+[1650641425.356630]  [] ptlrpc_expired_set+0xaf/0x1a0 [ptlrpc]
+[1650641425.364630]  [] ptlrpcd+0x29c/0x570 [ptlrpc]
+[1650641425.370630]  [] ? wake_up_state+0x20/0x20
+[1650641425.376630]  [] ? ptlrpcd_check+0x5e0/0x5e0 [ptlrpc]
+[1650641425.383630]  [] kthread+0xd1/0xe0
+[1650641425.388630]  [] ? insert_kthread_work+0x40/0x40
+[1650641425.395630]  [] ret_from_fork_nospec_begin+0x7/0x21
+[1650641425.402630]  [] ? insert_kthread_work+0x40/0x40
+
+--- Comment (defazio, Fri, 22 Apr 2022 21:06:37 +0000) ---
+I've uploaded the console logs for a node that crashed during the call on 2022-04-22, pascal128,
+
+console.pascal128, pascal128-vmcore-dmesg.txt
+
+--- Comment (defazio, Fri, 22 Apr 2022 16:23:52 +0000) ---
+Are you available for another call today?
+
+--- Comment (defazio, Fri, 22 Apr 2022 16:18:55 +0000) ---
+The migration jobs are now being run on a different cluster, pascal.
+
+pascal is in the same building, B654, as the source and destination of the migrations (zinc to boa).
+
+We're still having issues with dropped messages and hangs and timeouts while the migrations are running. However, some migration jobs have been able to complete.
+
+The machines in B451 and the relic routers look good now that they're not involved in the migration.
+
+--- Comment (defazio, Wed, 20 Apr 2022 23:55:03 +0000) ---
+Cameron started running tests before I could.
+
+He ran an ior test with 1m block sizes and had no issues.
+
+He ran this ior command with no issues:
+
+ior -a POSIX -i 2 -b 32G -t 32k -F -C -e -z -o /p/asplustre2/harr1/OST0000/2204201032 -v -v -wWr -g -d 15
+
+We had a configuration change made to the 2 infiniband networks, B654_CZ_IB_SAN and B451_CZ_IB_SAN, which turned on hardware proxy mode. This was because hardware proxy mode had helped with another issue at our site on a different network.
+
+After hardware proxy mode was turned on, Cameron ran his migration jobs again. They caused issues, including the same errors we've seen previously on the relic routers and timeouts and disconnect for other clusters on the network. 
+
+However, there are currently 3 migration jobs running our things look ok, and a few have been able to complete today.
+
+--- Comment (defazio, Wed, 20 Apr 2022 17:18:57 +0000) ---
+That might be the case, but it's hard to tell due to how Cameron's migration script works.
+
+Me:
+
+also, does your migration script tell you what phase of dsync you're in?
+ That is, is it possible to see what phase you're in when things start 
+going bad? Serguei seems to think that things were fine during the walk 
+of zinc (FS "A"), which is kinda how it looked to me too yesterday.
+
+Cameron:
+
+That's not quite how the jobs work. The script first looks for the 
+heaviest users and prioritizes them at the top of the user list, then 
+goes through the user list and submits a new job for each
+ user or group directory at the root of the file system. So there's 
+always a mix of jobs doing pure syncing and some doing walking
+
+You are correct that the tool we're using, dsync from Mpifileutils, scans (or walks) the source and destination before making changes to the destination.
+
+ 
+
+We have done IO testing on boa (FS "B"), although a lot of it was testing hardware and zfs performance, not lustre. However we've done lustre testing on it as well.
+
+I ran some IOR benchmarks on boa about 2 months ago after an OS update that changed the lustre version. However my tests used relatively large transfer sizes (2M) and block sizes (2G). I don't have any records of tests using small transfer and block sizes.
+
+We generally use catalyst for such tests and transfers because catalyst has a lot of spare cycles, and we did use it for some (and I believe most) of the initial performance testing on boa.
+
+I'll try some IOR runs with smaller sizes from catalyst.
+
+--- Comment (ssmirnov, Wed, 20 Apr 2022 14:32:47 +0000) ---
+These messages in orelic logs:
+
+ Apr 19 15:22:28 orelic4 kernel: LNetError: 15918:0:(socklnd.c:1681:ksocknal_destroy_conn()) Completing partial receive from 12345-172.16.70.64@tcp[1], ip 172.16.70.64:988, with error, wanted: 224, left: 224, last alive is 0 secs ago
+
+are likely caused by connection getting destroyed while transferring data, but I haven't yet been able to establish why the connection is getting destroyed.
+
+My understanding is that
+
+	there are 2 FS involved and the migration job is first scanning FS "A" and then, after a while, applying changes to FS "B"
+
+	the issue starts happening when FS "B" starts getting accessed
+
+Is is correct? If so, have you tried any other (fio) tests with FS "B" (using same catalyst nodes)?
+
+--- Comment (defazio, Wed, 20 Apr 2022 00:21:59 +0000) ---
+I've added pfstest-nodes.tar.gz which has the console logs for slurm group pfstest on catalyst. These are the nodes used to perform the migration.
+
+--- Comment (ssmirnov, Tue, 19 Apr 2022 23:30:04 +0000) ---
+Gian-Carlo,
+
+Would it be possible to provide the dmsg from the compute node(s) used to run the migration job around the time of the issue? It looks like these may be useful after all.
+
+Thanks,
+
+Serguei.
+
+--- Comment (defazio, Tue, 19 Apr 2022 23:15:32 +0000) ---
+I've added the lustre logs from today's call as call-2022-4-19.tar.gz
+
+boa isn't on the diagram yet, but it's in building 654, the same as zinc.
+
+--- Comment (defazio, Tue, 19 Apr 2022 18:52:28 +0000) ---
+The fix we had during the call (which was keeping catalyst154 off) didn't last . We're currently having issues even with all the catalyst routers off. It seems like we have underlying network issues on another compute cluster, quartz.
+
+As for the stack trace from LU-14282, Brian Behlendorf noticed that and we made sure that net was turned off. It's usually off on our systems.
+
+I've uploaded some logs for the relic clusters, including from the infiniband subnet manager. If you look at the network digram, the subnet managers for the 2 SANs are on orelic1 and zrelic1.
+
+Would you be able to do another call today?
+
+--- Comment (ssmirnov, Mon, 18 Apr 2022 15:32:25 +0000) ---
+The problem described in this ticket didn't show up while bringing up "catalyst" routers during the call last week.
+
+The stack trace from above appears to be the same issue as LU-14282
+
+--- Comment (defazio, Fri, 15 Apr 2022 15:52:25 +0000) ---
+I've attached that network diagram from the call yesterday. This one is more up to date, but it doesn't have network types or bandwidths yet.
+
+--- Comment (defazio, Fri, 15 Apr 2022 01:01:06 +0000) ---
+Here's the stacktrace from earlier that Cameron Harr pointed out
+
+[Thu Apr 14 15:33:23 2022] ------------[ cut here ]------------ [Thu Apr 14 15:33:23 2022] WARNING: CPU: 12 PID: 6263 at
+kernel/softirq.c:151 local_bh_enable_ip+0x82/0xb0 [Thu Apr 14 15:33:23 2022] Modules linked in: ko2iblnd(OE) lnet(OE)
+libcfs(OE) iTCO_wdt iTCO_vendor_support sb_edac intel_powerclamp coretemp intel_rapl iosf_mbi kvm irqbypass pcspkr rpcrdma ib_iser joydev lpc_ich zfs(POE) ioatdma zunicode(POE) zavl(POE) icp(POE) zcommon(POE)
+znvpair(POE) spl(OE) sg i2c_i801 ipmi_si ipmi_devintf ipmi_msghandler acpi_cpufreq sch_fq_codel binfmt_misc msr_safe(OE) ib_ipoib rdma_ucm ib_umad iw_cxgb4 rdma_cm iw_cm ib_cm iw_cxgb3 ip_tables nfsv3 nfs_acl
+rpcsec_gss_krb5 auth_rpcgss nfsv4 dns_resolver nfs lockd grace fscache
+overlay(T) ext4 mbcache jbd2 dm_service_time mlx4_ib ib_uverbs mlx4_en sd_mod crc_t10dif crct10dif_generic be2iscsi bnx2i cnic uio cxgb4i cxgb4 cxgb3i cxgb3 mdio libcxgbi libcxgb qla4xxx iscsi_boot_sysfs mgag200 drm_kms_helper 8021q syscopyarea sysfillrect sysimgblt [Thu Apr 14 15:33:23 2022]  garp fb_sys_fops crct10dif_pclmul crct10dif_common crc32_pclmul mrp stp crc32c_intel ib_qib llc ghash_clmulni_intel ahci ttm dm_multipath mlx4_core igb mpt2sas isci rdmavt aesni_intel libahci lrw drm libsas gf128mul dca glue_helper ablk_helper ptp raid_class ib_core cryptd libata pps_core devlink scsi_transport_sas drm_panel_orientation_quirks i2c_algo_bit wmi sunrpc dm_mirror dm_region_hash dm_log dm_mod iscsi_tcp libiscsi_tcp libiscsi scsi_transport_iscsi fuse [Thu Apr 14 15:33:23 2022] CPU: 12 PID: 6263 Comm: kworker/12:2H Kdump: 
+loaded Tainted: P           OE  ------------ T
+3.10.0-1160.59.1.1chaos.ch6.x86_64 #1
+[Thu Apr 14 15:33:23 2022] Hardware name: cray cray-2628-lr/S2600GZ, BIOS SE5C600.86B.02.06.0002.101320150901 10/13/2015 [Thu Apr 14 15:33:23 2022] Workqueue: rdmavt_cq send_complete [rdmavt] [Thu Apr 14 15:33:23 2022] Call Trace:
+[Thu Apr 14 15:33:23 2022]  [] dump_stack+0x19/0x1b [Thu Apr 14 15:33:23 2022]  [] warn+0xd8/0x100 [Thu Apr 14 15:33:23 2022]  []
+warn_slowpath_null+0x1d/0x20
+[Thu Apr 14 15:33:23 2022]  []
+local_bh_enable_ip+0x82/0xb0
+[Thu Apr 14 15:33:23 2022]  []
+_raw_spin_unlock_bh+0x1e/0x20
+[Thu Apr 14 15:33:23 2022]  []
+cfs_trace_unlock_tcd+0x65/0xb0 [libcfs]
+[Thu Apr 14 15:33:23 2022]  []
+libcfs_debug_vmsg2+0x728/0xbb0 [libcfs]
+[Thu Apr 14 15:33:23 2022]  [] ? 
+enqueue_entity+0x78/0x80
+[Thu Apr 14 15:33:23 2022]  [] ? 
+enqueue_entity+0x2ef/0xc40
+[Thu Apr 14 15:33:23 2022]  []
+libcfs_debug_msg+0x57/0x80 [libcfs]
+[Thu Apr 14 15:33:23 2022]  []
+kiblnd_cq_completion+0x11a/0x160 [ko2iblnd] [Thu Apr 14 15:33:23 2022]  [] send_complete+0x3e/0x60 [rdmavt] [Thu Apr 14 15:33:23 2022]  []
+process_one_work+0x18f/0x4a0
+[Thu Apr 14 15:33:23 2022]  [] worker_thread+0x126/0x3e0 [Thu Apr 14 15:33:23 2022]  [] ? 
+rescuer_thread+0x430/0x430
+[Thu Apr 14 15:33:23 2022]  [] kthread+0xd1/0xe0 [Thu Apr 14 15:33:23 2022]  [] ? 
+insert_kthread_work+0x40/0x40
+[Thu Apr 14 15:33:23 2022]  []
+ret_from_fork_nospec_begin+0x21/0x21
+[Thu Apr 14 15:33:23 2022]  [] ? 
+insert_kthread_work+0x40/0x40
+[Thu Apr 14 15:33:23 2022] ---[ end trace a92e008f43779f3c ]---
+
+--- Comment (ssmirnov, Thu, 14 Apr 2022 21:29:54 +0000) ---
+https://us05web.zoom.us/j/87389783961?pwd=VU9sNjRVcG1Tdmt1ODlvQ3dTa0N2QT09
+
+--- Comment (defazio, Thu, 14 Apr 2022 21:25:23 +0000) ---
+can you send a link, technical difficulties on my side
+
+--- Comment (ssmirnov, Thu, 14 Apr 2022 21:22:56 +0000) ---
+My skype name is serguei.d.smirnov in case you want to try skype
+
+--- Comment (ssmirnov, Thu, 14 Apr 2022 21:17:44 +0000) ---
+No, it says "We couldn't find the Personal Room defazio1. Try again."
+
+We can also try zoom, skype or teams as an alternative
+
+--- Comment (defazio, Thu, 14 Apr 2022 21:11:19 +0000) ---
+Does this link work? I'm better at joining meetings that starting them.
+
+https://llnlfed.webex.com/join/defazio1
+
+2760 705 6334
+
+--- Comment (ssmirnov, Thu, 14 Apr 2022 21:02:31 +0000) ---
+Today in the next hour or so would be good if you can make it, otherwise Monday, or Tuesday if you're off Monday.
+
+Thanks,
+
+Serguei.
+
+--- Comment (defazio, Thu, 14 Apr 2022 20:59:27 +0000) ---
+Unfortunately there's a lot of noise in the logs due to our troubleshooting efforts. The routers were all taken down on purpose at various times in the last few days, so you might be seeing that. In fact from the catalyst153 logs, and our local chat, 2020-04-13 12:11:58 appears to be one of those times. 
+
+ 
+
+Yes, I'll work on getting set up for a call. When is a good time for you?
+
+--- Comment (ssmirnov, Thu, 14 Apr 2022 20:32:02 +0000) ---
+There's a number of issues in the logs (orelic2):
+
+2022-04-14 09:35:52 [1649954152.744675] LNetError: 23032:0:(o2iblnd_cb.c:2337:kiblnd_passive_connect()) Can't accept conn from 172.19.1.54@o2ib100, queue depth too large:  32 (
+
+indicates mismatch in peer_credits settings.
+
+ 
+
+ 2022-04-13 12:11:58 [1649877118.943520] LNetError: 15903:0:(lib-move.c:1557:lnet_select_pathway()) no route to 192.168.112.239@o2ib15
+
+means there's no route to o2ib15 or all routers are considered to be "down".
+
+ 
+
+And many more.
+
+ 
+
+Would it be possible to set up a call for live debugging?
+
+--- Comment (defazio, Thu, 14 Apr 2022 19:10:37 +0000) ---
+Hi Serguei,
+
+There was an OS update from TOSS 3.7-18 to 3.7-19.
+
+However, the kernel didn't change (3.10.0-1160.59.1 for both) and lustre didn't change (2.12.8_6.llnl  for both).
+
+No new client or routers were added. One catalyst router was removed about a week ago due to a cable issue.
+
+I'm not sure if this is the same as LU-15234 but the relic routers do seem to be having problems when the catalyst routers are running. We're seeing issues where pings work in one direction but not the other.
+
+I'll post some logs from the catalyst routers and from the relics.
+
+--- Comment (ssmirnov, Thu, 14 Apr 2022 17:57:36 +0000) ---
+Hi,
+
+Are the issues the same as reported in LU-15234?
+
+Did anything trigger the issues (e.g. lustre version upgrade, adding new clients or routers)?
+
+Are there any (client/server/router) logs that illustrate the issues?
+
+Thanks,
+
+Serguei.
+
+--- Comment (pjones, Thu, 14 Apr 2022 16:55:16 +0000) ---
+Serguei
+
+Could you please assist
+
+Thanks
+
+Peter
+
+--- Comment (defazio, Thu, 14 Apr 2022 16:39:00 +0000) ---
+The lustre version for the catalyst cluster is at https://github.com/LLNL/lustre/tree/2.12.8_6.llnl
+
+The relic routers are running lustre 2.10 https://github.com/LLNL/lustre/tree/2.10.8_11.chaos
+
+--- Comment (defazio, Thu, 14 Apr 2022 16:36:35 +0000) ---
+For my notes the local ticket is https://lc.llnl.gov/jira/browse/TOSS-5626

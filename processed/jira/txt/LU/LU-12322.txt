@@ -1,0 +1,227 @@
+Key:        LU-12322
+Summary:    negative grant and tgt_grant.c:561:tgt_grant_incoming() LBUG
+Link:       https://jira.whamcloud.com/browse/LU-12322
+Type:       Bug
+Priority:   Critical
+Status:     Resolved
+Resolution: Duplicate
+Assignee:   WC Triage
+Reporter:   Stephane Thiell
+Created:    Tue, 21 May 2019 05:40:14 +0000
+Updated:    Mon, 27 May 2019 14:38:45 +0000
+Resolved:   Tue, 21 May 2019 17:18:42 +0000
+Links:      Duplicate: duplicates LU-12120
+Attachments: oak-io2-s2-crash-cmd-20190520.txt, oak-io2-s2-foreach-bt-20190520.txt, oak-io2-s2-vmcore-dmesg-20190520.txt
+
+--- Environment ---
+CentOS 7.6
+
+--- Description ---
+New LBUG tonight with 2.10.7, likely a duplicate of LU-12120.
+
+[219417.266382] LustreError: 281433:0:(tgt_grant.c:559:tgt_grant_incoming()) oak-OST0053: cli 0eb5afeb-9924-327f-d61d-428dac6cb441/ffff883c7ef04800 dirty 0 pend 0 grant -29360128
+[219417.283969] LustreError: 281433:0:(tgt_grant.c:561:tgt_grant_incoming()) LBUG
+[219417.292035] Pid: 281433, comm: ll_ost00_045 3.10.0-693.2.2.el7_lustre.pl3.x86_64 #1 SMP Thu Mar 15 13:06:45 PDT 2018
+[219417.303881] Call Trace:
+[219417.306716] [] save_stack_trace_tsk+0x22/0x40
+[219417.313560] [] libcfs_call_trace+0x8c/0xc0 [libcfs]
+[219417.320982] [] lbug_with_loc+0x4c/0xa0 [libcfs]
+[219417.328013] [] tgt_grant_prepare_read+0x0/0x3b0 [ptlrpc]
+[219417.335979] [] tgt_grant_prepare_read+0x10b/0x3b0 [ptlrpc]
+[219417.344121] [] ofd_set_info_hdl+0x23d/0x4a0 [ofd]
+[219417.351343] [] tgt_request_handle+0x925/0x1370 [ptlrpc]
+[219417.359202] [] ptlrpc_server_handle_request+0x236/0xa90 [ptlrpc]
+[219417.367930] [] ptlrpc_main+0xa92/0x1e40 [ptlrpc]
+[219417.375101] [] kthread+0xcf/0xe0
+[219417.380671] [] ret_from_fork+0x58/0x90
+[219417.386823] [] 0xffffffffffffffff
+[219417.392529] Kernel panic - not syncing: LBUG
+
+ prior to this, a lot of evictions and network errors 
+
+[218920.410034] LustreError: 257942:0:(events.c:449:server_bulk_callback()) event type 5, status -125, desc ffff881d0b310a00
+[218923.029069] LustreError: 257941:0:(events.c:449:server_bulk_callback()) event type 5, status -125, desc ffff882566547000
+[218928.063611] LustreError: 257941:0:(events.c:449:server_bulk_callback()) event type 5, status -125, desc ffff880050289600
+[218957.709743] Lustre: oak-OST004d: haven't heard from client ed27e8aa-82e0-d7bd-37eb-95d83ba476b8 (at 10.8.7.32@o2ib6) in 227 seconds. I think it's dead, and I am evicting it. exp ffff883c83a64000, cur 1558412848 expire 1558412698 last 1558412621 
+
+ 
+
+Attaching vmcore-dmesg, output of basic crash commands and foreach bt.
+
+Please note that (just in case) I didn't have the patch for LU-12018 on this OSS. It was a stock 2.10.7. Now the OSS has been updated.
+
+--- Comment (bougetq, Mon, 27 May 2019 00:40:56 +0000) ---
+Hello,
+
+I've looked at the code a little, and here is what I found (I hope it helps):
+
+I suppose this is now obvious to anyone who read Stephane's description: the LBUG is triggered by a negative value of ted_grant.
+
+I first thought it happened in tgt_grant_incoming() itself, because of this line:
+
+        ted->ted_grant -= dropped;
+
+But this assignment is actually protected:
+
+        dropped = oa->oa_dropped;
+        ...
+        if (ted->ted_grant ted_grant -= dropped;
+
+ 
+
+Guided by LU-6877, I looked for a potential error during an arithmetic conversion:
+
+variable
+data type
+
+oa->oa_dropped
+__u32
+
+dropped
+long long
+
+ted->ted_grant
+long
+
+I could not find any (though that looked promising at first with long being at least an int32_t and long long an int64_t).
+
+From there I concluded that ted->ted_grant must be set to a negative value elsewhere/earlier. Repeating a similar analysis, I could only find one place where this can happen [*]:
+
+static void tgt_grant_shrink(struct obd_export *exp, struct obdo *oa,
+			     u64 left_space)
+{
+        struct tg_export_data *ted = &exp->exp_target_data;
+        struct obd_device     *obd = exp->exp_obd;
+        struct tg_grants_data *tgd = &obd->u.obt.obt_lut->lut_tgd;
+        long grant_shrink;
+
+        assert_spin_locked(&tgd->tgd_grant_lock);
+        LASSERT(exp);
+        if (left_space >= tgd->tgd_tot_granted_clients *
+                          TGT_GRANT_SHRINK_LIMIT(exp))
+                return;
+        grant_shrink = oa->o_grant;
+        ted->ted_grant -= grant_shrink;
+        tgd->tgd_tot_granted -= grant_shrink;
+        CDEBUG(D_CACHE, "%s: cli %s/%p shrink %ld ted_grant %ld total %llu\n",
+               obd->obd_name, exp->exp_client_uuid.uuid, exp, grant_shrink,
+               ted->ted_grant, tgd->tgd_tot_granted);
+
+        /* client has just released some grant, don't grant any space back */
+        oa->o_grant = 0;
+}
+
+All the other places where ted_grant is set seem to be protected with appropriate checks.
+
+Now tgt_grant_shrink() is only called in two places: tgt_grant_prepare_read() and tgt_grant_prepare_write(). The odd part is that in tgt_grant_prepare_read() it is called after tgt_grant_incoming() (the function that raises the LBUG).
+
+My understanding is that there is a workqueue on the client side that periodically updates a client's grant size (cf. ost_grant_work_handler()). The update RPC is sent asynchronously and a callback is set to process the server's response:
+
+static int osc_shrink_grant_interpret(const struct lu_env *env,
+				      struct ptlrpc_request *req,
+				      void *args, int rc)
+{
+	struct osc_grant_args *aa = args;
+	struct client_obd *cli = &req->rq_import->imp_obd->u.cli;
+	struct ost_body *body;
+
+	if (rc != 0) {
+		__osc_update_grant(cli, aa->aa_oa->o_grant);
+		GOTO(out, rc);
+	}
+
+	body = req_capsule_server_get(&req->rq_pill, &RMF_OST_BODY);
+	LASSERT(body);
+	osc_update_grant(cli, body);
+out:
+	OBD_SLAB_FREE_PTR(aa->aa_oa, osc_obdo_kmem);
+
+	return rc;
+}
+
+...
+
+int osc_set_info_async(...)
+{
+        ...
+        if (KEY_IS(KEY_GRANT_SHRINK)) {
+                ...
+                req->rq_interpret_reply = osc_shrink_grant_interpret;
+        }
+        ...
+}
+
+So at some point the client probably receives a bogus value from the server, and the next RPC triggers the LBUG.
+
+Where to go from there?
+
+I could not figure out where exp->exp_target_data comes from in tgt_grant_shrink(). If someone can, we should be able to find the root cause of all this.
+
+—
+
+[*] I only looked at places in the code where ted_grant is explicitly set (grep -R 'ted->ted_grant\s+[-+]?=' lustre). However, it is possible that somewhere, the whole ted structure is set at once and I missed it (for example during RPC packing / unpacking).
+
+--- Comment (pjones, Sat, 25 May 2019 16:41:46 +0000) ---
+Sure. We'll get someone who is not out for Memorial Day long weekend to look at LU-12120
+
+--- Comment (sthiell, Sat, 25 May 2019 16:32:58 +0000) ---
+Peter,
+
+ Is it possible to increase the severity of this issue or LU-12120? Hit us again this morning with 2.12. No massive evictions seen prior the LBUG nor network issues:
+
+[Sat May 25 07:46:41 2019]fir-io2-s1 login: [ 3622.566306] Lustre: fir-OST000e: haven't heard from client df23de56-dd2e-8a63-a8d5-338686a662ec (at 10.8.17.18@o2ib6) in 227 seconds. I think it's dead, and I am evicting it. exp ffff9530d128d000, cur 1558795971 expire 1558795821 last 1558795744^M
+[Sat May 25 08:04:13 2019][ 4304.680584] Lustre: fir-OST000c: Connection restored to d7e6489c-4ac3-8ad5-951f-ff4462d87a95 (at 10.8.15.2@o2ib6)^M
+[Sat May 25 08:04:13 2019][ 4304.690868] Lustre: Skipped 17 previous similar messages^M
+[Sat May 25 08:05:29 2019][ 4380.571168] Lustre: fir-OST0014: haven't heard from client 25c68a06-73fb-c817-93ec-98f34b969f96 (at 10.8.23.14@o2ib6) in 227 seconds. I think it's dead, and I am evicting it. exp ffff952a0dde9c00, cur 1558796729 expire 1558796579 last 1558796502^M
+[Sat May 25 08:05:29 2019][ 4380.592942] Lustre: Skipped 53 previous similar messages^M
+[Sat May 25 08:20:16 2019][ 5267.591216] Lustre: fir-OST000c: Connection restored to 25c68a06-73fb-c817-93ec-98f34b969f96 (at 10.8.23.14@o2ib6)^M
+[Sat May 25 08:20:16 2019][ 5267.601571] Lustre: Skipped 5 previous similar messages^M
+[Sat May 25 08:36:11 2019][ 6223.053938] Lustre: fir-OST000c: Connection restored to f0ba9527-4000-78d5-07ea-44ae00898a99 (at 10.8.15.5@o2ib6)^M
+[Sat May 25 08:36:11 2019][ 6223.064213] Lustre: Skipped 5 previous similar messages^M
+[Sat May 25 08:36:36 2019][ 6247.582854] Lustre: fir-OST000c: Connection restored to e267eed0-45c3-44be-99a6-206acecf07ea (at 10.8.15.6@o2ib6)^M
+[Sat May 25 08:36:36 2019][ 6247.593114] Lustre: Skipped 5 previous similar messages^M
+[Sat May 25 08:40:43 2019][ 6495.331104] Lustre: fir-OST000c: Connection restored to 85720600-89f3-ddb2-047a-1b853ce6c3da (at 10.8.21.24@o2ib6)^M
+[Sat May 25 08:40:43 2019][ 6495.341461] Lustre: Skipped 5 previous similar messages^M
+[Sat May 25 08:41:10 2019][ 6521.769152] Lustre: fir-OST000c: Connection restored to b8bfc82f-1f8e-8596-4178-06354c0fe0f1 (at 10.8.17.15@o2ib6)^M
+[Sat May 25 08:41:10 2019][ 6521.779522] Lustre: Skipped 5 previous similar messages^M
+[Sat May 25 08:41:19 2019][ 6531.255514] Lustre: fir-OST000c: Connection restored to e6c11c37-f182-6c12-4d0c-27449ff35ca8 (at 10.8.17.16@o2ib6)^M
+[Sat May 25 08:41:19 2019][ 6531.265922] Lustre: Skipped 5 previous similar messages^M
+[Sat May 25 08:41:37 2019][ 6548.836936] Lustre: fir-OST000c: Connection restored to 834edbb7-1073-058c-c5af-7281bda3b502 (at 10.8.17.17@o2ib6)^M
+[Sat May 25 08:41:37 2019][ 6548.847289] Lustre: Skipped 9 previous similar messages^M
+[Sat May 25 08:41:56 2019][ 6568.361589] Lustre: fir-OST000c: Connection restored to 29c83ccc-4cd0-0a75-8213-b42166238c97 (at 10.8.17.19@o2ib6)^M
+[Sat May 25 08:41:56 2019][ 6568.371960] Lustre: Skipped 17 previous similar messages^M
+[Sat May 25 08:42:49 2019][ 6620.986599] Lustre: fir-OST000c: Connection restored to f70dbc8f-f692-ceed-bbff-b6639edcae72 (at 10.9.113.8@o2ib4)^M
+[Sat May 25 08:42:49 2019][ 6620.996948] Lustre: Skipped 5 previous similar messages^M
+[Sat May 25 08:44:04 2019][ 6696.251816] Lustre: fir-OST000c: Connection restored to dc489b81-8258-354a-1cb8-0896baf24eea (at 10.8.12.24@o2ib6)^M
+[Sat May 25 08:44:04 2019][ 6696.262177] Lustre: Skipped 17 previous similar messages^M
+[Sat May 25 08:47:59 2019][ 6931.536750] Lustre: fir-OST000c: Connection restored to dca21337-fdba-5128-347e-592b37646902 (at 10.9.108.60@o2ib4)^M
+[Sat May 25 08:47:59 2019][ 6931.547220] Lustre: Skipped 5 previous similar messages^M
+[Sat May 25 08:55:44 2019][ 7396.501593] LustreError: 79137:0:(tgt_grant.c:563:tgt_grant_incoming()) fir-OST0012: cli ebef6758-802b-3d88-0fb7-39f9e3a97c72/ffff952bb4d08000 dirty 0 pend 0 grant -29360128^M
+[Sat May 25 08:55:44 2019][ 7396.517073] LustreError: 79137:0:(tgt_grant.c:565:tgt_grant_incoming()) LBUG^M
+[Sat May 25 08:55:44 2019][ 7396.524130] Pid: 79137, comm: ll_ost_io02_069 3.10.0-957.1.3.el7_lustre.x86_64 #1 SMP Fri Dec 7 14:50:35 PST 2018^M
+[Sat May 25 08:55:44 2019][ 7396.534427] Call Trace:^M
+[Sat May 25 08:55:44 2019][ 7396.536895]  [] libcfs_call_trace+0x8c/0xc0 [libcfs]^M
+[Sat May 25 08:55:44 2019][ 7396.543496]  [] lbug_with_loc+0x4c/0xa0 [libcfs]^M
+[Sat May 25 08:55:44 2019][ 7396.549728]  [] tgt_grant_prepare_read+0x0/0x3b0 [ptlrpc]^M
+[Sat May 25 08:55:44 2019][ 7396.556804]  [] tgt_grant_prepare_read+0x10b/0x3b0 [ptlrpc]^M
+[Sat May 25 08:55:44 2019][ 7396.564043]  [] ofd_preprw+0x450/0x1160 [ofd]^M
+[Sat May 25 08:55:44 2019][ 7396.569998]  [] tgt_brw_read+0x9db/0x1e50 [ptlrpc]^M
+[Sat May 25 08:55:44 2019][ 7396.576479]  [] tgt_request_handle+0xaea/0x1580 [ptlrpc]^M
+[Sat May 25 08:55:45 2019][ 7396.583429]  [] ptlrpc_server_handle_request+0x24b/0xab0 [ptlrpc]^M
+[Sat May 25 08:55:45 2019][ 7396.591167]  [] ptlrpc_main+0xafc/0x1fc0 [ptlrpc]^M
+[Sat May 25 08:55:45 2019][ 7396.597506]  [] kthread+0xd1/0xe0^M
+[Sat May 25 08:55:45 2019][ 7396.602421]  [] ret_from_fork_nospec_begin+0xe/0x21^M
+[Sat May 25 08:55:45 2019][ 7396.608915]  [] 0xffffffffffffffff^M
+[Sat May 25 08:55:45 2019][ 7396.613949] Kernel panic - not syncing: LBUG^M
+
+A patch to avoid the OSS LBUG would be a good first step I guess.
+
+--- Comment (sthiell, Sat, 25 May 2019 01:58:47 +0000) ---
+I got the same kind of crash with 2.12 today. Exact same scenario than with 2.10: a bunch of Bulk IO error, event type 5, status -125, negative grant, then crash. More than 5 OSS crashed today on Fir. We had to remount the OSTs with -o abort_recov. Then everything went back to normal.
+
+--- Comment (pjones, Tue, 21 May 2019 17:18:42 +0000) ---
+Hi Stephane
+
+We reviewed the ticket and agree that this looks to be a duplicate of LU-12120
+
+Peter

@@ -1,0 +1,267 @@
+Key:        LU-15620
+Summary:    Poor write performance with nfsd over Lustre
+Link:       https://jira.whamcloud.com/browse/LU-15620
+Type:       Bug
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   Patrick Farrell
+Reporter:   Stephane Thiell
+Created:    Sat, 5 Mar 2022 02:14:55 +0000
+Updated:    Fri, 18 Mar 2022 23:57:29 +0000
+Attachments: client-nfs-server_oak-h03v09.log.gz
+
+--- Environment ---
+CentOS 7.9 - Lustre 2.12.7 servers and 2.12.8 clients with kernel 3.10.0-1160.53.1.el7.x86_64
+
+--- Description ---
+We're re-exporting a Lustre filesystem over NFSv4+krb5 (using nfsd) and I believe we're hitting the problem of poor write performance described in LU-11070 (Partial page write by NFS).
+
+When I write to a file over NFS with nice 1 MB blocks, I can see many 1-page read rpcs to the OSTs (from the client that re-exports Lustre over NFSv4).
+
+The writes done by nfsd must be small or misaligned leading to ll_io_read_page() being called on ll_write_begin():
+
+[1840548.682492] nfsd            S ffff900c6a12a100     0  2408      2 0x00000080
+[1840548.683626] Call Trace:
+[1840548.684002]  [] schedule+0x29/0x70
+[1840548.684810]  [] cl_sync_io_wait+0x2b5/0x3d0 [obdclass]
+[1840548.685843]  [] ? wake_up_state+0x20/0x20
+[1840548.686703]  [] ll_io_read_page+0x306/0x4c0 [lustre]
+[1840548.687715]  [] ? lov_attr_get+0x22/0x60 [lov]
+[1840548.688629]  [] ll_write_begin+0x505/0xc00 [lustre]
+[1840548.689611]  [] generic_file_buffered_write+0x10f/0x270
+[1840548.690628]  [] __generic_file_aio_write+0x1e2/0x400
+[1840548.691639]  [] __generic_file_write_iter+0xcb/0x340 [lustre]
+[1840548.692763]  [] vvp_io_write_start+0x504/0xa70 [lustre]
+[1840548.693844]  [] ? cl_lock_enqueue+0x65/0x120 [obdclass]
+[1840548.694885]  [] cl_io_start+0x68/0x130 [obdclass]
+[1840548.695886]  [] cl_io_loop+0xcc/0x1c0 [obdclass]
+[1840548.696879]  [] ll_file_io_generic+0x63b/0xc90 [lustre]
+[1840548.697935]  [] ? __kernel_fpu_end+0x1f/0x40
+[1840548.698845]  [] ll_file_aio_write+0x289/0x660 [lustre]
+[1840548.699852]  [] ? rw_copy_check_uvector+0x5e/0x140
+[1840548.700826]  [] do_sync_readv_writev+0x7b/0xd0
+[1840548.701759]  [] do_readv_writev+0xce/0x260
+[1840548.702652]  [] ? ll_file_splice_read+0x210/0x210 [lustre]
+[1840548.703722]  [] ? ll_file_aio_write+0x660/0x660 [lustre]
+[1840548.704780]  [] ? __wake_up_common_lock+0x91/0xc0
+[1840548.705748]  [] ? task_rq_unlock+0x20/0x20
+[1840548.706688]  [] vfs_writev+0x35/0x60
+[1840548.707528]  [] nfsd_vfs_write+0xb5/0x390 [nfsd]
+[1840548.708498]  [] nfsd4_write+0x1cf/0x240 [nfsd]
+[1840548.709456]  [] nfsd4_proc_compound+0x3dd/0x780 [nfsd]
+[1840548.710538]  [] nfsd_dispatch+0xe0/0x290 [nfsd]
+[1840548.711463]  [] svc_process_common+0x400/0x7d0 [sunrpc]
+[1840548.712526]  [] svc_process+0xf3/0x110 [sunrpc]
+[1840548.713463]  [] nfsd+0xdf/0x150 [nfsd]
+[1840548.714300]  [] ? nfsd_destroy+0x80/0x80 [nfsd]
+[1840548.715244]  [] kthread+0xd1/0xe0
+[1840548.715987]  [] ? insert_kthread_work+0x40/0x40
+[1840548.716963]  [] ret_from_fork_nospec_begin+0xe/0x21
+[1840548.717976]  [] ? insert_kthread_work+0x40/0x40
+ 
+
+This is dramatically affecting write performance to Lustre over NFS... The NFS server/lustre client is busy with many read rpcs in flight to the OST serving the file (98% of 1-page rpcs):
+
+[root@oak-h03v09 .testsrcc]# lctl get_param osc.oak-OST015c*.rpc_stats
+osc.oak-OST015c-osc-ffff900c98c2a000.rpc_stats=
+snapshot_time:         1646445606.359753793 (secs.nsecs)
+read RPCs in flight:  9
+write RPCs in flight: 0
+pending write pages:  1270
+pending read pages:   1
+
+			read			write
+pages per rpc         rpcs   % cum % |       rpcs   % cum %
+1:		    940581  98  98   |        206   4   4
+2:		      8652   0  98   |         76   1   5
+4:		       810   0  98   |         53   1   6
+8:		        80   0  98   |         26   0   7
+16:		       100   0  99   |         26   0   7
+32:		       618   0  99   |         31   0   8
+64:		       656   0  99   |        315   6  14
+128:		        67   0  99   |        341   6  21
+256:		       231   0  99   |        696  13  35
+512:		        55   0  99   |        535  10  45
+1024:		      7886   0 100   |       2727  54 100
+
+			read			write
+rpcs in flight        rpcs   % cum % |       rpcs   % cum %
+0:		         0   0   0   |          0   0   0
+1:		      9849   1   1   |       3854  76  76
+2:		     51413   5   6   |        635  12  89
+3:		      2920   0   6   |        214   4  93
+4:		      1945   0   6   |        106   2  95
+5:		      1992   0   7   |         65   1  96
+6:		      5397   0   7   |         49   0  97
+7:		      9105   0   8   |         28   0  98
+8:		     30909   3  11   |         21   0  98
+9:		    845544  88  99   |         58   1  99
+10:		       662   0 100   |          2   0 100
+
+			read			write
+offset                rpcs   % cum % |       rpcs   % cum %
+0:		      1520   0   0   |       1073  21  21
+1:		        51   0   0   |          5   0  21
+2:		       128   0   0   |          1   0  21
+4:		       171   0   0   |          1   0  21
+8:		       100   0   0   |          2   0  21
+16:		       188   0   0   |          0   0  21
+32:		       397   0   0   |          0   0  21
+64:		       797   0   0   |          0   0  21
+128:		      1545   0   0   |          0   0  21
+256:		      3816   0   0   |          4   0  21
+512:		      5070   0   1   |          8   0  21
+1024:		      8483   0   2   |         59   1  22
+2048:		     10840   1   3   |         78   1  24
+4096:		     17936   1   5   |        131   2  27
+8192:		     40789   4   9   |        203   4  31
+16384:		     32536   3  12   |        253   5  36
+32768:		     35348   3  16   |        296   5  42
+65536:		     43505   4  21   |        429   8  50
+131072:		    209057  21  42   |        568  11  61
+262144:		    358818  37  80   |        909  18  79
+524288:		    188641  19 100   |       1012  20 100
+
+If I take some Lustre debug logs, I see many small writes:
+
+[root@oak-h03v09 .testsrcc]# grep ll_write_end /tmp/dk5  | grep pos | head
+00000080:00200000:11.0:1646438240.275220:0:2401:0:(rw26.c:830:ll_write_end()) pos 84250624, len 3848, copied 3848
+00000080:00200000:11.0:1646438240.275335:0:2401:0:(rw26.c:830:ll_write_end()) pos 84254472, len 248, copied 248
+00000080:00200000:13.0:1646438240.290720:0:2405:0:(rw26.c:830:ll_write_end()) pos 86269952, len 3848, copied 3848
+00000080:00200000:13.0:1646438240.290810:0:2405:0:(rw26.c:830:ll_write_end()) pos 86273800, len 248, copied 248
+00000080:00200000:13.0:1646438240.295724:0:2403:0:(rw26.c:830:ll_write_end()) pos 89305088, len 3848, copied 3848
+00000080:00200000:13.0:1646438240.295808:0:2403:0:(rw26.c:830:ll_write_end()) pos 89308936, len 248, copied 248
+00000080:00200000:11.0:1646438240.325755:0:2401:0:(rw26.c:830:ll_write_end()) pos 84254720, len 3848, copied 3848
+00000080:00200000:11.0:1646438240.325846:0:2401:0:(rw26.c:830:ll_write_end()) pos 84258568, len 248, copied 248
+00000080:00200000:13.0:1646438240.340791:0:2405:0:(rw26.c:830:ll_write_end()) pos 86274048, len 3848, copied 3848
+00000080:00200000:13.0:1646438240.340971:0:2405:0:(rw26.c:830:ll_write_end()) pos 86277896, len 248, copied 248
+
+Also many of these:
+
+/tmp/dk6:00000080:00000001:10.0:1646441821.230362:0:2402:0:(rw26.c:634:ll_prepare_partial_page()) Process leaving
+/tmp/dk6:00000080:00000001:10.0:1646441821.230589:0:2402:0:(rw26.c:591:ll_prepare_partial_page()) Process entered
+
+I'm attaching a sample of logs with +ALL and +rpc as client-nfs-server_oak-h03v09.log.gz
+
+On the Lustre side, I disabled readahead, statahead, played with max_dirty_mb, max_rpcs_in_flight... without luck.
+
+On the NFS side, I tried sec=krb5/krb5i/krb5p without luck. We run Kernel 3.10.0-1160.53.1.el7.x86_64 on the client / NFS server.
+
+I'm wondering if anyone has some ideas on how to fix this problem. Happy to provide more logs if needed. Thanks!
+
+--- Comment (sthiell, Fri, 18 Mar 2022 23:57:29 +0000) ---
+Thank you, Etienne!
+
+--- Comment (eaujames, Fri, 18 Mar 2022 15:23:51 +0000) ---
+Hi Stephane,
+
+You could check the patch https://review.whamcloud.com/45838/ ("LU-15366 nrs: increase maximum rate for tbf rule") (backport b2_12: https://review.whamcloud.com/46164/ + https://review.whamcloud.com/46828/).
+
+As workaround, you can set the default tbf rate via ptlrpc module parameter "tbf_rate" (this value is not limited).
+
+--- Comment (sthiell, Wed, 16 Mar 2022 02:24:55 +0000) ---
+FYI, we have noticed that using NRS TBF didn't help us in this case. Even when using the default rate of 10000 per CPT, it is too low. We've been able to get better write performance by increasing the NRS TBF rate for ost_io to the maximum of 65534. We cannot disable NRS completely at this point, instead I plan to apply the fix from LU-15366 to be able to set the RPC rate even higher and as such, "exempt" Lustre clients running nfsd. With these unexpected small read RPCs, the OSTs don't seem to do any I/O to disk because I assume it's all cached, so it's mainly a matter of getting small read RPCs as fast as possible between the client and OSTs. It will be a workaround for now. The root cause of small reads with nfsd remains though.
+
+--- Comment (sthiell, Fri, 11 Mar 2022 00:18:42 +0000) ---
+Hi Patrick,
+
+I hope you can find some time to look at this problem. Today I've been trying to narrow down the issue and what I can say at this point, is that nfsd receives nice 1 MiB write requests over the network and seems to write vectors of vlen=257 and the difference between the offsets shows writes of 1,048,576 bytes.
+
+perf probe -m nfsd -v nfsd_vfs_write 'offset' 'vlen' gives:
+
+nfsd  3505 [015]  4060.922514: probe:nfsd_vfs_write: (ffffffffc07ffed0) offset=65011712 vlen=257
+                    6f41 nfsd_vfs_write (/lib/modules/3.10.0-957.27.2.el7.x86_64/kernel/fs/nfsd/nfsd.ko.xz)
+                   16e3d nfsd4_proc_compound (/lib/modules/3.10.0-957.27.2.el7.x86_64/kernel/fs/nfsd/nfsd.ko.xz)
+                    1880 nfsd_dispatch (/lib/modules/3.10.0-957.27.2.el7.x86_64/kernel/fs/nfsd/nfsd.ko.xz)
+                   14ca3 svc_process_common ([sunrpc])
+                   15193 svc_process ([sunrpc])
+                    11df nfsd (/lib/modules/3.10.0-957.27.2.el7.x86_64/kernel/fs/nfsd/nfsd.ko.xz)
+                  2c2e81 kthread ([kernel.kallsyms])
+                  976c1d ret_from_fork_nospec_begin ([kernel.kallsyms])
+
+nfsd  3500 [015]  4062.046901: probe:nfsd_vfs_write: (ffffffffc07ffed0) offset=66060288 vlen=257
+                    6f41 nfsd_vfs_write (/lib/modules/3.10.0-957.27.2.el7.x86_64/kernel/fs/nfsd/nfsd.ko.xz)
+                   16e3d nfsd4_proc_compound (/lib/modules/3.10.0-957.27.2.el7.x86_64/kernel/fs/nfsd/nfsd.ko.xz)
+                    1880 nfsd_dispatch (/lib/modules/3.10.0-957.27.2.el7.x86_64/kernel/fs/nfsd/nfsd.ko.xz)
+                   14ca3 svc_process_common ([sunrpc])
+                   15193 svc_process ([sunrpc])
+                    11df nfsd (/lib/modules/3.10.0-957.27.2.el7.x86_64/kernel/fs/nfsd/nfsd.ko.xz)
+                  2c2e81 kthread ([kernel.kallsyms])
+                  976c1d ret_from_fork_nospec_begin ([kernel.kallsyms])
+
+# perf script| grep offset
+nfsd  3499 [015]  4051.725219: probe:nfsd_vfs_write: (ffffffffc07ffed0) offset=400556032 vlen=257
+nfsd  3502 [015]  4053.351214: probe:nfsd_vfs_write: (ffffffffc07ffed0) offset=401604608 vlen=257
+nfsd  3495 [003]  4053.393739: probe:nfsd_vfs_write: (ffffffffc07ffed0) offset=402653184 vlen=257
+nfsd  3504 [015]  4053.425144: probe:nfsd_vfs_write: (ffffffffc07ffed0) offset=403701760 vlen=257
+...
+
+However, at the Lustre client level,  
+
+perf probe -m lustre -v ll_write_begin pos len
+
+gives:
+
+nfsd  3504 [011]  4877.369855: probe:ll_write_begin: (ffffffffc125c040) pos=677711612 len=0x104
+	           510b1 ll_write_begin (/lib/modules/3.10.0-957.27.2.el7.x86_64/extra/lustre-client/fs/lustre.ko)
+	          3b9ce2 __generic_file_aio_write ([kernel.kallsyms])
+	           5e23b __generic_file_write_iter (/lib/modules/3.10.0-957.27.2.el7.x86_64/extra/lustre-client/fs/lustre.ko)
+	           62414 vvp_io_write_start (/lib/modules/3.10.0-957.27.2.el7.x86_64/extra/lustre-client/fs/lustre.ko)
+	           5e218 cl_io_start ([obdclass])
+	           603ec cl_io_loop ([obdclass])
+	           17f7b ll_file_io_generic (/lib/modules/3.10.0-957.27.2.el7.x86_64/extra/lustre-client/fs/lustre.ko)
+	           18a89 ll_file_aio_write (/lib/modules/3.10.0-957.27.2.el7.x86_64/extra/lustre-client/fs/lustre.ko)
+	          441cdb do_sync_readv_writev ([kernel.kallsyms])
+	          44391e do_readv_writev ([kernel.kallsyms])
+	          443b45 vfs_writev ([kernel.kallsyms])
+	            7000 nfsd_vfs_write ([nfsd])
+	           15041 nfsd4_write ([nfsd])
+	           16e3d nfsd4_proc_compound ([nfsd])
+	            1880 nfsd_dispatch ([nfsd])
+	           14ca3 svc_process_common ([sunrpc])
+	           15193 svc_process ([sunrpc])
+	            11df nfsd ([nfsd])
+	          2c2e81 kthread ([kernel.kallsyms])
+	          976c1d ret_from_fork_nospec_begin ([kernel.kallsyms])
+
+nfsd  3504 [011]  4877.369902: probe:ll_write_begin: (ffffffffc125c040) pos=677711872 len=0xefc
+	           510b1 ll_write_begin (/lib/modules/3.10.0-957.27.2.el7.x86_64/extra/lustre-client/fs/lustre.ko)
+	          3b9ce2 __generic_file_aio_write ([kernel.kallsyms])
+	           5e23b __generic_file_write_iter (/lib/modules/3.10.0-957.27.2.el7.x86_64/extra/lustre-client/fs/lustre.ko)
+	           62414 vvp_io_write_start (/lib/modules/3.10.0-957.27.2.el7.x86_64/extra/lustre-client/fs/lustre.ko)
+	           5e218 cl_io_start ([obdclass])
+	           603ec cl_io_loop ([obdclass])
+	           17f7b ll_file_io_generic (/lib/modules/3.10.0-957.27.2.el7.x86_64/extra/lustre-client/fs/lustre.ko)
+	           18a89 ll_file_aio_write (/lib/modules/3.10.0-957.27.2.el7.x86_64/extra/lustre-client/fs/lustre.ko)
+	          441cdb do_sync_readv_writev ([kernel.kallsyms])
+	          44391e do_readv_writev ([kernel.kallsyms])
+	          443b45 vfs_writev ([kernel.kallsyms])
+	            7000 nfsd_vfs_write ([nfsd])
+	           15041 nfsd4_write ([nfsd])
+	           16e3d nfsd4_proc_compound ([nfsd])
+	            1880 nfsd_dispatch ([nfsd])
+	           14ca3 svc_process_common ([sunrpc])
+	           15193 svc_process ([sunrpc])
+	            11df nfsd ([nfsd])
+	          2c2e81 kthread ([kernel.kallsyms])
+	          976c1d ret_from_fork_nospec_begin ([kernel.kallsyms])
+
+0x104 (260) + 0xefc (3836) = 4096...
+
+but they seem to be contiguous  677711612 + 260 = 677711872
+
+I don't get why this is happening.
+
+I've tried various Lustre tunings without luck for now.
+
+Is there a way for Lustre to combine those two writes to avoid a partial write?
+
+Thanks!
+
+--- Comment (pjones, Mon, 7 Mar 2022 18:23:19 +0000) ---
+Patrick
+
+Could you please investigate?
+
+Peter

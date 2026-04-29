@@ -1,0 +1,107 @@
+Key:        LU-18238
+Summary:    Ghost hsm/agents on MDTs
+Link:       https://jira.whamcloud.com/browse/LU-18238
+Type:       Bug
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   Etienne Aujames
+Reporter:   Stephane Thiell
+Created:    Thu, 19 Sep 2024 15:49:30 +0000
+Updated:    Fri, 3 Oct 2025 18:11:23 +0000
+
+--- Environment ---
+EL9.3 Lustre 2.15.62
+
+--- Description ---
+We noticed that in some cases, when an HSM agent crashes, some MDTs retain a "ghost" agent, as shown here with 3 out of 4 MDTs still referencing the agent after it crashed:
+
+# clush -w@mds -b 'grep "" /sys/kernel/debug/lustre/mdt/elm-MDT*/hsm/agents'
+---------------
+elm-rcf-md1-s1
+---------------
+/sys/kernel/debug/lustre/mdt/elm-MDT0000/hsm/agents:uuid=e27ffd42-fa46-4657-a582-e2fe5e4a4b9c archive_id=1 requests=[current:0 ok:0 errors:0]
+/sys/kernel/debug/lustre/mdt/elm-MDT0002/hsm/agents:uuid=e27ffd42-fa46-4657-a582-e2fe5e4a4b9c archive_id=1 requests=[current:0 ok:0 errors:0]
+---------------
+elm-rcf-md1-s2
+---------------
+/sys/kernel/debug/lustre/mdt/elm-MDT0001/hsm/agents:uuid=e27ffd42-fa46-4657-a582-e2fe5e4a4b9c archive_id=1 requests=[current:0 ok:0 errors:0]
+
+# clush -w@mds -b 'grep e2fe5e4a4b9c /proc/fs/lustre/mdt/elm-MDT*/exports/*/uuid'
+clush: elm-rcf-md1-s[1-2] (2): exited with exit code 1
+
+Even after remounting/rebooting the Lustre client running the copytool (here, the coordinatool, the old agent remains, causing trouble with new archive requests. Wanted to investigate more but opening this now to reference it at LAD next week. A restart of the MDTs fixes it.
+
+--- Comment (gerrit, Thu, 15 May 2025 13:59:05 +0000) ---
+"Sylwyn GIARDI " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/59251
+
+Subject: LU-18238 mdt : ghost hsm fix
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 5c5465ea11b6921e7572eec01f9b1377408ee982
+
+--- Comment (gerrit, Fri, 2 May 2025 08:09:54 +0000) ---
+"Etienne AUJAMES " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/59067
+
+Subject: LU-18238 llite: deregister HSM agent on close()
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: db5eedfa49092412deecd3a6468b0d9fa32e5f10
+
+--- Comment (courrier, Wed, 9 Apr 2025 13:24:21 +0000) ---
+Hello sthiell,
+
+Looking at the HSM code, it seems that the detection of disconnected clients happen when the coordinator tries to schedule requests on the missing agents. In mdt_hsm_agent_send:
+
+        exp = obd_uuid_lookup(mdt2obd_dev(mdt), &uuid);                                        
+        if (exp == NULL || exp->exp_disconnected) {                                            
+                if (exp != NULL)                                                               
+                        class_export_put(exp);                                                 
+                /* This should clean up agents on evicted exports */                           
+                rc = -ENOENT;                                                                  
+                CERROR("%s: agent uuid (%s) not found, unregistering:"                         
+                       " rc = %d\n",                                                           
+                       mdt_obd_name(mdt), obd_uuid2str(&uuid), rc);                            
+                mdt_hsm_agent_unregister(mti, &uuid);                                          
+                GOTO(out, rc);                                                                 
+        } 
+
+I've reproduced this behavior as follows:
+
+$ llmount.sh
+$ echo 10 > /mnt/lustre/a
+$ lctl set_param mdt.*.hsm_control=enabled
+$ lhsmtool_posix --daemon --hsm-root /tmp/hsm /mnt/lustre
+$ pkill -9 lhsmtool_posix
+$ lctl get_param mdt.*.hsm.agents
+mdt.lustre-MDT0000.hsm.agents=uuid=e32f7c3c-8f5e-4f94-acfd-f0174fd63cad archive_id=ANY requests=[current:0 ok:0 errors:0]
+$ umount /mnt/lustre
+$ lctl get_param mdt..exports..uuid
+mdt.lustre-MDT0000.exports.0@lo.uuid=
+lustre-MDT0000-lwp-OST0001_UUID
+lustre-MDT0000-lwp-MDT0000_UUID
+lustre-MDT0000-lwp-OST0000_UUID
+
+// Reconnect the client
+$ mount -t lustre client@tcp:/lustre /mnt/lustre
+
+// Now run an HSM request to make the coordinator send a request to the old copytool
+$ lfs hsm_archive /mnt/lustre/a
+$ dmesg -T | tail -n 1
+[Wed Apr  9 13:03:27 2025] LustreError: 58131:0:(mdt_hsm_cdt_agent.c:547:mdt_hsm_agent_send()) lustre-MDT0000: agent uuid (e32f7c3c-8f5e-4f94-acfd-f0174fd63cad) not found, unregistering: rc = -2
+
+After that the agent has been removed
+$ lctl get_param mdt.*.hsm.agents
+$  
+
+I guess this can be a problem if there are already "max_requests" actions in flight when the copytool gets killed. The coordinator wont try to send new requests and therefore will not see that the client has disappeared. One solution would be to check the export of each agent in the list at regular intervals (loop_period ?). In practice, when this happens, I think temporarily increasing the max_requests should solve the issue. Reducing the request_timeout might also help in this case. When the timeout is reached, the requests are canceled an new requests can be scheduled.

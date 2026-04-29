@@ -1,0 +1,338 @@
+Key:        LU-17149
+Summary:    TBF: req_capsule_extend() ASSERTION( fmt->rf_fields[i].nr >= old->rf_fields[i].nr )
+Link:       https://jira.whamcloud.com/browse/LU-17149
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Etienne Aujames
+Reporter:   Etienne Aujames
+Created:    Wed, 27 Sep 2023 11:09:01 +0000
+Updated:    Thu, 31 Jul 2025 22:25:02 +0000
+Resolved:   Fri, 3 Nov 2023 13:00:13 +0000
+Labels:     tbf
+Links:      Related: is related to  LU-16077; Related: is related to  LU-15118
+
+--- Environment ---
+"tbf" activated on "mdt" service
+
+--- Description ---
+We hit the follwing crash on a 2.15.3 Lustre version with TBF NRS policy activated on "mdt" service:
+
+[892127.117400] LustreError: 8949:0:(layout.c:2467:req_capsule_extend()) ASSERTION( fmt->rf_fields[i].nr >= old->rf_fields[i].nr ) failed:
+[892127.118895] LustreError: 8949:0:(layout.c:2467:req_capsule_extend()) LBUG
+[892127.119727] Pid: 8949, comm: mdt03_008 4.18.0-477.13.1.el8_8.x86_64 #1 SMP Tue May 30 14:53:41 EDT 2023
+[892127.120846] Call Trace TBD:
+[892127.121216] [] libcfs_call_trace+0x6f/0xa0 [libcfs]
+[892127.121874] [] lbug_with_loc+0x3f/0x70 [libcfs]
+[892127.122485] [] req_capsule_extend+0x174/0x1b0 [ptlrpc]
+[892127.123422] [] nrs_tbf_id_cli_set+0x1ee/0x2a0 [ptlrpc]
+[892127.124165] [] nrs_tbf_generic_cli_init+0x50/0x180 [ptlrpc]
+[892127.124986] [] nrs_tbf_res_get+0x1fe/0x430 [ptlrpc]
+[892127.125670] [] nrs_resource_get+0x6c/0xe0 [ptlrpc]
+[892127.126382] [] nrs_resource_get_safe+0x87/0xe0 [ptlrpc]
+[892127.127126] [] ptlrpc_nrs_req_initialize+0x58/0xb0 [ptlrpc]
+[892127.127919] [] ptlrpc_server_request_add+0x248/0xa20 [ptlrpc]
+[892127.128771] [] ptlrpc_server_handle_req_in+0x36a/0x8c0 [ptlrpc]
+[892127.129607] [] ptlrpc_main+0xb97/0x1530 [ptlrpc]
+[892127.130284] [] kthread+0x134/0x150
+[892127.130826] [] ret_from_fork+0x1f/0x40
+
+ldlm_tbf_id_cli_set() try to extend a request already extend:
+
+We have pill->rc_fmt == RQF_LDLM_INTENT_GETATTR
+
+And we try to do: req_capsule_extend(&req->rq_pill, &RQF_LDLM_INTENT_BASIC);
+
+RQF_LDLM_INTENT_GETATTR has 7 fields:
+
+static const struct req_msg_field *ldlm_intent_getattr_client[] = {           
+        &RMF_PTLRPC_BODY,                                                     
+        &RMF_DLM_REQ,                                                         
+        &RMF_LDLM_INTENT,                                                     
+        &RMF_MDT_BODY,     /* coincides with mds_getattr_name_client[] */     
+        &RMF_CAPA1,                                                           
+        &RMF_NAME,                                                            
+        &RMF_FILE_SECCTX_NAME                                                 
+};                                                              
+
+RQF_LDLM_INTENT_BASIC has only 3 fields:
+
+static const struct req_msg_field *ldlm_intent_basic_client[] = { 
+        &RMF_PTLRPC_BODY,                                         
+        &RMF_DLM_REQ,                                             
+        &RMF_LDLM_INTENT,                                         
+};                                                                
+
+This was made possible since the patch: https://review.whamcloud.com/45272 ("LU-15118 ldlm: no free thread to process resend request")
+
+We call ldlm_enqueue_hpreq_check() before nrs_resource_get_safe() that initialize the pill with RMF_DLM_REQ for LDLM_ENQUEUE with MSG_RESENT flag:
+
+static int ldlm_enqueue_hpreq_check(struct ptlrpc_request *req)                          
+{                                                                                        
+....                                                                                                                                                  
+        if ((lustre_msg_get_flags(req->rq_reqmsg) & (MSG_REPLAY|MSG_RESENT)) !=    
+            MSG_RESENT)                                                            
+                RETURN(0);                                                         
+                                                                                   
+        req_capsule_init(&req->rq_pill, req, RCL_SERVER);                          
+        req_capsule_set(&req->rq_pill, &RQF_LDLM_ENQUEUE);                         
+                                                        
+....
+
+Then nrs_tbf_id_cli_set() is called 2 times in nrs_tbf_res_get():
+
+	o_cli_find(): nrs_tbf_id_cli_find()
+
+	o_cli_init(): nrs_tbf_id_cli_init()
+
+After nrs_tbf_id_cli_find(): rc_fmt == RQF_LDLM_INTENT_GETATTR
+
+So nrs_tbf_id_cli_init() -> nrs_tbf_id_cli_set() -> ldlm_tbf_id_cli_set() -> req_capsule_extend() will crash.
+
+This crash does not occur if rc_fmt was initially NULL because nrs_tbf_id_cli_set() restores the NULL pointer before returning:
+
+ static int nrs_tbf_id_cli_set(struct ptlrpc_request *req ...
+....
+        req_capsule_init(&req->rq_pill, req, RCL_SERVER); 
+        if (req->rq_pill.rc_fmt == NULL) {                
+                req_capsule_set(&req->rq_pill, fmt);      
+                fmt_unset = true;                         
+        }                                                 
+....
+       /* restore it to the initialized state */        
+       if (fmt_unset)                                   
+               req->rq_pill.rc_fmt = NULL;              
+       return rc;                                       
+
+ 
+
+Reproducer
+
+I was not able to reproduce the issue in a test environment. But this appears when the server was heavily loaded. This occurs only for resent requests, not replays.
+
+The impacted versions are:
+
+	2.15.3
+
+	master with client in 2.15.3 or 2.12 (without the LU-16077)
+
+--- Comment (gerrit, Fri, 9 May 2025 01:46:40 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/52974/
+
+Subject: rf_fields[i].nr >= old->rf_fields[i].nr )" class="issue-link" data-issue-key="LU-17149">LU-17149 tbf: nrs_tbf_id_cli_set should not modify the fmt
+
+Project: fs/lustre-release
+
+Branch: b2_15
+
+Current Patch Set: 
+
+Commit: 8a8c9818ca3eedbb2be22b0e4c0def9408f8f95d
+
+--- Comment (adilger, Sat, 24 Aug 2024 04:05:44 +0000) ---
+davidls, you are free to apply the patch to your b2_15 tree if you are hitting this Niue frequently.
+
+--- Comment (JIRAUSER16930, Sat, 24 Aug 2024 02:25:53 +0000) ---
+I am not sure this is the appropriate place to ask, but recently our site hit this bug on Lustre 2.15.5. 
+
+It seems like a patch for the 2.15 branch was submitted a while back, but has yet to land for 2.15 due to a merge conflict.
+
+Was work on the patch for the 2.15 branch stopped due to higher priority tasks?
+
+--- Comment (pjones, Fri, 3 Nov 2023 13:00:13 +0000) ---
+Landed for 2.16
+
+--- Comment (gerrit, Fri, 3 Nov 2023 12:45:18 +0000) ---
+"Etienne AUJAMES " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/52974
+
+Subject: rf_fields[i].nr >= old->rf_fields[i].nr )" class="issue-link" data-issue-key="LU-17149">LU-17149 tbf: nrs_tbf_id_cli_set should not modify the fmt
+
+Project: fs/lustre-release
+
+Branch: b2_15
+
+Current Patch Set: 1
+
+Commit: 87c09c807f72c62af6ed97f2b1ea83469d1bebbf
+
+--- Comment (gerrit, Fri, 3 Nov 2023 04:05:42 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/52528/
+
+Subject: rf_fields[i].nr >= old->rf_fields[i].nr )" class="issue-link" data-issue-key="LU-17149">LU-17149 tbf: nrs_tbf_id_cli_set should not modify the fmt
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 855f3d03c21752c8d7136a8a9e48223ee3302512
+
+--- Comment (eaujames, Fri, 29 Sep 2023 13:15:37 +0000) ---
+I have been able to reproduce the issue with 2.15.3 LTS (without any patch) in a test environment (VMs):
+
+LustreError: 23971:0:(layout.c:1898:req_capsule_set()) ASSERTION( pill->rc_fmt == ((void *)0) || pill->rc_fmt == fmt ) failed: 
+LustreError: 23971:0:(layout.c:1898:req_capsule_set()) LBUG                                                                    
+Pid: 23971, comm: mdt00_001 3.10.0-1160.59.1.el7.centos.plus.x86_64 #1 SMP Wed Feb 23 17:40:21 UTC 2022                        
+Call Trace:
+ [] dump_stack+0x19/0x1b
+ [] panic+0xe8/0x21f
+ [] lbug_with_loc+0x9b/0xa0 [libcfs]
+ [] req_capsule_set+0x9d/0xa0 [ptlrpc]
+ [] tgt_request_preprocess.isra.26+0xca/0x850 [ptlrpc]
+ [] tgt_request_handle+0x90e/0x19c0 [ptlrpc]
+ [] ? libcfs_nid2str_r+0x106/0x130 [lnet]
+ [] ptlrpc_server_handle_request+0x253/0xc30 [ptlrpc]
+ [] ptlrpc_main+0xbf4/0x15e0 [ptlrpc]
+ [] ? finish_task_switch+0x4e/0x1c0
+ [] ? ptlrpc_wait_event+0x5c0/0x5c0 [ptlrpc]
+ [] kthread+0xd1/0xe0
+ [] ? insert_kthread_work+0x40/0x40
+ [] ret_from_fork_nospec_begin+0x21/0x21
+ [] ? insert_kthread_work+0x40/0x40
+
+This time the entry exists in the TBF hashmap (nrs_tbf_id_cli_set() is executed 1 times) so it crashes at the next req_capsule_set().
+
+crash> ptlrpc_request.rq_pill ffff914bf953ec00
+  rq_pill = {
+    rc_req = 0xffff914bf953ec00, 
+    rc_reqmsg = 0xffff914bf15ad3d0, 
+    rc_repmsg = 0x0, 
+    rc_req_swab_mask = 0, 
+    rc_rep_swab_mask = 0, 
+    rc_fmt = 0xffffffffc15087a0 , 
+
+rc_fmt should be set with RQF_LDLM_ENQUEUE or NULL.
+
+crash> ptlrpc_body_v3 0xffff914bf15ad420
+struct ptlrpc_body_v3 {
+  pb_handle = {
+    cookie = 15792526650769917007
+  }, 
+  pb_type = 4711,                                     ------> PTL_RPC_MSG_REQUEST
+  pb_version = 262147, 
+  pb_opc = 101,                                        ------> LDLM_ENQUEUE
+  pb_status = 24424, 
+  pb_last_xid = 1778373737838399, 
+  pb_tag = 4, 
+  pb_padding0 = 0, 
+  pb_padding1 = 0, 
+  pb_last_committed = 0, 
+  pb_transno = 0, 
+  pb_flags = 2,                                          ------> MSG_RESENT
+  pb_op_flags = 0, 
+  pb_conn_cnt = 19, 
+  pb_timeout = 6, 
+  pb_service_time = 0, 
+  pb_limit = 0, 
+  pb_slv = 0, 
+  pb_pre_versions = {0, 0, 0, 0}, 
+  pb_mbits = 1778373739752960, 
+  pb_padding64_0 = 0, 
+  pb_padding64_1 = 0, 
+  pb_padding64_2 = 0, 
+  pb_jobid = "\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000"
+
+"pb_flags = 2" means that req_capsule_set() has been called inside ldlm_enqueue_hpreq_check()
+
+Reproducer
+
+"tbf uid" enable on mdt service.
+
+2 clients mounted on the VM:
+
+[root@client client]# while true; do printf "%s\n" toto{1..100}/toto{1..100} | xargs -P100 -I{} flock -x {}  touch {}; done
+[root@client client2]# while true; do printf "%s\n" toto{1..100}/toto{1..100} | xargs -P100 -I{} flock -x {}  touch {}; done
+
+Then force the client to recover:
+
+[root@client ~]# lctl dl                                                                                    
+  0 UP mgc MGC10.0.2.4@tcp f5da7520-e1a5-4ff4-a419-9408020da144 4                                           
+  1 UP lov lustrefs-clilov-ffff9183fae23800 8898dba4-553b-4c57-80f4-4751185cf9a8 3                          
+  2 UP lmv lustrefs-clilmv-ffff9183fae23800 8898dba4-553b-4c57-80f4-4751185cf9a8 4                          
+  3 UP mdc lustrefs-MDT0000-mdc-ffff9183fae23800 8898dba4-553b-4c57-80f4-4751185cf9a8 4                     
+....
+[root@client ~]# lctl --device 3 recover
+[root@client ~]# lctl --device 3 recover
+[root@client ~]# lctl --device 3 recover
+[root@client ~]# lctl --device 3 recover
+
+--- Comment (delbaryg, Fri, 29 Sep 2023 11:39:42 +0000) ---
+Crash analysis:
+
+Interesting things on backtrace:
+
+crash> bt -FF | grep -C2 RQF
+    ffffa7f76706fa68: __crash_kexec+0x6a
+ #1 [ffffa7f76706fa68] __crash_kexec at ffffffff939b564a
+    ffffa7f76706fa70: 0000000000000000 RQF_LDLM_ENQUEUE
+    ffffa7f76706fa80: [ffff8efcd2a43550:ptlrpc_cache] __func__.59802+0xa52
+    ffffa7f76706fa90: ffffa7f76706fba0 [ffff8ef468350000:task_struct]
+--
+    ffffa7f76706fb70: 0000000000000000 c0000000ffff7fff
+    ffffa7f76706fb80: [ffff8ef468350000:task_struct] 0000000000000065
+-->>    ffffa7f76706fb90: [ffff8efcd2a43550:ptlrpc_cache] RQF_LDLM_ENQUEUE
+    ffffa7f76706fba0: [ffff8efcd2a43180:ptlrpc_cache] libcfs_debug_dumplog_thread.cold.9
+    ffffa7f76706fbb0: ffffa7f76706fc10 req_capsule_extend+0x174
+
+As Etienne said RQF_LDLM_ENQUEUE is set.
+
+Check rc_fmt:
+
+crash> kmem ffff8efcd2a43550
+CACHE             OBJSIZE  ALLOCATED     TOTAL  SLABS  SSIZE  NAME
+ffff8ef5223de840     1120       4777      6888    246    32k  ptlrpc_cache
+  SLAB              MEMORY            NODE  TOTAL  ALLOCATED  FREE
+  ffffd067a64a9000  ffff8efcd2a40000     0     28         28     0
+  FREE / [ALLOCATED]
+  [ffff8efcd2a43180]
+
+      PAGE        PHYSICAL      MAPPING       INDEX CNT FLAGS
+ffffd067a64a90c0 992a43000 dead000000000400        0  0 17ffffc0000000
+
+crash> struct ptlrpc_request ffff8efcd2a43180 | grep -A2 rq_peer
+  rq_peer = {
+    nid = 0xourclientnid,
+    pid = 0x3039
+
+crash> p ((struct ptlrpc_request*)0xffff8efcd2a43180)->rq_pill
+$11 = {
+  rc_req = 0xffff8efcd2a43180,
+-->>  rc_reqmsg = 0xffff8ef58015b8c8,
+  rc_repmsg = 0x0,
+  rc_req_swab_mask = 0x0,
+  rc_rep_swab_mask = 0x0,
+-->>  rc_fmt = 0xffffffffc12ab8e0 ,
+  rc_loc = RCL_SERVER,
+  rc_area = {{0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff}, {0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff}}
+}
+
+Oups rc_fmt is set to RQF_LDLM_INTENT_GETATTR.
+
+Get back to ptlrpc_body_v3 to check MGS_SENT flag too (thanks Etienne for crash assistance ):
+
+crash> x/500s 0xffff8ef58015b8c8
+...
+0xffff8ef58015b998:     "robinhood.0"
+...
+crash> struct ptlrpc_body_v3 -l ptlrpc_body_v3.pb_jobid 0xffff8ef58015b998 | grep flags
+-->>  pb_flags = 0x2,
+  pb_op_flags = 0x0,
+
+#define MSG_RESENT               0x0002 /* was previously sent, no reply seen */
+
+As Etienne said, this behavior is due to patch: https://review.whamcloud.com/45272 ("LU-15118 ldlm: no free thread to process resend request")
+
+--- Comment (gerrit, Wed, 27 Sep 2023 12:11:27 +0000) ---
+"Etienne AUJAMES " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/52528
+
+Subject: rf_fields[i].nr >= old->rf_fields[i].nr )" class="issue-link" data-issue-key="LU-17149">LU-17149 tbf: nrs_tbf_id_cli_set should not modify the fmt
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 8f8512d8a3593d463a8216f7882d436305fb4bf3

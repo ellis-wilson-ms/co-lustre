@@ -1,0 +1,243 @@
+Key:        LU-2871
+Summary:    Data can't be striped across all the OSTs correctly by running "lfs setstripe -c -1 -i n" (n>0)
+Link:       https://jira.whamcloud.com/browse/LU-2871
+Type:       Bug
+Priority:   Blocker
+Status:     Closed
+Resolution: Fixed
+Assignee:   Emoly Liu
+Reporter:   Emoly Liu
+Created:    Tue, 26 Feb 2013 20:38:03 +0000
+Updated:    Fri, 15 Mar 2013 01:53:12 +0000
+Resolved:   Fri, 15 Mar 2013 01:52:55 +0000
+Labels:     MB
+Links:      Duplicate: is duplicated by LU-2893; Related: is related to LU-2809
+
+--- Description ---
+I found this problem during the investigation on LU-2809. While running "lfs setstripe -c -1 -i n testfile", if ost index n doesn't start from 0, it shows that data can't be striped across all the OSTs and OST0 is always ignored.
+
+--- Comment (emoly.liu, Fri, 15 Mar 2013 01:52:56 +0000) ---
+Landed for 2.4
+
+--- Comment (emoly.liu, Fri, 1 Mar 2013 04:27:45 +0000) ---
+Sure, I made the both changes in the patch and will update it per Ned Bass' advice later. Thanks!
+
+--- Comment (bzzz, Fri, 1 Mar 2013 04:19:14 +0000) ---
+liuying, it's better to mark index used after successful lod_qos_declare_object_on(). and I don't think this is an option to the change by Zhenyu Xu, I think the both changes should be applied.
+
+--- Comment (emoly.liu, Thu, 28 Feb 2013 01:54:39 +0000) ---
+Patch is at http://review.whamcloud.com/5554
+
+--- Comment (emoly.liu, Wed, 27 Feb 2013 21:58:59 +0000) ---
+I will add a sanity test for this case.
+
+--- Comment (emoly.liu, Wed, 27 Feb 2013 21:32:35 +0000) ---
+Another way, run lod_qos_ost_in_use() after lod_qos_is_ost_used() check, right?
+
+diff --git a/lustre/lod/lod_qos.c b/lustre/lod/lod_qos.c
+index 2b81ad8..92b3b36 100644
+--- a/lustre/lod/lod_qos.c
++++ b/lustre/lod/lod_qos.c
+@@ -887,6 +887,7 @@ repeat_find:
+                 */
+                if (lod_qos_is_ost_used(env, ost_idx, stripe_num))
+                        continue;
++               lod_qos_ost_in_use(env, stripe_num, ost_idx);
+ 
+                /* Drop slow OSCs if we can, but not for requested start idx.
+                 *
+
+--- Comment (bzzz, Wed, 27 Feb 2013 20:47:30 +0000) ---
+pretty much correct. please put a patch into gerrit, thanks.
+
+--- Comment (bobijam, Wed, 27 Feb 2013 11:36:42 +0000) ---
+I found the root cause.
+
+in lod_qos_ost_in_use_clear(), the ost_in_use array is initialised to 0, and in lod_qos_prep_create()->old_alloc_specific(), the ost_idx is
+
+        for (i = 0; i op_array[array_idx];
+
+and the ost_idx will be checked upon ost_in_use array
+
+                if (lod_qos_is_ost_used(env, ost_idx, stripe_num))
+                        continue;
+
+If the stripe_offset starts from 0, and in the 1st iteration, stripe_num is also 0, and lod_qos_is_ost_used() will return false, then object will be allocated on the first OST device.
+
+While if file stripe starting from a number other than 0, when the loop comes to which ost_idx is 0, the lod_qos_is_ost_used(env, 0, stripe_num) will return true, and the 1st OST device will be skipped.
+
+The fix should be in lod_qos_ost_in_use_clear(). With following patch, the object stripe allocation will be correct.
+
+diff --git a/lustre/lod/lod_qos.c b/lustre/lod/lod_qos.c
+index 2b81ad8..2f46e7c 100644
+--- a/lustre/lod/lod_qos.c
++++ b/lustre/lod/lod_qos.c
+@@ -629,7 +629,7 @@ static inline int lod_qos_ost_in_use_clear(const struct lu_env *env, int stripes
+                CERROR("can't allocate memory for ost-in-use array\n");
+                return -ENOMEM;
+        }
+-       memset(info->lti_ea_store, 0, sizeof(int) * stripes);
++       memset(info->lti_ea_store, -1, sizeof(int) * stripes);
+        return 0;
+ }
+
+--- Comment (emoly.liu, Wed, 27 Feb 2013 08:25:07 +0000) ---
+I Added some debug messages, 
+
+diff --git a/lustre/lod/lod_dev.c b/lustre/lod/lod_dev.c
+index 17dca0c..851caee 100644
+--- a/lustre/lod/lod_dev.c
++++ b/lustre/lod/lod_dev.c
+@@ -68,7 +68,10 @@ int lod_fld_lookup(const struct lu_env *env, struct lod_device *lod,
+ 
+        LASSERTF(fid_is_sane(fid), "Invalid FID "DFID"\n", PFID(fid));
+        if (fid_is_idif(fid)) {
++               printk("before ostindex:%d, FID "DFID"\n",
++                      cpu_to_le32(*tgt), PFID(fid));
+                *tgt = fid_idif_ost_idx(fid);
++               printk("after ostindex:%d\n", cpu_to_le32(*tgt));
+                RETURN(rc);
+        }
+diff --git a/lustre/osd-ldiskfs/osd_handler.c b/lustre/osd-ldiskfs/osd_handler.c
+index f6dad39..39decd5 100644
+--- a/lustre/osd-ldiskfs/osd_handler.c
++++ b/lustre/osd-ldiskfs/osd_handler.c
+@@ -2206,6 +2206,20 @@ static inline int __osd_xattr_set(struct osd_thread_info *info,
+ 
+        ll_vfs_dq_init(inode);
+        dentry->d_inode = inode;
++       if (strcmp(name, XATTR_NAME_LOV) == 0) {
++               struct lov_mds_md_v1 *lmm = (struct lov_mds_md_v1 *)buf;
++               int stripe_count = lmm->lmm_stripe_count;
++               struct lov_ost_data *objects = lmm->lmm_objects;
++               int i;
++
++               printk("stripecount=%d, stripesize=%d\n",
++                      stripe_count, lmm->lmm_stripe_size);
++               for (i = 0; i int idx = objects[i].l_ost_idx;
++                      printk("here ostindex:%d\n", idx);
++               }
++       }
+        return inode->i_op->setxattr(dentry, name, buf, buflen, fl);
+ }
+
+and dmesg showed
+
+Lustre: ctl-lustre-MDT0000: super-sequence allocation rc = 0 [0x0000000200000400-0x0000000240000400):0:mdt
+before ostindex:-30720, FID [0x100000000:0x1:0x0]
+after ostindex:0
+before ostindex:0, FID [0x100010000:0x1:0x0]
+after ostindex:1
+before ostindex:1, FID [0x100020000:0x1:0x0]
+after ostindex:2
+before ostindex:2, FID [0x100030000:0x1:0x0]
+after ostindex:3
+stripecount=4, stripesize=1048576
+here ostindex:0
+here ostindex:1
+here ostindex:2
+here ostindex:3
+before ostindex:-30720, FID [0x100010000:0x2:0x0]
+after ostindex:1
+before ostindex:1, FID [0x100020000:0x2:0x0]
+after ostindex:2
+before ostindex:2, FID [0x100030000:0x2:0x0]
+after ostindex:3
+before ostindex:3, FID [0x100010000:0x3:0x0]
+after ostindex:1
+stripecount=4, stripesize=1048576
+here ostindex:1
+here ostindex:2
+here ostindex:3
+here ostindex:1
+before ostindex:-30720, FID [0x100020000:0x3:0x0]
+after ostindex:2
+before ostindex:2, FID [0x100030000:0x3:0x0]
+after ostindex:3
+before ostindex:3, FID [0x100010000:0x4:0x0]
+after ostindex:1
+before ostindex:1, FID [0x100020000:0x4:0x0]
+after ostindex:2
+stripecount=4, stripesize=1048576
+here ostindex:2
+here ostindex:3
+here ostindex:1
+here ostindex:2
+before ostindex:-30720, FID [0x100030000:0x4:0x0]
+after ostindex:3
+before ostindex:3, FID [0x100010000:0x5:0x0]
+after ostindex:1
+before ostindex:1, FID [0x100020000:0x5:0x0]
+after ostindex:2
+before ostindex:2, FID [0x100030000:0x5:0x0]
+after ostindex:3
+stripecount=4, stripesize=1048576
+here ostindex:3
+here ostindex:1
+here ostindex:2
+here ostindex:3
+
+There is something wrong with fid sequence.
+
+--- Comment (emoly.liu, Tue, 26 Feb 2013 22:09:11 +0000) ---
+OSTCOUNT=4,
+
+[root@centos6-1 ~]# cd /mnt/lustre
+[root@centos6-1 lustre]# mkdir test;cd test
+[root@centos6-1 test]# for i in 0 1 2 3; do lfs setstripe -i $i -c -1 testfile$i;dd if=/dev/zero of=testfile$i bs=2M count=5;done
+5+0 records in
+5+0 records out
+10485760 bytes (10 MB) copied, 0.0220632 s, 475 MB/s
+5+0 records in
+5+0 records out
+10485760 bytes (10 MB) copied, 0.0193019 s, 543 MB/s
+5+0 records in
+5+0 records out
+10485760 bytes (10 MB) copied, 0.0200823 s, 522 MB/s
+5+0 records in
+5+0 records out
+10485760 bytes (10 MB) copied, 0.0190184 s, 551 MB/s
+[root@centos6-1 test]# lfs getstripe *
+testfile0
+lmm_stripe_count:   4
+lmm_stripe_size:    1048576
+lmm_layout_gen:     0
+lmm_stripe_offset:  0
+	obdidx		 objid		objid		 group
+	     0	             1	          0x1	             0
+	     1	             1	          0x1	             0
+	     2	             1	          0x1	             0
+	     3	             1	          0x1	             0
+
+testfile1
+lmm_stripe_count:   4
+lmm_stripe_size:    1048576
+lmm_layout_gen:     0
+lmm_stripe_offset:  1
+	obdidx		 objid		objid		 group
+	     1	             2	          0x2	             0
+	     2	             2	          0x2	             0
+	     3	             2	          0x2	             0
+	     1	             3	          0x3	             0
+
+testfile2
+lmm_stripe_count:   4
+lmm_stripe_size:    1048576
+lmm_layout_gen:     0
+lmm_stripe_offset:  2
+	obdidx		 objid		objid		 group
+	     2	             3	          0x3	             0
+	     3	             3	          0x3	             0
+	     1	             4	          0x4	             0
+	     2	             4	          0x4	             0
+
+testfile3
+lmm_stripe_count:   4
+lmm_stripe_size:    1048576
+lmm_layout_gen:     0
+lmm_stripe_offset:  3
+	obdidx		 objid		objid		 group
+	     3	             4	          0x4	             0
+	     1	             5	          0x5	             0
+	     2	             5	          0x5	             0
+	     3	             5	          0x5	             0

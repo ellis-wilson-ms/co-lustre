@@ -1,0 +1,59 @@
+Key:        LU-17290
+Summary:    Don't deregister idle changelog consumers
+Link:       https://jira.whamcloud.com/browse/LU-17290
+Type:       Improvement
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Nathan Rutman
+Created:    Wed, 15 Nov 2023 17:39:10 +0000
+Updated:    Wed, 10 Apr 2024 18:15:56 +0000
+Links:      Related: is related to  LU-14699; Related: is related to  LU-12871; Related: is related to  LU-15524; Related: is related to LU-17316
+
+--- Description ---
+In (some of) our customer's experience, we get complaints that restarting their consumers is too "high touch" - they have to interact with each MDT manually to re-register a new consumer ID, then their kubernetes kafka whatever setup to change some config and redeploy etc. They might be ok with missing the records (which happens if they have to reregister or not), they just don't like the additional ID reconfig hassle.
+
+Deregistration of an idle changelog consumer is a heavy penalty, requiring a user to re-register and restart their consumer process with a new ID. It would make more sense to mark this consumer internally as "stale" and simply ignore it during the lowest-unconsumed-record check. Then if the consumer does come back to life, we remove the "stale" flag and the consumer still has access to the (remaining) changelog records.
+
+This means less impact on users with an intermittently-working consumer. Stale consumers can be reported/seen in mdd.*.changelog_users. 
+
+If a stale consumer is still alive and connected, it can continue consuming records. (An idle consumer on an idle system would feel no impact.)
+
+If disconnected and restarted, a stale consumer would restart with the old ID in llapi_changelog_start(), which would return -ESTALE in this case. Consumers that are aware of this feature can take appropriate action as they need, and then re-start a second time which would then succeed. Old unaware consumers that don't understand ESTALE would presumably fail with the error and require manual intervention, just like current deregistration/reregistration (which would also still work).
+
+The important part is that this way, modern consumers can automatically do their recovery without having to do anything special on the MDS itself.
+
+See also LU-14699
+
+--- Comment (adilger, Wed, 10 Apr 2024 18:15:56 +0000) ---
+If re-registering users are calling llapi_changelog_clear() to check the status, they could pass "-1 = first time user"?  I don't think this would be considered an API change, and I'm supportive of not returning an error for the "value == last cleared value" no-op case.
+
+--- Comment (nrutman, Wed, 10 Apr 2024 18:00:31 +0000) ---
+llapi_changelog_start() does not include the reader id in its parameter list, so it cannot return -ESTALE. So instead, call llapi_changelog_clear immediately after start to "unstale" this reader in the MDS's eyes. This call can also return an ESTALE if changelog has moved past, so the consumer knows.
+
+	There is no safe neutral value for the clear record to call  llapi_changelog_clear with. Value 0 means "clear everything", and a value equal to or less than the last cleared value results in EINVAL. Change this to "no error if value == last cleared value". This would be reasonable for a "heartbeat" call as well to prevent being marked as stale based on time.
+
+	The first time a consumer registers, it's last_cleared would be 0, but if we call llapi_changelog_clear with that, it clears everything. Ideally we would change "0" be  "-1": "0" means 1st time consumer, haven't received/cleared any records yet, and "-1" = clear all. But this is an API change and old consumers might keep using 0 as clear-all. So instead, new consumers will just have to special-case their first time starting to not send "_clear 0" after "_start". (Or we introduce a new variant of llapi_changelog_clear2.)
+
+--- Comment (nrutman, Tue, 6 Feb 2024 22:42:32 +0000) ---
+yes to your question Andreas, we have this as a task in our Jira (LUS-11978), but I don't get to assign tasks... I'll kick it again.
+
+--- Comment (adilger, Thu, 7 Dec 2023 10:49:55 +0000) ---
+Nathan, do you have any plans for implementing this?  I think the consensus is that the proposed change makes sense.
+
+--- Comment (tappro, Thu, 23 Nov 2023 07:41:05 +0000) ---
+Concept of idle users is the same as 'users are deregistered only explicitly' In this terms the basis of changelogs is changing - it was 'stream of records are consistent and all users are able to read all records if there are too many recordsm remove idle users, so records first, users second', now proposed concept is different: 'users first, records are second. Keep all users no matter how many records we have, if there are too many records, just kill older of them'
+
+While the means are the same - we are killing most older records on per-user basis - the result for consumers are different, they can't expect consistent stream of records anymore, but there can be gaps in stream if user was idle too long or not too long but records were added aggressively. But strictly speaking now it doesn't guarantee constant stream either, user is just dropped, breaking a stream and new registration will start with gap too. The problem is just that now consumer knows the moment of gap, when user is dropped but with new approach it would look like there is no gap, records just continues.
+
+Nathan proposes to return -ESTALE looks sufficient to mark that event, I'd just return it always for any new request from client, not just llapi_changelog_start() to let consumer know about gap.
+
+Other changes look doable, GC will do the same mostly but keeps idle users as described, idle users are just ignored. The only question remains - when and by whom they will be deregistered after a while? Just to don't have thousands of them in 'changelog_users'.  So far it looks like we need manual intervention or GC still. should deregister too old users
+
+It worths to mention that currently GC uses 3 thresholds: how long user is idle, how many idle records we have and how big their product: idle time * idle records. The last one is to balance situation when aggressive records adding can cause GC for quite recent users, on other hand exactly that check may cause user deregister earlier than idle threshold and that third condition is very heuristic right now and can be quite aggressive sometime, we can get rid of it with these idle users proposal it seems
+
+--- Comment (adilger, Tue, 21 Nov 2023 19:34:51 +0000) ---
+Nathan, it would be useful to know some details about which circumstances the Changelog users are being deregistered.  The fact that you are filing a ticket on this would indicate that this has happened more than once, and is a case of the Changelog consumer actually being desirable rather than some dead registration for a test or service that was turned off.
+
+How long were the users idle?  How much space on the MDT?  How many unprocessed records?  I'm trying to determine if the Changelog GC is too aggressive or is doing the wrong thing.  The user shouldn't be deregistered until the changelog consumes more than half of the remaining space on the MDT (from LU-15524 if mdd.*.mdd_changelog_free_space_gc=1 is set), or it exceeds the limits on the number of unconsumed records or age (from LU-14699 if mdd.*.changelog_gc=1), so before we go changing the logic further it would be good to confirm that the Changelog users were deregistered for the right reasons.

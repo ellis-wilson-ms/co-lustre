@@ -1,0 +1,289 @@
+Key:        LU-2634
+Summary:    short symlinks on MDT with "extents" have EXT4_EXTENTS_FL set
+Link:       https://jira.whamcloud.com/browse/LU-2634
+Type:       Technical task
+Priority:   Blocker
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Emoly Liu
+Reporter:   Andreas Dilger
+Created:    Thu, 17 Jan 2013 13:46:33 +0000
+Updated:    Fri, 22 Mar 2013 20:18:24 +0000
+Resolved:   Mon, 18 Feb 2013 15:47:05 +0000
+Labels:     LB
+Links:      Related: is related to LU-2627
+
+--- Environment ---
+MDT needs to be formatted with {{--mkfsoptions="-O extents"}}.  This is not a normal configuration, but has been seen in the field
+
+--- Description ---
+Short symlinks on MDT filesystems formatted with the "extents" feature appear to be created with the EXT4_EXTENTS_FL in osd-ldiskfs, but that shouldn't be happening.  e2fsck considers this a corruption and deletes the symlink.
+
+While we have never formatted MDT filesystems with "extents" enabled, some users have done this, or enabled it after formatting, and the MDS should not corrupt such filesystems.
+
+--- Comment (pjones, Mon, 18 Feb 2013 15:47:05 +0000) ---
+Landed for 2.4
+
+--- Comment (emoly.liu, Mon, 18 Feb 2013 03:41:57 +0000) ---
+b2_1 port is at http://review.whamcloud.com/5458
+
+--- Comment (emoly.liu, Sun, 27 Jan 2013 21:35:01 +0000) ---
+Thanks for Andreas' comment! I saw the code in ext4/ldiskfs_symlink(). Now I know my previous change to ext4/ldiskfs is not a right place. It should be fixed in lustre osd-ldiskfs level not ext4/ldiskfs level.
+
+BTW, I test the change above in osd_ldiskfs_writelink() and it works.
+
+--- Comment (adilger, Fri, 25 Jan 2013 03:19:30 +0000) ---
+Looking at the ext4 code in the kernel, it shows something like:
+
+static int ext4_symlink(struct inode *dir,
+                        struct dentry *dentry, const char *symname)
+{
+        if (l /* clear the extent format for fast symlink */
+                ext4_clear_inode_flag(inode, EXT4_INODE_EXTENTS);
+                inode->i_op = &ext4_fast_symlink_inode_operations;
+        }
+
+It appears we should be doing the same thing in our own code:
+
+ static int osd_ldiskfs_writelink(struct inode *inode, char *buffer, int buflen)
+ {
++        /* clear the extent format for fast symlink */
++        ldiskfs_clear_inode_flag(inode, LDISKFS_INODE_EXTENTS);
+
+         memcpy((char *)&LDISKFS_I(inode)->i_data, (char *)buffer, buflen);
+         LDISKFS_I(inode)->i_disksize = buflen;
+         i_size_write(inode, buflen);
+         inode->i_sb->s_op->dirty_inode(inode);
+
+         return 0;
+ }
+
+--- Comment (emoly.liu, Thu, 24 Jan 2013 04:29:41 +0000) ---
+patch tracking at http://review.whamcloud.com/5154
+
+--- Comment (emoly.liu, Wed, 23 Jan 2013 21:25:34 +0000) ---
+Since the feature extents is disabled by default in current mkfs.lustre code, the patch only needs to fix the problem in the following two situations:
+
+1. if the users still format MDT with "-O extents", we will prevent setting EXT4_INODE_EXTENTS flag to the new fast symlink inodes;
+
+2. if the users disable extents feature but the old data already have extents flag, we will clear EXT4_INODE_EXTENTS for the old fast symlink inodes and write back to disk to avoid e2fsck error.
+
+Now the patch can pass my local test for the above two situations. BTW, because the part of patch for situation 1 has avoided to set that extent flag for new inodes, it's hard to reproduce situation 2 in conf-sanity test. I simulate it manually and it works.
+
+--- Comment (adilger, Tue, 22 Jan 2013 05:22:11 +0000) ---
+Sorry, it seems mkfs.lustre works too hard to clear the "extents" option from the MDT feature list.  It could also be enabled with tune2fs after formatting.
+
+--- Comment (emoly.liu, Sun, 20 Jan 2013 20:38:23 +0000) ---
+When I use --mkfsoptions=\\\"-O ^extents,extents\\\", the error "Fast symlink xxx has EXTENT_FL set.  Clear? no" can be reproduced.
+
+--- Comment (emoly.liu, Sat, 19 Jan 2013 10:58:05 +0000) ---
+Probably because option "extents" is in front of "^extents"?
+
+-O extents,dirdata,uninit_bg,^extents,dir_nlink,quota,huge_file,flex_bg
+
+--- Comment (emoly.liu, Sat, 19 Jan 2013 10:49:56 +0000) ---
+I write a conf-sanity test for this case, but I can't reproduce the failure. No symlink error found by e2fsck if MDT is formatted with "-O extents".
+
+Andreas, could you please have a look if anything wrong in my script? Thanks.
+
+test_72() { #LU-2634
+        #enable "-O extents" to overwrite "^extents"
+        local mdsdev=$(mdsdevname 1)
+        local ostdev=$(ostdevname 1)
+        add ${SINGLEMDS} $(mkfs_opts ${SINGLEMDS} ${mdsdev}) \
+                --reformat --mkfsoptions=\\\"-O extents\\\" $mdsdev ||
+                        error "start mds with "-O extents failed""
+        add ost1 $(mkfs_opts ost1 ${ostdev}) --reformat ${ostdev}
+        start_mgsmds || error "MDT start fail"
+        start_ost || error "OST0 start fail"
+        mount_client $MOUNT || error "Unable to mount client"
+
+        #create 100 short symlinks
+        local fn=100
+        mkdir -p $DIR/$tdir
+        createmany -o $DIR/$tdir/$tfile-%d $fn || error "create files failed"
+        echo "create $fn short symlinks"
+        for i in $(seq -w 1 $fn); do
+                ln -s $DIR/$tdir/$tfile-$i $MOUNT/$tfile-$i
+        done
+
+        #umount
+        umount_client $MOUNT || error "umount client failed"
+        stop_ost || error "stop ost failed"
+        stop_mds || error "stop mds failed"
+
+        #run e2fsck
+        local cmd="$E2FSCK -fnvd $mdsdev"
+        local rc=0
+        do_facet ${SINGLEMDS} $cmd || rc=$?
+        echo "$cmd return $rc"
+        [ $rc -gt 0 ] && error "e2fsck $rc errors found"
+        return $rc
+}
+run_test 72 "Short symlink won't cause e2fsck error if MDT is formatted with extents enabled"
+
+This is the output on my local machine.
+
+== conf-sanity test 72: Short symlink won't cause e2fsck error if MDT is formatted with extents enabled == 01:53:26 (1358531606)
+
+Loading modules from /root/master/lustre/tests/..
+
+detected 2 online CPUs by sysfs
+
+Force libcfs to create 2 CPU partitions
+
+../libcfs/libcfs/libcfs options: 'cpu_npartitions=2 cpu_npartitions=2'
+
+debug=-1
+
+subsystem_debug=all -lnet -lnd -pinger
+
+gss/krb5 is not supported
+
+quota/lquota options: 'hash_lqs_cur_bits=3'
+
+   Permanent disk data:
+
+Target:     lustre:MDT0000
+
+Index:      0
+
+Lustre FS:  lustre
+
+Mount type: ldiskfs
+
+Flags:      0x65
+
+              (MDT MGS first_time update )
+
+Persistent mount opts: user_xattr,errors=remount-ro
+
+Parameters: sys.timeout=20 lov.stripesize=1048576 lov.stripecount=0 mdt.identity_upcall=/root/master/lustre/tests/../utils/l_getidentity
+
+formatting backing filesystem ldiskfs on /dev/loop0
+
+	target name  lustre:MDT0000
+
+	4k blocks     50000
+
+	options        -I 512 -i 2048 -q -O extents,dirdata,uninit_bg,^extents,dir_nlink,quota,huge_file,flex_bg -E lazy_journal_init -F
+
+mkfs_cmd = mke2fs -j -b 4096 -L lustre:MDT0000  -I 512 -i 2048 -q -O extents,dirdata,uninit_bg,^extents,dir_nlink,quota,huge_file,flex_bg -E lazy_journal_init -F /dev/loop0 50000
+
+Writing CONFIGS/mountdata
+
+   Permanent disk data:
+
+Target:     lustre:OST0000
+
+Index:      0
+
+Lustre FS:  lustre
+
+Mount type: ldiskfs
+
+Flags:      0x62
+
+              (OST first_time update )
+
+Persistent mount opts: errors=remount-ro
+
+Parameters: mgsnode=10.211.55.7@tcp sys.timeout=20
+
+formatting backing filesystem ldiskfs on /dev/loop0
+
+	target name  lustre:OST0000
+
+	4k blocks     50000
+
+	options        -I 256 -q -O extents,uninit_bg,dir_nlink,quota,huge_file,flex_bg -G 256 -E lazy_itable_init,resize=4290772992,lazy_journal_init -F
+
+mkfs_cmd = mke2fs -j -b 4096 -L lustre:OST0000  -I 256 -q -O extents,uninit_bg,dir_nlink,quota,huge_file,flex_bg -G 256 -E lazy_itable_init,resize=4290772992,lazy_journal_init -F /dev/loop0 50000
+
+Writing CONFIGS/mountdata
+
+start mds service on centos6-3
+
+Starting mds1:   -o loop /tmp/lustre-mdt1 /mnt/mds1
+
+Started lustre-MDT0000
+
+start ost1 service on centos6-3
+
+Starting ost1:   -o loop /tmp/lustre-ost1 /mnt/ost1
+
+Started lustre-OST0000
+
+mount lustre on /mnt/lustre.....
+
+Starting client: centos6-3: -o user_xattr,flock centos6-3@tcp:/lustre /mnt/lustre
+
+total: 100 creates in 0.12 seconds: 801.81 creates/second
+
+create 100 short symlinks
+
+umount lustre on /mnt/lustre.....
+
+Stopping client centos6-3 /mnt/lustre (opts
+
+stop ost1 service on centos6-3
+
+Stopping /mnt/ost1 (opts:-f) on centos6-3
+
+stop mds service on centos6-3
+
+Stopping /mnt/mds1 (opts:-f) on centos6-3
+
+e2fsck 1.42.3.wc3 (15-Aug-2012)
+
+Pass 1: Checking inodes, blocks, and sizes
+
+Pass 2: Checking directory structure
+
+Pass 3: Checking directory connectivity
+
+Pass 4: Checking reference counts
+
+Pass 5: Checking group summary information
+
+     348 inodes used (0.35%)
+
+       4 non-contiguous files (1.1%)
+
+       1 non-contiguous directory (0.3%)
+
+	of inodes with ind/dind/tind blocks: 0/0/0
+
+   16926 blocks used (33.85%)
+
+       0 bad blocks
+
+       1 large file
+
+     192 regular files
+
+      47 directories
+
+       0 character device files
+
+       0 block device files
+
+       0 fifos
+
+       6 links
+
+     100 symbolic links (100 fast symbolic links)
+
+       0 sockets
+
+--------
+
+     345 files
+
+e2fsck -fnvd /tmp/lustre-mdt1 return 0
+
+Resetting fail_loc on all nodes...done.
+
+PASS 72 (37s)
+
+== conf-sanity test complete, duration 64 sec == 01:54:03 (1358531643)

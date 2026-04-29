@@ -1,0 +1,78 @@
+Key:        LU-9989
+Summary:    a concurrent blocking AST can cause short read from a splice buffer
+Link:       https://jira.whamcloud.com/browse/LU-9989
+Type:       Bug
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Andrew Perepechko
+Created:    Thu, 14 Sep 2017 13:03:39 +0000
+Updated:    Thu, 14 Sep 2017 18:05:03 +0000
+
+--- Description ---
+A complete description of the bug we are seeing is rather lengthy, so I'll just explain a simplified version of the bug that can be easily reproduced.
+
+In short, when Lustre page cache pages are put into a pipe buffer by ll_file_splice_read() a concurrent blocking AST can truncate them (more confusingly, before LU-8633, they would be even marked NON-uptodate). If the first page is truncated when transferring data from the pipe, depending on the exact kernel routine and the kernel version, userspace will see ENODATA, EIO or 0. 0 will usually be treated as a bug by applications because according to VFS conventions it marks EOF (applications usually will not restart reading if they are not making progress at all).
+
+A simple reproducer for master is as follows:
+
+[root@panda-testbox lustre]# cat splice.fio 
+[file]
+ioengine=splice
+iodepth=1
+rw=read
+bs=4k
+size=1G
+[root@panda-testbox lustre]# while true; do for i in /sys/fs/lustre/ldlm/namespaces/*OST*osc*/lru_size; do echo clear > $i; done ; done > /dev/null 2>&1 &
+[1] 2422
+[root@panda-testbox lustre]# fio splice.fio 
+file: (g=0): rw=read, bs=4K-4K/4K-4K/4K-4K, ioengine=splice, iodepth=1
+fio-2.1.10
+Starting 1 process
+fio: pid=2425, err=61/file:engines/splice.c:140, func=vmsplice, error=No data available
+
+The exact scenario leading to this bug is as follows:
+
+             fio-1373  [003]  7061.034844: p_ll_readpage_0: (ll_readpage+0x0/0x1c40 [lustre]) arg1=ffffea0002af5888
+             fio-1373  [003]  7061.037857: p_page_cache_pipe_buf_confirm_0: (page_cache_pipe_buf_confirm+0x0/0x90) arg1=ffffea0002af5888
+   ptlrpcd_00_00-27942 [003]  7061.039328: p_vvp_page_export_0: (vvp_page_export+0x0/0x90 [lustre]) arg1=1 arg2=ffffea0002af5888
+           -30290 [000]  7061.039338: p_ll_invalidatepage_0: (ll_invalidatepage+0x0/0x180 [lustre]) arg1=ffffea0002af5888
+             fio-1373  [002]  7061.039379: r_page_cache_pipe_buf_confirm_0: (pipe_to_user+0x31/0x130 
+
+So,
+
+1) splice allocates the page cache pages, locks the pages and calls ->readpage()
+
+2) pages are put into the pipe buffer
+
+3) another thread (actually, the same thread in this scenario) requests data from the pipe (via vmsplice - in this scenario)
+
+4) page_cache_pipe_buf_confirm() fails the PageUptodate check because the pages haven't got read so far
+
+5) the reads complete and the pages are marked uptodate by vvp_page_export()
+
+6) a concurrent blocking AST truncates the pages
+
+7) page_cache_pipe_buf_confirm() finds that the page was truncated and returns ENODATA
+
+From the perspective of this scenario, it seems that Lustre has been truncating pages in a broken way for many years. No filesystem truncates pages without a real truncate, clear_inode or I/O error. Even NFS only invalidates (but not truncates) pages in the context of mapping revalidate.
+
+However, not truncating pages when the corresponding DLM lock is revoked raises cache coherency concerns. So we need to decide how to fix that.
+
+A possible solution is to replace generic_file_splice_read() call with its copy which waits until the first page becomes uptodate so that page_cache_pipe_buf_confirm() should always pass the PageUptodate() check. Even more straightforward solution is to use default_file_splice_read(), however, it removes any sort of "zero-copy" and the performance can drop significantly.
+
+We would like to know an opinion from Intel on this defect before we propose our solution.
+
+P.S. The original bug is NFS client getting EIO if the OST is failed over during some fio load. The kernel NFSD uses ->splice_read when its avalable (see nfsd_vfs_read()). Short read is converted to EIO on the NFS client (see nfs_readpage_retry()).
+
+--- Comment (adilger, Thu, 14 Sep 2017 18:05:03 +0000) ---
+I haven't looked at this code in detail, but I the Lustre client can't wait indefinitely for the userspace thread to read the pages from the pipe before cancelling the lock and dropping the pages from cache.  It might be hours or days before a process is woken up to read pages from a pipe.
+
+Two solutions come to mind, in addition to those presented above:
+
+	use generic_file_splice_read() to do zero-copy reads from the pages in the normal case where there is no AST on the lock, but in the lock callback handler copy the pages into the pipe in case of an AST.  That avoids overhead in the most common scenarios
+
+	return an error like -EAGAIN or -EINTR or -ERESTARTSYS to the caller so that the read will be retried if the pages are dropped from cache.  This would add overhead if there are lots of lock conflicts, and potentially prevent forward progress on reading from the pipe, so the "fall back to copy" solution is probably better
+
+Since there is no guarantee of data consistency when reading from a pipe (i.e. cat "largefile.txt" | more might show old data if data is stuffed in the pipe and the file is changed, even before the data is shown to the user, I don't think there is a consistency problem with making a copy of the data to put into the pipe before the lock is cancelled and pages dropped, even if another client is immediately modifying that data.  It is just a normal concurrent read-write race.

@@ -1,0 +1,177 @@
+Key:        LU-3484
+Summary:    Incorrect identification of anonymous dentry as root under SLES11SP2
+Link:       https://jira.whamcloud.com/browse/LU-3484
+Type:       Bug
+Priority:   Critical
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Bob Glossman
+Reporter:   Patrick Farrell
+Created:    Thu, 20 Jun 2013 14:36:49 +0000
+Updated:    Thu, 27 Mar 2014 23:14:43 +0000
+Resolved:   Tue, 16 Jul 2013 22:05:55 +0000
+Labels:     mn4, patch
+
+--- Description ---
+When attempting to export Lustre 2.4 via NFS with SLES11SP2, we ran in to an issue (See LU-3483 as well for another) where Lustre identifies anonymous dentries as root dentries and bugs when calling ll_invalidate_aliases.
+
+Here's the code in question (from ll_invalidate_aliases in lustre/llite/dcache.c):
+
+if (dentry->d_name.len == 1 && dentry->d_name.name[0] == '/') {
+                        CERROR("called on root (?) dentry=%p, inode=%p "
+                               "ino=%lu\n", dentry, inode, inode->i_ino);
+                        lustre_dump_dentry(dentry, 1);
+                        libcfs_debug_dumpstack(NULL);
+                }
+
+The problem is a change in d_obtain_alias that's been made in SLES11SP2.  Here's where anonymous dentries are named, this is from d_obtain_alias in CentOS6.4 or SLES11SP1:
+
+        static const struct qstr anonstring = { .name = "" };
+        :
+        :
+        tmp = d_alloc(NULL, &anonstring);
+
+In SLES11SP2, it's this:
+
+        static const struct qstr anonstring = { .name = "/", .len = 1 };
+
+        tmp = d_alloc(NULL, &anonstring);
+
+As you can see, that looks like a root dentry to the check being done by Lustre.  There's a comment just above saying this was the intention:
+
+ * This alias can sometimes be seen by prepend_path, so make it look
+ * the same as a d_alloc_root alias.
+ */
+
+[The commit is recorded here: http://kernel.opensuse.org/cgit/kernel-source/commit/?id=f9a956fc1dc4b5271662736b5016324d43b1b99f
+
+and appears to be SLES specific.]
+
+Ideally, Lustre would find another way to identify the root dentry here.  I have simply commented out this check while doing further testing, but I'd like to understand:
+
+Is there a reason Lustre can't use the same method to see if a dentry is root as the kernel does?
+
+IE:
+
+#define IS_ROOT(x) ((x) == (x)->d_parent)
+
+If so, I'd suggest that.
+
+--- Comment (bogl, Tue, 16 Jul 2013 22:03:27 +0000) ---
+fix landed before 2.4.52 tag.  closing.
+
+--- Comment (paf, Wed, 26 Jun 2013 18:58:30 +0000) ---
+Quick note on this:
+
+Contrary to what I said above, the dentry name change has landed in the upstream Linux kernel, by at least 3.7.
+
+--- Comment (pjones, Tue, 25 Jun 2013 14:46:02 +0000) ---
+Thanks Patrick!
+
+Bob
+
+Could you please take care of this patch?
+
+Thanks
+
+Peter
+
+--- Comment (paf, Thu, 20 Jun 2013 22:29:13 +0000) ---
+Patch is up:
+
+http://review.whamcloud.com/6726
+
+--- Comment (adilger, Thu, 20 Jun 2013 22:05:36 +0000) ---
+It looks like comparing against d_sb->s_root should be correct.
+
+--- Comment (paf, Thu, 20 Jun 2013 18:41:19 +0000) ---
+Couldn't we compare the value of the dentry pointer to the value of the root dentry as given in the super block?
+
+IE:
+
+if(dentry == dentry->d_sb->s_root)
+
+As a replacement for the name check.
+
+Is there a reason that might be unsafe or incorrect in some cases?
+
+--- Comment (paf, Thu, 20 Jun 2013 17:20:21 +0000) ---
+Andreas,
+
+There is such a flag, here's what the header file has to say in SLES11SP2:
+
+—
+
+#define DCACHE_DISCONNECTED     0x0004
+
+     /* This dentry is possibly not currently connected to the dcache tree, in
+
+	which case its parent will either be itself, or will have this flag as
+
+	well.  nfsd will not use a dentry with this bit set, but will first
+
+	endeavour to clear the bit either by discovering that it is connected,
+
+	or by performing lookup operations.   Any filesystem which supports
+
+	nfsd_operations MUST have a lookup function which, if it finds a
+
+	directory inode with a DCACHE_DISCONNECTED dentry, will d_move that
+
+	dentry into place and return that dentry rather than the passed one,
+
+	typically using d_splice_alias. */
+
+—
+
+However, it's set on anonymous dentries (from d_obtain_alias):
+
+—
+
+        /* attach a disconnected dentry */
+
+        spin_lock(&tmp->d_lock);
+
+        tmp->d_sb = inode->i_sb;
+
+        d_set_d_op(tmp, tmp->d_sb->s_d_op);
+
+        tmp->d_inode = inode;
+
+->   tmp>d_flags |= DCACHE_DISCONNECTED;
+
+        list_add(&tmp->d_alias, &inode->i_dentry);
+
+        hlist_bl_lock(&tmp->d_sb->s_anon);
+
+        hlist_bl_add_head(&tmp->d_hash, &tmp->d_sb->s_anon);
+
+        hlist_bl_unlock(&tmp->d_sb->s_anon);
+
+        spin_unlock(&tmp->d_lock);
+
+        spin_unlock(&inode->i_lock);
+
+        security_d_instantiate(tmp, inode);
+
+        return tmp; 
+
+—
+
+According to what I'm reading here, it can be unset later, but I don't know when that would be:
+
+http://www.mjmwired.net/kernel/Documentation/filesystems/Exporting
+
+I'll do a bit more reading.
+
+--- Comment (adilger, Thu, 20 Jun 2013 17:09:38 +0000) ---
+I think in modern kernels there is a flag in the dentry DCACHE_DISCONNECTED, that can be used instead of checking the name.
+
+--- Comment (paf, Thu, 20 Jun 2013 15:02:54 +0000) ---
+Looks like there's a problem with that idea - Anonymous dentries are their own parents, just like root dentries.  From d_obtain_alias again:
+
+        tmp->d_parent = tmp; /* make sure dput doesn't croak */
+
+If no other alias is found, tmp is returned with the parent set as above.
+
+Suggestions?

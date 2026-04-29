@@ -1,0 +1,304 @@
+Key:        LU-8124
+Summary:    MDT zpool capacity consumed at greater rate than inode allocation
+Link:       https://jira.whamcloud.com/browse/LU-8124
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Andreas Dilger
+Reporter:   Jeff Johnson
+Created:    Mon, 25 Apr 2016 18:23:25 +0000
+Updated:    Thu, 14 Jun 2018 21:41:16 +0000
+Resolved:   Wed, 26 Oct 2016 23:24:34 +0000
+Labels:     ZFS
+Links:      Related: is related to  LUDOC-161; Related: is related to  LU-8068; Related: is related to LU-8123
+
+--- Environment ---
+CentOS 6.7, Lustre 2.8, ZFS 6.5.3
+
+--- Description ---
+When running mdtest to create zero byte files on a new LFS to benchmark the MDS I noticed that in creating 600K zero byte files I only used a small percentage of Lustre inodes but the MDT zpool capacity was 65% used. The ratio of inodes used to capacity used not only seems way off but it appears on track to run out of zpool space before Lustre thinks it's out of inodes.
+
+I'm on a plane and can give specifics later tonight. I know one large LFS is seeing similar on a production LFS. 
+
+In my case the MDT is a five-plex mirror vdev made in the following way:
+
+zpool create -o ashift=12 -O recordsize=4096 mdt.pool mirror A1 A2 mirror A3 A4 mirror A5 A6 mirror A7 A8 mirror A9 A10
+
+I have also seen the behavior using default recordsize.
+
+Maybe I'm overlooking something but it seems the capacity consumption is overtaking inode allocation. This could be something in the way ZFS reports capacity used when Lustre is hooking in at a level below ZFS layer but from the cockpit it looks like my MDT tops out while Lustre thinks there are inodes available.
+
+--- Comment (pjones, Wed, 26 Oct 2016 23:24:35 +0000) ---
+Landed for 2.9
+
+--- Comment (gerrit, Wed, 26 Oct 2016 23:02:39 +0000) ---
+Oleg Drokin (oleg.drokin@intel.com) merged in patch http://review.whamcloud.com/20123/
+
+Subject: LU-8124 osd-zfs: fix statfs small blocksize inode estimate
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 141037baa112f63f42c0f558ad3eec038712714d
+
+--- Comment (gerrit, Wed, 11 May 2016 18:00:21 +0000) ---
+Andreas Dilger (andreas.dilger@intel.com) uploaded a new patch: http://review.whamcloud.com/20123
+
+Subject: LU-8124 osd-zfs: fix statfs small blocksize inode estimate
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: bc138a92b6deac5e4227e8212e1ff0f275384765
+
+--- Comment (adilger, Tue, 10 May 2016 19:17:15 +0000) ---
+Reopen for ZFS dnode estimation patch landing.
+
+--- Comment (adilger, Thu, 28 Apr 2016 04:12:45 +0000) ---
+Just to clarify, the recordsize on the MDT affects the statfs calculation by limiting the maximum "bytes per inode" that it will use to estimate the number of inodes that can fit into the remaining free space.  It would also potentially affect the blocksize of regular files stored on the MDT (OI files, last_rcvd, changelogs, etc).  It probably makes sense to allow using recordsize=4096 on the MDT without affecting the statfs calculation, and I can work on a patch to fix the statfs reporting in this case, but it won't affect the actual space usage.  In the meantime, there would be a benefit to increasing the recordsize to 16KB so that the current statfs free inodes estimation can work properly.
+
+I don't think that changing the recordsize (which allows blocks up to 128KB) will actually lose capacity in any way.  I think the major reason for higher per-dnode space consumption for regular files is the use of ashift=12 (or underlying 4KB sector size drives) forcing the minimum block allocation to be 4KB (x2 for ditto copies) for data that doesn't fit directly into the dnode.  The only solutions I see here are to (unfortunately) reformat without ashift=12 or to use the large dnode patch (which will create new dnodes more efficiently, and eventually the space consumption will decline as old dnodes are recycled).
+
+As for the question about backup and restore of the MDT data, currently only zfs send and zfs recv can be used to do this.  This will preserve the required ZFS filesystem structure, but allow changes to the underlying zpool configuration (e.g. ashift, VDEVs, etc) as needed.  This is documented to some extent in LUDOC-161, but hasn't made it into the user manual yet.
+
+For the mdtest I think you were only creating directories the whole time, since it kept at 32KB of space per dnode until the filesystem was full, and the parameters specified didn't allow for any files to be created.  You should probably pick a smaller depth and/or fanout (e.g. -i 1 -n 100000 to create about 100k files in a single directory and see how much space that is consuming per inode.  I expect 8KB/inode for ashift=12 and 2KB/inode for ashift=9 (assuming that is possible for your disks).
+
+--- Comment (aeonjeffj, Wed, 27 Apr 2016 16:35:37 +0000) ---
+I am re-running the mdtest on a new LFS with the exact configuration, just omitting the recordsize=4096 zpool option. So far the percentages are tracking nearly identically, currently at 16% and climbing. 
+
+[root@n0002 ~]# lfs df && lfs df -i
+
+UUID                   1K-blocks        Used   Available Use% Mounted on
+
+lustre2-MDT0000_UUID  1566225280   246041344  1320181888  16% /lustre[MDT:0]
+
+lustre2-OST0000_UUID 42844636160       15360 42844618752   0% /lustre[OST:0]
+
+lustre2-OST0001_UUID 42844636160       15360 42844618752   0% /lustre[OST:1]
+
+filesystem summary:  85689272320       30720 85689237504   0% /lustre
+
+UUID                      Inodes       IUsed       IFree IUse% Mounted on
+
+lustre2-MDT0000_UUID    48371166     7598884    40772282  16% /lustre[MDT:0]
+
+lustre2-OST0000_UUID   193185425         223   193185202   0% /lustre[OST:0]
+
+lustre2-OST0001_UUID   193185425         223   193185202   0% /lustre[OST:1]
+
+filesystem summary:     48371166     7598884    40772282  16% /lustre
+
+As I read your dnode breakdown in your last comment I am left with the sense that in the osd-zfs environment the MDT inode utilization and monitoring high water mark of available inodes is a bit of black magic as opposed to a ldiskfs MDT. Based on the distribution of files and directories running out of inodes on the MDT is less predictable until you are close to running out.
+
+Does it make sense to use a recordsize=32768 or recordsize=65536 as a way to avoid loss of so much potential capacity to the 128K default?
+
+--- Comment (aeonjeffj, Tue, 26 Apr 2016 23:34:03 +0000) ---
+I will retest using an MDT pool created without the recordsize option. 
+
+Thoughts on how to get existing Lustre metadata out of a pool like this and into a new pool? It would appear that the metadata is trapped in this environment. The touches on a question I asked recently about tar, zfs send or some other method of pulling contents of an existing MDT pool and pushing into a new or rebuilt pool. It seems that the Lustre metadata and the underlying zpool dnode structure is inextricably linked. Am I wrong?
+
+Also, am I correct in reading that under the large dnode patch is able to be implemented that there will be an inefficient use of MDT zpool space that in my case is being exacerbated by the recordsize=4096 zpool creation option?
+
+--- Comment (adilger, Tue, 26 Apr 2016 23:10:46 +0000) ---
+Do you know how many inodes are actually created from mdtest -i 10 -z 10 -n 32768?  It would seem to be north of 10^9=1B directories (depth=10, fanout=10), but not a large number of regular files (or any regular files at all, since my testing shows the files are created at each level of the tree, but only if files > sum(depth^i, i = 0..fanout)).  It appears with 1B directories and only 32k files that no regular files would be created in this test.
+
+The "df -i" and "lfs df -i" are somewhat inconsistent, showing either 13M or 10M inodes allocated.  Similarly, the clients also show fewer blocks allocated on the MDT (421MB vs. 327MB), which makes me think that the client is showing slightly stale statfs data?  If anything, that is a different issue I think.
+
+In both cases, however, the ratio of space used per inode is about the same - 32KB per allocated inode.  If the majority of "files" created by mdtest are actually directories (as my local testing shows) then this space usage may not be unusual since there is a FAT ZAP allocated for each directory, which includes an 8KB index block and at least one 8KB leaf block, x2 for metadata ditto copies.
+
+What does seem confusing, and I believe is the root of your concern, is that while df is showing the MDT to be 27% (or 21%) full at the block level, df -i is showing only 5% (or 3%) full at the inode level.  Looking at the "Available" values (1238155616 KB * 1024 / 309754058 inodes) ~= 4096 bytes/inode which is why there is a discrepancy.  Looking at the osd_statfs code for osd-zfs, the 4096 bytes/inode value comes from the recordsize=4096 dataset parameter.
+
+The statfs calculations should be taking the actual space used per inode into account when computing the "total" inode count, but this appears to be confused by the low recordsize parameter, since it constrains the average dnode space usage to at most block (e.g. if a large number of small files were created).  Normally, the maximum blocksize is 128KB and it will use the actual space usage (32KB per dnode, which is less than one block/dnode) when computing the number of "free" dnodes.  It should be computing avg_bytes_per_inode = used_bytes / used_inodes (which is the only information that ZFS actually tracks) and then total_inodes = available_blocks / avg_bytes_per_inode, in this case (1238155616 KB * 1024 / 32768 bytes/inode ~= 38M inodes) and 10M/48M ~= 21% full as the blocks usage would suggest.
+
+For this particular test case, I suspect removing the recordsize=4096 setting will fix the total dnode count to align with the average 32KB/dnode used by each directory.  In the real-world case where there are 8KB of spill blocks per dnode instead of the estimated 1KB per dnode, this will depend on the large dnode support in order to fix, but removing the recordsize parameter would at least allow the code to compute the estimate more accurately.
+
+--- Comment (aeonjeffj, Tue, 26 Apr 2016 20:45:40 +0000) ---
+Here is the same output after the mdtest run failed with the LFS free inodes being exhausted. It appears that the pool capacity and inodes used start far apart but both reach 100% together. I am going to re-run this test and track the changes at a shorter interval and plot it.
+
+I find 73 septillion 1K blocks in the MGT (as reported on the MDS) to be rather interesting.
+
+From client:
+
+[root@n0001 ~]# lfs df -i
+
+UUID                      Inodes       IUsed       IFree IUse% Mounted on
+
+lustre1-MDT0000_UUID    49145314    49145314           0 100% /lustre[MDT:0]
+
+lustre1-OST0000_UUID  1339205463      321655  1338883808   0% /lustre[OST:0]
+
+lustre1-OST0001_UUID  1339200474      316602  1338883872   0% /lustre[OST:1]
+
+filesystem summary:     49145314    49145314           0 100% /lustre
+
+[root@n0001 ~]# lfs df
+
+UUID                   1K-blocks        Used   Available Use% Mounted on
+
+lustre1-MDT0000_UUID  1566118984  1566118984           0 100% /lustre[MDT:0]
+
+lustre1-OST0000_UUID 42844636160      354304 42844279808   0% /lustre[OST:0]
+
+lustre1-OST0001_UUID 42844636160      352256 42844281856   0% /lustre[OST:1]
+
+filesystem summary:  85689272320      706560 85688561664   0% /lustre
+
+On MDS:
+
+[root@lustre-mds-00 ~]# df -i
+
+Filesystem           Inodes    IUsed    IFree IUse% Mounted on
+
+/dev/md1            4325376   138180  4187196    4% /
+
+tmpfs              16505085       88 16504997    1% /dev/shm
+
+/dev/md0             128016       46   127970    1% /boot
+
+lustre-mds.mdt/mgt      150      150        0  100% /lustre-mds-mgt/mgt
+
+lustre-mds.mdt/mdt 49145314 49145314        0  100% /lustre-mds-mdt/mdt
+
+[root@lustre-mds-00 ~]# df
+
+Filesystem                    1K-blocks                 Used Available Use% Mounted on
+
+/dev/md1                       67966536              4188320  60319044   7% /
+
+tmpfs                          66020340                59432  65960908   1% /dev/shm
+
+/dev/md0                         487588                84467    377525  19% /boot
+
+lustre-mds.mdt/mgt 73786976294838193548 73786976294838193548         0 100% /lustre-mds-mgt/mgt
+
+lustre-mds.mdt/mdt           1566118984           1566118984         0 100% /lustre-mds-mdt/mdt
+
+--- Comment (aeonjeffj, Tue, 26 Apr 2016 18:36:17 +0000) ---
+Some additional data from the same test longer into the runtime. In case the numbers show a trend or ratio that gives additional data points.
+
+From client:
+
+[root@n0001 ~]# lfs df
+
+UUID                   1K-blocks        Used   Available Use% Mounted on
+
+lustre1-MDT0000_UUID  1565977868  1018771092   547204728  65% /lustre[MDT:0]
+
+lustre1-OST0000_UUID 42844636160      354304 42844279808   0% /lustre[OST:0]
+
+lustre1-OST0001_UUID 42844636160      352256 42844281856   0% /lustre[OST:1]
+
+filesystem summary:  85689272320      706560 85688561664   0% /lustre
+
+[root@n0001 ~]# lfs df -i
+
+UUID                      Inodes       IUsed       IFree IUse% Mounted on
+
+lustre1-MDT0000_UUID   168568757    31935608   136633149  19% /lustre[MDT:0]
+
+lustre1-OST0000_UUID  1339205463      321655  1338883808   0% /lustre[OST:0]
+
+lustre1-OST0001_UUID  1339200474      316602  1338883872   0% /lustre[OST:1]
+
+filesystem summary:    168568757    31935608   136633149  19% /lustre
+
+From MDS:
+
+[root@lustre-mds-00 ~]# df
+
+Filesystem          1K-blocks       Used Available Use% Mounted on
+
+lustre-mds.mdt/mgt  540043836       3468 540038320   1% /lustre-mds-mgt/mgt
+
+lustre-mds.mdt/mdt 1565979808 1034017676 531960084  67% /lustre-mds-mdt/mdt
+
+[root@lustre-mds-00 ~]# df -i
+
+Filesystem            Inodes    IUsed     IFree IUse% Mounted on
+
+lustre-mds.mdt/mgt 134915505      150 134915355    1% /lustre-mds-mgt/mgt
+
+lustre-mds.mdt/mdt 165293260 32398210 132895050   20% /lustre-mds-mdt/mdt
+
+--- Comment (aeonjeffj, Tue, 26 Apr 2016 16:41:37 +0000) ---
+Running a zero byte mdtest starting with an empty LFS: 
+
+/opt/mdtest/mdtest -w 0 -C -i 1 -z 10 -b 10 -n 32768 -d /lustre/mdtest -N 28
+
+Path: /lustre
+
+FS: 79.8 TiB   Used FS: 0.0%   Inodes: 368.0 Mi   Used Inodes: 0.3%
+
+from MDS:
+
+[root@lustre-mds-00 ~]# df
+
+Filesystem          1K-blocks      Used  Available Use% Mounted on
+
+/dev/md1             67966536   4188028   60319336   7% /
+
+tmpfs                66020340     59432   65960908   1% /dev/shm
+
+/dev/md0               487588     84467     377525  19% /boot
+
+lustre-mds.mdt/mgt 1148246072      3468 1148240556   1% /lustre-mds-mgt/mgt
+
+lustre-mds.mdt/mdt 1565959340 421005820 1144951472  27% /lustre-mds-mdt/mdt
+
+[root@lustre-mds-00 ~]# df -i
+
+Filesystem            Inodes    IUsed     IFree IUse% Mounted on
+
+/dev/md1             4325376   138180   4187196    4% /
+
+tmpfs               16505085       88  16504997    1% /dev/shm
+
+/dev/md0              128016       46    127970    1% /boot
+
+lustre-mds.mdt/mgt 287262733      150 287262583    1% /lustre-mds-mgt/mgt
+
+lustre-mds.mdt/mdt 299848796 13406894 286441902    5% /lustre-mds-mdt/mdt
+
+from client:
+
+[root@n0001 ~]# lfs df
+
+UUID                   1K-blocks        Used   Available Use% Mounted on
+
+lustre1-MDT0000_UUID  1565962020   327804356  1238155616  21% /lustre[MDT:0]
+
+lustre1-OST0000_UUID 42844636160      354304 42844279808   0% /lustre[OST:0]
+
+lustre1-OST0001_UUID 42844636160      352256 42844281856   0% /lustre[OST:1]
+
+filesystem summary:  85689272320      706560 85688561664   0% /lustre
+
+[root@n0001 ~]# lfs df -i
+
+UUID                      Inodes       IUsed       IFree IUse% Mounted on
+
+lustre1-MDT0000_UUID   320279754    10525696   309754058   3% /lustre[MDT:0]
+
+lustre1-OST0000_UUID  1339205463      321655  1338883808   0% /lustre[OST:0]
+
+lustre1-OST0001_UUID  1339200474      316602  1338883872   0% /lustre[OST:1]
+
+filesystem summary:    320279754    10525696   309754058   3% /lustre
+
+--- Comment (adilger, Mon, 25 Apr 2016 23:58:16 +0000) ---
+I'm not sure what effect -O recordsize=4096 has on the MDT, but this may result in a number of inefficient changes to the metadata structure such as ZFS ZAP leaf records (directory blocks) and metadnode blocks of only 4KB in size rather than the default of 32KB or 64KB.  Normally ZFS will compress metadata, but if the recordsize is 4KB and ashift=12 is also forcing the blocksize=4KB then the compression cannot have any benefit since the compressed data will always take up 4KB of space anyway.  Maybe this conclusion isn't totally correct as I haven't looked into this in detail, but it isn't something that we've used in any of our testing.
+
+I think more important is using ashift=12 for the MDT.  This means the minimum allocation size on the MDT is 4KB, and the dnode spill block for each dnode (needed to hold the Lustre xattrs in ZFS "system attributes") will also be allocated as a full 4KB block and then duplicated because it is metadata, so it will consume 8KB per dnode.
+
+Does the underlying MDT storage require ashift=12 (i.e. 4KB sector size) or does also allow the default ashift=9 (512-byte sector size)?  I think ashift=12 is fairly typical for the OSTs (which have fewer dnodes, fewer xattrs, and much more data per file), but we haven't been using this for MDTs, which are typically on SSDs that support smaller sector sizes.
+
+I believe that the large dnode patch (LU-8068, https://github.com/zfsonlinux/zfs/pull/3542) will handle ashift=12 filesystems properly so that it doesn't allocate 8KB of extra space per dnode, but until that is landed I think ashift=9 is better for the MDT (that would allocate only a 512-byte spill block per dnode as expected).
+
+As for the disconnect between free/used inodes reported by Lustre vs. space used by ZFS - they should be tracking fairly closely, especially as the filesystem gets full.  The initial estimate when the filesystem is empty is about 1KB/dnode, but this should track the average space used per dnode as the filesystem becomes more full.  If you could provide both "lfs df" and "lfs df -i" as well as "df" and "df -i" for the MDT we can track down where this discrepancy is coming from.

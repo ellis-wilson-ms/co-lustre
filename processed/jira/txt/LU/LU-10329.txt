@@ -1,0 +1,105 @@
+Key:        LU-10329
+Summary:    DNE3: REMOTE_PARENT_DIR scalability
+Link:       https://jira.whamcloud.com/browse/LU-10329
+Type:       Improvement
+Priority:   Critical
+Status:     Open
+Resolution: Unresolved
+Assignee:   Lai Siyao
+Reporter:   Andreas Dilger
+Created:    Tue, 5 Dec 2017 05:55:07 +0000
+Updated:    Wed, 10 Sep 2025 13:23:37 +0000
+Labels:     LMR, dne3, medium, performance, scalability
+Links:      Gantt End to Start: has to be done before LU-11025; Gantt End to Start: has to be done before LU-10784; Related: is related to  LU-12892; Related: is related to  LU-11546; Related: is related to  LU-10192; Related: is related to  LU-4684; Related: is related to LU-15383; Related: is related to LU-4876; Related: is related to LU-11446; Related: is related to LU-11502; Related: is related to LU-15330; Related: is related to LU-17818; Related: is related to LU-12310; Related: is related to LU-15307; Related: is related to LU-13440
+
+--- Description ---
+For DNE filesystems where there are large numbers of remote entries, for example once LU-4684 is landed to restripe directories, or DNE2 striped directories with many renames, the size of the REMOTE_PARENT_DIR may become very large.
+
+In order to limit contention and scaling issues in REMOTE_PARENT_DIR it makes sense to have multiple such directories.  As a starting point, one REMOTE_PARENT_DIR_MDTxxxx for each remote MDT would be useful, but it may be necessary to have a tree of directories similar to the O//dN object directories.  Having a separate REMOTE_PARENT_DIR_MDTxxxx per MDT would also allow LFSCK to efficiently scan remote entries for a given MDT, if there was a problem (e.g. MDT was marked offline and returned into the namespace later).
+
+--- Comment (gerrit, Thu, 10 Aug 2023 02:50:44 +0000) ---
+"Lai Siyao " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/51912
+
+Subject: LU-10329 osd-ldiskfs: add osd_obj_map for remote objects
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: ffbc774053bec88e1aacb16831b6f0fa632529d5
+
+--- Comment (gerrit, Thu, 10 Aug 2023 02:50:44 +0000) ---
+"Lai Siyao " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/51911
+
+Subject: LU-10329 obdclass: add linkEA version 2
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 8ea62123db1a9bbbb2e36b511c03fbd368f80b75
+
+--- Comment (gerrit, Thu, 10 Aug 2023 02:50:43 +0000) ---
+"Lai Siyao " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/51910
+
+Subject: LU-10329 obdclass: tidy up linkEA code
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: b27fd4006b7e763da72eb9d834fd4423293e5349
+
+--- Comment (adilger, Mon, 8 May 2023 15:07:03 +0000) ---
+There are definitely benefits to splitting the entries up by remote MDT.  This could be used to quickly find/check/remove remote links for a specific MDT if needed (eg. MDT removed/lost with metadata redundancy).
+
+Does it make sense to lift REMOTE_PARENT_DIR out of the OSD and into MDD?
+
+--- Comment (laisiyao, Mon, 8 May 2023 14:04:40 +0000) ---
+REMOTE_PARENT_DIR is used in osd layer only, which means it doesn't know which MDT its parent is located, but only knows that whether parent is on local MDT. So we can't create a subdir for each MDT, do you think it's okay to create 64 subdirs for all remote MDTs?
+
+--- Comment (adilger, Mon, 3 Apr 2023 23:38:24 +0000) ---
+For upgrading MDTs that are currently using a single REMOTE_PARENT_DIR, I think a two-stage approach could be used.   Initially, add "read-only" support for such directories into 2.16.0 to allow for downgrade:
+
+	accept OBD_INCOMPAT_REMOTE_PARENTS = 0x00000800 in tgt_scd, but do not set it
+
+	open REMOTE_PARENT_DIR_MDTxxxx directories when a remote MDT connection is made, using local_file_find(), if available
+
+	do agent FID lookups in REMOTE_PARENT_DIR first, and fall back to REMOTE_PARENT_DIR_MDTxxxx if it exists and FID was not found
+
+	create new entries in REMOTE_PARENT_DIR only (as before)
+
+Then in 2.17+ start using those directories (which would be incompatible for pre-2.16 servers, or servers not patched as above):
+
+	set OBD_INCOMPAT_REMOTE_PARENTS = 0x00000800 in tgt_scd so that unpatched MDS cannot mount the MDT
+
+	create/open REMOTE_PARENT_DIR_MDTxxxx directories when a remote MDT connection is made, using local_file_find_or_create()
+
+	do agent FID lookups in REMOTE_PARENT_DIR_MDTxxxx first, and fall back to REMOTE_PARENT_DIR if it exists and FID was not found
+
+	start linking new agent inodes into REMOTE_PARENT_DIR_MDTxxxx based on remote parent FID
+
+	update LFSCK to do the same when linking or looking up remote FIDs on the MDT
+
+	(optionally?) start a background thread to move entries from REMOTE_PARENT_DIR to the proper ..._MDTxxxx subdir based on the parent FID, then remove the old REMOTE_PARENT_DIR when it is empty.
+
+Having a two-stage update process like this, and minimizing the "read-only" patches to simplify backport (e.g. to b2_15) will allow upgrade/downgrade without breaking the whole filesystem.
+
+One minor drawback of having separate directories would be that renaming files/subdirs from one remote MDT directory to another would also mean renaming the agent locally from one REMOTE_PARENT_DIR_MDTxxxx to another, but that is not worse than a local cross-directory rename, and only a small fraction of the overhead of the distributed rename itself (BFL, multiple MDT transactions, etc.).  That local filesystem overhead is probably offset by not having a single huge REMOTE_PARENT_DIR to hold all of the remote links.
+
+--- Comment (adilger, Thu, 2 Dec 2021 20:56:02 +0000) ---
+In addition to improving performance by having multiple REMOTE_PARENT_DIR_MDTxxxx directories, another significant benefit would be reduced risk from filesystem corruption.  An MDT with 60M entries in REMOTE_PARENT_DIR is currently running e2fsck because of a problem with that directory, with an unknown ETA, so having multiple independent directories would reduce risk and the number of entries that need to be repaired significantly, and potentially improve the scalability of parallel pass2/pass3 operations as well.
+
+--- Comment (adilger, Thu, 30 Jul 2020 07:52:36 +0000) ---
+It seems that the large directory patches have landed, so the need for this is reduced.
+
+However, it would still be useful to have a per-MDT REMOTE_PARENT_DIR_MDTxxxx directory, since that would simplify things like LFSCK checking if one MDT was offline/corrupted/removed.  It also provides a point of scaling so that there can be different updates between pairs of MDTs that do not contend for the same locks.
+
+--- Comment (adilger, Thu, 18 Oct 2018 22:47:38 +0000) ---
+This is needed before LU-11025 or LU-10784 or implements automatic directory restriping or remote directories.  Otherwise, the large number of remote entries in the filesystem will exceed the per-directory limit (unless LU-11546 is implemented first, and that is a sub-optimal solution).

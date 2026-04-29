@@ -1,0 +1,175 @@
+Key:        LU-19474
+Summary:    Allow replay of TN_EVENT_RX_OK events
+Link:       https://jira.whamcloud.com/browse/LU-19474
+Type:       Bug
+Priority:   Medium
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Chris Horn
+Reporter:   Chris Horn
+Created:    Tue, 14 Oct 2025 19:42:46 +0000
+Updated:    Tue, 28 Oct 2025 17:06:10 +0000
+Resolved:   Tue, 28 Oct 2025 17:06:10 +0000
+
+--- Description ---
+When we receive a message from a "new" peer it is dropped:
+
+static int kfilnd_tn_state_idle(struct kfilnd_transaction *tn,
+                                enum tn_events event, int status,
+                                bool *tn_released)
+{
+...
+        case TN_EVENT_RX_OK:
+                if (kfilnd_peer_needs_hello(tn->tn_kp, false)) {
+                        rc = kfilnd_send_hello_request(tn->tn_ep->end_dev,
+                                                       tn->tn_ep->end_cpt,
+                                                       tn->tn_kp);
+                        if (rc)
+                                KFILND_TN_ERROR(tn,
+                                                "Failed to send hello request: rc=%d",
+                                                rc);
+                        rc = 0;
+                }
+
+                /* If this is a new peer then we cannot progress the transaction
+                 * and must drop it
+                 */
+                if (kfilnd_peer_is_new_peer(tn->tn_kp)) {
+                        KFILND_TN_ERROR(tn,
+                                        "Dropping message from %s due to stale peer",
+                                        libcfs_nid2str(tn->tn_kp->kp_nid));
+                        kfilnd_tn_status_update(tn, -EPROTO,
+                                                LNET_MSG_STATUS_LOCAL_DROPPED);
+                        rc = 0;
+                        goto out;
+                }
+
+The concern about messages from "new" peers is that they may be using an invalid session key for the operation.
+
+Cases to consider:
+
+	KFILND_MSG_IMMEDIATE:
+	
+		The peer session key doesn't play a role in immediate message operations.
+
+	
+	
+
+	KFILND_MSG_BULK_PUT_REQ:
+
+	KFILND_MSG_BULK_GET_REQ:
+	
+		For BULK requests, the session key is used when processing the TN_EVENT_INIT_TAG_RMA event. kfilnd_ep_post_read() and kfilnd_ep_post_write() are called by kfilnd_tn_state_imm_recv(). In each of those functions we validate the session key by calling tn_session_key_is_valid().
+
+		The session key is also used when processing the TN_EVENT_SKIP_TAG_RMA event. In this case kfilnd_tn_state_imm_recv() calls kfilnd_ep_post_tagged_send(). Inside kfilnd_ep_post_tagged_send() we validate the session key by calling tn_session_key_is_valid().
+		
+			For Lustre the code flow is:
+			
+				Server issues an LNetPut()/LNetGet() to initiate the bulk transfer:
+				
+					LNetPut()/LNetGet() > kfilnd_send() > kfilnd_tn_event_handler(TN_EVENT_INIT_BULK) > kfilnd_tn_state_idle() > kfilnd_ep_post_tagged_recv() > kfilnd_tn_state_tagged_recv_posted() > kfilnd_tn_pack_bulk_req()/kfilnd_ep_post_send()
+					
+						kfilnd_ep_post_tagged_recv() generates the "tag" (RKEY) for the RMA using gen_target_tag_bits().
+
+int kfilnd_ep_post_tagged_recv(struct kfilnd_ep *ep,
+                               struct kfilnd_transaction *tn)
+{
+        struct kfi_msg_tagged msg = {
+                .tag = gen_target_tag_bits(tn),
+                .context = tn,
+                .addr = tn->tn_kp->kp_addr,
+        };
+...
+
+static uint64_t gen_target_tag_bits(struct kfilnd_transaction *tn)
+{
+        return (tn->tn_kp->kp_local_session_key tn_mr_key;
+}
+
+						Since KFILND_MSG_VERSION_2, the tn->tn_kp->kp_local_session_key is stored in the bulk request message (both V_1 and V_2 also have the tn->tn_mr_key).
+
+					
+					
+
+				
+				
+
+			
+			
+
+		
+		
+
+	
+	
+
+---- Client receives the KFILND_MSG_BULK_PUT_REQ/KFILND_MSG_BULK_GET_REQ:
+
+----- kfilnd_cq_process_completion() > kfilnd_cq_process_event() > kfilnd_tn_process_rx_event() > kfilnd_tn_event_handler(TN_EVENT_RX_OK) > kfilnd_tn_state_idle() > lnet_parse() > kfilnd_recv() > kfilnd_tn_event_handler(TN_EVENT_RX_OK) > kfilnd_tn_state_imm_recv() > kfilnd_ep_post_read()/kfilnd_ep_post_write()/kfilnd_ep_post_tagged_send()
+
+This is the check of the session key:
+
+static bool tn_session_key_is_valid(struct kfilnd_transaction *tn)
+{
+        if (tn->tn_response_session_key == tn->tn_kp->kp_remote_session_key)
+                return true;
+
+        KFILND_TN_DEBUG(tn, "Detected session key mismatch %u != %u\n",
+                        tn->tn_response_session_key,
+                        tn->tn_kp->kp_remote_session_key);
+        return false;
+}
+
+Where tn->tn_response_session_key is retrieved from the BULK_REQ message:
+
+static int kfilnd_recv(struct lnet_ni *ni, void *private, struct lnet_msg *msg,
+                       int delayed, unsigned int niov,
+                       struct bio_vec *kiov,
+                       unsigned int offset, unsigned int mlen,
+                       unsigned int rlen)
+{
+...
+        /* Store relevant fields to generate a bulk response. */
+        if (rxmsg->version == KFILND_MSG_VERSION_1) {
+                tn->tn_response_mr_key = rxmsg->proto.bulk_req.key;
+                tn->tn_response_rx = rxmsg->proto.bulk_req.response_rx;
+                tn->tn_response_session_key = tn->tn_kp->kp_remote_session_key;
+        } else {
+                tn->tn_response_mr_key = rxmsg->proto.bulk_req_v2.kbrm2_key;
+                tn->tn_response_rx = rxmsg->proto.bulk_req_v2.kbrm2_response_rx;
+                tn->tn_response_session_key =
+                                rxmsg->proto.bulk_req_v2.kbrm2_session_key;
+        }
+
+Thus it should be safe in all cases for BULK messages (at least for KFILND_MSG_VERSION_2+) to replay the RX_OK events for receipt of the BULK_PUT/GET_REQ. The V_2 protocol protects us against potential RKEY re-use.
+
+In fact, we ought to be able to drop the session key validation altogether. For bulk V1, the keys will never mismatch. For V2, we use key stored in the bulk request to generate the RKEY, so it shouldn't be possible to re-use an RKEY due to a change in the kfilnd_peer session key.
+
+--- Comment (pjones, Tue, 28 Oct 2025 17:06:10 +0000) ---
+Merged for 2.17
+
+--- Comment (gerrit, Tue, 28 Oct 2025 15:24:00 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/61823/
+
+Subject: LU-19474 kfilnd: Replay early RX events
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: cd3bd0f9819879935b30bd017cffcbcc44e8b2b5
+
+--- Comment (gerrit, Tue, 14 Oct 2025 19:44:34 +0000) ---
+"Chris Horn " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/61823
+
+Subject: LU-19474 kfilnd: Replay early RX events
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 2f3ea5739e8ad17429b85bb62899ed12d7a807d3

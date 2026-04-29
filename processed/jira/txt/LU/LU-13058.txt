@@ -1,0 +1,120 @@
+Key:        LU-13058
+Summary:    Intermediate component removal (PFL/SEL)
+Link:       https://jira.whamcloud.com/browse/LU-13058
+Type:       Improvement
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   Patrick Farrell
+Reporter:   Patrick Farrell
+Created:    Sun, 8 Dec 2019 20:19:37 +0000
+Updated:    Tue, 9 Apr 2024 16:54:02 +0000
+Links:      Related: is related to  LU-10070; Related: is related to  LU-11918; Related: is related to  LU-15011; Related: is related to LU-11023; Related: is related to LU-16857; Related: is related to LU-12785
+
+--- Description ---
+This is a simple extension to the SEL functionality for PFL files, originally suggested by Andreas.
+
+One of the features of SEL is that if there is an intermediate layout component (Consider a PFL layout like: DOM->SSD->HDD, in this case SSD is the intermediate component), it will not be instantiated if that tier is low on space, instead, the next component (HDD) is extended downwards. This allows us to skip the SSD tier if it's full.
+
+This is a nice feature, and there's no particular reason it has to be limited to SEL layouts. It's easy to do this for normal layouts, where the SSD component has a normally defined length.
+
+So, this patch adds that functionality. The canonical case is a DOM->SSD->HDD layout where the SSD tier is low on space (or even out of space entirely). Currently, when the first write happens to the SSD component, it's simply instantiated. If there is absolutely no space, an error results. With this feature, in the low on space condition*, that intermediate component is removed.
+
+*the same low on space condition as used in SEL, basically if one of the chosen OSTs is below the threshold value for striping. The stripe allocator will only stripe to these OSTs in absence of a better choice, so this indicates we're very low on space.
+
+There is one detail: The SEL code uses the "extension size" as a way to estimate how much space this component might use, so it's factored in to the "low on space" calculation. There is no obvious substitute for this with a regular file, which leads to two options:
+
+1. Act like the file will consume (effectively) zero space and only act if the OSTs are already low on space
+
+2. Pick some amount of data to assume it will use - The most logical guess seems to be a multiple of stripe size, but perhaps an absolute value would be better, as stripe sizes can vary widely.
+
+It's not clear that 1 isn't fine, and in either case, this is just an optimization.
+
+Patch forthcoming.
+
+--- Comment (adilger, Fri, 26 Nov 2021 23:04:28 +0000) ---
+This may be mostly unnecessary in the presence of the pool spill mechanism added in patch https://review.whamcloud.com/43989 "LU-14825 lod: pool spilling".  Rather than drop the component with the full pool and move to the next one, pool spill reassigns that component to its specified spill_target pool.
+
+That allows the admin to "fix" all layouts that are targeting a specific pool, including cases where removing a component wouldn't help because the next (...) component is also on the same pool, but with a larger stripe count.  Also, it avoids unnecessarily inflating the stripe count when an early component is dropped.
+
+The one drawback of pool spill is that it is a single global parameter and does not allow the fine-grained control of the layout that SEL does (i.e. which pool to use for each component), but that is not (IMHO) going to be a common use case, since most users don't know how to set the layout.
+
+In summary, I'm not against keeping this open to eventually land this patch, but I don't think it is as useful/important as it once was.
+
+--- Comment (adilger, Tue, 26 May 2020 23:53:10 +0000) ---
+Mike, this is very similar to the DoM component shrinking/removal that you implemented.  Would you be able to finish off Patrick's patch in time for 2.14?
+
+--- Comment (paf0186, Fri, 13 Dec 2019 16:17:25 +0000) ---
+I agree, the only downside is that it seems like it would require a little bit of plumbing - Handling quotas was rejected as part of the SEL work (at least initially) for that reason.
+
+Although now that I think about it, my position at the time (in the design discussions within Cray) was based on the idea of integrating quota levels in to the stripe allocator decisions, which really would be kind of terrible.
+
+But if we assume that quota pools and OST tiers are arranged sanely (ie, the pools used for quota match up with the pools used in the layout/tiering), which I think is fair (since things won't break if they are not - it will just give suboptimal behavior), then we could just make quota checking part of the "are these selected OSTs OK" step*, since the quota itself is split across the OSTs evenly.
+
+*ie, when we check the OSTs selected by the stripe allocator to verify space levels
+
+ 
+
+It's not quite as good as integrating quota in to the stripe allocator decisions, but that would be a huge amount of work and I think definitely overkill.
+
+So, yeah, that would be manageable I think.  Just some extra plumbing to check quotas from the LOD context.
+
+But as you noted, pool quotas required first.
+
+--- Comment (adilger, Thu, 12 Dec 2019 23:34:12 +0000) ---
+I also thought of another important use case for this - skipping the PFL/SEL components for OST pools in which the user has no quota.  That depends on the OST pool quota feature (LU-11023) to be available, but seems like a logical extension of this work.
+
+--- Comment (paf0186, Tue, 10 Dec 2019 20:19:09 +0000) ---
+OK, that makes sense.  I can try to take a quick look at some of that at some point - I'm doing this in my spare time, so it's uncertain how much I'll dig in to the other test stuff.
+
+"In some respects, it would be nice if all components were treated like SEL components by default and users didn't have to explicitly set extension components, or worry about if some OST is going to run out of space."
+
+I think this is intriguing - It would be doable.  Very doable, in fact, though the effects would be wide ranging.  It would be a matter of converting the normal PFL component expression (with setstripe) to have an implicit -z, basically, and then I guess converting regular setstripe -c to make an SEL file rather than a plain file.
+
+So all first components (DOM excluded, since it has a fixed size) would start out small, and all other components would start out zero length, and all followed by extension space.
+
+ 
+
+There would be lots of ripple effects, but the only obvious question (to me) is how to set the extension size (the amount of space given out at a time).  Perhaps something like 1% or 100 GiB, whichever is larger?  I'm not sure - Layout lock changes could be pretty disruptive for a large file being written in parallel.  It seems like it would be important to allow not doing this for that case.  (Though I suppose if a file is striped widely as well, the data per stripe might not be much different from a single writer file being written quickly by one client, so the issue might be roughly the same.)
+
+Hm.  The number of ripple effects and the complexity it introduces to regular layouts make me nervous.
+
+ 
+
+"That said, I do like the idea you are proposing here."
+
+ As I alluded to, you originally suggested it (the "PFL could remove intermediate components" bit) during SEL review.
+
+--- Comment (adilger, Mon, 9 Dec 2019 23:14:44 +0000) ---
+I agree that it is likely that some tests will fail if the default layout is changing.  I think in many cases the failures can be mitigated by small/sane changes to the layout used for a particular test, or by making the test smart enough to handle this.
+
+I think the first thing to do would be getting regular testing to pass with a default PFL layout, starting with patch https://review.whamcloud.com/26576 "LU-11918 tests: modify file system layout in testing".  The results for that patch show there are already a number of subtests failing because that have built-in assumptions of stripe_count=1 or stripe-size=1MB as the default filesystem layout.
+
+I'd recommend to approach this in a systematic manner, first changing the filesystem default stripe_count=3 or similar and fixing subtests to handle the new default and/or explicitly specify the layout that they require for the test, then the default stripe_size=3MB or whatever and repeat, then PFL layout with stripe_count=1, stripe_size=1MB as the first component, etc.
+
+Without first addressing the hidden assumptions in the existing tests, I think that this will be a very large patch that conflates existing issues with potential new issues that are added with this additional change.
+
+That said, I do like the idea you are proposing here.  In some respects, it would be nice if all components were treated like SEL components by default and users didn't have to explicitly set extension components, or worry about if some OST is going to run out of space.
+
+--- Comment (paf0186, Mon, 9 Dec 2019 17:46:03 +0000) ---
+Ah, of course, yeah.  I'm stuck in the mindset of self extending layouts, where the component can change later.  These are fixed from the beginning, so, yeah, component size kinda makes sense.
+
+Unfortunately, this will likely break a bunch of tests and may introduce some usability issues for developers...?  Because if the size of your second component is (for example) 1 GiB, but you're running on the default llmount.sh config, that will never show as having enough space for that.  So essentially, creating a three component PFL layout on that test config and trying to instantiate that second component won't work, unless the components are very small.
+
+I'll give it a shot and see how many tests it breaks.  Let me know if that adjusts your thinking or if you've got an idea for coping with that.
+
+--- Comment (adilger, Mon, 9 Dec 2019 02:28:12 +0000) ---
+It would make sense to use the size of the intermediate component as the threshold for whether there is enough space on the OST(s).
+
+--- Comment (gerrit, Sun, 8 Dec 2019 20:24:22 +0000) ---
+Patrick Farrell (farr0186@gmail.com) uploaded a new patch: https://review.whamcloud.com/36953
+
+Subject: LU-13058 lod: Intermediate component removal
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: ac5638e83a8436b3d46a2cd74634b2a8578dadb3

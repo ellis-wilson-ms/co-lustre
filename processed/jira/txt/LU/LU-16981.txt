@@ -1,0 +1,123 @@
+Key:        LU-16981
+Summary:    LBUG in lod_striped_create, fewer stripes allocated than requested
+Link:       https://jira.whamcloud.com/browse/LU-16981
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Thomas Bertschinger
+Reporter:   Thomas Bertschinger
+Created:    Tue, 25 Jul 2023 15:52:17 +0000
+Updated:    Sat, 23 Sep 2023 14:10:56 +0000
+Resolved:   Sat, 23 Sep 2023 14:10:56 +0000
+Links:      Related: is related to  LU-16623
+
+--- Description ---
+This relates to these crashes in sanity test 270a: https://knox.linuxhacker.ru/crashdb_ui_external.py.cgi?newid=68931
+
+ 
+
+A file is created and should have 4 stripes but one OST gets deactivated and only 3 stripes get created. There is a race condition and if the OST gets deactivated at the wrong moment, then stripe count doesn't correctly get updated and later there is a crash.
+
+Here are relevant lines from the debug log prior to this crash:
+
+00020000:00000001:4.0:1689017245.043107:0:7535:0:(lod_qos.c:2686:lod_qos_prep_create()) Process entered
+...
+00020000:00000001:4.0:1689017245.043110:0:7535:0:(lod_qos.c:2088:lod_get_stripe_count()) Process leaving (rc=4 : 4 : 4)
+00020000:00000010:4.0:1689017245.043118:0:7535:0:(lod_qos.c:2723:lod_qos_prep_create()) kmalloced '(stripe)': 32 at ffff880295611e38.
+00020000:00000010:4.0:1689017245.043124:0:7535:0:(lod_qos.c:2726:lod_qos_prep_create()) kmalloced '(ost_indices)': 16 at ffff8802d8267868.
+00020000:00001000:4.0:1689017245.043125:0:7535:0:(lod_qos.c:2734:lod_qos_prep_create()) tgt_count 4 stripe_count 4
+...
+00020000:00000001:4.0:1689017245.043136:0:7535:0:(lod_qos.c:1533:lod_ost_alloc_qos()) Process entered
+...
+00020000:00000001:4.0:1689017245.043147:0:7535:0:(lod_qos.c:109:lod_statfs_and_check()) Process entered
+00000004:00000001:4.0:1689017245.043149:0:7535:0:(osp_dev.c:795:osp_statfs()) Process entered
+00000004:00001000:4.0:1689017245.043150:0:7535:0:(osp_dev.c:815:osp_statfs()) lustre-OST0000-osc-MDT0000: blocks=61184, bfree=1024, bavail=0, bsize=4096, reserved_mb_low=1, reserved_mb_high=3, files=35818, ffree=128, state=20
+00000004:00000001:4.0:1689017245.043153:0:7535:0:(osp_dev.c:833:osp_statfs()) Process leaving (rc=0 : 0 : 0)
+00020000:01000000:4.0:1689017245.043154:0:7535:0:(lod_qos.c:141:lod_statfs_and_check()) lustre-OST0000-osc-MDT0000: turns inactive
+00020000:00000001:4.0:1689017245.043155:0:7535:0:(lod_qos.c:168:lod_statfs_and_check()) Process leaving (rc=18446744073709551588 : -28 : ffffffffffffffe4)
+...
+00020000:00001000:4.0:1689017245.043173:0:7535:0:(lod_qos.c:1639:lod_ost_alloc_qos()) found 3 good osts
+...
+# there are only 3 of these lines that actually allocated stripes...
+00000004:00000010:4.0:1689017245.043188:0:7535:0:(osp_dev.c:118:osp_object_alloc()) slab-alloced 'o': 456 at ffff8801a38115b0.
+...
+00020000:00000001:4.0:1689017245.043460:0:7535:0:(lod_qos.c:1771:lod_ost_alloc_qos()) Process leaving (rc=0 : 0 : 0)
+00020000:00000001:4.0:1689017245.043462:0:7535:0:(lod_qos.c:2820:lod_qos_prep_create()) Process leaving (rc=0 : 0 : 0)
+
+In most cases, lod_ost_alloc_qos() will return -EAGAIN when it can't allocate enough stripes, and then lod_ost_alloc_rr() later will be called.
+
+lod_ost_alloc_rr() will adjust lod_comp->llc_stripe_count if it needs to be reduced because fewer stripes are allocated than requested.
+
+However, in this case, if an OST is deactivated after the call to ltd_qos_is_usable() on line 1592 but before lod_statfs_and_check() on line 1615, then we can end up with fewer stripes than requested, but lod_ost_alloc_qos() still returns 0, not EAGAIN, so the llc_stripe_count is never reduced to the right value.
+
+This can happen as long as the number of available OSTs is greater than stripe_count_min (but less than stripe_count).
+
+Here is how to reproduce. There might be a more elegant way to reproduce this but this works for me...
+
+ 
+
+# this is just to make one OST usage higher so that the QOS algorithm is used instead of RR
+lfs setstripe -i0 -c1 /mnt/lustre/bigfile && head --bytes=$((1024 * 100000)) /dev/zero > /mnt/lustre/bigfile
+# on my setup (single VM, 2 MDT, 4 OST), this triggers the LBUG pretty reliably within a few hundred loops
+for i in {0..500}; do
+        lctl set_param osp.lustre-OST0000-osc-MDT0000.max_create_count=0 & lfs setstripe -c -1 /mnt/lustre/f$i
+        lctl set_param osp.lustre-OST0000-osc-MDT0000.max_create_count=1000 & lfs setstripe -c -1 /mnt/lustre/g$i
+done
+
+--- Comment (pjones, Sat, 23 Sep 2023 14:10:56 +0000) ---
+Landed for 2.16
+
+--- Comment (gerrit, Sat, 23 Sep 2023 06:02:56 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/51759/
+
+Subject: LU-16981 lod: update llc_stripe_count after ost inactive
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 78336aa166f4a7a0128a5891c747eecf26ff9565
+
+--- Comment (sergey, Tue, 12 Sep 2023 12:30:32 +0000) ---
+[17543.927775] Lustre: DEBUG MARKER: == sanity test 270a: DoM: basic functionality tests ====== 15:27:22 (1689017242)
+[17545.833056] LustreError: 7535:0:(lod_object.c:6357:lod_striped_create()) ASSERTION( object != ((void *)0) ) failed: 
+[17545.835206] LustreError: 7535:0:(lod_object.c:6357:lod_striped_create()) LBUG
+[17545.835883] Pid: 7535, comm: mdt02_001 3.10.0-7.9-debug #2 SMP Tue Feb 1 18:17:58 EST 2022
+[17545.837081] Call Trace:
+[17545.837617] [] libcfs_call_trace+0x90/0xf0 [libcfs]
+[17545.838108] [] lbug_with_loc+0x4c/0xa0 [libcfs]
+[17545.838720] [] lod_striped_create+0x50b/0x5d0 [lod]
+[17545.839298] [] lod_layout_change+0x1ab/0x2a0 [lod]
+[17545.839913] [] mdd_layout_change+0x1491/0x1bc0 [mdd]
+[17545.840533] [] mdt_layout_change+0x2c7/0x460 [mdt]
+[17545.841151] [] mdt_intent_layout+0x910/0xeb0 [mdt]
+[17545.843660] [] mdt_intent_opc+0x1dc/0xc40 [mdt]
+[17545.844270] [] mdt_intent_policy+0xfa/0x460 [mdt]
+[17545.844904] [] ldlm_lock_enqueue+0x3e1/0xbe0 [ptlrpc]
+[17545.845620] [] ldlm_handle_enqueue+0x373/0x17d0 [ptlrpc]
+[17545.846243] [] tgt_enqueue+0x68/0x240 [ptlrpc]
+[17545.846876] [] tgt_request_handle+0x88e/0x19b0 [ptlrpc]
+[17545.848492] [] ptlrpc_server_handle_request+0x251/0xc00 [ptlrpc]
+[17545.851948] [] ptlrpc_main+0xc41/0x1610 [ptlrpc]
+[17545.852574] [] kthread+0xe4/0xf0
+[17545.853129] [] ret_from_fork_nospec_begin+0x7/0x21
+[17545.853749] [] 0xfffffffffffffffe
+[17545.854332] Kernel panic - not syncing: LBUG 
+
+Adding back trace from the crash dump to make it is easier to find.
+
+--- Comment (gerrit, Tue, 25 Jul 2023 16:30:24 +0000) ---
+"Thomas Bertschinger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/51759
+
+Subject: LU-16981 lod: update llc_stripe_count after ost inactive
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: fe98f7f0aad369c6062c302aa4ebc14185cad80c

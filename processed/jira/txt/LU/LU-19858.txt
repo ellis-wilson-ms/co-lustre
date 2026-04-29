@@ -1,0 +1,200 @@
+Key:        LU-19858
+Summary:    Remote agent entry incorrectly unlinked (REMOTE_PARENT_DIR/<file_fid>)
+Link:       https://jira.whamcloud.com/browse/LU-19858
+Type:       Bug
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   Etienne Aujames
+Reporter:   Etienne Aujames
+Created:    Fri, 6 Feb 2026 10:22:17 +0000
+Updated:    Wed, 4 Mar 2026 12:02:50 +0000
+Links:      Related: is related to LU-11446
+
+--- Description ---
+This happens when linkea overflow: some remote entries are not accounted in linkea (trusted.link).
+
+Reproducer (lustre master branch):
+
+Create 1000 hardlinks to overflow linkea (4K max):
+
+[root@client-el8 mdt1]# cd ../mdt0
+[root@client-el8 mdt0]# touch test
+[root@client-el8 mdt0]# printf "%s\n" test_link{1..1000} | xargs -n1 ln test   
+[root@client-el8 mdt0]# debugfs -c -R 'stat /ROOT/mdt0/test' /dev/mapper/mds1_flakey                                                                                                                                                          
+debugfs 1.47.3-wc2 (11-Nov-2025)
+Inode: 166   Type: regular    Mode:  0644   Flags: 0x80000
+Generation: 2615803926    Version: 0x00000001:0000139e
+User:     0   Group:     0   Project:     0   Size: 0
+File ACL: 0
+Links: 1001   Blockcount: 8
+Fragment:  Address: 0    Number: 0    Size: 0
+ ctime: 0x6985bae8:00000000 -- Fri Feb  6 10:56:56 2026
+ atime: 0x6985ba99:00000000 -- Fri Feb  6 10:55:37 2026
+ mtime: 0x6985ba99:00000000 -- Fri Feb  6 10:55:37 2026
+crtime: 0x6985ba99:27a3b61c -- Fri Feb  6 10:55:37 2026
+Size of extra inode fields: 32
+Extended attributes:
+  lma: fid=[0x200000402:0x3:0x0] compat=0 incompat=0
+  trusted.lov (56) = d0 0b d1 0b 01 00 00 00 03 00 00 00 00 00 00 00 02 04 00 00 02 00 00 00 00 00 10 00 01 00 00 00 02 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 01 00 00 00 
+  trusted.som (24) = 04 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+  inode  linkea: idx=0 parent=[0x200000402:0x1:0x0] name='test'
+          idx=1 parent=[0x200000402:0x1:0x0] name='test_link1'
+....
+          idx=138 parent=[0x200000402:0x1:0x0] name='test_link138'
+EXTENTS:
+
+move all entries to create 1000 remote entries
+
+[root@client-el8 mdt0]# printf "%s\n" test test_link{1..1000} | xargs -I{} mv {} ../mdt1
+[root@client-el8 mdt0]# debugfs -c -R 'ls /REMOTE_PARENT_DIR' /dev/mapper/mds1_flakey 
+debugfs 1.47.3-wc2 (11-Nov-2025)
+ 25001  (12) .    2  (12) ..    166  (4072) 0x200000402:0x3:0x0
+
+Unlink all the entries register in linkea:
+
+[root@client-el8 mdt0]# cd ../mdt1
+[root@client-el8 mdt1]# printf "%s\n" test test_link{1..138} | xargs -n1 unlink
+
+Now the remote agent entry is removed:
+
+[root@client-el8 mdt1]# debugfs -c -R 'ls /REMOTE_PARENT_DIR' /dev/mapper/mds1_flakey 
+debugfs 1.47.3-wc2 (11-Nov-2025)
+ 25001  (12) .    2  (4084) ..   
+
+No more entries reference this inode, so e2fsck complains about it:
+
+[root@client-el8 mdt1]# cd
+[root@client-el8 ~]# umount /dev/mapper/mds1_flakey 
+[root@client-el8 ~]# e2fsck -nvf /dev/mapper/mds1_flakey
+e2fsck 1.47.3-wc2 (11-Nov-2025)
+Pass 1: Checking inodes, blocks, and sizes
+Pass 2: Checking directory structure
+Pass 3: Checking directory connectivity
+Pass 4: Checking reference counts
+Unattached inode 166
+Connect to /lost+found? no
+
+Pass 5: Checking group summary information
+
+lustre-MDT0000: ********** WARNING: Filesystem still has errors **********
+
+         280 inodes used (0.28%, out of 100000)
+           5 non-contiguous files (1.8%)
+           1 non-contiguous directory (0.4%)
+             # of inodes with ind/dind/tind blocks: 0/0/0
+             Extent depth histogram: 273/1
+       30083 blocks used (48.13%, out of 62500)
+           0 bad blocks
+           1 large file
+
+         151 regular files
+         119 directories
+           0 character device files
+           0 block device files
+           0 fifos
+           0 links
+           0 symbolic links (0 fast symbolic links)
+           0 sockets
+------------
+         269 files
+
+--- Comment (eaujames, Wed, 4 Mar 2026 12:02:50 +0000) ---
+adilger, I try to reformulate what I have understood from LU-11446:
+
+	Global distributed link count should be stored in linkea leh_padding -> leh_linkcount
+
+	The ldiskfs/zfs inode should store only local links
+
+	agent deletion/insertion can be trigger by computing the remote link count:  leh_linkcount - (i_nlink - local_agent_ref)
+
+Did I miss something?
+
+I think that would have the advantage to keep e2fsck unchanged: it repairs only the local references.
+
+But we should address the following issues:
+
+	Agent local ref: if all the links are remote, we should maintain i_nlink = 1 for the local agent (otherwise e2fsck will complain). This means we count an additional ref for the local agent (that is not a Lustre link).
+
+	Backward/Forward compatibility: existing Lustre FS rely on i_nlink to get the global Lustre link count. So we still have to manage the transition between old FS to new FS. E.g flag in LMA/inode can be added to determine if the inode is storing the global refs or the local one (reccount is not sufficient for an overflow linkea).
+
+	This would e2fsck version incompatible, the current version fix i_nlink via linkea ("LU-11446 e2fsck: check trusted.link when fixing nlink"). We need to revert this if we implemented that i_nlink stores only the local refs.
+
+	The code changes could be significant (linkea, lfsck, osd link refs, mdd link refs, attr get, agent ref, e2fsck...) and so the bug occurrences.
+
+I think we could achieve the same with remote link count in linkea (except for e2fsck, it needs to trust linkea for counting nlinks). e2fsck is able to recompute the global link count for the overflow case by summing the number of local ref counted, and the remote link count saved in linkea (minus one for the agent ref counted).
+
+--- Comment (adilger, Mon, 2 Mar 2026 06:19:48 +0000) ---
+Etienne,
+
+please see my comments in LU-11446 ("ldiskfs inodes nlink mismatch with DNE").  I think the right solution for this is to separate the blink count between MDTs.
+
+--- Comment (gerrit, Wed, 25 Feb 2026 20:05:44 +0000) ---
+"Etienne AUJAMES " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/64235
+
+Subject: )" class="issue-link" data-issue-key="LU-19858">LU-19858 obdclass: track remote link count in linkea
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 0b42ee2406a6792fbab37852556a2d0d58addf37
+
+--- Comment (eaujames, Fri, 6 Feb 2026 10:45:26 +0000) ---
+adilger, how do you think we should approach fixing this issue?
+
+I was thinking about tracking the number of remote entries in linkea.
+
+There are still space in the header:
+
+/** The link ea holds 1 \a link_ea_entry for each hardlink */ 
+#define LINK_EA_MAGIC 0x11EAF1DFUL                            
+struct link_ea_header {                                       
+        __u32 leh_magic;                                      
+        __u32 leh_reccount;                                   
+        __u64 leh_len;  /* total size */                      
+        __u32 leh_overflow_time;                              
+        __u32 leh_padding;
+
+--- Comment (eaujames, Fri, 6 Feb 2026 10:31:53 +0000) ---
+The root cause is explained here:
+
+ /*                                                                            
+  * In DNE environment, the object (in spite of regular file or directory)     
+  * and its name entry may reside on different MDTs. Under such case, we will  
+  * create an agent entry on the MDT where the object resides. The agent entry 
+  * references the object locally, that makes the object to be visible to the  
+  * userspace when mounted as 'ldiskfs' directly. Then the userspace tools,    
+  * such as 'tar' can handle the object properly.                              
+  *                                                                            
+  * We handle the agent entry during set linkEA that is the common interface   
+  * for both regular file and directroy, can handle kinds of cases, such as    
+  * create/link/unlink/rename, and so on.                                      
+  *                                                                            
+  * NOTE: we can NOT do that when ea_{insert,delete} that is only for directory
+  *                                                                            
+  * XXX: There are two known issues:                                           
+  * 1. For one object, we will create at most one agent entry even if there    
+  *    may be more than one cross-MDTs hard links on the object. So the local  
+  *    e2fsck may claim that the object's nlink is larger than the name entries
+  *    that reference such inode. And in further, the e2fsck will fix the nlink
+  *    attribute to match the local references. Then it will cause the object's
+  *    nlink attribute to be inconsistent with the global references. it is bad
+  *    but not fatal. The ref_del() can handle the zero-referenced case. On the
+  *    other hand, the global namespace LFSCK can repair the object's attribute
+  *    according to the linkEA.                                                
+  * 2. There may be too many hard links on the object as to its linkEA overflow       for cross-MDTs reference may be discarded. If such
+  *    case happened, then at this point, we do not know whether there are some
+  *    cross-MDTs reference. But there are local references, it guarantees that
+  *    object is visible to userspace when mounted as 'ldiskfs'. That is enough
+  */                                                                           
+ static int osd_xattr_handle_linkea(const struct lu_env *env,                  
+                                    struct osd_device *osd,                    
+                                    struct osd_object *obj,                    
+                                    const struct lu_buf *buf,                  
+                                    struct thandle *handle)                    
+....
+
+The osd-ldiskfs implementation check linkea entries to know if there are still remote entries, if not it unkinks the remote agent.

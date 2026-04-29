@@ -1,0 +1,397 @@
+Title:        LFSCK Phase 1.5 - FID-in-Dirent LinkEA Consistency High Level Design
+URL:          https://wiki.lustre.org/LFSCK_Phase_1.5_-_FID-in-Dirent_LinkEA_Consistency_High_Level_Design
+Page ID:      1363
+Last Updated: 2025-09-25T19:22:08Z
+Last Editor:  Adilger
+Edit Comment: Move to common Architecture category
+
+--- Content (MediaWiki markup) ---
+
+==Introduction==
+
+This document describes the agreed design decisions that will be implemented to achieve the goals of the LFSCK 1.5 FID-in-dirent and linkEA consistency checking/repairing. The scope of the project is presented in the [[LFSCK_Phase_1.5_-_FID-in-Dirent_LinkEA_Consistency_Scope_Statement|LFSCK 1.5 Scope Statement]]. The [[LFSCK_Phase_1.5_-_FID-in-Dirent_LinkEA_Consistency_Solution_Architecture|LFSCK 1.5 Solution Architecture]] describes the important components of a successful implementation. A familiarity with the Solution Architecture is necessary before embarking on this document.
+
+==Scanning the MDT OSD device==
+
+LFSCK 1.5 FID-in-dirent and linkEA consistency checking will combine the object table-based iteration and incremental namespace-based directory traversal to scan the whole MDT device to discover inconsistent FID-in-dirent and linkEA entries.
+
+LFSCK is driven by the object table-based iterator concurrently with OI Scrub. The OSD layer object table-based iteration will scan and return each object in sequential order to the MDD layer index iterator.
+
+If the object returned by the object table-based iteration is a directory, then LFSCK will traverse entries in the directory in index order. Directories renamed during directory traversal will not cause subtrees to be missed as would be the case during pure namespace traversal, because the object table-based iteration will guarantee that all the directory objects are processed.
+
+Before LFSCK begins namespace-based directory traversal, directory object client visibility is verified. FID-in-dirent and linkEA are needed only on the client-visible objects.
+
+===Upgrade Lustre 1.8 objects===
+
+For filesystems formatted with Lustre 1.8, objects are identified with Inode and Generation in FID (IGIF FID) identifiers from the underlying filesystem.  IGIF FID is mapped into a reserved subset of the FID namespace. This is inconsistent with Lustre 2.x filesystem FIDs which are abstracted from the underlying filesystem for portability. The first step for upgrading such filesystems is to add the IGIF FID into the LMA xattr on each inode and add the IGIF FID into the Object Index (OI) files. This task is performed during normal OI Scrub processing that will ensure that both normal FID objects and IGIF FID objects are handled uniformly.
+
+If an upgraded 1.8 filesystem that has had LFSCK 1.5 store the IGIF FID in the LMA xattr and OI is downgraded, there will not be any problems as a result.  Since the IGIF FID is a 1:1 mapping to the underlying inode and generation numbers used by the 1.8 MDS there will not be duplicate identifiers for any object.
+
+===Filter out objects not visible to the client===
+
+For a 2.x formatted device it is simple to distinguish if the given object is visible to client by checking linkEA. linkEA are only generated for client visible objects. The Lustre “'''ROOT/'''” object is an exception. The "'''ROOT/'''" is visible to client but does not have a linkEA. In this case the Lustre “'''ROOT/'''” object can be identified as it is pinned in RAM.
+
+Complexity increases when considering the case of an MDT upgraded from Lustre 1.8. Lustre 1.8 objects do not have the linkEA regardless of whether it is visible to client or not. The OSD cannot itself distinguish whether an object is visible to the client. As a consequence, the object table-based iteration will scan the entire device and return all the objects in flat order irrespective of client visibility. The LFSCK will filter out the internal objects at the MDD layer. The logic for filter out client invisible objects is as follows:
+
+# For the object returned by object table-based iteration, the LFSCK 1.5 needs only to process directory objects, because the non-directory object has the same visibility as its parent directory.
+# If the directory object returned by the object table-based iteration has a linkEA, or the object is the Lustre “ROOT”, then it is visible to client and the same for all child objects.
+# If the directory returned by the object table-based iteration does not have a linkEA and is not the Lustre “ROOT”, then it is either hidden from the client (i.e. Lustre internal metadata), or the object is of 1.8-format. It is also possible that the object is a 2.x object that has a corrupted linkEA that was removed by '''e2fsck'''. For all these cases, the LFSCK will check the parent visibility by '''lookup("..")'''. If the parent is also missing linkEA and is not the Lustre "ROOT", then the LFSCK will repeat '''lookup("..")''' on each parent directory until an ancestor directory that has linkEA or the Lustre “ROOT” is discovered. If this is the case, the object is visible to client; otherwise the OSD root directory will be reached and the object is a hidden internal object.
+
+For most of 2.x objects, the step 1) and 2) are enough. The step 3) is mainly for 1.8-IGIF objects being upgraded. Since upgrading is a 'once-only' operation that can terminate as soon as the any parent is found with a linkEA xattr, the overhead introduced by '''lookup("..")''' recursively for object visibility is judged to be acceptable.
+
+===Find missing or inconsistent FID-in-dirent===
+
+For the client visible directory object returned by the OSD object table-based iteration LFSCK will traverse the directory in namespace-based order. For each child object the processing in the OSD layer is as following:
+
+# If the child object has neither FID-in-LMA nor FID-in-Dirent, it is a 1.8-format IGIF object. Insert the IGIF FID into the dirent to repair it.
+# Else if the child has no FID-in-dirent then it is restored from file-level backup or half-processed 1.8-format IGIF object. Insert the LMA FID into the dirent to repair it.
+# Else if the FID-in-dirent does not match the FID-in-LMA, then it is an inconsistent FID-in-dirent. If LMA exists, store it into FID-in-dirent. If LMA is missing (it was lost or removed by e2fsck,) store FID-in-dirent into LMA.
+
+===Find missing or inconsistent linkEA===
+
+For the client visible directory object returned by the low layer object table-based iteration, LFSCK will traverse the directory with namespace-based order. For each name entry, LFSCK will verify whether there is valid linkEA entry on the target object corresponding to the "parent FID + child name". In the design document, the character 'L' is used to identify object linkEA entries count, 'D' is the count of the directory entries pointing to the target object, 'N' is for the object nlinks count. For most, but not all cases, "L == D == N". There is an important condition for LFSCK 1.5: whether we should trust that "D == N" or not, it will much affect LFSCK 1.5 complexity.
+
+# '''The case of "D == N" is trusted.''' It is relative easy. For example, the object_A, assume N = 1, when the LFSCK finds some name entry name_A pointing to the object_A under the parent FID_PA, then we can exactly know that the unique valid linkEA entry for the object_A is the "name_A + FID_PA", any other linkEA entries on the object_A are invalid or redundant, and should be removed. So the single-linked object_A can be completely processed when the first name entry is found during the first cycle LFSCK scanning.
+# '''The case of "D == N" is not trusted.''' Things become more complex. The same example as above, when the LFSCK finds some name entry name_A pointing to the object_A under the parent FID_PA, we only can know that the "name_A + FID_PA" is a valid linkEA entry for the object_A, but we do not know whether it is the unique valid linkEA entry for the object_A. Because 'D' may be larger than 'N', and before the LFSCK finish to scan the whole device, nobody knows the 'D'. Although we know the 'L' at the beginning, but 'L' may increases if found some other directory entries pointing to the object_A but related linkEA entries on the object_A do not exist originally.
+#: On the other hand, for the case of "L >= 1" at the beginning of the LFSCK, to verify whether the object_A contains some invalid linkEA entries or not. The LFSCK needs to store the object_A in some on-disk file (called “lfsck_namespace”, will be described in more detail later in this document), then if the MDT crashed during the LFSCK, it can re-scan the objects stored in the “lfsck_namespace”.
+
+Originally, we trended to use option 1). But it is depends on the offline e2fsck tool to guarantee the "D == N". As an online system consistency tool, it is impossible to run e2fsck offline before each LFSCK run. So over the lifetime of an active Lustre system, 'D' may become different from 'N', because of some partial operations (such as link/unlink/rename) or some system failures/errors. So now, we will design and implement the LFSCK 1.5 based on the assumption 2): 'D' may be different from 'N'.
+
+Make the linkEA entries consistent with the directory entries is one of the LFSCK 1.5 goal, so the LFSCK will trust 'D' if there is an inconsistency. But there is an exception: we will ignore the case of 'D == 0', that means if we cannot find any name entry pointing to the object_A during the namespace-based directory traversal, even though the object_A may has non-zero 'L' and 'N', we will not repair it. It is the e2fsck's duty to fix such inconsistencies. Since client cannot find the object_A through namespace, such inconsistency is harmless for the client until it is repaired by e2fsck.
+
+====Store objects in the “lfsck_namespace” for double scanning====
+
+Assume that the number of verified linkEA entries on the object_A is 'V', it is an in-RAM variable, and will be reset to 0 if LFSCK is restarted in the case of resume from a MDT crash. For a detailed description of lfsck_namespace see "section 3 LFSCK tracing" below. LFSCK needs to store the object in the “lfsck_namespace” only when "(V == 1) && (N > 1 || L > 1)". Consider the following cases:
+
+* '''L > 1 || N > 1''' Typically, this is for multiple-linked object. If the object_A contains more than one linkEA entries at the beginning of LFSCK, then it will be stored in the “lfsck_namespace” when the first name entry pointing to the object_A is found.
+
+* L == 1 && N == 1''' Typically, this is for singly-linked object. If LFSCK finds the directory entry pointing to the object_A that matches the unique linkEA entry, then processing is complete. Otherwise if a name entry pointing to the object_A does not match the unique linkEA entry, then a new linkEA entry will be added, and 'L' will increase ('N' will not increase, become the case 1). object_A would then be stored in the “lfsck_namespace” file.
+* '''L == 0''' It is usually for IGIF object. When new linkEA entries are added, it becomes the case 2 or the case 1.
+
+As LFSCK executes, object_A can be removed from the “lfsck_namespace” when "L == V == N > 1" is detected to avoid unnecessary double scanning.
+====Post-processing after the LFSCK first cycle device scanning====
+
+After the first cycle object table-based iteration, the LFSCK will try to remove the linkEA entries that reference non-existent link names, as following:
+
+* Rescan the objects stored in the “lfsck_namespace” to check if some linkEA entries reference non-existent link names. If a non-existent entry is found, remove the invalid name entry.
+
+When an object is post-processed, then remove it from the  “lfsck_namespace” to avoid repeatedly processing it if LFSCK restarts (due to MDT crash or sysadmin pause/stop) during the post-processing.
+==LFSCK tracing==
+
+The LFSCK will introduce a new local file named “lfsck_namespace” on the MDT to track the processing for FID-in-dirent and linkEA consistency check/repair. The LFSCK parameters including status, statistics, checkpoint, and the FIDs for multiple-linked objects will be recorded in the “lfsck_namespace”. This file can be used for querying from user space and for providing the LFSCK resume functionality.
+
+Updating “lfsck_namespace” for each object processed will significantly impact performance. Instead, the update will be cached in RAM and written to disk periodically. Writes to disk will be processed asynchronously through the server journal. The default write interval is 60 seconds. Write to the file “lfsck_namespace” will create a new checkpoint. If the system crashes before the write, at most 60 seconds (plus journal commit interval) work will be lost. When the system recovered, the LFSCK can restart (resume) from the position of the last checkpoint in the “lfsck_namespace” file.
+
+* lfsck_namespace
+*: This is the “lfsck_namespace” file on-disk structure:
+        #define LFSCK_NAMESPACE_MAGIC     0xA0629D03
+        
+        struct lfsck_namespace {
+                /* Magic number to detect that this struct contains valid data. */
+                __u32      ln_magic;
+                /* See 'enum lfsck_status'. */
+                __u32      ln_status;
+                /* See 'enum lfsck_flags'. */
+                __u32      ln_flags;
+                /* How many completed LFSCK runs on the device. */
+                __u32      ln_success_count;
+                /*  How long the LFSCK phase1 has run in seconds. */
+                __u32      ln_run_time_phase1;
+                /*  How long the LFSCK phase2 has run in seconds. */
+                __u32      ln_run_time_phase2;
+                /* Time for the last LFSCK completed in seconds since epoch. */
+                __u64      ln_time_last_complete;
+                /* Time for the latest LFSCK ran in seconds since epoch. */
+                __u64      ln_time_latest_start;
+                /* Time for the last LFSCK checkpoint in seconds since epoch. */
+                __u64      ln_time_last_checkpoint;
+                /* Position for the latest LFSCK started from. */
+                struct lfsck_position      ln_pos_latest_start;
+                /* Position for the last LFSCK checkpoint. */
+                struct lfsck_position      ln_pos_last_checkpoint;
+                /* Position for the first should be updated object. */
+                struct lfsck_position      ln_pos_first_inconsistent;
+                /* How many items (including dir) have been checked. */
+                __u64      ln_items_checked;
+                /* How many items have been repaired. */
+                __u64      ln_items_repaired;
+                /* How many items failed to be processed. */
+                __u64      ln_items_failed;
+                /* How many directories have been traversed. */
+                __u64      ln_dirs_checked;
+                /* How many multiple-linked objects have been checked. */
+                __u64      ln_mlinked_checked;
+                /* How many objects have been double scanned. */
+                __u64      ln_objs_checked_phase2;
+                /* How many objects have been reparied during double scan. */
+                __u64      ln_objs_repaired_phase2;
+                /* How many objects failed to be processed during double scan. */
+                __u64      ln_objs_failed_phase2;
+                /* How many objects with nlink fixed. */
+                __u64      ln_objs_nlink_repaired;
+                /* How many objects were lost before, but found back now. */
+                __u64      ln_objs_lost_found;
+                /* The latest object has been processed (failed) during double scan. */
+                struct lu_fid      ln_fid_latest_scanned_phase2;
+                /* For further using. 256-bytes aligned now. */
+                __u64      ln_reserved[2];
+        };
+*: The position for the LFSCK 1.5 is composed of two parts as following:
+        struct lfsck_positionition {
+                /** local layer object table-based iteration position. */
+                __u64 lp_oit_cookie;
+                /** parent FID for directory traversal. */
+                __u64 lp_dir_parent;
+                /** namespace-based directory traversal position. */
+                __u64 lp_dir_cookie;
+        };
+*: This file description is to support LFSCK for FID-in-dirent and linkEA consistency check/repair. There may be other tracing files for other LFSCK components in the future. It is undesirable for not want multiple LFSCK components shares the same trace file because it will require unnecessary complexity to the tracing file structure and potentially introduce compatibility issues.
+
+* '''lfsck_namespace::status'''
+*: For LFSCK current status, as following:
+        enum lfsck_status {
+                /** Initial state, no LFSCK has been run on this filesystem */
+                LS_INIT,
+                /** first-step system scanning. */
+                LS_FIRST-SCANNING,
+                /** second-step system scanning for multiple-linked objects. */
+                LS_SECOND-SCANNING,
+                /** LFSCK processing has completed for all objects */
+                LS_COMPLETED,
+                /** The LFSCK exited automatically for some failure, will not auto restart. */
+                LS_FAILED,
+                /** The LFSCK is stopped manually, will not auto restart. */
+                LS_STOPPED,
+                /** The LFSCK is paused automatically when umount, can be restarted automatically when remount. */
+                LS_PAUSED,
+                /* System crashed during the LFSCK, can be restarted automatically after recovery. */
+                LS_CRASHED,
+        };
+*: Each time the MDT is mounted it will check if a LFSCK restart is required. If in the status is '''LS_PAUSED''' or '''LS_CRASHED''', then LFSCK will be restarted from the breakpoint automatically.
+
+* '''lfsck_nlink_record'''
+*: As described in former sections, the "lfsck_namespace" file is also used for storing the multiple-linked objects for double scanning. To simplify the operations (insert/delete/lookup/iteration) on the file, it will be implemented as an index file. Above the on-disk "struct lfsck_namespace" will be stored as a new extended attribute (named '''XATTR_NAME_LFSCK_NAMESPACE''') in the "lfsck_namespace" file. And for each multiple-linked object to be double scanned, it will stored as an fixed-length record as following:
+        struct lfsck_nlink_record {
+                /** KEY: the object's FID. */
+                struct lu_fid FID;
+                /** REC: some flags, such as "VERIFIED". */
+                __u8 flags;
+        };
+*:The operations against the '''lfsck_nlink_record''' will use the existing fixed-length IAM APIs (osd_index_iam_ops) in the OSD layer.
+
+==LFSCK user space control==
+
+Where prudent, the existing LFSCK user space tools will be reused to control the LFSCK for FID-in-dirent and linkEA consistency check/repair. A new LFSCK type “namespace” will be introduced.
+
+    lctl lfsck_start -M lustre-MDT0000 -t namespace
+
+Kernel space logic will be implemented to start/stop the LFSCK for FID-in-dirent and linkEA consistency check/repair.
+
+===Query LFSCK processing===
+
+New, special tools for querying the LFSCK processing will not be created. Instead, querying will be performed via new lproc interface:
+
+    lctl get_param mdd.${fsname}-MDT${idx}.lfsck_namespace
+
+This is a MDT-side lproc interface in YAML format for querying FID-in-dirent and linkEA consistency check/repair processing. A key feature of this interface is to provide access to the “lfsck_namespace” file on the MDT.
+
+===Speed control===
+
+LFSCK phase I implemented a basic LFSCK speed control mechanism. The administrator can specify the max speed for the LFSCK to scan the device through the MDD layer lproc interface:
+
+    lctl set_param mdd.${fsname}-MDT${idx}.lfsck_speed_limit=N
+
+Where N is the maximum speed in inodes per second. We prefer to reuse such mechanism in LFSCK phase 1.5 for controlling the LFSCK speed.
+
+==Repair the inconsistency==
+
+Since the FID-in-dirent and linkEA belong to different code layers of the metadata stack they will be repaired separately. As a result, the FID-in-dirent and linkEA will be checked and repaired in different layers by separate mechanisms. This will not result in repeat scanning or duplicate processing.
+
+===Initial OI scrub to verify server local objects===
+
+When the server mounts, it needs to access to some server local objects. These server local objects can be accessed by name or by FID. This requires the FID mappings in the OI files for these server local objects to be correct, even though the server is restored from server-side file-level backup. As a result, an initial OI scrub is required to make a local scope OI check/repair synchronously when the server mounts. Compared with the normal whole device OI scrub, the initial OI scrub has the following different behaviour or requirements:
+
+# The scan is not object table-based iteration. A backend local root namespace-based directory traversal is performed.
+# The scan scope is not the whole device. Only server local objects are recursively scanned, except for the subdirs:
+## /lost+found. The sysadmin should guarantee all the useful objects have been moved out of the lost+found.
+## /PENDING. The "/PENDING" directory itself will be checked/repaired.
+## /ROOT. The "/ROOT" directory itself and its child "/ROOT/.lustre" will be checked/repaired.
+# The initial OI scrub is triggered by the mount thread directly inside the OSD at the beginning of the server mount. This guarantees the server local object FID mappings can be verified before others using them.
+# The OI scrub is triggered automatically when the server mounts under the conditions:
+## The server is upgraded from old 2.x or 1.8 device.
+## The server is restored from server-side file-level backup.
+## OI files crash caused by known/unknown reasons.
+
+Timing considerations: A typical server has hundreds of local objects. The performance results from LFSCK 1 a full speed OI scrub can process 50K objects per second. Hence, an initial OI scrub would expect to complete within 1 second. However, the initial OI scrub is not triggered frequently, so even though it takes a longer time it will not affect normal system availability.
+
+If the target device is 2.4 or newer format, processing is simple. In Lustre-2.4, when the local object is created, the FID_SEQ_LOCAL_FILE FID is stored in the object LMA. With this information the related FID mapping can be directly checked and repaired in the OI files. For 2.x or 1.8 formatted device, no FID was stored in the object LMA when the local object was created. When the server upgrades from old 2.x or 1.8 device the initial OI scrub will generate IGIF mode FID for those old local objects, store the IGIF FID in local object LMA, and build related IGIF FID mappings.
+
+===Handle IGIF objects===
+
+If a MDT is upgraded from Lustre 1.8 then the object has IGIF mode FID: it has no FID in LMA, no OI mapping in the OI file, and neither the FID-in-dirent nor linkEA is available. This case needs additional logic on the MDT to process these IGIF objects. To unify and simplify the normal LFSCK and RPC processing, Lustre 1.8 IGIF objects are treated as normal 2.x FIDs. The following tasks must be completed to the inodes:
+
+# '''Add the IGIF FID in the object LMA.''' With the FID-in-LMA, the OI scrub can rebuild its OI mapping when the MDT restored from file-level backup.
+# '''Add the IGIF FID mapping in the OI file.''' The mapping for “IGIF <=> ino/gen” that allows the IGIF FID can be reserved as normal FID even after a MDT file-level backup/restore. The OI scrub can rebuild the OI files when needed to guarantee lookup-by-FID still completes after the MDT file-level backup/restore against IGIF files.
+# '''Add IGIF FID to the name entry in the parent directory.''' '''readdir(3)''' on the MDT can resolve all the needed information from parent directory directly without reading each child object.
+# '''Add linkEA with the child name and the parent FID.''' "'''lfs fid2path'''" will work against IGIF objects.
+
+It is the OI scrub's responsibility to add IGIF FID in the object LMA and insert related IGIF FID mapping into the OI file. This is the case for normal 2.x FID. In Lustre-2.4, both client visible objects and server local objects have FID-in-LMA. This means the OSD will not distinguish between client visible or local objects. The OI scrub can process 1.8-IGIF objects during an upgrade. If the object has no FID-in-LMA, then an IGIF is generated with the inode ino/gen. The IGIF FID is added into the object LMA, and the related IGIF FID mapping is inserted into the OI file.
+
+OI Scrub scans the device in a flat order. This may be somewhat different from the LFSCK piecewise directory traversal order. It is possible to the system crashes immediately after LFSCK adds an IGIF FID to the name entry the parent directory and before the OI scrub adding IGIF FID to the inode LMA has completed. When the system recovers from this situation, the FID-in-dirent exists but FID-in-LMA missed. This situation is resolved as follows:
+
+# In the normal case where there is no MDT file-level backup/restore after the crash, the IGIF FID in the object name entry is valid in regardless of weather the IGIF FID is stored (by the OI scrub) in the inode LMA or not because the IGIF FID is just composed of the inode number and generation, and can be regenerated as needed.
+# In the highly unlikely case there is an MDT file-level backup/restore after the crash where the FID-in-dirent cannot be backed-up, the inconsistency will be automatically resolved by LFSCK after the MDT is restored from backup.
+
+For this reason, it is unnecessary to keep the order between the LFSCK adding IGIF FID to the parent directory name entry and the OI scrub adding IGIF FID in the inode LMA. The OI scrub logic will include a minor modification for 1.8-IGIF objects upgrading as following:
+
+        for_each_inode {
+                fetch LMA;
+                if (no FID-in-LMA) {
+                        fid = IGIF;
+                        osd_ea_fid_set(inode, fid);
+                }
+                verify/update OI mapping with FID-in-LMA;
+        }
+
+With above processing by the OI Scrub, IGIF objects can be treated as the normal FID case. This has important impact on the higher LFSCK layers that no longer need to distinguish 1.8-IGIF objects. For the MDT upgraded from old 2.x-format device, the local objects have no FID-in-LMA and the OI Scrub will treat them as 1.8-IGIF objects: generate IGIF FID with the inode ino/gen, add the IGIF FID in the object LMA, and insert related IGIF FID mapping in the OI file. This method is robust even the system is downgraded back to the old 2.x format.
+
+===Repair inconsistent FID-in-dirent===
+
+The FID-in-dirent consistency check/repair will be processed in OSD layer when the higher layer LFSCK traverses the parent directory with namespace-based order.
+
+# If both the FID-in-dirent and the FID-in-LMA exist, but they do not match and FID-in-LMA is not an IGIF FID, then replace the FID-in-dirent with the FID in the LMA directly.
+
+        handle = start_trans(update);
+        bh = find_entry(dir, dentry, &de);
+        
+        journal_get_write_access(handle, bh);
+        update_entry(handle, dir, de);
+        journal_dirty_metadata(handle, bh);
+        brelse(bh);
+        stop_trans(handle);
+
+# If the FID-in-dirent does not exist for the child object, then the object is either restored from file-level backup or upgraded from 1.8-formatted device. Ideally, the the FID (or IGIF) should be appended to the name entry in the parent directory directly. However, there may not be not sufficient space in the name entry to hold the FID. In this case the name entry is removed from the parent directory and the name entry with the FID is reinserted into the parent directory.
+
+        if (no FID-in-LMA) {
+                /* For 1.8-IGIF object, needs LMA and OI initialization by OI scrub. */
+                add to OI scrub pending list;
+                handle = start_trans(delete + insert);
+                bh = find_entry(dir, dentry, &de);
+                
+                journal_get_write_access(handle, bh);
+                delete_entry(handle, dir, bh, de);
+                journal_dirty_metadata(handle, bh);
+                brelse(bh);
+                
+                pack_FID(de, FID-in-dirent);
+                insert_entry(handle, dir, de);
+                stop_trans(handle);
+        }
+
+===Repair inconsistent linkEA===
+
+The linkEA consistency check/repair will be processed in MDD layer when traversing the parent directory in namespace-based order.
+
+# For single-linked child object, if it has single linkEA entry but not point back to the given parent directory, then the old linkEA will be replaced by the new one:
+        if (unmatched) {
+                handle = start_trans(delete);
+                
+                remove_linkEA(handle, child, old_linkEA_entry);    
+                add_linkEA(handle, child, child_name, parent_FID);
+                stop_trans(handle);
+        }
+# For a multiple-linked child object, if it has no valid linkEA pointing back to the parent directory, then the valid linkEA entry is added. Other linkEA entries cannot be removed because it is impossible to know if they are valid linkEA entries for other link names. It is also not possible verify other linkEA entries at current time point because the low layer OI scrub may be rebuilding OI files, and the OI mapping for some parent FIDs in the linkEA entries may be not rebuilt yet. Under such case, we cannot locate related parent object according to the FID in the child linkEA entry. So the child object (its FID) will be recorded in the "lfsck_namespace" file for further processing.
+
+        handle = start_trans(insert);
+        add_linkEA(handle, child, child_name, parent_FID);
+        stop_trans(handle);
+        
+        if (multiple_linked) {
+                store the child object in the "lfsck_namespace" file;
+        }    
+
+When the first cycle of the object table-based iteration is completed, the LFSCK will rescan the multiple-linkEA objects according to the FIDs in the “lfsck_namespace” file. Verify every linkEA entry and remove the invalid linkEA entries as follows:
+
+        for_each_linkEA_entries {
+            if (invalid) {
+                handle = start_trans(delete);
+                remove_linkEA(handle, child, linkEA_entry);
+                stop_trans(handle);
+            }
+        }
+        
+        remove the object from the "lfsck_namespace" file;
+        continue for next object;
+
+===Concurrent link operation during the LFSCK===
+
+The current implementation for link operation has already processed the FID-in-dirent and linkEA.
+
+===Concurrent unlink operation during the LFSCK===
+
+The current implementation for unlink operation has already processed the FID-in-dirent and linkEA.
+
+===Concurrent rename operation during the LFSCK===
+
+As an online system consistency maintaining tool, there may concurrent rename operations during LFSCK. These may cause LFSCK to miss objects when traversing directories in namespace-based order. The rename operation will process the source/target objects as LFSCK does: guarantee the consistency of the FID-in-dirent and linkEA.
+
+==Race control between the LFSCK and other operations==
+
+Use the existing lock mechanism to control the race between normal object accessing for the RPC services and the LFSCK for FID-in-dirent and linkEA.
+
+===Race control when check/repair FID-in-dirent===
+
+Processing the FID-in-dirent is internal to the OSD. ldiskfs PDO lock can be used on the parent object to control the race with lookup/readdir/create/unlink as following:
+
+        lock_handle = ldiskfs_htree_lock(parent, LDISKFS_HLOCK_ADD);
+        update or re-insert FID-in-dirent;
+        ldiskfs_htree_unlock(lock_handle);
+
+===Race control when check/repair linkEA===
+
+LFSCK will check/repair linkEA consistency in the MDD layer. MDD layer will use the OSD layer read-write lock through the dt APIs to control the race with other linkEA operations as following:
+
+        mdd_write_lock(child);
+        insert or remove linkEA;
+        mdd_write_unlock(child);
+
+==Compatibility issues==
+
+Storing FID-in-dirent entries for 2.x directories is incompatible with Lustre 1.8 formatted filesystems.  Once FID-in-dirent is enabled on a Lustre 1.8 formatted filesystem it is not safe to downgrade the MDT to Lustre 1.8. As a result, a switch is needed to control the upgrading explicitly. An ldiskfs filesystem feature “'''dir_data'''” controls whether FID-in-dirent is used or not.
+
+If the administrator decides to permanently upgrade from Lustre 1.8 to Lustre 2.x then the command “'''tune2fs -O dir_data ${mdtdev}'''” to will throw the switch. When the LFSCK or create/link/rename operation detects this feature is enabled, it will begin storing FID-in-dirent entries in the Lustre 2.x format as described above.
+
+==API changes==
+
+Most of the LFSCK work for FID-in-dirent and linkEA consistency check/repair can be processed either in MDD layer or OSD layer through existing APIs. The cases where this is not possible are described here:
+
+===New param value for dt_it_ops::init===
+
+LFSCK in MDD layer uses the '''dt_it_ops::init()''' API to initialize the parent directory traversing with namespace-based order. It is possible to implement special iterations methods for this such purpose, but reusing the existing iteration methods for MDT readdir is more convenient.
+
+        struct dt_it *(*init)(const struct lu_env *env, struct dt_object *dt,
+                              __u32 attr, struct lustre_capa *capa);
+
+Currently, the API implementation in OSD layer of '''osd_it_ea_init()''' does not know if the directory traversing is for MDT readdir or for LFSCK. As a result, the subsequent iteration does not know if the FID-in-dirent requires verification. A new flag '''LUDA_LFSCK''' for the parameter “attr” will be introduced for the intention of calling the '''osd_it_ea_init()'''.
+
+        enum lu_dirent_attrs {
+                LUDA_FID                 = 0x0001,
+                LUDA_TYPE                = 0x0002,
+                LUDA_64BITHASH           = 0x0004,
+                
+                /* The following attrs are used for MDT interanl only,
+                 * not visible to client */
+                
+                /* Verify the dirent consistency */
+                LUDA_VERIFY              = 0x8000,
+                /* Only check but not repair the dirent inconsistency */
+                LUDA_VERIFY_DRYRUN       = 0x4000,
+                /* The dirent has been repaired, or to be repaired (dryrun). */
+                LUDA_REPAIR              = 0x2000,
+                /* The system is upgraded, has beed or to be repaired (dryrun). */
+                LUDA_UPGRADE             = 0x1000,
+                /* Ignore this record, go to next directly. */
+                LUDA_IGNORE              = 0x0800,
+        };
+[[Category:LFSCK]]
+[[Category:Architecture]]

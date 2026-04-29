@@ -1,0 +1,328 @@
+Key:        LU-11848
+Summary:    filefrag/FIEMAP doesn't work for PFL or FLR files
+Link:       https://jira.whamcloud.com/browse/LU-11848
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Zhenyu Xu
+Reporter:   Andreas Dilger
+Created:    Thu, 10 Jan 2019 10:06:42 +0000
+Updated:    Tue, 12 Sep 2023 14:59:19 +0000
+Resolved:   Fri, 18 Dec 2020 07:53:39 +0000
+Links:      Related: is related to LU-17110; Related: is related to LU-14149; Related: is related to LU-14510
+
+--- Description ---
+It appears that FIEMAP doesn't work quite correctly for PFL or FLR files.  I'd expect that it would dump the FIEMAP information for all copies of a mirrored file, but it exits when the first object is printed.  I verified with GDB that the fiemap structure returned by the kernel only has a single extent in it.
+
+$ lfs getstripe /mnt/testfs/flr2
+/mnt/testfs/flr2
+  lcm_layout_gen:    5
+  lcm_mirror_count:  2
+  lcm_entry_count:   2
+    lcme_id:             65537
+    lcme_mirror_id:      1
+    lcme_flags:          init
+    lcme_extent.e_start: 0
+    lcme_extent.e_end:   EOF
+      lmm_stripe_count:  1
+      lmm_stripe_size:   1048576
+      lmm_pattern:       raid0
+      lmm_layout_gen:    0
+      lmm_stripe_offset: 3
+      lmm_objects:
+      - 0: { l_ost_idx: 3, l_fid: [0x100030000:0x4:0x0] }
+
+    lcme_id:             131074
+    lcme_mirror_id:      2
+    lcme_flags:          init
+    lcme_extent.e_start: 0
+    lcme_extent.e_end:   EOF
+      lmm_stripe_count:  1
+      lmm_stripe_size:   1048576
+      lmm_pattern:       raid0
+      lmm_layout_gen:    0
+      lmm_stripe_offset: 0
+      lmm_objects:
+      - 0: { l_ost_idx: 0, l_fid: [0x100000000:0x4:0x0] }
+
+$ filefrag -v /mnt/testfs/flr2
+Filesystem type is: bd00bd0
+File size of /mnt/testfs/flr2 is 8388608 (8192 blocks of 1024 bytes)
+ ext:     device_logical:        physical_offset: length:  dev: flags:
+   0:        0..    8191:     140000..    148191:   8192: 0003: last,net,eof
+/mnt/testfs/flr2: 1 extent found
+
+For FLR files this is at least somewhat usable, since a full copy of the file is handled.  However, for PFL files, the kernel returns an -EFBIG error after the first component is read:
+
+$ lfs getstripe /mnt/testfs/pfl3x8
+  lcm_entry_count:   3
+    lcme_extent.e_start: 0
+    lcme_extent.e_end:   1048576
+      lmm_stripe_count:  1
+      lmm_stripe_size:   1048576
+      lmm_pattern:       raid0
+      lmm_objects:
+      - 0: { l_ost_idx: 2, l_fid: [0x100020000:0x2:0x0] }
+
+    lcme_extent.e_start: 1048576
+    lcme_extent.e_end:   4194304
+      lmm_stripe_count:  3
+      lmm_stripe_size:   1048576
+      lmm_pattern:       raid0
+      lmm_objects:
+      - 0: { l_ost_idx: 3, l_fid: [0x100030000:0x2:0x0] }
+      - 1: { l_ost_idx: 0, l_fid: [0x100000000:0x2:0x0] }
+      - 2: { l_ost_idx: 1, l_fid: [0x100010000:0x2:0x0] }
+
+    lcme_extent.e_start: 4194304
+    lcme_extent.e_end:   EOF
+      lmm_stripe_count:  4
+      lmm_stripe_size:   1048576
+      lmm_pattern:       raid0
+      lmm_objects:
+      - 0: { l_ost_idx: 3, l_fid: [0x100030000:0x3:0x0] }
+      - 1: { l_ost_idx: 0, l_fid: [0x100000000:0x3:0x0] }
+      - 2: { l_ost_idx: 1, l_fid: [0x100010000:0x3:0x0] }
+      - 3: { l_ost_idx: 2, l_fid: [0x100020000:0x3:0x0] }
+
+$ filefrag -v /mnt/testfs/pfl3x8
+Filesystem type is: bd00bd0
+File size of /mnt/testfs/pfl3x8 is 8388608 (8192 blocks of 1024 bytes)
+ ext:     device_logical:        physical_offset: length:  dev: flags:
+   0:        0..    1023:     134880..    135903:   1024: 0002: net
+   1:        0..    1023:     134880..    135903:   1024: 0000: net
+   2:     1024..    2047:     136928..    137951:   1024: 0003: net
+
+It starts almost correctly, with an extent on OST0002 for [0,1MB] and then something that looks like a duplicate of the first extent with only the device number changed, and an extent on OST0003 for [1MB,2MB].  The last 6 extents are not returned in the first call despite there being plenty of room in the fiemap array.
+
+Running strace shows:
+
+ioctl(3, FS_IOC_FIEMAP, {fm_start=0, fm_length=18446744073709551615, fm_flags=0x40000000 /* FIEMAP_FLAG_??? */, fm_extent_count=292} => {fm_flags=0x40000000 /* FIEMAP_FLAG_??? */, fm_mapped_extents=3, fm_extents=...}) = 0
+ioctl(3, FS_IOC_FIEMAP, {fm_start=0, fm_length=18446744073709551615, fm_flags=0x40000000 /* FIEMAP_FLAG_??? */, fm_extent_count=292}) = -1 EFBIG (File too large)
+
+Running under GDB and dumping the returned extents shows that indeed 3 separate extents are returned (so strangeness is not in filefrag), and then -EFBIG is returned on the second ioctl(FIEMAP) call when it tries to continue on the next extent.
+
+247                     rc = ioctl(fd, FS_IOC_FIEMAP, (unsigned long) fiemap);
+248                     if (rc fm_extents[0]
+$2 = {fe_logical = 0, fe_physical = 138117120, fe_length = 1048576, 
+  fe_reserved64 = {0, 0}, fe_flags = 2147483648, fe_device = 2, fe_reserved = {0, 0}}
+(gdb) p fiemap->fm_extents[1]
+$3 = {fe_logical = 0, fe_physical = 138117120, fe_length = 1048576, 
+  fe_reserved64 = {0, 0}, fe_flags = 2147483648, fe_device = 0, fe_reserved = {0, 0}}
+(gdb) p fiemap->fm_extents[2]
+$4 = {fe_logical = 1048576, fe_physical = 140214272, fe_length = 1048576, 
+  fe_reserved64 = {0, 0}, fe_flags = 2147483648, fe_device = 3, fe_reserved = {0, 0}}
+:
+:
+305                     if (flags & FIEMAP_FLAG_DEVICE_ORDER) {
+306                             fm_ext[0].fe_logical =  fm_ext[i - 1].fe_logical + fm_ext[i - 1].fe_length;
+308                             fm_ext[0].fe_device =   fm_ext[i - 1].fe_device;
+309                             fiemap->fm_start =      0;
+:
+:
+244                     fiemap->fm_length = ~0ULL;
+245                     fiemap->fm_flags = flags;
+246                     fiemap->fm_extent_count = count;
+247                     rc = ioctl(fd, FS_IOC_FIEMAP, (unsigned long) fiemap);
+248                     if (rc 
+
+It looks like the LOV code needs to be taught how to iterate over a composite layout to populate the FIEMAP structure, and to be able to find the right component to restart.  It may be that we need to make changes to filefrag itself, since it currently only returns the file logical offset of the end of the last printed extent and the device number it was on.  This could be ambiguous in rare cases if there were two mirrors on the same OST for the same file offset and FIEMAP was interrupted just there, but it doesn't seem likely and is not a primary concern.
+
+--- Comment (gerrit, Fri, 18 Dec 2020 05:47:26 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/40967/
+
+Subject: LU-11848 misc: update e2fsprogs to 1.45.6.wc3
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 6985a47d48d7bfbd0174af09902a7469d4b3a33c
+
+--- Comment (gerrit, Fri, 18 Dec 2020 05:37:34 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/40897/
+
+Subject: LU-11848 tests: handle 4-digit version numbers properly
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 7e0aeeec0bbff30956ce862546a1c71e322af5a9
+
+--- Comment (spitzcor, Thu, 17 Dec 2020 21:47:13 +0000) ---
+LU-10180 says that FIEMAP is supported for DoM, but the code in lov_object_fiemap() indicates otherwise.  That function is touched in https://review.whamcloud.com/40766/.  Should it be handled under this ticket or another?
+
+--- Comment (gerrit, Thu, 17 Dec 2020 17:03:04 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/40766/
+
+Subject: LU-11848 lov: FIEMAP support for PFL and FLR file
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 409719608cf0f607635fca5fb66b84a2e4aa1d4f
+
+--- Comment (gerrit, Mon, 14 Dec 2020 21:37:37 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/40967
+
+Subject: LU-11848 misc: update e2fsprogs to 1.45.6.wc3
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: f13fab4e8f3d938b54277c89bcb7d789b9c2e4e3
+
+--- Comment (gerrit, Mon, 14 Dec 2020 21:11:51 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) merged in patch https://review.whamcloud.com/40874/
+
+Subject: LU-11848 build: update version to 1.45.6.wc3
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 
+
+Commit: b46f7f0490c05d55e23474558859560a62bd054c
+
+--- Comment (gerrit, Thu, 10 Dec 2020 13:02:58 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) merged in patch https://review.whamcloud.com/40932/
+
+Subject: LU-11848 filefrag: further PFL and FLR fixes
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 
+
+Commit: 3bdf8ca2e409773892002327b188a32c3f302601
+
+--- Comment (gerrit, Thu, 10 Dec 2020 11:20:57 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/40932
+
+Subject: LU-11848 filefrag: further PFL and FLR fixes
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 1
+
+Commit: f37f564f389cbd26bd53ab66f88d504c314007b2
+
+--- Comment (gerrit, Thu, 10 Dec 2020 08:43:05 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) merged in patch https://review.whamcloud.com/40889/
+
+Subject: LU-11848 filefrag: rework port PFL and FLR file
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 
+
+Commit: d99d208e73cd5b9c3edbc8fea3bb66875b706df7
+
+--- Comment (gerrit, Wed, 9 Dec 2020 08:48:52 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) merged in patch https://review.whamcloud.com/40873/
+
+Subject: LU-11848 filefrag: add -V option to print version
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 
+
+Commit: 233fe52cade6dd2317db3cd5698e924c82328ad8
+
+--- Comment (gerrit, Mon, 7 Dec 2020 08:48:48 +0000) ---
+Bobi Jam (bobijam@hotmail.com) uploaded a new patch: https://review.whamcloud.com/40889
+
+Subject: LU-11848 filefrag: support PFL and FLR file
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 1
+
+Commit: 648eed62ae49a887254c4902b3579d824dd7a5f5
+
+--- Comment (gerrit, Fri, 4 Dec 2020 23:47:32 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/40874
+
+Subject: LU-11848 build: update version to 1.45.6.wc3
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 1
+
+Commit: 8b4cbc0b1612d66a3447d2597e24afbc045a1daf
+
+--- Comment (gerrit, Fri, 4 Dec 2020 23:47:31 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/40873
+
+Subject: LU-11848 filefrag: add -V option to print version
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 1
+
+Commit: d5192efa9f7e6786289367abe08d690449324562
+
+--- Comment (adilger, Tue, 1 Dec 2020 08:37:24 +0000) ---
+Andreas Dilger (adilger@hotmail.com) merged in patch: https://review.whamcloud.com/40765
+
+Subject: LU-11848 filefrag: support PFL and FLR file
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 3
+
+Commit: 0b6718f5e22d57cedb732f0253e1e7deb4c80931
+
+--- Comment (bobijam, Thu, 26 Nov 2020 06:48:05 +0000) ---
+Bobi Jam (bobijam@hotmail.com) uploaded a new patch: https://review.whamcloud.com/40765
+
+Subject: LU-11848 filefrag: support PFL and FLR file
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 1
+
+Commit: 93dfaa57d91d2111ec44765570076c3ab661a6b8
+
+--- Comment (gerrit, Thu, 26 Nov 2020 06:41:49 +0000) ---
+Bobi Jam (bobijam@hotmail.com) uploaded a new patch: https://review.whamcloud.com/40766
+
+Subject: LU-11848 lov: FIEMAP support for PFL and FLR file
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: b1a2029b34f7b589417364f77e9108734743c643

@@ -1,0 +1,202 @@
+Key:        LU-6805
+Summary:    at_init is not safe to use anywhere but on initialization
+Link:       https://jira.whamcloud.com/browse/LU-6805
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   WC Triage
+Reporter:   Vladimir Saveliev
+Created:    Tue, 7 Jul 2015 13:39:08 +0000
+Updated:    Thu, 23 Nov 2017 18:21:45 +0000
+Resolved:   Thu, 16 Jul 2015 12:47:10 +0000
+Labels:     patch
+
+--- Description ---
+at_init() modifies part of struct adaptive_timeout without taking at_lock. That makes it unsafe to be used anywhere but on creation time.
+
+That is at_init() should not be used in ptlrpc_connect_interpret() and in ptlrpc_service_part_init().
+
+--- Comment (pjones, Thu, 16 Jul 2015 12:47:10 +0000) ---
+Landed for 2.8
+
+--- Comment (gerrit, Thu, 16 Jul 2015 03:09:49 +0000) ---
+Oleg Drokin (oleg.drokin@intel.com) merged in patch http://review.whamcloud.com/15522/
+
+Subject: LU-6805 ptlrpc: use smp unsafe at_init only for initialization
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 96ddb3b168297e7d59a2f4b7b357549f2632bcb4
+
+--- Comment (vsaveliev, Wed, 8 Jul 2015 14:30:25 +0000) ---
+One of the issue instances contains the following logs:
+
+00000100:00001000:9:1435782375.689537:0:5910:0:(import.c:1586:at_measured()) add 121 to ffff8807ecb12ba0 time=146 v=96 (96 1 1 1)
+00000100:00001000:19:1435782375.689537:0:5896:0:(import.c:1586:at_measured()) add 14 to ffff8807ecb12ba0 time=146 v=96 (96 1 1 1)
+00000100:00001000:9:1435782375.689541:0:5910:0:(import.c:1644:at_measured()) AT ffff8807ecb12ba0 change: old=96 new=121 delta=25 (val=121) hist 121 1 1 1
+00000100:00001000:19:1435782375.689542:0:5896:0:(import.c:1586:at_measured()) add 14 to ffff8807ecb12ba0 time=1435782375 v=0 (0 0 0 0)
+
+crash dump shows that pid 5896 is at_measured() -> spin_lock(&at->at_lock);-ing on the at (ffff8807ecb12ba0) which has been recently at_init()-ed.
+
+It is possible that the spinlock got corrupted due to race between unprotected initialization and regular spin_lock()-ing.
+
+crash> adaptive_timeout ffff8807ecb12ba0
+struct adaptive_timeout {
+  at_binstart = 0, 
+  at_hist = {0, 0, 0, 0}, 
+  at_flags = 0, 
+  at_current = 0, 
+  at_worst_ever = 0, 
+  at_worst_time = 1435782375, 
+  at_lock = {
+    {
+      rlock = {
+        raw_lock = {
+          slock = 514
+        }
+      }
+    }
+  }
+}
+
+--- Comment (amk, Tue, 7 Jul 2015 18:00:02 +0000) ---
+Yes, we're seeing threads stuck in infinite loops trying to get the spinlock. This problem has been seen on at least 2 customer systems and a few internal test systems.
+
+> crash> ps -m | grep '\^'
+> ^[0 00:00:00.002] [IN]  PID: 573    TASK: ffff88083370b800  CPU: 12  COMMAND: "kworker/12:1"
+> ^[0 00:00:00.003] [IN]  PID: 5698   TASK: ffff88083cb70800  CPU: 15  COMMAND: "gsock_send_1"
+[skip]
+> ^[0 00:00:00.252] [IN]  PID: 5785   TASK: ffff88083f074040  CPU: 0   COMMAND: "ptlrpcd_15"
+> ^[0 00:41:02.337] [RU]  PID: 5781   TASK: ffff880833673800  CPU: 2   COMMAND: "ptlrpcd_11"
+             ^41 minutes  running on CPU 2
+> crash> bt 5781
+> PID: 5781   TASK: ffff880833673800  CPU: 2   COMMAND: "ptlrpcd_11"
+>     [exception RIP: _raw_spin_lock+27]
+>     RIP: ffffffff8141eabb  RSP: ffff8807e29d3bc0  RFLAGS: 00000202
+>     RAX: 0000000000000266  RBX: ffff8808378d8ba0  RCX: ffffffffa0559aa0
+>     RDX: 0000000000001000  RSI: 0000000000000000  RDI: ffff8808378d8bd0
+>     RBP: ffff8807e29d3bc0   R8: 0000000000000001   R9: 0000000000000001
+>     R10: 0000000000000001  R11: 0000ffffffffff0a  R12: 0000000000000258
+>     R13: 000000000000003b  R14: 0000000055944d05  R15: 0000000000000028
+>     ORIG_RAX: ffffffffffffffff  CS: 0010  SS: 0018
+> ---  ---
+>  #3 [ffff8807e29d3bc0] _raw_spin_lock at ffffffff8141eabb
+>  #4 [ffff8807e29d3bc8] at_measured at ffffffffa04c0123 [ptlrpc]
+>  #5 [ffff8807e29d3c38] ptlrpc_at_adj_net_latency at ffffffffa0494547 [ptlrpc]
+>  #6 [ffff8807e29d3c78] after_reply at ffffffffa0497223 [ptlrpc]
+>  #7 [ffff8807e29d3ce8] ptlrpc_check_set at ffffffffa049c3d0 [ptlrpc]
+>  #8 [ffff8807e29d3d78] ptlrpcd_check at ffffffffa04c810b [ptlrpc]
+>  #9 [ffff8807e29d3dd8] ptlrpcd at ffffffffa04c87bb [ptlrpc]
+> #10 [ffff8807e29d3ee8] kthread at ffffffff8107373e
+> #11 [ffff8807e29d3f48] kernel_thread_helper at ffffffff81427bb4
+
+spinlock is ptlrpc_request.rq_import->imp_at.iat_net_latency.at_lock
+
+> crash> ptlrpc
+> 
+> Sent RPCS: ptlrpc_request_set.set_requests->rq_set_chain
+> thread        ptlrpc_request      pid xid                   nid                opc  phase  bulk  sent/deadline
+> ===============================================================================================
+> ptlrpcd_11:   ffff8807fa1fc000   5781 x1505497848647028     325@gni             400 RPC    0:0 1435782346/1435782478 
+> ===============================================================================================
+
+> crash> ptlrpc_request ffff8807fa1fc000 | grep rq_import
+>   rq_import_generation = 1, 
+>   rq_import = 0xffff8808378d8800, 
+ 
+> crash> struct -o obd_import | grep imp_at
+>    [896] struct imp_at imp_at;
+> crash> struct -o imp_at | grep iat_net_latency
+>    [32] struct adaptive_timeout iat_net_latency;
+> crash> struct -o adaptive_timeout | grep at_lock
+>   [48] spinlock_t at_lock;
+
+So spinlock address: 
+    0xffff8808378d8800 + 896 + 32 + 48 = ffff8808378d8bd0
+
+> crash> spinlock_t -x ffff8808378d8bd0
+> struct spinlock_t {
+>   {
+>     rlock = {
+>       raw_lock = {
+>         slock = 0x6666
+>       }
+>     }
+>   }
+> }
+
+This at_lock is not locked.
+> crash> px xtdumpregs | grep -B 15 -A 6 ffff8808378d8bd0
+>   }, {
+>     r15 = 0x28, 
+>     r14 = 0x55944d05, 
+>     r13 = 0x3b, 
+>     r12 = 0x258, 
+>     bp = 0xffff8807e29d3bc0, 
+>     bx = 0xffff8808378d8ba0, 
+>     r11 = 0xffffffffff0a, 
+>     r10 = 0x1, 
+>     r9 = 0x1, 
+>     r8 = 0x1, 
+>     ax = 0x266, 
+>     cx = 0xffffffffa0559aa0, 
+>     dx = 0x1000, 
+>     si = 0x0, 
+>     di = 0xffff8808378d8bd0, 
+>     orig_ax = 0xffffffffffffffff, 
+>     ip = 0xffffffff8141eabb, 
+>     cs = 0x10, 
+>     flags = 0x202, 
+>     sp = 0xffff8807e29d3bc0, 
+>     ss = 0x18
+
+>>     RAX: 0000000000000266  RBX: ffff8808378d8ba0  RCX: ffffffffa0559aa0
+
+> crash> dis _raw_spin_lock
+> 0xffffffff8141eaa0 :	push   %rbp
+> 0xffffffff8141eaa1 :	mov    %rsp,%rbp
+> 0xffffffff8141eaa4 :	data32 data32 data32 xchg %ax,%ax
+> 0xffffffff8141eaa9 :	mov    $0x100,%eax
+> 0xffffffff8141eaae :	lock xadd %ax,(%rdi)
+> 0xffffffff8141eab3 :	cmp    %ah,%al
+> 0xffffffff8141eab5 :	je     0xffffffff8141eabd 
+> 0xffffffff8141eab7 :	pause  
+> 0xffffffff8141eab9 :	mov    (%rdi),%al
+> 0xffffffff8141eabb :	jmp    0xffffffff8141eab3     0xffffffff8141eabd :	leaveq 
+> 0xffffffff8141eabe :	retq   
+> 0xffffffff8141eabf :	nop
+
+So %ah == 2 and %al == 66. The value of %ah does not change in the spinlock loop. So %al needs to wrap around to 2 before the loop will exit. (Note: my assembly skills are pretty rusty so good chance I've got something wrong here, but the state of the spinlock compared to the values in use here looks suspicious. )
+
+The dklog shows that other threads have requested this particular spinlock over 300 times since pid 5781 made this hung request. The fact that these threads are not also hung suggests that the spinlock requests were successful.
+
+> 00000100:00001000:15:1435782195.117166:0:5781:0:(import.c:1586:at_measured()) add 40 to ffff880837297c48 time=33 v=40 (40 40 0 0)
+> 00000100:00001000:14:1435782195.260830:0:5777:0:(import.c:1586:at_measured()) add 40 to ffff880837297c48 time=33 v=40 (40 40 0 0)
+> 00000100:00001000:15:1435782195.270513:0:5773:0:(import.c:1586:at_measured()) add 40 to ffff880837297c48 time=33 v=40 (40 40 0 0)
+> 00000100:00001000:14:1435782195.285561:0:5777:0:(import.c:1586:at_measured()) add 40 to ffff880837297c48 time=33 v=40 (40 40 0 0)
+> 00000100:00001000:15:1435782195.291757:0:5773:0:(import.c:1586:at_measured()) add 40 to ffff880837297c48 time=33 v=40 (40 40 0 0)
+...
+> 00000100:00001000:1:1435782534.441946:0:5778:0:(import.c:1586:at_measured()) add 130 to ffff880837297c48 time=72 v=130 (130 0 40 40)
+
+--- Comment (adilger, Tue, 7 Jul 2015 17:45:18 +0000) ---
+What problems are seen without this patch? Have you seen issues with this in real life, or was this found by code inspection or static analysis?
+
+It seems like a problem that the spinlock is being reset while it might be locked. That might cause an oops if there is spinlock debugging enabled in some rare cases. If that is the case, then including the stack trace in the big and/or patch would make it easier to correlate any future failures with this ticket and patch.
+
+--- Comment (gerrit, Tue, 7 Jul 2015 14:06:19 +0000) ---
+Vladimir Saveliev (vladimir_saveliev@xyratex.com) uploaded a new patch: http://review.whamcloud.com/15522
+
+Subject: LU-6805 ptlrpc: use smp unsafe at_init only for initialization
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 568e59b44e4f093436ff83f1ffd860aaff114b46

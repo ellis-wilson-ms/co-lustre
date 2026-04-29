@@ -1,0 +1,184 @@
+Key:        LU-3018
+Summary:    small reads occur during bulk writes hurting overall performance
+Link:       https://jira.whamcloud.com/browse/LU-3018
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Won't Fix
+Assignee:   Cliff White
+Reporter:   Andrew Perepechko
+Created:    Fri, 22 Mar 2013 13:48:07 +0000
+Updated:    Fri, 9 May 2014 19:41:50 +0000
+Resolved:   Fri, 9 May 2014 19:41:50 +0000
+Labels:     patch
+
+--- Description ---
+During obdfilter-survey on OSS node or IOR write test from the client there are small reads during bulk writes which impact the performance of the OST.
+
+Based on the block trace and dumpe2fs output these reads are for ldiskfs block bitmaps.
+
+A patch will be uploaded shortly.
+
+--- Comment (cliffw, Fri, 9 May 2014 19:41:38 +0000) ---
+Closing ticket per Andrew
+
+--- Comment (panda, Fri, 27 Sep 2013 15:41:22 +0000) ---
+this ticket should be closed and the long-term solution backported from the vanilla kernel
+
+--- Comment (keith, Wed, 22 May 2013 15:54:17 +0000) ---
+That is excellent news.
+
+--- Comment (panda, Wed, 22 May 2013 11:24:20 +0000) ---
+Keith Mannthey, there is a lot ongoing activity in LKML.
+
+--- Comment (keith, Tue, 21 May 2013 05:59:17 +0000) ---
+Andrew Perepechko, Any update?
+
+--- Comment (keith, Mon, 25 Mar 2013 17:19:39 +0000) ---
+Can you please post any detailed performance data you have? What environment are you testing in and what results do you see?
+
+--- Comment (panda, Sat, 23 Mar 2013 19:37:26 +0000) ---
+Using mark_page_accessed() is not enough to avoid page eviction.
+
+find_or_create_page() allocates a page and links it to the corresponding cpu buffer.
+
+struct page *find_or_create_page(struct address_space *mapping,
+                pgoff_t index, gfp_t gfp_mask)
+{
+        struct page *page;
+        int err;
+repeat:
+        page = find_lock_page(mapping, index);
+        if (!page) {
+                page = __page_cache_alloc(gfp_mask);
+                if (!page)
+                        return NULL;
+                /*
+                 * We want a regular kernel memory (not highmem or DMA etc)
+                 * allocation for the radix tree nodes, but we need to honour
+                 * the context-specific requirements the caller has asked for.
+                 * GFP_RECLAIM_MASK collects those requirements.
+                 */
+                err = add_to_page_cache_lru(page, mapping, index,
+                        (gfp_mask & GFP_RECLAIM_MASK));
+...
+}
+
+void __lru_cache_add(struct page *page, enum lru_list lru)
+{
+        struct pagevec *pvec = &get_cpu_var(lru_add_pvecs)[lru];
+
+        page_cache_get(page);
+        if (!pagevec_add(pvec, page))
+                ____pagevec_lru_add(pvec, lru);
+        put_cpu_var(lru_add_pvecs);
+}
+
+Note that ____pagevec_lru_add() which calls SetPageLRU() is only performed when the cpu buffer is full.
+
+make_page_accessed() activates the page only if it is on LRU. Otherwise, the page is marked or kept referenced:
+
+void mark_page_accessed(struct page *page)
+{
+        if (!PageActive(page) && !PageUnevictable(page) &&
+                        PageReferenced(page) && PageLRU(page)) {
+                activate_page(page);
+                ClearPageReferenced(page);
+        } else if (!PageReferenced(page)) {
+                SetPageReferenced(page);
+        }
+}
+
+shrink_inactive_list() drains the buffer and evicts the pages even if mark_page_accessed() was called a lot of times:
+
+static unsigned long shrink_inactive_list(unsigned long max_scan,
+                        struct zone *zone, struct scan_control *sc,
+                        int priority, int file)
+{
+        LIST_HEAD(page_list);
+        struct pagevec pvec;
+        unsigned long nr_scanned = 0;
+        unsigned long nr_reclaimed = 0;
+        unsigned long nr_dirty = 0;
+        unsigned long nr_writeback = 0;
+        struct zone_reclaim_stat *reclaim_stat = get_reclaim_stat(zone, sc);
+
+        while (unlikely(too_many_isolated(zone, file, sc))) {
+                congestion_wait(BLK_RW_ASYNC, HZ/10);
+
+                /* We are about to die and free our memory. Return now. */
+                if (fatal_signal_pending(current))
+                        return SWAP_CLUSTER_MAX;
+        }
+
+        pagevec_init(&pvec, 1);
+
+        lru_add_drain();
+...
+}
+
+--- Comment (panda, Fri, 22 Mar 2013 18:11:00 +0000) ---
+Hello James!
+
+That would be very nice.
+
+Thank you.
+
+--- Comment (simmonsja, Fri, 22 Mar 2013 17:55:51 +0000) ---
+Would you mind if I update the patch to support SLES11 SP2 as well?
+
+--- Comment (panda, Fri, 22 Mar 2013 14:38:21 +0000) ---
+Xyratex-bug-id: MRP-691
+
+--- Comment (panda, Fri, 22 Mar 2013 14:03:53 +0000) ---
+The logs showing how bitmap pages are evicted:
+
+ [] ? __remove_mapping+0xd8/0x160
+ [] ? shrink_page_list.clone.0+0x47d/0x5e0
+ [] ? shrink_inactive_list+0x2f0/0x730
+ [] ? cfs_hash_rw_unlock+0x1d/0x30 [libcfs]
+ [] ? cfs_hash_dual_bd_unlock+0x34/0x60 [libcfs]
+ [] ? shrink_zone+0x38f/0x510
+ [] ? ktime_get_ts+0xa9/0xe0
+ [] ? do_try_to_free_pages+0xfe/0x520
+ [] ? try_to_free_pages+0x9f/0x130
+ [] ? isolate_pages_global+0x0/0x380
+ [] ? __alloc_pages_nodemask+0x447/0x920
+ [] ? alloc_pages_current+0xaa/0x110
+ [] ? __page_cache_alloc+0x87/0x90
+ [] ? find_or_create_page+0x4f/0xb0
+
+ [] ? __remove_mapping+0xd8/0x160
+ [] ? remove_mapping+0x16/0x30
+ [] ? invalidate_inode_page+0x82/0xb0
+ [] ? invalidate_mapping_pages+0xda/0x150
+ [] ? _spin_unlock+0x2b/0x40
+ [] ? shrink_icache_memory+0x1c0/0x2e0
+ [] ? shrink_icache_memory+0x295/0x2e0
+ [] ? shrink_slab+0x14d/0x1b0
+ [] ? balance_pgdat+0x5ad/0x810
+ [] ? isolate_pages_global+0x0/0x380
+ [] ? kswapd+0x144/0x3a0
+
+ [] isolate_pages_global+0x1ab/0x380
+ [] ? shrink_inactive_list+0xb9/0x730
+ [] shrink_inactive_list+0x162/0x730
+ [] ? cfs_hash_rw_unlock+0x1d/0x30 [libcfs]
+ [] ? cfs_hash_dual_bd_unlock+0x34/0x60 [libcfs]
+ [] ? cfs_hash_lookup+0x82/0xa0 [libcfs]
+ [] ? cl_env_fetch+0x25/0x80 [obdclass]
+ [] shrink_zone+0x38f/0x510
+ [] balance_pgdat+0x719/0x810
+ [] ? isolate_pages_global+0x0/0x380
+ [] kswapd+0x144/0x3a0
+
+Note they are not passing through shrink_active_list();
+
+I_NEW is needed to avoid the following code path:
+
+ [] ? invalidate_mapping_pages+0xda/0x150
+ [] ? _spin_unlock+0x2b/0x40
+ [] ? shrink_icache_memory+0x1c0/0x2e0
+
+--- Comment (panda, Fri, 22 Mar 2013 14:01:05 +0000) ---
+http://review.whamcloud.com/#change,5811

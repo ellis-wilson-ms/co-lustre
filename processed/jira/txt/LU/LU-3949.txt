@@ -1,0 +1,512 @@
+Key:        LU-3949
+Summary:    umount is lazy and takes hours
+Link:       https://jira.whamcloud.com/browse/LU-3949
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Cannot Reproduce
+Assignee:   Hongchao Zhang
+Reporter:   Christopher Morrone
+Created:    Fri, 13 Sep 2013 23:46:12 +0000
+Updated:    Wed, 13 Oct 2021 03:14:18 +0000
+Resolved:   Wed, 13 Oct 2021 03:14:18 +0000
+Labels:     llnl
+Attachments: iwc175.console.txt, iwc175.dump.txt.gz
+
+--- Environment ---
+Lustre 2.1.4-5chaos on client, Lustre 2.1.4-5chaos on ldiskfs servers, Lustre 2.4.0-15chaos on zfs servers
+
+--- Description ---
+With lustre 2.1.4-5chaos, we are finding that clients are not honoring umount correctly.  The sysadmins are using the normal "umount" command with no additional options, and it returns relatively quickly.
+
+Linux no longer has a record of the mount in /proc/mounts after the command returns, and the mount point (/p/lscratchrza) appears to be empty.  However the directory clearly still has a reference and cannot be removed:
+
+# rzzeus26 /p > ls -la lscratchrza
+total 0
+drwxr-xr-x 2 root root  40 Aug 13 11:24 .
+drwxr-xr-x 4 root root 140 Aug 13 11:24 ..
+# rzzeus26 /p > rmdir lscratchrza
+rmdir: failed to remove `lscratchrza': Device or resource busy
+
+When we look in /proc/fs/lustre it is clear that most, if not all, objects for this filesystem are still present in llite, osc, mdc, ldlm/namespace, etc.
+
+The sysadmins issued the "umount /p/lscratchrza" command at around 9:42am, but this message did not appear on one of the nodes until over five hours later:
+
+2013-09-13 15:18:11 Lustre: Unmounted lsa-client
+
+So there appear to be at least two problems here
+
+	umount is taking far too long
+
+	umount for lustre is not blocking until umount is complete (it is exhibiting umount "lazy" behavior)
+
+I should note that this lustre client node is mounting two lustre filesystems, and only one was being umounted.  I don't know if it is significant yet, but the servers that we were trying to umount are running Lustre 2.1.4-5chaos with ldiskfs, and servers for the other filesystem are running Lustre 2.4.0-15chaos with zfs.
+
+I did not seem to be able to speed up the umount process by running the sync command, or "echo 3 > /proc/sys/vm/drop_caches".
+
+I did a "foreach bt" under crash, but I don't see any processes that are obviously stuck sleeping in umount related call paths.
+
+Real user applications are running on the client nodes while the umounts are going on.  "lsof" does not list any usage under /p/lscratchrza (the filesystem that we are trying to unmount).
+
+--- Comment (morrone, Fri, 22 Aug 2014 17:32:10 +0000) ---
+I am thinking that ns.lua is the likely culprit.  I'll have to get someone at LLNL to look into why we are doing that, and how to do it better.
+
+--- Comment (morrone, Thu, 21 Aug 2014 00:24:31 +0000) ---
+Perhaps /etc/slurm/lua.d/ns.lua is more likely.
+
+--- Comment (morrone, Thu, 21 Aug 2014 00:11:12 +0000) ---
+but I do see this in the use-env source
+
+Are you sure about that?  It looks to me like that code is from the iorelay plugin, not use-env.  The other place mentioning CLONE_NEWNS is the private_mount plugin.
+
+I got my sources from:
+
+  https://code.google.com/p/slurm-spank-plugins/
+
+--- Comment (cliffw, Tue, 19 Aug 2014 15:56:48 +0000) ---
+Slurm plugins on Hyperion (From /etc/slurm/plugstack.conf)
+
+ use-env.so
+
+ auto-affinity.so
+
+ io-watchdog.so
+
+ renice.so 
+
+lua.so
+
+I am not sure if this is the LLNL version , but I do see this in the use-env source:
+
+ /* Unshare file namespace.  This means only this process and its children
+     * will see the following mounts, and when this process and its children
+     * terminate, the mounts go away automatically.
+     */
+    if (unshare (CLONE_NEWNS) "unshare CLONE_NEWNS: %m");
+        return (-1);
+    }
+
+--- Comment (cliffw, Tue, 12 Aug 2014 15:06:24 +0000) ---
+Sorry, previous comment was lost.
+
+Using Oleg's patch, we see this backtrace:
+
+2014-08-12 07:52:20 Pid: 109868, comm: slurmstepd Tainted: P           ---------------    2.6.32-431.23.3.el6_lustre.g549407e.x86_64 #1
+
+2014-08-12 07:52:20 Call Trace:
+
+2014-08-12 07:52:20  [] ? create_new_namespaces+0x3c/0x1b0
+
+2014-08-12 07:52:20  [] ? unshare_nsproxy_namespaces+0x76/0xd0
+
+2014-08-12 07:52:20  [] ? sys_unshare+0x12f/0x2d0
+
+2014-08-12 07:52:20  [] ? tracesys+0xd9/0xde
+
+2014-08-12 07:52:53 New namespace created
+
+2014-08-12 07:52:53 Pid: 110584, comm: slurmstepd Tainted: P           ---------------    2.6.32-431.23.3.el6_lustre.g549407e.x86_64 #1
+
+--- Comment (cliffw, Tue, 12 Aug 2014 15:04:48 +0000) ---
+I then straced slurmd, with -e trace=unshare, and see this result:
+
+root     110934      1  0 07:53 ?        00:00:00 slurmstepd: [1742267.0]
+
+strace of that gives
+
+unshare(CLONE_NEWNS|0x8000000)
+
+I see the same call in several other traces.
+
+--- Comment (green, Tue, 12 Aug 2014 14:36:12 +0000) ---
+So we clearly see the slurmd or one of it's children call unshare syscall that clones namespace and prevents all fulesystems from unmounting, not just lustre, for the life of the cloned namespace (that ends when the child does).
+
+What's strange is that I do not see any unshare calls in the slurmd source I downloaded from github, so I wonder if this is coming from some of the libraries in use at LLNL.
+
+In any case there's absolutely nothing we (on the lustre side) can do here to speed up unmounting it appears. The userspace asked the kernel not to allow any real unmounts after all.
+
+--- Comment (cliffw, Tue, 12 Aug 2014 14:30:55 +0000) ---
+Running the new test patch, I see this backtrace repeatedly
+
+2014-08-12 00:13:47 Call Trace:
+
+2014-08-12 00:13:47  [] ? create_new_namespaces+0x3c/0x1b0
+
+2014-08-12 00:13:47  [] ? unshare_nsproxy_namespaces+0x76/0xd0
+
+2014-08-12 00:13:47  [] ? sys_unshare+0x12f/0x2d0
+
+2014-08-12 00:13:47  [] ? system_call_fastpath+0x16/0x1b
+
+2014-08-12 00:13:54 New namespace created
+
+--- Comment (cliffw, Mon, 11 Aug 2014 22:14:07 +0000) ---
+While running SWL, on multiple clients I straced slurmd, like this:
+
+SPID=slurmd pid
+
+strace -ff -p $SPID -e trace=clone -o $DIR/$FILE
+
+Then I grepped through the results for 'flags=' , sorted for unique, and looked for CLONE_NEWNS.
+
+--- Comment (morrone, Mon, 11 Aug 2014 20:21:58 +0000) ---
+I straced while running SWL
+
+Could you please explain exactly what you did?
+
+--- Comment (cliffw, Mon, 11 Aug 2014 14:18:30 +0000) ---
+I straced while running SWL. Did not find any use of CLONE_NEWNS
+
+--- Comment (green, Fri, 8 Aug 2014 00:42:51 +0000) ---
+Here's a simple reproducer for the CLONE_NEWNS behavior that matches what you are seeing I believe (it certainly does for me):
+
+#include 
+#include 
+#include 
+#include 
+#include 
+#include 
+
+void child_fn(void *ptr)
+{
+	sleep(100);
+	return;
+}
+
+void main(void)
+{
+	long *stack=malloc(10000 * sizeof(stack));
+	int rc;
+
+	rc = clone(child_fn, stack+9999, CLONE_NEWNS | SIGCHLD, NULL);
+	if (rc == -1)
+		perror("Cannont clone");
+
+	exit(0);
+}
+
+Just compile and run it, it'll spawn another thread that'll hang there for 100 seconds. During these 100 seconds try to unmount a lustre filesystem an you'll see that while mount exits right away with success and the filesystem is gone from /proc/mounts, the "Unmounted" lustre message is not printed.
+
+I experimented a little and umount -f doe not help too much. It does mark the import invalid forcefully, but servers are never informed of that and moreover, does not even get any messages, so they end up evicting the client once ping timeout hits:
+
+[383407.089403] Lustre: Mounted lustre-client
+[383419.633431] Lustre: setting import lustre-MDT0000_UUID INACTIVE by administrator request
+[383465.064335] Lustre: lustre-OST0000: haven't heard from client 9ecf059c-5c43-49c9-61c1-7df1b424d51d (at 0@lo) in 53 seconds. I think it's dead, and I am evicting it. exp ffff8800b00f7bf0, cur 1407457950 expire 1407457920 last 1407457897
+[383465.084392] LustreError: 4666:0:(ofd_grant.c:183:ofd_grant_sanity_check()) ofd_statfs: tot_granted 281728 != fo_tot_granted 2378880
+[383467.052644] Lustre: lustre-MDT0000: haven't heard from client 9ecf059c-5c43-49c9-61c1-7df1b424d51d (at 0@lo) in 55 seconds. I think it's dead, and I am evicting it. exp ffff88008dd3abf0, cur 1407457952 expire 1407457922 last 1407457897
+[383467.056074] Lustre: Skipped 1 previous similar message
+[383478.941396] Lustre: Unmounted lustre-client
+
+Granted, the entire idea behind umount -f was to just cut all communications, so we probably cannot easily turn around and change the semantics to "tell the server we are gone too".
+
+--- Comment (green, Thu, 7 Aug 2014 05:09:02 +0000) ---
+Afteer rereading everything in the ticket here again and re-examining the in-kernel code, I think HongChao is right here.
+
+At least for the test Cliff has performed it is quite clear that slurmstepd has a private namespace that has an extra reference to lustre fs being unmounted by the admin.
+
+It is caught red-handed with that release of the last reference to the namespace that triggers final mnt put.
+
+Now - how did it end up having the namespace I am not really sure, my examination of the code seems to imply that the most easy way is to do a clone with CLONE_NEWNS, but I got the copy of the code and there's nothing like that unless  you have some really strange pthreads library on your system. Another easy way is when unshare() is called - I do not see any calls in your code, though.
+
+I see there's cgroups used that also plays with namespaces that might influence this, but I am not really sure about that.
+
+As such, there's really nothing Lustre can do here until this additional namespace goes away, in fact Lustre is not even called to try and perform an actual unmount until this happens (Note, this is very different from a task having a file opened on Lustre or CWD there, because then umount itself  will fail with EBUSY).
+
+This is somewhat similar to the case when you do mount --bind /mnt/lustre /mnt/lustre2 – after this you can do umount /mnt/lustre, but because there's still another reference - /mnt/lustre2 - the lustre is not going to be unmounted (though in this case you would be able to delete /mnt/lustre at least unlike this discussed case).
+
+So to summarize. In my view this is not a Lustre bug at all, Lustre has no control about other namespaces referencing it.
+
+For the next step it would be great to understand how this new namespace is really getting created. I tried to make a simple proof of concept, but have not figured out how to create this additional namespace that would reference Lustre.
+
+I imagine you cannot just kill all slurmstepd processes on the node as the workaround as this kills the job it happens to be running and that's not really acceptable. I imagine you have a lot of logging going somewhere that would let you correlate job termination times on the affected nodes with the lustre "Unmounted" message, though.
+
+This is assuming there are really no any stray slurmstepd processes (do you have any easy way to check?) that might be hogging this separate namespace needlessly long after the job using it has terminated.
+
+I suspect when the problem occurs cat /proc/mounts might show something useful.
+
+Cliff - can you please run slurm and slurmstepd under strace somehow and see if clone is called with CLONE_NEWNS anywhere? CLONE_NEWNS is designed to be exactly like we see here - to separate parent namespace from child, so that they can do further mounts and unmounts without affecting each other.
+
+--- Comment (cliffw, Mon, 21 Jul 2014 21:22:08 +0000) ---
+Slurmstepd is an LLNL product.
+
+" slurmstepd  is  a  job  step  manager  for SLURM.  It is spawned by the
+
+       slurmd daemon when a job step is launched and terminates when  the  job
+
+       step  does.   It  is  responsible for managing input and output (stdin,
+
+       stdout and stderr) for the job step along with its accounting and  sig-
+
+       nal  processing.  slurmstepd should not be initiated by users or system
+
+       administrators.
+
+"
+
+--- Comment (hongchao.zhang, Tue, 15 Jul 2014 04:37:09 +0000) ---
+the kill_super/put_super triggered in the first 4 umount is by the "sys_umount" syscall, and the final one
+
+(which caused the "Device or resource busy") is caused by the exit of process (the syscall is sys_exit_group,
+
+PID is 126735, comm is "slurmstepd"), and it is very likely to cause this issue. 
+
+Hi Cliff, could you please check what is the process "slurmstepd" in the client? and how the process get
+
+the namespace of the newly mounted Lustre client, thanks!
+
+It could be the same issue in LLNL (some background process hold an extra reference of the namespace of
+
+the Lustre client which was umounted explicitly by "umount" command).
+
+--- Comment (cliffw, Fri, 11 Jul 2014 14:39:39 +0000) ---
+I used your script from this bug.  The final mount was /mnt/lustre_test, and the script exits upon failure, so the final mount was the error.
+
+--- Comment (hongchao.zhang, Fri, 11 Jul 2014 11:10:48 +0000) ---
+Hi, 
+
+Do you run mount & umount in a loop? and as per the console log, the client has been mounted&umounted successfully for 5 times.
+
+which mount point (or times) gave the error "Device or resource busy"?
+
+Thanks
+
+--- Comment (cliffw, Thu, 10 Jul 2014 15:50:47 +0000) ---
+I ran the umount script on a single client while running SWL on a different mount point. I was also mounting and starting other clients.
+
+Within 10 minutes, client failed to delete the mount point, error was 'Device or resource busy' Attached are console log and lctl dk for the client.
+
+--- Comment (hongchao.zhang, Sun, 4 May 2014 11:22:24 +0000) ---
+Hi, 
+
+Did you try the debug patch?  Did the issue occur again and are there any new logs generated by this debug patch?
+
+Thanks
+
+--- Comment (hongchao.zhang, Fri, 18 Apr 2014 13:32:22 +0000) ---
+the debug patch against b2_4 is tracked at http://review.whamcloud.com/#/c/10012/
+
+--- Comment (morrone, Fri, 4 Apr 2014 18:39:11 +0000) ---
+Yes, it is still a problem in 2.4.
+
+--- Comment (hongchao.zhang, Fri, 4 Apr 2014 14:57:11 +0000) ---
+Hi,
+
+Did this issue occur again in 2.4?
+
+Thanks
+
+--- Comment (morrone, Fri, 4 Apr 2014 00:26:09 +0000) ---
+FYI, we are no longer using 2.1 in production.  We have completely migrated to 2.4.
+
+--- Comment (hongchao.zhang, Wed, 5 Mar 2014 15:29:25 +0000) ---
+the debug patch against b2_1 is tracked at http://review.whamcloud.com/#/c/9502/
+
+--- Comment (hongchao.zhang, Tue, 4 Mar 2014 15:07:01 +0000) ---
+status update:
+
+the debug patch is still being tested.
+
+--- Comment (hongchao.zhang, Mon, 3 Mar 2014 15:20:16 +0000) ---
+yes, it could be related to this issue, and there are also some "mntget" calls in "push_ctxt" (lustre/lvfs/lvfs_linux.c) and
+
+"llog_lvfs_destroy" (lustre/obdclass/llog_lvfs.c), which could cause lazy umount?
+
+will create a debug to verify it.
+
+--- Comment (morrone, Tue, 25 Feb 2014 16:49:20 +0000) ---
+In patch 6392 from LU-3270, Lai is adding a wait for running statahead threads to ll_kill_super().  Perhaps that relates to the issues in this ticket?
+
+--- Comment (cliffw, Mon, 24 Feb 2014 22:39:55 +0000) ---
+On Hyperion (12 OSS, 36 OSTs) we normally remount between test passes, have not noticed this issue. I am currently running the mount test script on some idle clients, will report if errors.
+
+--- Comment (hongchao.zhang, Mon, 24 Feb 2014 13:30:46 +0000) ---
+I have tested it with by the following script,
+
+#!/bin/bash
+
+if [ $# != 1 ]; then
+    echo "Usage: $(basename $0) Server_IP"
+    exit 0
+fi
+
+ADDR=$1
+
+mkdir -p /mnt/lustre_test || (echo "can't mkdir /mnt/lustre_test \n" && exit)
+
+while [ TRUE ];
+do
+    mkdir -p /mnt/lustre_test || exit 1
+    mount -t lustre $ADDR@tcp:/lustre /mnt/lustre_test || exit 2
+    echo -e "$(date) Lustre mounted"
+
+    dd if=/dev/zero of=/mnt/lustre_test/dd.file bs=1024 count=10000 || exit 3
+
+    umount /mnt/lustre_test || exit 4
+    rmdir /mnt/lustre_test || exit 5
+    echo -e "$(date) Lustre umounted"
+
+    echo -e "\n\n"
+    sleep 1
+done
+
+there is another Lustre mount (test with same server and different server) on /mnt/lustre, which continues running some loads (say, tar, dd).
+
+there is no umount problem for long time.
+
+--- Comment (hongchao.zhang, Tue, 18 Feb 2014 14:55:33 +0000) ---
+how about printing the debug info (then it will not be overwritten by the debug logs of the other Lustre mount) in the two functions related to umount
+
+(ll_umount_begin, ll_put_super) to check whether it is Lustre that costs so much time during umount.
+
+diff --git a/lustre/llite/llite_lib.c b/lustre/llite/llite_lib.c
+index aff4ccb..5787f5d 100644
+--- a/lustre/llite/llite_lib.c
++++ b/lustre/llite/llite_lib.c
+@@ -1138,7 +1138,7 @@ void ll_put_super(struct super_block *sb)
+        int ccc_count, next, force = 1, rc = 0;
+         ENTRY;
+ 
+-        CDEBUG(D_VFSTRACE, "VFS Op: sb %p - %s\n", sb, profilenm);
++       LCONSOLE_WARN("VFS Op: sb %p - %s\n", sb, profilenm);
+ 
+         ll_print_capa_stat(sbi);
+ 
+@@ -2116,8 +2116,8 @@ void ll_umount_begin(struct super_block *sb)
+         }
+ #endif
+ 
+-        CDEBUG(D_VFSTRACE, "VFS Op: superblock %p count %d active %d\n", sb,
+-               sb->s_count, atomic_read(&sb->s_active));
++       LCONSOLE_WARN("VFS Op: superblock %p count %d active %d\n", sb,
++                     sb->s_count, atomic_read(&sb->s_active));
+ 
+         obd = class_exp2obd(sbi->ll_md_exp);
+         if (obd == NULL) {
+
+btw, did you see any these debug info in the previous debug logs when the issue occurred.
+
+--- Comment (hongchao.zhang, Tue, 18 Feb 2014 03:14:56 +0000) ---
+status update:
+
+I have investigated the kernel/Lustre, particularly the mount part, but didn't find anything that is interesting.
+
+does the issue occur again recently? and on which kernel versions?
+
+Thanks
+
+--- Comment (morrone, Fri, 31 Jan 2014 23:51:49 +0000) ---
+Still a problem.
+
+--- Comment (hongchao.zhang, Mon, 30 Sep 2013 16:04:15 +0000) ---
+the most possible case should be the super_block.s_active is higer than 1
+
+1, the umount returns successfully (without -l option), then the vfsmnt.mnt_count will be dropped to zero in "do_umount", which triggers deactivate_super
+
+2, if the super_block.s_active is dropped to zero, then "lustre_kill_super" will be called, which will call "kill_anon_super"
+
+3, "kill_anon_super" will call generic_shutdown_super, which calls "ll_put_super"
+
+the super_block.s_active will be increased in "sget", "get_active_super", "copy_tree" and "do_loopback".
+
+"sget" is mainly called during mount
+
+"get_active_super" is called by "freeze_bdev"
+
+"copy_tree" and "do_loopback" will be called when mount with --bind option
+
+btw, no "sget" and "get_active_super" call is found in Lustre.
+
+--- Comment (morrone, Sat, 28 Sep 2013 01:20:29 +0000) ---
+Apparently there isn't much in the way of explicit callbacks into Lustre at umount time.  The callbacks mostly trigger when sufficient references are dropped.  There is a call path that looks like this:
+
+umount
+mntput_no_Expire
+__mntput
+deactivate_super
+fs->kill_sb
+lustre_kill_super
+
+deactivate_super() also calls put_super() after the call to fs->kill_sb(), which should in theory kick off ll_put_super() if the super_block s_count is decremented to zero.
+
+So that leaves us to wonder what part of this failed...
+
+I think it seems most likely that the super_block s_count was higher than 1 when __put_super() was called, but it is not clear to me what else would be holding the reference.
+
+--- Comment (morrone, Thu, 26 Sep 2013 21:27:20 +0000) ---
+Maybe I should clarify my "disconnect from the servers" comment.  I mean things like the imports and other components associated with that filesystem should be cleanly shut down before umount returns.  I don't expect the lnet connections to necessarily be shut down.
+
+--- Comment (morrone, Thu, 26 Sep 2013 21:14:23 +0000) ---
+I think that the kernel pretty clearly does not wait until ll_put_super is complete before allowing whatever syscall umount is using to return.  That implies to me that lustre is doing the wrong thing.  The Lustre client needs to disconnect from the servers before umount returns.
+
+I have high confidence that we will see it again on thousands of nodes then next time we use umount.
+
+--- Comment (hongchao.zhang, Thu, 26 Sep 2013 15:01:20 +0000) ---
+the umount should return before ll_put_super is called for the "Unmounted lsa-client" message was printed long time after the umount command.
+
+Lustre will disconnect from the servers in ll_put_super, and it should be the kernel responsibility to call put_super operation of specific
+
+filesystem when the vfsmount is going to be destroyed.
+
+Hi Chris, Does the issue occur again in your site?
+
+Thanks!
+
+--- Comment (morrone, Wed, 25 Sep 2013 17:12:42 +0000) ---
+No, I don't see anything to suggest an implicit use of -l.  But I'm not sure what I should look for that could cause an "implicit" use.  I don't see -l used.
+
+And just to be clear, I'm not trying to imply that the code thinks it is in lazy mode.  I am just saying that the behavior is similar to lazy mode.  In other words, Lustre allows umount to return before the client really disconnects from the servers and removes the final references on the mount point.  It certainly is allowing umount to return before ll_put_super is complete.  I suspect that umount returns before ll_put_super is even called, but I don't have hard evidence for that.
+
+--- Comment (hongchao.zhang, Wed, 25 Sep 2013 10:32:21 +0000) ---
+normally, lazy umount is only used for "umount -l" option (kernel uses MNT_DETACH to represent it), but this option is not found to use in Lustre (2.1.4-llnl),
+
+and I tried with two mount and the operations "umount /mnt/lustre && rmdir /mnt/lustre" is successful while there is a test (dd in a loop) running
+
+in the other mount "/mnt/lustre2", the kernel is RHEL6 (2.6.32-279.2.1).
+
+Is there any chance the "-l" option to be used implicitly by umount in your environment?
+
+Thanks!
+
+--- Comment (morrone, Tue, 24 Sep 2013 17:12:33 +0000) ---
+Even without reproducing, I should think that we can figure out from the code why umount is exhibiting lazy behavior.
+
+Obviously the unmount is not complete until ll_put_super is called and Lustre prints that "Unmounted lsa-client" message.  However the umount command returns well before that.  Is that not a bug?
+
+--- Comment (hongchao.zhang, Tue, 24 Sep 2013 11:16:41 +0000) ---
+the mnt_count of the vfs_mount used by Lustre should be not dropped to zero during umount, and it could be used by some other process, for the log
+
+"2013-09-13 15:18:11 Lustre: Unmounted lsa-client" will be outputted in ll_put_super (there is no other kernel thread to call).
+
+will try to reproduce it with Lustre-2.1.4-5chaos.
+
+--- Comment (morrone, Tue, 24 Sep 2013 00:46:38 +0000) ---
+There are lustre processes listed, of course, but they all looked like the normal contingent of processes, waiting for something to work on.  The only one that might be interesting is this:
+
+PID: 5833   TASK: ffff8802cec68040  CPU: 3   COMMAND: "flush-lustre-2"
+ #0 [ffff8802b33c7ce0] schedule at ffffffff8150d6e2
+ #1 [ffff8802b33c7da8] schedule_timeout at ffffffff8150e522
+ #2 [ffff8802b33c7e58] schedule_timeout_interruptible at ffffffff8150e6ce
+ #3 [ffff8802b33c7e68] bdi_writeback_task at ffffffff811ad100
+ #4 [ffff8802b33c7eb8] bdi_start_fn at ffffffff8113c686
+ #5 [ffff8802b33c7ee8] kthread at ffffffff81096c76
+ #6 [ffff8802b33c7f48] kernel_thread at ffffffff8100c0ca
+
+There is certainly traffic in the lustre logs that I dumped, but nothing that appeared to be for the filesystem in question.  As far as I can tell it was all related to the other filesystem (which was in use by an application).
+
+--- Comment (hongchao.zhang, Mon, 16 Sep 2013 10:51:07 +0000) ---
+Hi Chris,
+
+Is there any process related to Lustre that was processing something in the output of "foreach bt"?
+
+can you have any chance to get the debug log while waiting umount to complete?
+
+Thanks
+
+--- Comment (pjones, Sun, 15 Sep 2013 03:30:43 +0000) ---
+Hongchao
+
+Could you please help with this one?
+
+Thanks
+
+Peter

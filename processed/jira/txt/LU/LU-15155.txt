@@ -1,0 +1,83 @@
+Key:        LU-15155
+Summary:    Add lock request to readahead
+Link:       https://jira.whamcloud.com/browse/LU-15155
+Type:       Improvement
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Patrick Farrell
+Reporter:   Patrick Farrell
+Created:    Sat, 23 Oct 2021 21:14:53 +0000
+Updated:    Thu, 25 Apr 2024 03:01:00 +0000
+Labels:     readahead
+Links:      Related: is related to LU-17755; Related: is related to LU-15100
+
+--- Description ---
+Currently, readahead will not request an LDLM lock if it
+
+encounters a region without one. This causes it to take
+
+misses and can confuse the readahead state as well.
+
+Not requesting locks for readahead is an artifact of the
+
+idea that readahead is an optional optimization, but it's
+
+almost as important as full reads/writes from userspace,
+
+and we should request locks for it.
+
+This will help cut down misses when starting to read a new
+
+file, which is particularly helpful in tests, where total
+
+I/O is small and the extra misses make it hard to predict
+
+behavior.
+
+The benefit can be seen in the test changes - miss counts
+
+are reduced because stripe count no longer factors in, and
+
+we can reenable async readahead because it no longer fails
+
+due to this (leading to unpredictable numbers of misses).
+
+--- Comment (adilger, Sun, 24 Oct 2021 17:24:15 +0000) ---
+I'm not against doing opportunistic read locking in the case where the client is properly doing readahead.  If the client has a full-object lock on the current stripe, or al least the lock was expanded by one OST to cover an extent more than one stripe size, then it seems likely that it can get full-object locks for the other stripes as well (ie. there is no contention on the file, or at least not that region. 
+
+I do find it a bit odd that there wouldn't be an initial glimpse for all stripes to get locks for all stripes at open time?  I've found that annoying in the write case, that the client glimpses all of the stripe locks in PR mode, only to have to cancel and refresh them in PW mode immediately. I have a prototype PW glimpse patch when files are opened for write that I should push for that.
+
+--- Comment (paf0186, Sun, 24 Oct 2021 13:28:34 +0000) ---
+Sorry, I just realized I’m wrong about one thing in there and it matters.
+
+Lockahead locks are usually an async non-blocking (non-cancelling really) lock request.  It’s the async part that I don’t think is so good here - it means we still have to deal with all of that complex miss behavior.  But we can also just do synchronous non-blocking.
+
+If we did non-blocking, I’d also need to add something so we only requested it once per readahead, so we didn’t request it (and fail) for every page in a region.
+
+But yeah - this being a problem is based around a workload where there’s naturally a high degree of conflict and readahead is being activated but failing to catch a pattern.
+
+--- Comment (paf0186, Sun, 24 Oct 2021 13:21:55 +0000) ---
+Well, so the IOR case is going to be fine - we only request locks for regions we desire to read (with readahead), and shared IOR will be strided.  Readahead picks up the strided pattern and asks for locks on those regions.
+
+The idea of contention presumes a mixed read-write workload and one where readahead isn’t predicting correctly.  If it’s predicting correctly, then we’re asking for locks slightly early but no more than that.
+
+So I think this would only apply for a random mixed read write workload where readahead is still triggering but wrongly.  That would be made worse by this.
+
+But otherwise, if readahead is working correctly, we’re only asking for locks on regions are going to read anyway.
+
+To be fair about this - I came up with this partly because it makes it much easier to write the tests.  Otherwise you end up taking misses on the first access to each stripe with a very complex relationship between misses, stripe count, and access pattern.  (When read size is >> stripe size, it can be multiple misses from the first access.  It is very complicated.)
+
+Taking a lockahead type lock wouldn’t avoid that, and I disliked the idea of doing something special for the tests so they’d have locks in place.
+
+I first really noticed this limitation when I realized it hobbled whole file read testing - we’d read twice from the first stripe and then be unable to pull in the rest with readahead because we lacked the locks.
+
+--- Comment (adilger, Sun, 24 Oct 2021 06:54:38 +0000) ---
+One of the reasons that readahead does not take DLM locks is to avoid contention in the case of shared file access. In the uncontended read case, the client should already have prefetched the full-file read locks due to a glimpse, or at worst one serial read from each stripe of the file (though that could be improved). If the client doesn't have a local lock, there is probably some reason for that?
+
+In particular, when IOR is doing interleaved reads, this can result in client nodes prefetching far too much data, when each client is only intended to read a part of the file. That itself may be an artifact of our readahead algorithm being too aggressive in expanding the window ahead of the actual reader?
+
+In order for this to work properly, I think we need it to be a bit smarter than just "always get a read lock when doing readahead".  As a starting point, does it make sense to prefetch a limited lockahead lock if the client has detected readahead?  In that case, if the client gets the lock it is because there is no contention, yet it avoids canceling write locks on other clients if they are still writing to the file.
+
+--- Comment (paf0186, Sat, 23 Oct 2021 21:16:19 +0000) ---
+https://review.whamcloud.com/45317/

@@ -1,0 +1,210 @@
+Key:        LU-9627
+Summary:    Bad small-file behaviour even when local-only and on RAM-FS
+Link:       https://jira.whamcloud.com/browse/LU-9627
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Martin Schröder
+Created:    Fri, 9 Jun 2017 17:13:28 +0000
+Updated:    Fri, 21 Jan 2022 01:02:25 +0000
+Links:      Related: is related to  LU-10176; Related: is related to  LU-5603; Related: is related to  LU-10619; Related: is related to  LU-9409
+Attachments: test.py
+
+--- Description ---
+Hi everyone, I have noticed a curiously bad small-file creation behaviour on Lustre 2.9.55.
+
+I know that Lustre is inefficient when handling large amounts of small files and profits from the Metadata Servers running on SSDs – but while exploring just how bad this is, I found something curious.
+
+My use case is simple: Create 50.000 40-byte files in a single directory. The "test.py" script below will do just that.
+
+ 
+
+Since I wanted to find the theoretical speed of Lustre, I used the following setup:
+
+	A single server played the role of MGS, MDT, OST and Client.
+
+	All data storage happens via ldiskfs on a ramdisk
+	
+		16GB Metadata
+
+		48GB Object Data
+
+	
+	
+
+	All network accesses happen via TCP loopback
+
+The final Lustre FS looks like this:
+
+ 
+
+[-bash-4.3]$ lfs df -h
+UUID bytes Used Available Use% Mounted on
+ram-MDT0000_UUID 8.9G 46.1M 8.0G 1% /mnt/ram/client[MDT:0]
+ram-OST0000_UUID 46.9G 53.0M 44.4G 0% /mnt/ram/client[OST:0]
+filesystem_summary: 46.9G 53.0M 44.4G 0% /mnt/ram/client
+
+ 
+
+Unfortunately, when running the test-script (which needs ~5 seconds on a local disk), I instead get these abysmal speeds:
+
+[-bash-4.3]$ ./test.py /mnt/ram/client
+2017-06-09 18:49:56,518 [INFO ] Creating 50k files in one directory...
+2017-06-09 18:50:50,437 [INFO ] Reading 50k files...
+2017-06-09 18:51:09,310 [INFO ] Deleting 50k files...
+2017-06-09 18:51:20,604 [INFO ] Creation took: 53.92 seconds
+2017-06-09 18:51:20,604 [INFO ] Reading took: 18.87 seconds
+2017-06-09 18:51:20,604 [INFO ] Deleting took: 11.29 seconds
+
+This tells me, that there is a rather fundamental performance issue within Lustre – and that it has nothing to do with the disk or network latency.
+
+That – or my test script is broken – but I do not think it is.
+
+ 
+
+If you're curious, here's how I set up the test scenario:
+
+mkdir -p /mnt/ram/disk
+mount -t tmpfs -o size=64G tmpfs /mnt/ram/disk
+dd if=/dev/zero of=/mnt/ram/disk/mdt.img bs=1M count=16K
+dd if=/dev/zero of=/mnt/ram/disk/odt.img bs=1M count=48K
+losetup /dev/loop0 /mnt/ram/disk/mdt.img
+losetup /dev/loop1 /mnt/ram/disk/odt.img
+mkfs.lustre --mgs --mdt --fsname=ram --backfstype=ldiskfs --index=0 /dev/loop0
+mkfs.lustre --ost --fsname=ram --backfstype=ldiskfs --index=0 --mgsnode=127.0.0.1@tcp0 /dev/loop1
+
+mkdir -p /mnt/ram/mdt
+mount -t lustre -o defaults,noatime /dev/loop0 /mnt/ram/mdt
+mkdir -p /mnt/ram/ost
+mount -t lustre -o defaults,noatime /dev/loop1 /mnt/ram/ost
+
+mkdir -p /mnt/ram/client
+mount -t lustre 127.0.0.1@tcp0:/ram /mnt/ram/client
+chmod 1777 /mnt/ram/client
+
+ 
+
+Thanks!
+
+--- Comment (mhschroe, Mon, 19 Jun 2017 08:44:11 +0000) ---
+Hi Andreas.
+
+Thanks for the reply.
+
+Please note that I am indeed using ldiskfs already. The flow is:
+
+	I create a tmpfs file system and mount it under "/mnt/ram/disk"
+
+	I create two zero-filled files under that path: mdt.img and odt.img
+
+	These two files are loop-mounted into /dev/loop[0,1]
+
+	Each loop-mount is then formatted with ldiskfs and used by Lustre as either metadata or data storage target.
+
+So the effect is that each I/O operation goes like this:
+
+	ldiskfs --> loopmount --> tmpfs --> RAM
+
+ 
+
+Since the overhead of loopmount and tmpfs is virtually negligible – and the machine has 196 GB of RAM so does no swapping – the only speed block can be ldiskfs or Lustre.
+
+Just for comparison's sake, I have created the same loop, but used an EXT4 file system directly – with the same settings as used by Lustre.
+
+[bash-4.3]# mount -t tmpfs -o size=64G tmpfs /mnt/ram/disk
+[bash-4.3]# dd if=/dev/zero of=/mnt/ram/disk/odt.img bs=1M count=48K
+49152+0 records in
+49152+0 records out
+51539607552 bytes (52 GB) copied, 20.0891 s, 2.6 GB/s
+
+[bash-4.3]# losetup /dev/loop0 /mnt/ram/disk/odt.img
+[bash-4.3]# mke2fs -j -b 4096 -L ram:OST0000  -J size=400 -I 256 -i 69905 -q -O extents,uninit_bg,dir_nlink,quota,huge_file,flex_bg -G 256 -E resize="4290772992",lazy_journal_init -F /dev/loop0
+
+[bash-4.3]# mount -t ext4 -o rw,noatime /dev/loop0 /mnt/ram/ost
+[bash-4.3]# df -h /mnt/ram/ost
+Filesystem Size Used Avail Use% Mounted on
+/dev/loop0 48G 52M 45G 1% /mnt/ram/ost
+[bash-4.3]# chmod 1777 /mnt/ram/ost
+
+Then, I ran the performance test again:
+
+[bash-4.3]$ ./test.py /mnt/ram/ost
+[...]
+2017-06-19 10:37:52,651 [INFO ] Creation took: 2.11 seconds
+2017-06-19 10:37:52,651 [INFO ] Reading took: 0.86 seconds
+2017-06-19 10:37:52,651 [INFO ] Deleting took: 0.80 seconds
+
+As you can see, EXT4 adds about 1 second to the file creation speed, compared to "raw" tmpfs (2.11 sec vs. 1.23 sec).
+
+ Therefore, the write-amplification of 40 byte -> 4096 byte and other EXT4 overheads are present, but negligible.
+
+ 
+
+ The drastic, massive slow-down has to be because of something inside Lustre. Some kind of internal latency that gets added to every single read and write. It could be the LNET network layer, but since the packets never leave the machine, I could not imagine that this alone leads to a 10-20x slowdown.
+
+--- Comment (adilger, Fri, 16 Jun 2017 20:49:31 +0000) ---
+Martin, thank you for your continued investigation of this issue.  One note is that tmpfs provides the best concievable performance possible for such a workload, since there is virtually no overhead for this filesystem.  A more useful comparison would be formatting a ram-backed ldiskfs filesystem to see what the performance comparison is to the tmpfs filesystem.  That would expose how much of the overhead is in ldiskfs (locking, write amplification from 40->4096 byte blocks, journaling, etc), compared to how much is in the client+ptlrpc+MDS.  
+
+With ldiskfs there is a relatively new option called "inline_data" that allows storing the data of extremely small files directly in the inode.  While Lustre doesn't directly support this feature today, it may be useful for real-world usage with DoM to minimize space usage on the MDT as well as avoiding the extra IOPS/write amplification caused by using a full filesystem block for small files.  In Lustre 2.10 the default inode size has increased to 1024 bytes (from 512 bytes previously), which may also be a contributing factor in this benchmark, but will allow files up to ~768 bytes to be stored directly in the inode.
+
+--- Comment (mhschroe, Mon, 12 Jun 2017 14:38:08 +0000) ---
+Hi everyone.
+
+ 
+
+I have now built and deployed the "Data-on-MDT" feature, and – as expected – it indeed improves the timing by about 50%.
+
+[-bash-4.3]$ ./test.py /mnt/ram/client
+[...]
+2017-06-12 16:25:22,025 [INFO ] Creation took: 31.36 seconds
+2017-06-12 16:25:22,025 [INFO ] Reading took: 12.36 seconds
+2017-06-12 16:25:22,025 [INFO ] Deleting took: 8.38 seconds
+
+ 
+
+While this is good news, it still means that something in the code is producing a slow-down of a factor of 20.
+
+As mentioned before, that is weird since the two main suspects – disk speed (6GByte/s) and network latency (0.01ms) – have been removed as much as possible.
+
+If we assume that the network RTT would be the main slow-down compared to direct disk access, that would only account for 500ms (50k x 0.01) delay. So even with a factor of 10, I'd only expect ~5 seconds delay – but instead we see 30 seconds of delay.
+
+Curios.
+
+--- Comment (mhschroe, Mon, 12 Jun 2017 08:31:59 +0000) ---
+Andreas.
+
+ 
+
+Yes, I am aware of that planned feature. Thing just is: I do not believe it will actually improve the situation I created here.
+
+In my test, all network connection is local-loopback only – so round-trip-times for any network packet sent is in the microseconds.
+
+Additionally, all data is kept in memory, so all accesses should happen with a latency of nanoseconds (and a datarate of GB/s – not that that matters with 40 byte files.)
+
+ 
+
+So I'd expect this test to run in no time at all. I did a test on the raw ramdisk, and the test script passes in a bit over 2 seconds:
+
+[-bash-4.3]$ mount | grep ram
+tmpfs on /mnt/ram/disk type tmpfs (rw,size=1G)
+
+[-bash-4.3]$ ./test.py /mnt/ram/disk/
+2017-06-12 10:25:12,260 [INFO ] Creating 50k files in one directory...
+2017-06-12 10:25:13,489 [INFO ] Reading 50k files...
+2017-06-12 10:25:14,349 [INFO ] Deleting 50k files...
+2017-06-12 10:25:14,678 [INFO ] Creation took: 1.23 seconds
+2017-06-12 10:25:14,678 [INFO ] Reading took: 0.86 seconds
+2017-06-12 10:25:14,678 [INFO ] Deleting took: 0.33 seconds
+
+As far as I can tell, all that the Data-on-MDT feature does, is remove exactly one network connection to the OST per file creation. I fail to see how this could improve the time by more than a factor of 2 (because 2 conns get turned into 1 conn).
+
+So I'd expect the timing to fall from 85 seconds to ~40 seconds – which would still be 20x slower than raw access.
+
+ 
+
+But well, just for completeness' sake, I'll give it a try today and post the results.
+
+--- Comment (adilger, Mon, 12 Jun 2017 08:09:50 +0000) ---
+We are working on a feature for 2.11 to improve small file performance - Data-on-MDT in LU-3825. If you are interested to test this new feature (still under development), the last patch in the series is https://review.whamcloud.com/#/c/23010/24 currently.

@@ -1,0 +1,179 @@
+Key:        LU-7330
+Summary:    spinlock lockup on ldlm blp_lock in ldlm_bl_* threads
+Link:       https://jira.whamcloud.com/browse/LU-7330
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Niu Yawei
+Reporter:   Christopher Morrone
+Created:    Fri, 23 Oct 2015 00:39:57 +0000
+Updated:    Fri, 27 Jan 2017 22:38:46 +0000
+Resolved:   Wed, 11 Nov 2015 18:14:48 +0000
+Labels:     llnl, llnlfixready
+
+--- Description ---
+Our system administrators have reported that Lustre clients on our big BG/Q system are locking up due to lustre.  There are some softlockups, and then the kernel reports a "spinlock lockup" and dumps backtraces for many processes that are all stuck spinning on the same ldlm blp_lock.
+
+Many ldlm_bl_* threads are all spinning here:
+
+_raw_spin_lock
+_spin_lock
+ldlm_bl_get_work
+ldlm_bl_thread_main
+
+Meanwhile many sysiod processes (the I/O node portion of the I/O forwarding system on BG/Q) are stuck in either a read or write system call path that go through shrink_slab() and get stuck on the same spin lock.  Here is an example backtrace for a read case:
+
+_raw_spin_lock
+_spin_lock
+_ldlm_bl_to_thread
+ldlm_bl_to_thread
+ldlm_cancel_lru
+ldlm_cli_pool_shrink
+ldlm_pool_shrink
+ldlm_pools_shrink
+shrink_slab
+do_try_free_pages
+try_free_pages
+__alloc_pages_nodemask
+generic_file_aio_read
+vvp_io_read_start
+cl_io_start
+cl_io_loop
+ll_file_io_generic
+ll_file_aio_read
+ll_file_read
+vfs_read
+sys_read
+
+Crash dumps are unfortunately not available on this system.  That is about ll the information that I can currently get.
+
+Those clients are running lustre 2.5.4-4chaos.
+
+--- Comment (adilger, Tue, 29 Mar 2016 05:33:12 +0000) ---
+Just to restate the workaround for this problem (so that it is more easily visible) is to add options ptlrpc ldlm_num_threads=16 to /etc/modprobe.d/lustre.conf to avoid the problem until upgrading to a release in which this has been fixed.
+
+--- Comment (jgmitter, Wed, 11 Nov 2015 18:14:49 +0000) ---
+Landed for 2.8
+
+--- Comment (gerrit, Wed, 11 Nov 2015 15:53:52 +0000) ---
+Oleg Drokin (oleg.drokin@intel.com) merged in patch http://review.whamcloud.com/17026/
+
+Subject: LU-7330 ldlm: fix race of starting bl threads
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: ebda41d8de7956f19fd27f86208c668e43c6957c
+
+--- Comment (gerrit, Tue, 3 Nov 2015 07:04:39 +0000) ---
+Niu Yawei (yawei.niu@intel.com) uploaded a new patch: http://review.whamcloud.com/17026
+
+Subject: LU-7330 ldlm: fix race of starting bl threads
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 187c285188130bb670c9f4daa38a67c35f064046
+
+--- Comment (niu, Tue, 3 Nov 2015 04:57:37 +0000) ---
+I scrutinized the code and looks the only possible reason of so many bl threads being started is the racy thread starting code itself.
+
+When there are lots of unused locks cached on client and kernel senses memory pressure, there could be lots bl work items being generated and processed by the bl threads, and if several bl threads running in to the ldlm_bl_thread_need_create() in parallel, lot more thread could be created mistakenly (it could exceed the blp_max_threads). Probably it caused the spinlock lockup problem as well? (too many threads contending on the blp_lock)
+
+I'll post a patch to fix the problem of forking too many threads exceeding limit (along with the wrong thread name) first. That could fix the spinlock lockup too.
+
+limit the maximum number of ldlm_bl_* threads on client namespaces to a lower number like 16 instead of 128, since clients don't handle many blocking callbacks compared to servers, and these numbers are per CPT.
+
+Andreas, usually server sends blocking callbacks to client, so client should have more bl callbacks to handle, right? In addition, the bl threads on client needs to handle the unused lock cancel, so I don't think we should decrease the maximum thread number for client. (it's a per module parameter now, and bl threads are shared by all namespaces)
+
+--- Comment (adilger, Mon, 26 Oct 2015 22:51:53 +0000) ---
+I think there are three items that need to be fixed here:
+
+	figure out what is triggering so many ldlm_bl_* threads being started.
+
+	fix the thread naming problem.  Creating the thread name before calling kthread_run() is no longer needed, it should be possible to pass the format string and thread index to kthread_run() directly, if it didn't cause a racy startup.  It may be that we don't really want to have thread forking be so efficient
+
+	limit the maximum number of ldlm_bl_* threads on client namespaces to a lower number like 16 instead of 128, since clients don't handle many blocking callbacks compared to servers, and these numbers are per CPT.
+
+--- Comment (adilger, Mon, 26 Oct 2015 22:22:47 +0000) ---
+[ Comments from the other ticket, which cannot be made public ]
+
+Users that run jobs interactively and when they kill their jobs with Ctrl-C, they find that some nodes will end up with 100-200 LDLM processes. For comparison, freshly rebooted nodes have only 15-25 ldlm processes. The user checked and confirmed that after the Ctrl-C, there are no more processes of the user job remaining, nor are fuser and lsof reporting any open files. It is therefore not clear what is driving up the LDLM process count.
+
+There is one problem that is shown by the stack traces, which may only be cosmetic, but may also be a sign of a larger problem. There are a large number of threads named ldlm_bl_38, and in fact most of the ldlm_bl_* threads have duplicate names. That in itself is harmless (though confusing while debugging), but may indicate that there is some race condition when starting up these threads that causes so many to be started in such a short time.
+
+static int ldlm_bl_thread_start(struct ldlm_bl_pool *blp)
+{
+        struct ldlm_bl_thread_data bltd = { .bltd_blp = blp };
+        struct task_struct *task;
+
+        init_completion(&bltd.bltd_comp);
+        bltd.bltd_num = atomic_read(&blp->blp_num_threads);
+        snprintf(bltd.bltd_name, sizeof(bltd.bltd_name) - 1,
+                "ldlm_bl_%02d", bltd.bltd_num);
+        task = kthread_run(ldlm_bl_thread_main, &bltd, bltd.bltd_name);
+        if (IS_ERR(task)) {
+                CERROR("cannot start LDLM thread ldlm_bl_%02d: rc %ld\n",
+                       atomic_read(&blp->blp_num_threads), PTR_ERR(task));
+                return PTR_ERR(task);
+        }
+        wait_for_completion(&bltd.bltd_comp);
+
+        return 0;
+}
+
+The naming problem is clearly in the code above - it picks the thread name before actually starting the thread and incrementing the counter.
+
+I counted about 200 threads started on this node, none of which were doing anything. It appears that the check for the number of running threads is also racy:
+
+/* Not fatal if racy and have a few too many threads */
+static int ldlm_bl_thread_need_create(struct ldlm_bl_pool *blp,
+                                      struct ldlm_bl_work_item *blwi)
+{
+        int busy = atomic_read(&blp->blp_busy_threads);
+
+        if (busy >= blp->blp_max_threads)
+                return 0;
+
+        if (busy blp_num_threads))
+                return 0;
+        :
+        :
+}
+
+and could be improved.  I agree a small number of threads too many is not harmful, but it seems that this can go badly wrong in some cases.
+
+There is a module parameter that could be used to limit the number of threads, to add in /etc/modprobe.d/lustre.conf:
+
+options ptlrpc ldlm_num_threads=16
+
+which should reduce the number of threads significantly, but shouldn't cause any problems for clients since they don't handle many of these RPCs at one time.  Note that this tunable may only fix the "symptom" (many LDLM threads) and not the root cause of the hang. It's hard to know for sure what is causing this problem since there are no error messages and the threads themselves are not doing anything either.
+
+After implementing the options ptlrpc ldlm_num_threads=16 module option, the site has not experienced any further problems.
+
+--- Comment (pjones, Mon, 26 Oct 2015 17:21:31 +0000) ---
+Niu
+
+Could you please assist with this issue?
+
+Thanks
+
+Peter
+
+--- Comment (adilger, Sat, 24 Oct 2015 07:22:22 +0000) ---
+It sounds as if this may be a similar problem. The thread names are not important for their functionality, but the duplicate names do imply that many of the threads started around the same time. You could try the module option, but that won't take effect  until the next remount.
+
+--- Comment (morrone, Fri, 23 Oct 2015 23:25:24 +0000) ---
+The "spinlock lockup" backtraces are showing in the 50+ threads, and the thread numbers are up in the 120s.  I am also seeing multiple ldlm_bl_* threads duplicate names.
+
+On one node that is not currently locked up, there are 160 ldlm_bl_* threads with only 72 unique names between them.
+
+--- Comment (adilger, Fri, 23 Oct 2015 17:12:27 +0000) ---
+When the clients lock up, do you know how many ldlm_bl_* threads are running? There was another issue reported recently about too many ldlm_bl threads being started when a process is interrupted, but setting options ptlrpc ldlm_num_threads=16 has avoided the problem.

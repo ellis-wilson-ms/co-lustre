@@ -1,0 +1,69 @@
+Key:        LU-18865
+Summary:    Nodemap: Squashed PROJID not set on MDT inode
+Link:       https://jira.whamcloud.com/browse/LU-18865
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Marc Vef
+Created:    Fri, 28 Mar 2025 15:22:06 +0000
+Updated:    Mon, 31 Mar 2025 15:53:40 +0000
+Labels:     admin, nodemap, quota
+
+--- Description ---
+When using nodemaps, a squashed projid causes the projid to be out of sync on the MDT inode and OST objects. This can be reproduced with a client associated with a non-privileged nodemap that has the following fields set, most notably, no projid mapping and map_mode set to all:
+
+nodemap.tenant1.admin_nodemap=1
+nodemap.tenant1.audit_mode=1
+nodemap.tenant1.deny_unknown=0
+nodemap.tenant1.deny_mount=0
+nodemap.tenant1.exports=[]
+nodemap.tenant1.fileset=
+nodemap.tenant1.forbid_encryption=0
+nodemap.tenant1.id=3
+nodemap.tenant1.idmap=
+[
+ { idtype: uid, client_id: 1003, fs_id: 11000 },
+ { idtype: uid, client_id: 1004, fs_id: 11001 },
+ { idtype: gid, client_id: 1003, fs_id: 11000 }
+]
+nodemap.tenant1.map_mode=all
+nodemap.tenant1.offset=
+{
+ start_uid: 0,
+ limit_uid: 0,
+ start_gid: 0,
+ limit_gid: 0,
+ start_projid: 0,
+ limit_projid: 0
+}
+nodemap.tenant1.ranges=
+[
+ { id: 5, start_nid: 192.155.155.50@tcp, end_nid: 192.155.155.50@tcp }
+]
+nodemap.tenant1.rbac=file_perms,dne_ops,quota_ops,byfid_ops,chlg_ops,fscrypt_admin,server_upcall,ignore_root_prjquota,hsm_ops
+nodemap.tenant1.readonly_mount=0
+nodemap.tenant1.sepol=
+nodemap.tenant1.squash_gid=65535
+nodemap.tenant1.squash_projid=65535
+nodemap.tenant1.squash_uid=65535
+nodemap.tenant1.trusted_nodemap=0
+
+The PROJID 42 was set on the somedir directory from an admin=1 trusted=1 client via lfs project -s -p 42 /lustre/somedir. The issue can be reproduced by creating and writing to a new file from the non-privileged client: dd if=/dev/zero of=/lustre/somedir/somefile bs=1M count=32
+
+After writing to a file, debugfs reports the PROJID 42 on the MDT inode and PROJID 65535 on the OST object(s). Note that looking at the PROJIDs on the privileged client via lfs project only presents the value from the MDT inode, while lfs quota looks at the value from the OST objects. It is therefore not clear to the administrator that somefile consumes space for PROJID 65535.
+
+After some investigation, the MDT inode seems to use an incorrect value in this case. This is because on file creation, the MDS inherits the value from the parent directory and sets it for the new MDT inode (without considering the client's nodemap). And since the MDS is part of a trusted nodemap, it uses the fs_id (in nodemap mapping language), i.e., PROJID 42, while returning the client_id, i.e., PROJID 65535, to the client. As a result, the client only sees the client_id as the squashed PROJID and must send the squashed PROJID during OST_WRITE to an OST, which it uses to write to the OST object, causing the inconsistency. In summary, it seems that this PROJID mismatch is a result of the MDT not considering the client's nodemap (on MDT inode creation, inheriting the value from the parent inode) while the OST does (taking the PROJID from the client).
+
+Note that this situation also occurs when no PROJID is set on the directory (or inheritance is disabled)  in which case the MDT inode uses the PROJID 0 and the OST object uses the value 65535.
+
+--- Comment (JIRAUSER19288, Mon, 31 Mar 2025 15:53:40 +0000) ---
+Thanks, Andreas! To clarify, as I realize this may have been unclear: The file is created and written to from the same trusted=0 client. Otherwise, I would agree on the point you raised where, e.g., a trusted=1 client "a" creates the file while a trusted=0 client "b" writes to the file, which could also cause this PROJID mismatch. In the same trusted=0 client case, I'm not sure this is a misconfiguration on the nodemap. IIUC, if the nodemap "map_mode" is set to "all" (or projid) and the client cannot use the PROJID (e.g., 42) set on the directory, the PROJID should be squashed. This is happening from a trusted=0 client's point of view regarding existing files. However, since such a client could still create/write to a file in that directory even if no mapping for the PROJID exists, the MDT inode and OST object PROJID should both be squashed.
+
+So, it seems the issue is only that the PROJID is not mapped on the MDT side when a file is created. I haven't looked into this in great detail (I don't think this is a huge priority), but it looks like this is because UID/GID and PROJID are handled differently for this RPC on the MDT. From what I could gather, mdd_dir.c:mdd_create() uses the incoming mapped UID/GID while it takes the PROJID from the parent directory (which is the server-side ID unrelated to the client's nodemap).
+
+Another way to look at this is how a trusted=0 admin=1 client could set a PROJID on an existing file. Admin only so it can use lfs project. Here with lfs project -p 42 /lustre/somedir/somefile, the PROJID is squashed and set on the MDT inode (and asynchronously propagated to the OST objects). I might be missing something, but it is not clear to me why the MDT shouldn't map the PROJID according to the client's nodemap on file creation.
+
+--- Comment (adilger, Fri, 28 Mar 2025 17:19:45 +0000) ---
+Marc, I think this is more a configuration issue than it is a Lustre/PROJID issue.  If you set the PROJID on a trusted=1 node to some value that the client cannot use (e.g. 42) then it makes sense that the OST would squash the PROJID value as dictated by the nodemap ID mapping.  If the nodemap client tried to set the projid to "42" then it would also be squashed on the MDT, or if the file was written by trusted=1 client then the OST objects would not have the squashed PROJID.  This is only happening because of the "split brain" activity between the two domains, and I don't think that would happen under any normal usage scenario.

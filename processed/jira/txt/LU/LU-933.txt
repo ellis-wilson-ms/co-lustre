@@ -1,0 +1,139 @@
+Key:        LU-933
+Summary:    allow disabling the mdc_rpc_lock for performance testing
+Link:       https://jira.whamcloud.com/browse/LU-933
+Type:       Improvement
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Liang Zhen
+Reporter:   Andreas Dilger
+Created:    Fri, 16 Dec 2011 01:57:56 +0000
+Updated:    Sat, 22 Jun 2024 01:04:32 +0000
+Resolved:   Fri, 28 Sep 2012 12:08:38 +0000
+Labels:     opensfs
+Links:      Related: is related to  LU-5319
+
+--- Description ---
+It is desirable to allow disabling the client mdc_
+
+{get,put}
+_rpc_lock() in order to allow clients to send multiple filesystem-modifying RPCs at the same time.  While this would break MDS recovery (due to insufficient transaction slots in the MDS last_rcvd file) it would allow a smaller number of clients to generate a much higher RPC load on the MDS.  This is ideal for MDS/RPC load testing purposes, and can also be used to help evaluate the potential benefits of implementing the multi-slot last_rcvd feature.
+
+A simple mechanism to do this would be to set the client fail_loc to a specific value, which allows the client to multiple metadata-modifying requests at one time.  Some care must be taken when setting and clearing this fail_loc, since it could lead to inconsistencies where mdc_get_rpc_lock() is skipped when the fail_loc is set, but mdc_put_rpc_lock() for that same RPC is run when fail_loc is cleared.
+
+One possibility is something like the following, though there are may others.  This implementation:
+
+	ensures that requests sent when OBD_FAIL_MDC_SEM is turned off do not happen concurrent with other requests
+
+	is race free even in the transition period when OBD_FAIL_MDC_SEM is turned on or ff
+
+struct mdc_rpc_lock {
+        cfs_semaphore_t       rpcl_sem;
+        struct lookup_intent *rpcl_it;
+        int                   rpcl_fakes;
+};
+
+#define MDC_FAKE_RPCL_IT ((void *)0x2c0012bfUL)
+
+static inline void mdc_get_rpc_lock(struct mdc_rpc_lock *lck,
+                                    struct lookup_intent *it)
+{
+        ENTRY;
+        if (it == NULL || (it->it_op != IT_GETATTR && it->it_op != IT_LOOKUP)) {
+                /* This would normally block until the existing request finishes.
+                 * If fail_loc is set it will block until the regular request is
+                 * done, then set rpcl_it to MDC_FAKE_RPCL_IT.  Once that is set
+                 * it will only be cleared when all fake requests are finished.
+                 * Only when all fake requests are finished can normal requests
+                 * be sent, to ensure they are recoverable again. */
+                cfs_down(&lck->rpcl_sem);
+                if (CFS_FAIL_CHECK(OBD_FAIL_MDC_RPCS_SEM)) {
+                        lck->rpcl_it = MDC_FAKE_RPCL_IT;
+                        lck->rpcl_fakes++
+                        cfs_up(&lck->rpcl_sem);
+                } else {
+                        /* This will only happen when the CFS_FAIL_CHECK() was
+                         * just turned off but there are still requests in progress.
+                         * Wait until they finish.  It doesn't need to be efficient
+                         * in this extremely rare case, just have low overhead in
+                         * the common case when it isn't true. */
+                        while (unlikely(lck->rpcl_it == MDC_FAKE_RPCL_IT))
+                                cfs_schedule_timeout(cfs_time_seconds(1));
+                        LASSERT(lck->rpcl_it == NULL);
+                        lck->rpcl_it = it;
+                }
+        }
+}
+
+static inline void mdc_put_rpc_lock(struct mdc_rpc_lock *lck,
+                                    struct lookup_intent *it)
+{
+        if (it == NULL || (it->it_op != IT_GETATTR && it->it_op != IT_LOOKUP)) {
+                if (lck->rpcl_it == MDC_FAKE_RPCL_IT) {
+                        cfs_down(&lck->rpcl_sem);
+                        LASSERTF(lck->rpcl_fakes > 0, "%d\n", lck->rpcl_fakes);
+                        if (--lck->rpcl_fakes == 0) {
+                                lck->rpcl_it = NULL;
+                        }
+                } else {
+                        LASSERTF(it == lck->rpcl_it, "%p != %p\n", it, lck->rpcl_it);
+                        lck->rpcl_it = NULL;
+                }
+                cfs_up(&lck->rpcl_sem);
+        }
+        EXIT;
+}
+
+--- Comment (adilger, Thu, 14 Nov 2013 11:46:00 +0000) ---
+1073743876 = 0x40000804, and 2052 = 0x804 = OBD_FAIL_MDC_RPCS_SEM.  The 0x40000000 value is CFS_FAILED, which means that the OBD_FAIL_MDC_RPCS_SEM check was hit at least once.
+
+The default value for fail_loc is "0", which means no failures are being injected into the code.  Since the cfs_fail_loc variable is in the libcfs code, it will only be reset if you unmount the client and remove all of the Lustre modules.
+
+--- Comment (gabriele.paciucci, Thu, 14 Nov 2013 10:51:54 +0000) ---
+which is the default value for fail_loc? I have remounted the client and I have received the same value.
+
+--- Comment (gabriele.paciucci, Thu, 14 Nov 2013 10:05:54 +0000) ---
+Hi,
+
+I have received two different behaviors on two identical clients:
+
+root@pilatus11:~# rpm -qa | grep lustre
+
+lustre-client-modules-2.4.1-3.0.80_0.7_default
+
+lustre-client-2.4.1-3.0.80_0.7_default
+
+root@pilatus11:~# /usr/sbin/lctl set_param fail_loc=0x804
+
+fail_loc=0x804
+
+root@pilatus11:~# /usr/sbin/lctl get_param fail_loc
+
+fail_loc=1073743876
+
+this is for another client:
+
+root@pilatus31:~# rpm -qa | grep lustre
+
+lustre-client-modules-2.4.1-3.0.80_0.7_default
+
+lustre-client-2.4.1-3.0.80_0.7_default
+
+root@pilatus31:~# lctl set_param fail_loc=0x804
+
+fail_loc=0x804
+
+root@pilatus31:~# lctl get_param fail_loc
+
+fail_loc=2052
+
+--- Comment (jlevi, Fri, 28 Sep 2012 12:08:38 +0000) ---
+Please let me know if additional work is needed and I will reopen this ticket.
+
+--- Comment (liang, Fri, 3 Feb 2012 11:07:34 +0000) ---
+I've posted a patch at here: http://review.whamcloud.com/#change,2084
+
+it's just from code sample of Andreas with some small adjustments.
+
+--- Comment (adilger, Fri, 16 Dec 2011 02:01:55 +0000) ---
+Note that the reason I picked fail_loc as the mechanism for setting this is because this is hard for a user to accidentally think is "just a tunable".  If there was a tunable like mdc.*.write_rpcs_in_flight someone might set this and find improved performance, and not realize that it breaks recovery even if that were documented in the manual.

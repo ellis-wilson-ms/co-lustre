@@ -1,0 +1,191 @@
+Key:        LU-16674
+Summary:    read contention on "job_stats" "/proc" file
+Link:       https://jira.whamcloud.com/browse/LU-16674
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Etienne Aujames
+Reporter:   Etienne Aujames
+Created:    Mon, 27 Mar 2023 19:00:28 +0000
+Updated:    Fri, 7 Jul 2023 13:28:07 +0000
+Resolved:   Tue, 18 Apr 2023 12:15:11 +0000
+Attachments: sanity_205g_cleanup_300_with_patch.report, sanity_205g_cleanup_300_with_patch.svg, sanity_205g_cleanup_300_without_patch.report, sanity_205g_cleanup_300_without_patch.svg
+
+--- Description ---
+At the CEA, we observed a lot of contention on job_stats with a lot of jobs.
+
+In some critical cases (incorrect job_name pattern or a lot of read accesses on job_stats), this could lead the target to freeze.
+
+When reading the proc file "job_stats" a read lock "ojs_lock" is taken to read the list of job. While reading this file, no job stat entry can be added or removed, so the target processes must wait for the write lock.
+
+I think we can avoid those kinds of contention:
+
+Save the last job read
+
+For each read, the processes go through the entire list of jobs to get the entry corresponding to the file offset.
+
+static void *lprocfs_jobstats_seq_start(struct seq_file *p, loff_t *pos) 
+.....
+off--;                                                                  
+list_for_each_entry(job, &stats->ojs_list, js_list) {                   
+        if (!off--)                                                     
+                return job;                                             
+
+This could be improved by saving the last job accessed and its corresponding offset.
+
+Use RCU lock instead of rwlock
+
+RCU locking to protect the job stat list should be contention free for the read accesses.
+
+--- Comment (gerrit, Wed, 24 May 2023 08:43:32 +0000) ---
+"Etienne AUJAMES " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/51111
+
+Subject: LU-16674 obdclass: optimize job_stats reads
+
+Project: fs/lustre-release
+
+Branch: b2_12
+
+Current Patch Set: 1
+
+Commit: 7a00bdabe886e62c711944a12ff2a0c97fa51a96
+
+--- Comment (gerrit, Tue, 23 May 2023 16:15:52 +0000) ---
+"Etienne AUJAMES " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/51100
+
+Subject: LU-16674 obdclass: optimize job_stats reads
+
+Project: fs/lustre-release
+
+Branch: b2_15
+
+Current Patch Set: 1
+
+Commit: 70013238a55efd6623be9e939f090ee718f9f5e0
+
+--- Comment (pjones, Tue, 18 Apr 2023 12:15:11 +0000) ---
+Landed for 2.16
+
+--- Comment (gerrit, Tue, 18 Apr 2023 03:23:41 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/50459/
+
+Subject: LU-16674 obdclass: optimize job_stats reads
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: c6890a955f89508db46fd8ffbf22b05b145976cd
+
+--- Comment (eaujames, Wed, 29 Mar 2023 12:22:21 +0000) ---
+I have done perf analysis during all sanity test 205g duration (with slow mode 240s), but with job_cleanup_interval to 300s.
+
+perf record -ag -F100
+
+without the patch
+
+For the job stats read processes:
+
+40.22%--seq_read
+        |          
+        |--25.10%--lprocfs_jobstats_seq_start
+        |          
+         --14.43%--lprocfs_jobstats_seq_show
+
+For the mdt kernel threads:
+
+--6.68%--mdt_reint_setattr
+          |          
+           --6.51%--mdt_counter_incr
+                     |          
+                      --6.50%--lprocfs_job_stats_log
+                                |          
+                                 --6.49%--_raw_write_lock
+                                           |          
+                                            --6.45%--__write_lock_failed
+
+with the patch
+
+For the job stats read processes:
+
+--50.68%--seq_read
+          |          
+           --49.75%--lprocfs_jobstats_seq_show
+                     |          
+                     |--40.04%--seq_printf
+
+lprocfs_jobstats_seq_start() is not visible because it does not walk the list or waits for read lock.
+
+The mdt kernel threads are not in the perf report: no contention on ojs_lock (in lprocfs_job_stats_log()).
+
+job_stats dump performances
+
+Here is the performance results after the test (no fs activity) to dump job_stats procfile:
+
+time grep -c job_id /proc/fs/lustre/mdt/lustrefs-MDT0000/job_stats
+
+instance
+nbr of job
+real time
+sys time
+rate
+
+without patch
+14749
+1.3s
+1.3s
+11345 jobid/s
+
+with patch
+22209
+0.6
+0.6
+37015 jobid/s
+
+Here is the comparison before and after the patch:
+
+nbr of job
+time
+rate
+
++ 43%
+- 54 %
++ 226 %
+
+--- Comment (eaujames, Wed, 29 Mar 2023 09:53:46 +0000) ---
+Yes, the contention was observed on servers.
+
+The hang is observed when job_stat are added and suppressed at high rate (write lock needed on jobstat list). For most of those cases, the issue was malformed jobid from the compute side or a lot of short jobs (e.g: mpi tests).
+
+For example, we had some issues with users escaping their environment by opening new sessions via ssh in their job.
+
+We had also 2 different monitoring scripts using jobstat, the ATOS team is rewriting those scripts in one.
+
+To mitigate the issue, we have already shortened the job_cleanup_interval.
+
+The idea here is to protect the servers from malformed jobid (from bad practices), speed up job_stats reads and limit the performance impact of the monitoring jobs on the kernel threads.
+
+--- Comment (gerrit, Tue, 28 Mar 2023 19:48:55 +0000) ---
+"Etienne AUJAMES " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/50459
+
+Subject: LU-16674 obdclass: optimize job_stats reads
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: e5a08b991c3f48267a1fdba81971e9125a92b494
+
+--- Comment (adilger, Tue, 28 Mar 2023 01:39:35 +0000) ---
+Firstly, it isn't mentioned whether this contention is on a client or server?  I would guess on the server, but then what processes are reading from job_stats so heavily on the server?  Is this some monitoring tool? 
+
+Note that is the job_stats data is being ingested frequently by a userspace monitor, it would be possible to shorten the cleanup intervsl for old jobids to be dropped from the 10 minutes that is the current default. Alternately, old jobs can manually be evicted from the stats by writing the jobid into the job_stats file to keep the list shorter. 
+
+Also, it is worthwhile to understand if the jobid is being created properly for aggregating stats?  This isn't intended to give per-thread stats on the server for every individual command that is run on the client, so the linear list it isn't going to work well if you have 100k or 1M unique JobIds.  However, since the full list is returned for each read, alternate data structures may not help unless this is changed to allow partial locking of the hash table or similar. 
+
+As for bad JobIDs, there have been a couple of bugs already fixed in this area, mainly caused by bad input from the client, not from any issue on the server.

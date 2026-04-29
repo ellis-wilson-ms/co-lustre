@@ -1,0 +1,161 @@
+Key:        LU-18826
+Summary:    Kernel panic due to null pointer from obd_get_mod_rpc_slot
+Link:       https://jira.whamcloud.com/browse/LU-18826
+Type:       Bug
+Priority:   Critical
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Lijing Chen
+Reporter:   Lijing Chen
+Created:    Tue, 18 Mar 2025 15:17:45 +0000
+Updated:    Tue, 24 Feb 2026 16:27:04 +0000
+Resolved:   Wed, 21 May 2025 12:56:49 +0000
+
+--- Description ---
+[Sat Nov 23 23:41:34 UTC 2024] Call trace:
+[Sat Nov 23 23:41:34 UTC 2024]  kthread_should_stop+0x18/0x40
+[Sat Nov 23 23:41:34 UTC 2024]  obd_get_mod_rpc_slot+0x10c/0x43c [obdclass]
+[Sat Nov 23 23:41:34 UTC 2024]  ptlrpc_get_mod_rpc_slot+0x38/0x60 [ptlrpc]
+[Sat Nov 23 23:41:34 UTC 2024]  mdc_close+0x21c/0xe64 [mdc]
+[Sat Nov 23 23:41:34 UTC 2024]  lmv_close+0x1a8/0x480 [lmv]
+[Sat Nov 23 23:41:34 UTC 2024]  ll_close_inode_openhandle+0x404/0xcc8 [lustre]
+[Sat Nov 23 23:41:34 UTC 2024]  ll_md_real_close+0xa4/0x280 [lustre]
+[Sat Nov 23 23:41:34 UTC 2024]  ll_clear_inode+0x1a0/0x7e0 [lustre]
+[Sat Nov 23 23:41:34 UTC 2024]  ll_delete_inode+0x70/0x260 [lustre]
+[Sat Nov 23 23:41:34 UTC 2024]  evict+0xe4/0x240
+[Sat Nov 23 23:41:34 UTC 2024]  dispose_list+0x58/0x80
+[Sat Nov 23 23:41:34 UTC 2024]  prune_icache_sb+0x64/0x94
+[Sat Nov 23 23:41:34 UTC 2024]  super_cache_scan+0x14c/0x1a4
+[Sat Nov 23 23:41:34 UTC 2024]  do_shrink_slab+0x194/0x394
+[Sat Nov 23 23:41:34 UTC 2024]  shrink_slab+0xbc/0x13c
+[Sat Nov 23 23:41:34 UTC 2024]  shrink_node_memcgs+0x1d4/0x230
+[Sat Nov 23 23:41:34 UTC 2024]  shrink_node+0x150/0x5e0
+[Sat Nov 23 23:41:34 UTC 2024]  shrink_zones+0x98/0x220
+[Sat Nov 23 23:41:34 UTC 2024]  do_try_to_free_pages+0xac/0x2e0
+[Sat Nov 23 23:41:34 UTC 2024]  try_to_free_pages+0x120/0x25c
+[Sat Nov 23 23:41:34 UTC 2024]  __alloc_pages_slowpath.constprop.0+0x400/0x83c
+[Sat Nov 23 23:41:34 UTC 2024]  __alloc_pages_nodemask+0x2b4/0x308
+[Sat Nov 23 23:41:34 UTC 2024]  alloc_pages_current+0x8c/0x13c
+[Sat Nov 23 23:41:34 UTC 2024]  __vmalloc_area_node+0x104/0x280
+[Sat Nov 23 23:41:34 UTC 2024]  __vmalloc_node_range+0x80/0xe4
+[Sat Nov 23 23:41:34 UTC 2024]  alloc_thread_stack_node+0xc4/0x130
+[Sat Nov 23 23:41:34 UTC 2024]  dup_task_struct+0x54/0x29c
+[Sat Nov 23 23:41:34 UTC 2024]  copy_process+0x1cc/0x1244
+[Sat Nov 23 23:41:34 UTC 2024]  kernel_clone+0x94/0x380
+[Sat Nov 23 23:41:34 UTC 2024]  kernel_thread+0x6c/0x94
+[Sat Nov 23 23:41:34 UTC 2024]  kthreadd+0x19c/0x3b0
+[Sat Nov 23 23:41:34 UTC 2024] Code: d5384100 b9403401 36a800a1 f943f400 (f9400000) 
+[Sat Nov 23 23:41:34 UTC 2024] SMP: stopping secondary CPUs
+[Sat Nov 23 23:41:34 UTC 2024] Starting crashdump kernel...
+
+issue happen when to_kthread(current) == NULL . relevant source code below:
+
+bool kthread_should_stop(void)
+{
+        return test_bit(KTHREAD_SHOULD_STOP, &to_kthread(current)->flags);
+}
+
+static inline struct kthread *to_kthread(struct task_struct *k)
+{
+        WARN_ON(!(k->flags & PF_KTHREAD));
+        return (__force void *)k->set_child_tid;
+}
+
+Rootcause Analysis
+
+	Kernel try to start new kthread from kthreadd by alloc_thread_stack_node
+
+	Ran out of memory, try to clean up inode cache
+
+	In obd_get_mod_rpc_slot, unfortunately in flight rpcs is full. So trying to put into sleep using wait_woken
+
+	In kthread_should_stop -> to_kthread, it tried to read set_child_tid but it's null. It's expected since the task_struct here is kthreadd, which is still the parent one, because the allocation have not yet completed
+
+Repro
+
+	Create a dummy obd device
+
+	Modify current task_struct, 
+
+set_child_tid: 0000000000000000, current->flags: 208840, set max_in_flight_mod_rpcs to 0 so that it will be put into sleep all the time
+
+	call obd_get_mod_rpc_slot and get kernel panic
+
+[ 1621.881498] Call trace:
+[ 1621.881915]  kthread_should_stop+0x18/0x40
+[ 1621.882627]  obd_get_mod_rpc_slot+0x10c/0x43c [obdclass]
+[ 1621.883502]  test_obd_rpc_slot+0xdc/0x270 [task_mod]
+[ 1621.884317]  task_mod_init+0x70/0x1000 [task_mod] 
+
+Proposed fix
+
+Skip the waiting part in obd_get_mod_rpc_slot since we know it will cause kernel panic.
+
+https://git.whamcloud.com/?p=fs/lustre-release.git;a=blob;f=lustre/obdclass/genops.c;h=93b1fe8050729d38e507a8432c67aa8dddd8987d;hb=HEAD#l2274
+
+During the normal flow, the process will be put into sleep and be woken up by claim_mod_rpc_function.
+
+2231         avail = cli->cl_mod_rpcs_in_flight cl_max_mod_rpcs_in_flight ||
+2232                 (close_req && cli->cl_close_rpcs_in_flight == 0);
+2233         if (avail) {
+2234                 cli->cl_mod_rpcs_in_flight++;
+2235                 if (close_req)
+2236                         cli->cl_close_rpcs_in_flight++;
+2237                 ret = woken_wake_function(wq_entry, mode, flags, key);
+2238                 w->woken = true;
+2239         } else if (cli->cl_close_rpcs_in_flight) 
+
+In this special case, the process is kthreadd, which will trigger kernel panic if put into sleep. So the modified logic will looks similar to close_req, which simply get a guaranteed slot by
+
+2235                 if (close_req) cli->cl_close_rpcs_in_flight++; 
+
+The fix will be a similar process, except it will skip the whole enqueue process as well.
+
+	if (! ((current->flags & PF_KTHREAD) && current->set_child_tid) ){
+		// Skip wait_woken as it will cause kernel panic. Grant it a slot.
+		cli->cl_mod_rpcs_in_flight++;
+
+	} else {
+// ... enqueue and wake_woken logic
+
+--- Comment (gerrit, Fri, 23 May 2025 04:01:24 +0000) ---
+"Lijing Chen " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/59397
+
+Subject: LU-18826: obdclass: fix panic from shrink_slab
+
+Project: fs/lustre-release
+
+Branch: b2_15
+
+Current Patch Set: 1
+
+Commit: a6b71db5716c1b43bd1ccf258e38c54299d56eab
+
+--- Comment (pjones, Wed, 21 May 2025 12:56:49 +0000) ---
+Merged for 2.17
+
+--- Comment (gerrit, Wed, 21 May 2025 05:16:04 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/58501/
+
+Subject: LU-18826: obdclass: fix panic from shrink_slab
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 5ee6ce1bc7df2d87b828de8293e3e84b668d1687
+
+--- Comment (gerrit, Fri, 21 Mar 2025 17:58:00 +0000) ---
+"Lijing Chen " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/58501
+
+Subject: LU-18826: obdclass: fix panic from shrink_slab
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: a9e6d39b2a1a74ce9272200ab38e772bca87d193

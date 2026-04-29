@@ -1,0 +1,91 @@
+Key:        LU-18990
+Summary:    list_del corruption in tgt_free_reply_data
+Link:       https://jira.whamcloud.com/browse/LU-18990
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Kaitlin Hoang
+Created:    Thu, 8 May 2025 18:49:55 +0000
+Updated:    Sun, 21 Dec 2025 16:18:18 +0000
+Links:      Related: is related to  LU-11444
+
+--- Description ---
+Hi,
+
+We've seen a few occurrences of this list_del corruption issue on MDS which sometimes causes MDS to crash. The stack trace looks like this:
+
+[   61.794583] list_del corruption. prev->next should be ffff000475622e80, but was ffff000475622e00
+[   61.795928] WARNING: CPU: 3 PID: 6749 at lib/list_debug.c:59 
+[   61.822503] Call trace:
+[   61.822895]  __list_del_entry_valid+0xd4/0x100
+[   61.823636]  tgt_free_reply_data+0x78/0x344 [ptlrpc]
+[   61.824451]  tgt_release_reply_data+0x90/0x218 [ptlrpc]
+[   61.825304]  tgt_handle_received_xid+0x84/0xe0 [ptlrpc]
+[   61.826161]  process_req_last_xid+0x190/0x4b0 [ptlrpc]
+[   61.826999]  tgt_request_handle+0x1e0/0xaac [ptlrpc]
+[   61.827811]  ptlrpc_server_handle_request.isra.0+0x464/0xee8 [ptlrpc]
+[   61.828841]  ptlrpc_main+0xd24/0x15bc [ptlrpc]
+[   61.829536]  kthread+0x118/0x120
+[   61.830040] ---[ end trace 19946910bdb9cb2b ]---
+
+This list trd_list is protected by ted_lcd_lock mutex. There is an LASSERT to check ted_lcd_lock mutex is locked right before the list_del call in tgt_free_reply_data but we don't actually know if the calling thread has the lock - we just know that the mutex is locked. 
+
+Upon scanning the code, all the spots where trd_list is modified seem to be protected by this ted_lcd_lock mutex. However, in process_req_last_xid function, the locking/unlocking of ted_lcd_lock hinges on bool need_lock while the call to tgt_handle_received_xid does the same check tgt_is_multimodrpcs_client(exp) again. 
+
+static int process_req_last_xid(struct ptlrpc_request *req)
+{
+	__u64	last_xid;
+	int rc = 0;
+	struct obd_export *exp = req->rq_export;
+	struct tg_export_data *ted = &exp->exp_target_data;
+	bool need_lock = tgt_is_multimodrpcs_client(exp);
+	ENTRY;
+
+	if (need_lock)
+		mutex_lock(&ted->ted_lcd_lock);
+
+[ truncated some logic here ]
+
+	/* try to release in-memory reply data */
+	if (tgt_is_multimodrpcs_client(exp)) {
+		tgt_handle_received_xid(exp, last_xid);
+		rc = tgt_handle_tag(req);
+	}
+
+out:
+	if (need_lock)
+		mutex_unlock(&ted->ted_lcd_lock);
+
+	RETURN(rc);
+}
+
+Because this method doesn't lock the export itself, there could be a potential inconsistency where one thread does not lock ted_lcd_lock but still calls tgt_handle_received_xid while another thread is already deleting form trd_list. It's probably better to consistently use this need_lock boolean, or just fork this method to call something like process_req_last_xid_lock without these if-statements. 
+
+It would be helpful to get other's opinions on whether this is the right code path to be looking at, or whether I've overlooked something here. I can see that there's a lot of place in code that checks these connect flags, so I'm not sure if it makes sense that these flags could get unassigned and cause this racey behavior. Thanks!
+
+--- Comment (JIRAUSER18725, Mon, 12 May 2025 20:08:46 +0000) ---
+Thanks for the reply Andreas. I agree that I'm not entirely convinced this is the right code path causing this issue but I've uploaded a patch anyways to make this code path more clear
+
+--- Comment (gerrit, Mon, 12 May 2025 20:02:04 +0000) ---
+"Kaitlin Hoang " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/59194
+
+Subject: LU-18990 ptlrpc: always take lock in process_req_last_xid
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: a35ae8e816e9be106a819985ead7718d7ce13db5
+
+--- Comment (adilger, Fri, 9 May 2025 02:45:45 +0000) ---
+It doesn't seem unreasonable to always take the lock in process_req_last_xid().  Most of the time it would be taking it anyway, since the tgt_is_multimodrpcs_client() check should pretty much always be true today (since v2_7_55_0-43-g5fc7aa3687 client/server).
+
+It looks like this code was added in patch https://review.whamcloud.com/35114 ("LU-11444 ptlrpc: resend may corrupt the data") so please add to your commit message:
+
+Fixes: 23773b32bf ("LU-11444 ptlrpc: resend may corrupt the data")
+
+However, since tgt_is_multimodrpcs_client() should almost always be true, it isn't clear if that patch will help or not, but it is unlikely to hurt either and makes the code more clear.  There definitely have been issues with flags/bitfields flipping due to transient state changes (e.g. during a client reconnect in this case) so better to be safe than sorry.

@@ -1,0 +1,75 @@
+Key:        LU-16840
+Summary:    update llogs consume all MDT space
+Link:       https://jira.whamcloud.com/browse/LU-16840
+Type:       Bug
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Mikhail Pershin
+Created:    Mon, 22 May 2023 22:05:26 +0000
+Updated:    Tue, 23 May 2023 01:03:55 +0000
+Attachments: updatelog_ls.txt
+
+--- Description ---
+The situation occurred during performance tests on 'testfs' system. All MDTs were filled up to 100%, MDT0000 and MDT0003 were 100% full, some other showed about 98-99%:
+
+# lfs df
+UUID                   1K-blocks        Used   Available Use% Mounted on
+testfs-MDT0000_UUID    139539628   137929320           0 100% /lustre/testfs/client[MDT:0] 
+testfs-MDT0001_UUID    139539628   131245164     5878772  96% /lustre/testfs/client[MDT:1] 
+testfs-MDT0002_UUID    139539628   136989484      134452 100% /lustre/testfs/client[MDT:2] 
+testfs-MDT0003_UUID    139539628   125196112    11927824  92% /lustre/testfs/client[MDT:3] 
+testfs-MDT0004_UUID    139539628   134967276     2156660  99% /lustre/testfs/client[MDT:4] 
+testfs-MDT0005_UUID    139539628   134893132     2230804  99% /lustre/testfs/client[MDT:5] 
+testfs-MDT0006_UUID   1865094172   126687580  1706999696   7% /lustre/testfs/client[MDT:6] 
+testfs-MDT0007_UUID   1865094172   131057524  1702629752   8% /lustre/testfs/client[MDT:7]  
+
+FS was filled with striped dirs(4-wide) and many files most of which are remote. So DNE is heavily used along with update llogs. 
+
+One example of ls -l command over update_log_dir on MDT0000 is attached. It shows there are more than 1000 plain llog files with many at maximum size of 128Mb.
+
+MDTs targets were umounted and restarted, many showed errors during restart:
+
+[30398.329207] LustreError: 28024:0:(llog_osd.c:1055:llog_osd_next_block()) testfs-MDT0005-osp-MDT0002: missed desired record? 6 > 1
+[30398.331773] LustreError: 28023:0:(lod_dev.c:453:lod_sub_recovery_thread()) testfs-MDT0004-osp-MDT0002 get update log failed: rc = -2
+
+another one:
+
+May 22 21:09:06 vm07 kernel: LustreError: 31098:0:(llog_osd.c:1038:llog_osd_next_block()) testfs-MDT0003-osp-MDT0007: invalid llog tail at log id [0x2c00904b3:0x1:0x0]offset 7667712 bytes 32768
+May 22 21:09:06 vm07 kernel: LustreError: 31098:0:(lod_dev.c:453:lod_sub_recovery_thread()) testfs-MDT0003-osp-MDT0007 get update log failed: rc = -22
+
+or
+
+May 22 21:09:14 vm04 kernel: LustreError: 29436:0:(llog.c:478:llog_verify_record()) testfs-MDT0003-osp-MDT0001: [0x2c002b387:0x1:0x0] rec type=0 idx=0 len=0, magic is bad
+May 22 21:09:14 vm04 kernel: LustreError: 29434:0:(llog_osd.c:1028:llog_osd_next_block()) testfs-MDT0000-osp-MDT0001: invalid llog tail at log id [0x2000eaa11:0x1:0x0] offset 50790400 last_rec idx 4294937410 tail idx 0 lrt len 0 read_size 32768
+May 22 21:09:14 vm04 kernel: LustreError: 29434:0:(lod_dev.c:453:lod_sub_recovery_thread()) testfs-MDT0000-osp-MDT0001 get update log failed: rc = -22
+May 22 21:09:14 vm04 kernel: LustreError: 29436:0:(llog_osd.c:1038:llog_osd_next_block()) testfs-MDT0003-osp-MDT0001: invalid llog tail at log id [0x2c00904bb:0x1:0x0]offset 3342336 bytes 32768 
+
+After restart cluster has still no space and non-operational. The next step would require manual intervention to clear update llogs.
+
+Types of corruptions are related to lack of space, all are about partial llog update. So most likely lack of space of server cause update llog corruptions processing but considering how many update llogs we have there, they were the reason of space consuming. It is worth to mention that lamigo was active on nodes though changelog problems were not found.
+
+--- Comment (adilger, Tue, 23 May 2023 01:03:55 +0000) ---
+Note that the MDT already has some way to reserve space for critical local usage, but it is very small (e.g tens of KB, enough to delete a few files), but might need to be increased for larger MDTs with DNE.
+
+--- Comment (adilger, Tue, 23 May 2023 01:02:27 +0000) ---
+Definitely we should NOT be testing with default DNE striped directories.   That is just a problem waiting to happen, hurts performance, and not something we want anyone to ever use in production for any reason, even if LU-10329 is fixed.
+
+Mike, the DNE update logs should be sync'd within a fraction of a second, and cancelled within a few seconds after creation once committed on all MDTs, unless an MDS crashes in the middle of the distributed operation.  The log files themselves might stick around for some time  until the llog is no longer in use, but that should mean only 1-2 llogs per MDT at any time.  If there are lots of llog files accumulating then something is going wrong with the DNE recovery mechanism, and/or the llogs are being corrupted.
+
+--- Comment (JIRAUSER17312, Mon, 22 May 2023 23:07:33 +0000) ---
+tappro
+
+How can we work around this situation when it happens?
+
+--- Comment (tappro, Mon, 22 May 2023 22:36:06 +0000) ---
+it is not clear what caused ENOSPC exactly - client files or internal data in update logs. It can be that update logs problem make them grow endlessly or maybe they weren't able to proceed due to lack of space.
+
+I think there are several problems to review:
+
+	 we need to track somehow how update logs are consuming space, some visible stats are needed like for changelog - amount of plains in each catalog and space consumed, amount of orphaned plain llogs (without refs in any catalog)
+
+	we have to reserve space for update llog operations, which would be not used by clients, so update llogs could be updated even when clients get ENOSPC to prevent partial writes
+
+	should'n we prevent update llog to grow over some limit? E.g. if they are full, switch to synced DNE or reduce amount of DNE ops somehow else?

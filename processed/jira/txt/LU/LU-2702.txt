@@ -1,0 +1,88 @@
+Key:        LU-2702
+Summary:    client read RPCs do not generate read requests in brw_stats
+Link:       https://jira.whamcloud.com/browse/LU-2702
+Type:       Technical task
+Priority:   Minor
+Status:     Resolved
+Resolution: Not a Bug
+Assignee:   Andreas Dilger
+Reporter:   Andreas Dilger
+Created:    Tue, 29 Jan 2013 02:18:24 +0000
+Updated:    Tue, 14 May 2013 15:28:50 +0000
+Resolved:   Tue, 14 May 2013 15:28:50 +0000
+
+--- Description ---
+It appears that there is some kind of bug with the client page cache and DLM locking, where pages are left in cache when the DLM lock is cleared.  This can be easily demonstrated with a simple test:
+
+[root@sookie-gig tests]# dd if=/dev/zero of=/mnt/testfs/f2 bs=1M count=10
+10+0 records in
+10+0 records out
+10485760 bytes (10 MB) copied, 0.643432 s, 16.3 MB/s
+[root@sookie-gig tests]# lctl set_param ldlm.namespaces.*OST*.lru_size=0
+ldlm.namespaces.testfs-OST0000-osc-ffff88009ee56800.lru_size=0
+ldlm.namespaces.testfs-OST0001-osc-ffff88009ee56800.lru_size=0
+ldlm.namespaces.testfs-OST0002-osc-ffff88009ee56800.lru_size=0
+[root@sookie-gig tests]# wc -l /proc/fs/lustre/llite/*/dump_page_cache
+0 /proc/fs/lustre/llite/testfs-ffff88009ee56800/dump_page_cache
+[root@sookie-gig tests]# lctl set_param osd-ldiskfs.*.brw_stats=0
+osd-ldiskfs.testfs-OST0000.brw_stats=0
+osd-ldiskfs.testfs-OST0001.brw_stats=0
+osd-ldiskfs.testfs-OST0002.brw_stats=0
+[root@sookie-gig tests]# wc -l /proc/fs/lustre/llite/*/dump_page_cache
+0 /proc/fs/lustre/llite/testfs-ffff88009ee56800/dump_page_cache
+[root@sookie-gig tests]# dd of=/dev/null if=/mnt/testfs/f0 bs=1M count=10
+10+0 records in
+10+0 records out
+10485760 bytes (10 MB) copied, 0.55208 s, 19.0 MB/s
+[root@sookie-gig tests]# ../utils/lctl get_param osd-ldiskfs.*OST0002*.brw_stats | less
+osd-ldiskfs.testfs-OST0002.brw_stats=
+snapshot_time:         1359442889.629725 (secs.usecs)
+                           read      |     write
+pages per bulk r/w     rpcs  % cum % |  rpcs        % cum %
+
+This looks like no RPC is sent to the OST for the read, even though all of the DLM locks have been dropped on the client, and no pages are being tracked by Lustre.  However, dropping the VM cache causes an RPC on the OST.
+
+[root@sookie-gig tests]# echo 3 > /proc/sys/vm/drop_caches
+[root@sookie-gig tests]# dd of=/dev/null if=/mnt/testfs/f0 bs=1M count=10
+10+0 records in
+10+0 records out
+10485760 bytes (10 MB) copied, 0.698268 s, 15.0 MB/s
+[root@sookie-gig tests]# ../utils/lctl get_param osd-ldiskfs.*OST0002*.brw_stats | less
+osd-ldiskfs.testfs-OST0002.brw_stats=
+snapshot_time:         1359442909.926812 (secs.usecs)
+                           read      |     write
+pages per bulk r/w     rpcs  % cum % |  rpcs        % cum %
+256:                    10 100 100   |    0   0   0
+
+However, it appears that this is an artifact of having a single-node test system with client and OST on the same node:
+
+[root@sookie-gig tests]# lctl get_param osc.*OST0002*.stats
+osc.testfs-OST0002-osc-MDT0000.stats=
+snapshot_time             1359443359.105016 secs.usecs
+req_waittime              7 samples [usec] 823 1171 7129 7374769
+req_active                7 samples [reqs] 1 1 7 7
+ost_statfs                7 samples [usec] 823 1171 7129 7374769
+osc.testfs-OST0002-osc-ffff88009ee56800.stats=
+snapshot_time             1359443359.105890 secs.usecs
+req_waittime              18 samples [usec] 1870 26512 171590 2515558672
+req_active                18 samples [reqs] 1 2 22 30
+read_bytes                10 samples [bytes] 1048576 1048576 10485760 10995116277760
+ost_read                  10 samples [usec] 11644 26512 149316 2452393930
+obd_ping                  7 samples [usec] 2640 3084 20404 59667842
+[root@sookie-gig tests]# lctl get_param ost.OSS.ost_io.stats 
+ost.OSS.ost_io.stats=
+snapshot_time             1359443418.884993 secs.usecs
+req_waittime              10 samples [usec] 372 547 4714 2246654
+req_qdepth                10 samples [reqs] 0 0 0 0
+req_active                10 samples [reqs] 1 1 10 10
+req_timeout               10 samples [sec] 1 1 10 10
+reqbuf_avail              22 samples [bufs] 63 64 1404 89604
+ost_read                  10 samples [usec] 10818 17798 131256 1806684314
+
+This shows that the client did send an RPC to the OST.  The culprit is that the OST has a read cache to satisfy the read RPCs without submitting an IO request to the OSD. I think the easiest way to handle this is to just check the ost_read and ost_write RPC count in the client osc.*.stats instead of getting it from the OST.  That also avoids the need for drop_caches, which will not fix the test when the OST is on a remote node as is normal during our testing.
+
+--- Comment (adilger, Tue, 14 May 2013 15:28:50 +0000) ---
+The brw_stats file only contains IO submitted to disk at the OSD level, not RPC statistics.
+
+--- Comment (adilger, Tue, 29 Jan 2013 02:23:16 +0000) ---
+I was digging into the problem with the test in your patch http://review.whamcloud.com/4993 a bit more, and it looks like the drop_caches call is NOT needed, as described in this bug.

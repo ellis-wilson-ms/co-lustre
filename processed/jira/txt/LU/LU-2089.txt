@@ -1,0 +1,176 @@
+Key:        LU-2089
+Summary:    BUG: Bad page state in process ll_ost_io01_039  pfn:63ae41
+Link:       https://jira.whamcloud.com/browse/LU-2089
+Type:       Bug
+Priority:   Critical
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Alex Zhuravlev
+Reporter:   Prakash Surya
+Created:    Thu, 4 Oct 2012 12:32:56 +0000
+Updated:    Fri, 19 Apr 2013 14:55:48 +0000
+Resolved:   Mon, 8 Oct 2012 01:19:04 +0000
+Labels:     topsequoia
+
+--- Environment ---
+Lustre: 2.3.51-3chaos
+
+--- Description ---
+I see many messages on the console of our OSTs running 2.3.51-3chaos:
+
+2012-10-04 03:49:04 BUG: Bad page state in process ll_ost_io01_039  pfn:63ae41
+2012-10-04 03:49:04 page:ffffea0015ce1e38 flags:0040000000000080 count:0 mapcount:0 mapping:(null) index:0 (Tainted: P    B      ----------------  )
+2012-10-04 03:49:04 Pid: 7115, comm: ll_ost_io01_039 Tainted: P    B      ----------------   2.6.32-220.23.1.1chaos.ch5.x86_64 #1
+2012-10-04 03:49:04 Call Trace:
+2012-10-04 03:49:04  [] ? bad_page+0x107/0x160
+2012-10-04 03:49:04  [] ? free_hot_cold_page+0x1c9/0x220
+2012-10-04 03:49:04  [] ? free_hot_page+0x2f/0x60
+2012-10-04 03:49:04  [] ? __put_single_page+0x1e/0x30
+2012-10-04 03:49:04  [] ? put_page+0x25/0x40
+2012-10-04 03:49:04  [] ? ptlrpc_free_bulk+0x98/0x330 [ptlrpc]
+2012-10-04 03:49:04  [] ? ost_brw_write+0x501/0x15e0 [ost]
+2012-10-04 03:49:04  [] ? target_bulk_timeout+0x0/0xc0 [ptlrpc]
+2012-10-04 03:49:04  [] ? ost_handle+0x32e2/0x4690 [ost]
+2012-10-04 03:49:04  [] ? ptlrpc_update_export_timer+0x4b/0x470 [ptlrpc]
+2012-10-04 03:49:04  [] ? ptlrpc_server_handle_request+0x41c/0xe00 [ptlrpc]
+2012-10-04 03:49:04  [] ? cfs_timer_arm+0xe/0x10 [libcfs]
+2012-10-04 03:49:04  [] ? lc_watchdog_touch+0x6f/0x180 [libcfs]
+2012-10-04 03:49:04  [] ? ptlrpc_wait_event+0xa7/0x2a0 [ptlrpc]
+2012-10-04 03:49:04  [] ? __wake_up+0x53/0x70
+2012-10-04 03:49:04  [] ? ptlrpc_main+0xbf1/0x19e0 [ptlrpc]
+2012-10-04 03:49:04  [] ? ptlrpc_main+0x0/0x19e0 [ptlrpc]
+2012-10-04 03:49:04  [] ? child_rip+0xa/0x20
+2012-10-04 03:49:04  [] ? ptlrpc_main+0x0/0x19e0 [ptlrpc]
+2012-10-04 03:49:04  [] ? ptlrpc_main+0x0/0x19e0 [ptlrpc]
+2012-10-04 03:49:04  [] ? child_rip+0x0/0x20
+
+These drown out any other console messages, making it hard to pick out any other error messages.
+
+It looks very similar to ORI-783, although that bug was triggered by setting 'sync_journal=1', which we are not doing here.
+
+--- Comment (ian, Mon, 8 Oct 2012 01:19:04 +0000) ---
+4198 patch landed to master.
+
+--- Comment (adilger, Fri, 5 Oct 2012 18:12:59 +0000) ---
+To summarize a conversation in Skype, the root of this new problem is because LLNL is running a newer version of ZFS (rc11, AFAIK), while our testing was running an earlier version (rc10, AFAIK).  The newer ZFS is using different slab allocation internally, while the old version is only ever using vmalloc(), which is why we didn't see this problem in local testing.
+
+--- Comment (bzzz, Fri, 5 Oct 2012 08:39:08 +0000) ---
+http://review.whamcloud.com/4198
+
+another ideas are welcome.
+
+--- Comment (bzzz, Fri, 5 Oct 2012 05:58:48 +0000) ---
+I'm not sure why did this start to happen just now: osd-zfs and ofd are the same as in orion.
+
+so, the root cause is that arc_buf_alloc() -> kmem_cache_alloc() allocate order of N > 0 from slab:
+
+data ffff880000440000, size 131072, off 0
+
+  page:ffff8800062e8e00 flags:0000000000000080 count:1 mapcount:0 mapping:(null)
+
+  page:ffff8800062e8e38 flags:0000000000000080 count:0 mapcount:0 mapping:(null)
+
+  page:ffff8800062e8e70 flags:0000000000000080 count:0 mapcount:0 mapping:(null)
+
+  page:ffff8800062e8ea8 flags:0000000000000080 count:0 mapcount:0 mapping:(null)
+
+  page:ffff8800062e8ee0 flags:0000000000000080 count:0 mapcount:0 mapping:(null)
+
+  page:ffff8800062e8f18 flags:0000000000000080 count:0 mapcount:0 mapping:(null)
+
+  page:ffff8800062e8f50 flags:0000000000000080 count:0 mapcount:0 mapping:(null)
+
+page allocator does not increment page's refcounter unless requested with compound __GFP_COMP.
+
+ptlrpc_prep_bulk_page() grabs a reference on those pages, then ptlrpc_free_bulk() release them,
+
+page's reference goes back to 0 which should not happen.
+
+I tend to think the right solution is not to touch refcounters from ptlrpc, at least on the server
+
+and let >dbo_bufs_get()/>dbo_bufs_put() to make sure pages are pinned properly.
+
+--- Comment (bzzz, Thu, 4 Oct 2012 12:59:51 +0000) ---
+Peter, I'm already.
+
+--- Comment (pjones, Thu, 4 Oct 2012 12:49:21 +0000) ---
+Alex
+
+Please could someone look into this one?
+
+Thanks
+
+Peter
+
+--- Comment (prakash, Thu, 4 Oct 2012 12:39:46 +0000) ---
+And just in case it's relevant, these messages were printed just prior to the constant stream of "Bad page state" messages:
+
+2012-10-03 17:24:57 Lustre: Lustre: Build Version: 2.3.51-3chaos-3chaos--PRISTINE-2.6.32-220.23.1.1chaos.ch5.x86_64
+2012-10-03 17:25:21 LustreError: 137-5: UUID 'ls1-OST0182_UUID' is not available for connect (no target)
+2012-10-03 17:25:21 LustreError: 137-5: UUID 'ls1-OST0181_UUID' is not available for connect (no target)
+2012-10-03 17:25:44 LustreError: 137-5: UUID 'lstest-OST0181_UUID' is not available for connect (no target)
+2012-10-03 17:25:46 LustreError: 137-5: UUID 'lstest-OST0181_UUID' is not available for connect (no target)
+2012-10-03 17:25:46 LustreError: Skipped 3 previous similar messages
+2012-10-03 17:25:48 LustreError: 137-5: UUID 'lstest-OST0181_UUID' is not available for connect (no target)
+2012-10-03 17:25:48 LustreError: Skipped 48 previous similar messages
+2012-10-03 17:25:52 LustreError: 137-5: UUID 'lstest-OST0181_UUID' is not available for connect (no target)
+2012-10-03 17:25:52 LustreError: Skipped 48 previous similar messages
+2012-10-03 17:26:00 LustreError: 137-5: UUID 'lstest-OST0182_UUID' is not available for connect (no target)
+2012-10-03 17:26:00 LustreError: Skipped 24 previous similar messages
+2012-10-03 17:26:16 LustreError: 137-5: UUID 'lstest-OST0182_UUID' is not available for connect (no target)
+2012-10-03 17:26:16 LustreError: Skipped 88 previous similar messages
+2012-10-03 17:26:39 LustreError: 6396:0:(mgc_request.c:246:do_config_log_add()) failed processing sptlrpc log: -2
+2012-10-03 17:26:39 LustreError: 6517:0:(fsfilt.c:122:fsfilt_get_ops()) Can't find fsfilt_osd-zfs interface
+2012-10-03 17:26:39 LustreError: 6517:0:(filter.c:2324:filter_setup()) lstest-OST0182: filter_common_setup failed: -256.
+2012-10-03 17:26:39 LustreError: 6517:0:(obd_config.c:572:class_setup()) setup lstest-OST0182 failed (-256)
+2012-10-03 17:26:39 LustreError: 6517:0:(obd_config.c:1545:class_config_llog_handler()) MGC172.20.5.2@o2ib500: cfg command failed: rc = -256
+2012-10-03 17:26:39 Lustre:    cmd=cf003 0:lstest-OST0182  1:dev  2:0  3:f  
+2012-10-03 17:26:39 LustreError: 15c-8: MGC172.20.5.2@o2ib500: The configuration from log 'lstest-OST0182' failed (-256). This may be the result of communication errors between this node and the MGS, a bad configuration, or other errors. See the syslog for more information.
+2012-10-03 17:26:39 LustreError: 6396:0:(obd_mount.c:1212:server_start_targets()) failed to start server lstest-OST0182: -256
+2012-10-03 17:26:39 Lustre: lstest-OST0182: Unable to start target: -256
+2012-10-03 17:26:39 LustreError: 6396:0:(obd_config.c:619:class_cleanup()) Device 3 not setup
+2012-10-03 17:26:39 Lustre: server umount lstest-OST0182 complete
+2012-10-03 17:26:39 LustreError: 6396:0:(obd_mount.c:2332:lustre_fill_super()) Unable to mount  (-256)
+2012-10-03 17:26:40 LustreError: 6568:0:(mgc_request.c:246:do_config_log_add()) failed processing sptlrpc log: -2
+2012-10-03 17:26:44 Lustre: lstest-OST0182: Will be in recovery for at least 5:00, or until 256 clients reconnect.
+2012-10-03 17:27:01 LustreError: 137-5: UUID 'ls1-OST0181_UUID' is not available for connect (no target)
+2012-10-03 17:27:01 LustreError: Skipped 406 previous similar messages
+2012-10-03 17:27:55 Lustre: lstest-OST0182: Recovery over after 1:11, of 256 clients 256 recovered and 0 were evicted.
+2012-10-03 17:27:55 Lustre: 6654:0:(ofd_obd.c:1058:ofd_orphans_destroy()) lstest-OST0182: deleting orphan objects from 137009 to 137287
+2012-10-03 17:27:55 LustreError: 6654:0:(ldlm_resource.c:1101:ldlm_resource_get()) lvbo_init failed for resource 137254: rc -2
+2012-10-03 17:27:55 LustreError: 6654:0:(ldlm_resource.c:1101:ldlm_resource_get()) lvbo_init failed for resource 137253: rc -2
+2012-10-03 17:28:18 LustreError: 137-5: UUID 'ls1-OST0181_UUID' is not available for connect (no target)
+2012-10-03 17:28:18 LustreError: Skipped 4 previous similar messages
+2012-10-03 17:30:48 LustreError: 137-5: UUID 'ls1-OST0181_UUID' is not available for connect (no target)
+2012-10-03 17:30:48 LustreError: Skipped 12 previous similar messages
+2012-10-03 17:35:21 LustreError: 137-5: UUID 'ls1-OST0181_UUID' is not available for connect (no target)
+2012-10-03 17:35:21 LustreError: Skipped 21 previous similar messages
+2012-10-03 17:36:25 BUG: Bad page state in process ll_ost_io02_002  pfn:ff5e41
+2012-10-03 17:36:25 page:ffffea0037dc9e38 flags:00c0000000000080 count:0 mapcount:0 mapping:(null) index:0 (Tainted: P           ----------------  )
+2012-10-03 17:36:25 Pid: 6629, comm: ll_ost_io02_002 Tainted: P           ----------------   2.6.32-220.23.1.1chaos.ch5.x86_64 #1
+2012-10-03 17:36:25 Call Trace:
+2012-10-03 17:36:25  [] ? bad_page+0x107/0x160
+2012-10-03 17:36:25  [] ? free_hot_cold_page+0x1c9/0x220
+2012-10-03 17:36:25  [] ? free_hot_page+0x2f/0x60
+2012-10-03 17:36:25  [] ? __put_single_page+0x1e/0x30
+2012-10-03 17:36:25  [] ? put_page+0x25/0x40
+2012-10-03 17:36:25  [] ? ptlrpc_free_bulk+0x98/0x330 [ptlrpc]
+2012-10-03 17:36:25  [] ? ost_brw_write+0x501/0x15e0 [ost]
+2012-10-03 17:36:25  [] ? ptlrpc_send_reply+0x28e/0x860 [ptlrpc]
+2012-10-03 17:36:25  [] ? target_bulk_timeout+0x0/0xc0 [ptlrpc]
+2012-10-03 17:36:25  [] ? ost_handle+0x32e2/0x4690 [ost]
+2012-10-03 17:36:25  [] ? ptlrpc_update_export_timer+0x4b/0x470 [ptlrpc]
+2012-10-03 17:36:25  [] ? ptlrpc_server_handle_request+0x41c/0xe00 [ptlrpc]
+2012-10-03 17:36:25  [] ? cfs_timer_arm+0xe/0x10 [libcfs]
+2012-10-03 17:36:25  [] ? lc_watchdog_touch+0x6f/0x180 [libcfs]
+2012-10-03 17:36:25  [] ? ptlrpc_wait_event+0xa7/0x2a0 [ptlrpc]
+2012-10-03 17:36:25  [] ? __wake_up+0x53/0x70
+2012-10-03 17:36:25  [] ? ptlrpc_main+0xbf1/0x19e0 [ptlrpc]
+2012-10-03 17:36:25  [] ? ptlrpc_main+0x0/0x19e0 [ptlrpc]
+2012-10-03 17:36:25  [] ? child_rip+0xa/0x20
+2012-10-03 17:36:25  [] ? ptlrpc_main+0x0/0x19e0 [ptlrpc]
+2012-10-03 17:36:25  [] ? ptlrpc_main+0x0/0x19e0 [ptlrpc]
+2012-10-03 17:36:25  [] ? child_rip+0x0/0x20
+
+--- Comment (bzzz, Thu, 4 Oct 2012 12:38:28 +0000) ---
+thanks for the report, looking at this.

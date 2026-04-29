@@ -1,0 +1,157 @@
+Title:        Fault Tolerant MGS
+URL:          https://wiki.lustre.org/Fault_Tolerant_MGS
+Page ID:      1806
+Last Updated: 2025-09-25T19:25:15Z
+Last Editor:  Adilger
+Edit Comment: add LMR category
+
+--- Content ---
+Motivation
+There are several reasons to implement FTM in a Lustre filesystem.
+
+-  This will improve reliability, by avoiding loss/corruption of the filesystem configuration llog files. This happens often enough that the "writeconf" process is known to all experienced Lustre administrators.
+-  This will improve availability, by avoiding filesystem inaccessibility if the MGS service is failed over and/or the configuration logs are lost.  Even though it is possible for "tunefs.lustre --writeconf" to reset/regenerate the configuration logs, this is not necessarily a simple or robust process, and requires all of the servers to be taken offline and re-registered with the MGS.  Even the writeconf re-registration process needs to be managed carefully to avoid issues, and is better avoided if possible.
+-  This will improve recovery times, because the MGS IR Target Status Table will be maintained in memory on all of the MGS replicas, and be available to clients even if an MGS service is restarted/rebooted (for whatever reason).
+-  This will reduce mount times for large clusters, because the clients can contact any MDS server node to retrieve the filesystem configuration. This will avoid probing for the right MGS node at mount time, which can be slow if the MGS is not running on the first NID listed on the mount command-line.  It will also distribute the client configuration log reading across multiple servers, avoiding network contention if the configuration is large and thousands of clients are trying to retrieve it at the same time.
+-  New features like Multi-Tenancy For Lustre (MTFL) will also depend more heavily on the MGS to manage the dynamic network configuration for multiple tenants, where servers may have hundreds of different NIDs (multiple per VLAN with multiple interfaces and LNet Multi-Rail).
+-  The filesystem administrator's usage experience will be simplified, since it will be possible to run filesystem configuration commands on any MDS node (where an MGS replica is running), without having to query the HA system to learn where the MGS is currently located.
+-  The HA configuration can likely be simplified, since the MGS service will start automatically on every node with an MDT, and there will no longer be a need to failover the MGS/MGT to a server in case the server it is running on fails or is manually stopped.
+
+The FTM feature will provide improvements to several different use cases.
+
+-  There can be an arbitrary (configurable) number of MGS replicas be hosted on distinct server nodes, either on different VMs of the same physical server or pair, or on physically independent servers in different racks.  This will provide very good availability for the MGS service itself. 
+-  Each MGS will have a full replica of the filesystem configuration logs stored in a local MDT device, as well as the in-memory IR Target Status Table.  This minimizes the chance of the logs being lost or corrupted due to local storage issues.
+-  The MGS configuration log replication process can do validation of the configuration logs as they are being replicated to other nodes, minimizing the chance that a new corrupted record is written into the log.
+-  The lack of a single central MGS means that the MDS nodes and MDTs they host can be moved or removed from the filesystem without the current limitation of the MGS/MGT being hosted on a single appliance (typically with MDT0000).
+-  With an MGS replica on every MDS node, the "lctl set_param -P" command to set persistent configuration parameters, and other MGS-specific commands like dumping the configuration logs ("lctl llog_print") can be run anywhere.
+-  There will no longer need to be a dedicated device (LUN/VD/LV) for the MGT.  The MGT storage can return to being co-located with the MDT, since it will be replicated to other MDTs in the filesystem and not become unavailable if MDT0000 is stopped.
+
+The FTM feature should provide a robust ("always available") and fault-tolerant configuration service for even the largest Lustre filesystems. The configuration and management of the MGS service itself should become almost totally automated.
+
+Prior requests
+LU-17819 - LMR1a: Replicated MGS Service (https://jira.whamcloud.com/browse/LU-17819) was originally proposed as part of the Lustre Metadata Redundancy (LMR) design as a mechanism to avoid dependence on MDT0000 for critical filesystem services, and to allow the MGT to migrate configuration services to another MDS node transparently.  Early in Lustre's lifetime, the MGS was not a critical part of the infrastructure, and clients could initially mount the filesystem using a configuration file stored on the local filesystem or in LDAP (as XML).  This configuration file, file was eventually migrated to become the MGS config llog files to allow "zero-configuration" mounting just by specifying the MGS hostname/NID to the mount command.
+
+Later, the Imperative Recovery (IR) feature was added to reduce recovery time when a target (OST/MDT) failed over to another server node, so that the clients were notified directly of the targets new NID(s).  This avoided "probing" for which failover server was hosting the target, and avoided the client waiting for an RPC timeout before even trying to join RPC recovery.  With IR, the MGS keeps track of the current target NIDs in the IR Target Status Table and the clients "subscribe" for updates.  However, if the MGS failed at the same time as another target (e.g. co-located on the same server as an MDT and/or OST, as is commonly the case with EXAScaler embedded server configurations), then the IR functionality is unavailable and the clients and servers will have a much longer recovery time.  At the time of IR development, the MGS was rarely co-located with another target, because the MDS and MDT0000 were typically running on a single server in active-passive mode, and DNE with MDT0001 was rarely running on the backup MDS (which was otherwise only running the MGS).
+
+Technical Design
+MGS Cluster Membership
+For "MGS cluster" membership, the RAFT consensus algorithm (https://en.wikipedia.org/wiki/Raft_(algorithm)) seems like a very good fit for our purposes (see also Raft: A Consensus Algorithm for Distributed Systems (https://sulavpanthi.medium.com/raft-a-consensus-algorithm-for-distributed-systems-67f46c6ed030)).
+
+We would have a "MGS Leader" (possibly default to the initial external MGS+MGT if there is only one, or as a tie breaker) that controls the configuration and updates in the absence of other issues.
+
+When the RAFT MGS Leader is making updates to the config llog (e.g. via a Command Request from "lctl set_param -P" or other llog API update, or in the in-memory IR target log when a target reconnects with a new NID), it only appends new records to the configuration and assigns a unique index number, which fits the semantics of the config llog files well. The MGS Leader may be running on any MDS or dedicated MGS node. If "lctl set_param -P" or other configuration command is run on an MGS node that is not  the MGS Leader, that node should request a new election with itself as the Candidate MGS. This allows MGS configuration commands to be run on any MDS server.  This will also simplify usage for the administrator, as long as the Leader Election can be completed quickly (at least capturing a majority of the MGS nodes in the cluster).
+Config llog Mirroring
+
+There seem to be two possible approaches to config llog mirroring that could be used.  Most of the discussion here is initially focussed on the FSNAME-client configuration llog, since it is most widely used, and will benefit the most from the FTM replication and availability properties.  However, the FTM implementation will apply to other MGS config llogs such as FSNAME-MDTxxxx, FSNAME-OSTxxxx, and params, and is discussed in "MGS Replicas with Multiple Configuration llogs" below.
+
+Implementation Options
+Option 1: Lustre DNE Compound Transactions for llog Mirroring
+-  The MGS is stacked on top of the Logical Object Device (LOD) so that it has access to both the local MDT device as well as connections to the remote MDT devices.
+-  MGS Leader creates a compound DNE transaction to write to all available MGS replicas (local and remote), which is a mirrored write to the config llog objects on the remote MDTs using the MDT->LOD connections.
+-  The Leader "request forwarding" is essentially the LOD write to the remote llog files.
+-  Use DNE recovery to perform remote llog recovery for the remote config llogs if an MGS replica fails in the middle of a llog update.
+-  This is re-using the existing Lustre infrastructure, but has the drawback that the DNE distributed transaction recovery log is itself almost a RAFT-like update (remote llog write with sync), so this is (at least) doubling the number of writes for each record update.
+-  Another drawback of DNE transaction/RPC is that the DNE update may become very large with many replicas. The DNE distributed recovery mechanism needs to write the whole DNE update for all replicas to all of the remote targets (i.e. n2 growth of DNE transaction size).
+-  This doesn't really fit the exact definition of RAFT, and might introduce deadlocks, bugs during recovery, etc.
+
+Option 2: RAFT Algorithm for Individual llog Updates
+-  The Leader MGS could update its local and then remote config llogs in separate write requests to each remote replica.
+-  Depend on the RAFT recovery algorithm to perform synchronization of the configs independently upon recovery.
+-  This has the advantage of keeping each update simple, and does not entangle the MGS updates with the MDT DNE recovery (in case of aborted recovery, etc).
+-  Replicated MGS llog records would need to include the Leader Term Number, but this is easily stored in the "marker" records that bracket every config log record and contain a timestamp of the update. We can use the "marker" number of the last record as the Leader Term Number. This marker number is already extracted and stored in "fsdb->fsdb_gen" when the MGS is started.
+-  There may need to be a new llog interface added for truncating MGS config llogs, or otherwise "rolling back" any records at the end of remote config llogs (e.g. cancel and re-use records at the end of the llog?), if they were added during a failed Leader update. However, since there would generally only be a single source of configuration changes ("lctl set_param -P") the chance of conflicting records is low.
+-  Since MGS->client configuration updates are already asynchronous, any delay (hopefully below 1s) in Leader Election should not affect filesystem llog processing behavior more than today.
+-  In this configuration, we may not even need to move the MGS service on top of LOD, since each MGS could write the config replicas locally. It seems reasonable to have direct connections between the MGS nodes to avoid complexity and allow re-using the standard RAFT algorithm more closely. The RAFT communication might be implemented with e.g. MGS_RAFT RPCs directly between the MGS instances.
+
+Option 3: Recreate the MGS configuration by RAFT
+-  Each RAFT node sends (handshake) request to every MDT/OST to get the MTI from these targets during startup
+-  The replicated MGS node recreates the replicated MGS configurations by re-precessing these MTI (the same way as the leader MGS)
+-  When the leader MGS process other configuration parameters, it will synchronize these parameters to other RAFT nodes
+-  The  replicated MGS node process the configure parameters to update its replicated MGS configuration files
+
+RAFT Implementations
+Rather than re-implement a full RAFT algorithm from scratch, it seems prudent to start with an existing implementation, import it into the Lustre repository, and then modify the interfaces to work with PtlRPC for messaging and use kernel APIs for memory, locking, etc.  This should provide us with a robust algorithm and implementation, as long as the code can be aligned reasonably with the Lustre/kernel APIs.
+
+There are a number of RAFT implementations available on GitHub, as listed at There are a few implementations in C that are suitably licensed to be included into the kernel include, with the most popular ones being:
+
+-  [https://github.com/willemt/raft (https://raft.github.io/].) - has been around a long time, lots of contributors, lots of users, lots of stars, relatively small implementation
+-  - newer repository, lots of contributors, fewer users, fewer stars, larger implementation
+
+Number of MGS Replicas
+The number of MGS and MGT replicas should be configurable.  We would want at least 3-4 copies of the MGT config llogs for robustness in case of failure.  Usually there are at least 2-4 MDTs even on a minimum-sized filesystem, with 2-4 separate MDS nodes on 2-4 VMs sharing 2 physical servers.  Preferably the config llog mirrors would be on remote MDT nodes with different physical storage hardware for better availability.  There can be only one MGS service running on a single node, so MGS service replicas can only run on different MDS nodes, and not one MGS per MDT.
+
+-  We might consider writing the MGS config llogs to all MDTs in the filesystem. The size of the config logs is tiny compared to the size of an MDT, and this provides the most redundancy and ease of use.  The main reason not to do this is if the cost of full replication becomes too high (e.g. with 40+ MDTs existing in filesystems today, and demand for more already upon us).
+-  If replication to all MDTs is too expensive, we might also consider following the example of ext4 to store config replicas on MDT numbers with index 3^n, 5^n, 7^n = 0, 1, 3, 5, 7, 9, 25, 27, 49, 81, .... This provides high replica density when the MDT count is low, but fewer when the MDT count is high. This would begin to miss some servers completely (e.g. 12-15, 16-19, 20-23, ...) and this may be confusing for users.
+-  Create replicas on all MDTs up to a certain number (e.g. MDT0000-MDT0007) and then if more MDTs are added, then only add a single MGS replica per appliance (e.g. 1 MGS per 4 MDTs). That would provide the maximum hardware redundancy (each new MGS is on totally separate hardware) while creating far fewer MDT copies.  The main drawback is if the initial MDT0000-MDT0007 nodes are removed, the clients will not be able to locate the running MGS services on the higher-numbered MDS nodes.  This would require either that the administrator and clients adjust the MGS NIDs/hostnames provided on the mount command line, or (preferably) use a name service like DNS (or host a local Rendezvous server on the MGS itself?) with round-robin records that map a single MGS hostname to all available MGS NIDs.
+
+MGS Replica Initial Setup
+One option would be to format and initially mount a single standalone MGS as we do today. This minimizes configuration disruption, and provides an initial MGS to "jump start" where the MDTs and OSTs can register. This standalone MGS/MGT would initially be the RAFT Leader (only one MGS in the cluster). As more MDTs are mounted and register with the MGS, a new MGS would be started on each separate MDS node, join the MGS cluster, and the configuration would be replicated to the new MDT(s) on that node (subject to potential replica limits above).
+
+During initial formatting and mounting of MDT and OST filesystems and their registration with the MGS, it would seem prudent to drive all config llog updates through the Leader MGS, to avoid repeated elections for registrations sent to different MGS nodes... unless Leader Election is so fast that it doesn't matter (e.g. fractions of a second). Since initial target mount registration is an uncommon event, a small performance impact is not critical.
+MGS Replica Startup
+
+Whenever an MDT is mounted, if there is not already an MGS service running on the local node, then the MGS service would be started, and join the MGS cluster. It would try to read and/or RAFT re-sync the config files available on the local MDTs. It would then be available to export the config llogs to any clients that connect to it. If the HA system tries to start the MGS/MGT on a system that is already running a replica MGS/MDT, this should transparently succeed (rather than fail with EEXIST or similar), and add the MGT to the local list of mirror targets.
+
+In this model, the MGS service would not really need to be failed over between servers, though failover/failback of the MGT might still be useful in some cases (e.g. for offline configuration actions, in case a new filesystem is being formatted, etc.). Alternately, the initial MGS/MGT service/device could even be removed since its content would be replicated on all MDTs, but it isn't clear if there is much value in this.
+
+Each RAFT node will also try to start the MGS service just like the node configured with MGS (LDD_F_SV_TYPE_MGS), if there is no MGS service on its node, it will start the MGS service successfully and record it, then it will re-process the MTI passed by RAFT to recreate the MGS configuration files and provide MGS service to Clients (will also provide MGS service if the replicated MGS service is promoted to leader MGS service)
+
+Client Mounting
+The clients would only try to contact MGS NIDs that are listed in the mount command-line, or NIDs that the MGS hostname can be resolved to via DNS (or possibly Rendezvous). This would potentially be up to 32 NIDs, but that becomes cumbersome to configure manually. Improving the handling of many MGS NIDs, as described in LU-16738, would improve usability by reducing the number of displayed NIDs, and improve fault tolerance by having Round-Robin DNS records that advertise all MGS NIDs.  With a large number of MGS replicas, the clients in a large cluster might be able to concurrently connect to a random subset of 16 MGS replicas out of 50 or 100, distributing client load across all of the servers.
+
+Since the clients do not directly modify the MGS configuration, they can connect to any MGS without issues and do not need to be part of the RAFT cluster. If there is a config llog change or new MGS IR Table entry after a target restart, the RAFT algorithm and Config llog Mirroring will first replicate the changes to all MGS nodes, and then alert clients about the updated llog records by revoking their DLM lock, as is already done today. The clients should be able to read the identical configuration llog from any MGS transparently (potentially even multiple MGS nodes in the middle of config llog processing), as long as the config llog files are written identically to storage.
+
+MGS llog Consistency
+Since the llog interface deals with logical records, if two MGS replicas become out of sync, it might be possible that they have the same record contents, but at different llog indexes. That would confuse clients, which keep their config llog cursor based on the llog index. If a client reconnected to an MGS with a different llog index number, then the client might skip processing a record, or process a record twice.
+
+The RAFT algorithm assumes that the MGS Leader's llog records are always correct, which may not be true in all cases. It seems prudent that the MGS read and validate its local llog records, and if they are found to be corrupted then the MGS should not suggest itself as a Candidate for election. That means it would later replicate a new log from another MGS (after truncating back to at least the corrupted llog record, if not the entire llog). The RAFT algorithm should select the MGS with the most complete (and un-corrupted) llog file, by virtue of the highest Election Term Number stored in the last record.
+
+Would we need to consider the number of records in the config llog as well as the Leader Term Number, or would a natural outcome of the Leader Election choosing the highest Term Number result in the most complete llog being selected (i.e. any MGS having an llog file with fewer records could not be elected Leader)?
+
+MGS Replica and RAFT Status Monitoring
+There needs to be parameters available to monitor which MGS replica is Leader, the Term Number of each MGS, and the membership of the MGS RAFT Cluster.  It should also be able to collect statistics about RAFT Election duration, frequency, timeouts, etc.  There must be sufficient D_MGS debug logging to be able to monitor the RAFT Election process to identify issues.  Compound parameters should be read/written with a simple YAML format.
+
+MGS Shutdown
+Since the MGS service would be connected to the local MDT at mount time, it needs to be careful when the MDT tries to unmount due to HA or normal server shutdown. The MGS should not persistently hold a reference to the MDT. It should drop all references in the MDT "pre-shutdown" (for example) so that the MDT can unmount. If all local MDTs are stopped, and there is no local MGT, then the MGS service would also stop itself since the MGS would not have any local copies of the config anymore. I don't think it is useful if the MGS continues running on an MDS and accesses the remote config logs via LOD, compared to clients contacting the remote MGS that is hosting those MDTs, but there might be some reason to allow this.
+Resetting the MGS config llog
+
+Some administrative actions (e.g. "tunefs.lustre --writeconf" or "lctl replace_nids") may completely erase and/or rewrite a configuration log, and upset the normal RAFT Term Number that is used to determine which MGS has the most uptodate config log. The normal RAFT algorithm would assume that the older parts of the config llog do not need re-replication, but some kind of mechanism may be needed to handle an llog Reset. Is running "tunefs.lustre --writeconf" to reset the config llogs on all MGS nodes sufficient to avoid this issue?  Does the writeconf action need to maintain the Term Number across the Reset, so that there is no chance of an old Leader with an "un-reset" config llog taking over the Election and restoring the old config llog and erasing the new one?
+MGS Replicas with Multiple Configuration llogs
+
+Since there are multiple separate configuration llog files stored on the MGS (FSNAME-client, FSNAME-MDTxxxx for each MDT, FSNAME-OSTxxxx for each OST, params, sptlrpc, IR Target Status Table) their lifetime, replication requirements, and current replication status may each differ from the other.  The FSNAME-MDTxxxx and FSNAME-OSTxxxx llogs are only used by a single server, and might not need to be replicated as widely as the FSNAME-client configuration llog that is used by thousands of nodes.  More importantly, if there is ever an error during replicating these llog files to other nodes due to a failure in the middle of an update, their recovery status and Term Number may each be different, which would lead to different recovery actions being performed. 
+
+As such, it seems necessary that each MGS llog file needs to have its own RAFT Cluster and membership so that it can perform independent recovery and replication.
+ 
+MGS Replicas with Multiple Filesystems
+Some configurations have multiple separate Lustre filesystems on a single MDS node, and they will share a single MGS across all of the filesystems on those nodes.  Since there can only be a single MGS running on any (MDS) node, then some consideration is needed in this case. With the typical dedicated MDT-per-filesystem configuration, there is no need to distinguish between the MDTs and config llogs that the MGS needs to manage.  However, once FTM moves the MGS replicas to be embedded into an single filesystem's MDT, then it should be able to read the llogs from any MDT belonging to that filesystem upon request, but the "lctl set_param -P" command should only write llog records for an FSNAME to MDTs that belong to that filesystem. The single params log would be updated on all MDTs for different filesystems. We might consider introducing a new FSNAME-params llog file to separate the configuration between filesystems?
+
+Each filesystem will have several different configuration llogs each have a different RAFT cluster membership.  This allows the RAFT membership to differ if the MDTs and MDS nodes from one filesystem are (partially) different than the MDTs and MDS nodes of a second filesystem.  That might occur if an existing multi-filesystem configuration has a different number of MDTs or MDS nodes for the different filesystems (e.g. 2 MDTs for /home, 6 MDTs for /project, and 8 MDTs for /scatch due to higher performance requirements). At some point, the performance requirements or hardware aging may demand migrating the MDTs onto a different set of servers.  Initially, there would be new MDTs added to the filesystem on MDS nodes which only belong to one filesystem, and the old MDTs may be removed.  At some point, the MGS RAFT cluster membership will become totally disjoint.  As such, it makes sense to manage the membership of those groups separately from the beginning, instead of creating a "super MGS cluster" that overlaps all MDTs even though they are no longer related to each other.
+EMF Interaction
+
+If the filesystem "bootstraps" with a dedicated MGS/MGT as it does today, then this should not affect normal EMF installation and startup. Some care must be taken if HA would be confused to find an MGS device configured on multiple MDS nodes (e.g. appearing in "lctl dl" and having /proc and /sys entries on every MDS (though they should all generally contain the same information).
+Testing Expectations
+The FTM feature can be tested under a number of scenarios and stages of development.
+-  For initial functional testing, confirm that a filesystem with FTM enabled will start the MGS service on all MDS nodes (or the maximum number configured).  This can be seen by running "lctl device_list" on each MDS node.
+-  Check that the MGS config llogs are replicated to each MDT.  This can be seen with "lctl llog_catlist" on each MGS node, which should return a list of mirrored configuration logs, one for each MDT, OST, and client.
+-  Check that the config llog replicas are consistent.  This can be checked with e.g. "lctl llog_print FSNAME-client" (once for each config llog) and comparing the output. The contents of each llog should be identical.
+-  Run various "lctl set_param -P" commands on different MDS nodes and confirm that the records are replicated to all MGS nodes.
+-  Stop the MGS service on the first MDS node (with MGT) and mount a new client, to ensure that the MGS config llogs are available.
+-  Stop the MGS Leader node and confirm that the MGS leadership has moved to a new MGS.
+-  Format and mount a new MDT and OST devices to the filesystem. Confirm that the new MDT/OST can register to the filesystem, and their config records are replicated.
+-  Review the MGS/RAFT statistics and tunable parameters (TBD).
+
+Rationale and alternatives
+An alternative would be a total MGS re-implementation in userspace with some existing mechanism like etcd. This would be a much larger project and take longer to produce any visible progress/improvement. This may also have moderate-to-significant integration and compatibility issues with existing deployments that make it unattractive.  Also, depending on a userspace service for core filesystem config logs means additional configuration, package installation, etc. that might fail, or become starved if the Lustre servers become very busy.
+
+Other consensus algorithms like Paxos and Byzantine Fault Tolerance are more complex to implement, and are not as well suited for the configuration llog format that Lustre is currently using. Existing RAFT implementations appear to be usable with some adaptation, and are unlikely to be worse than implementing our own RAFT code.
+
+Not implementing FTM means that the MGS will continue to be a source of problems and service calls, and Lustre reliability will not be improved.  This is also a requirement for later phases of the Lustre Metadata Redundancy project.
+Unresolved questions
+
+Some aspects of the implementation are still TBD (e.g. exact parameters and statistics to expose), but will be largely driven by the existing RAFT implementation.
+
+Future possibilities
+The FTM project is the first step toward providing Lustre Metadata Rredundancy within the Lustre filesystem.  There are frequent requests for improved metadata resiliency.  Also, a near-term goal before full Metadata Redundancy is implemented is the ability to remove MDT0000 from the filesystem for hardware upgrade purposes.  This requires decoupling the FID Location Database (FLDB, [https://jira.whamcloud.com/browse/LU-15414 LU-15414 (https://github.com/cowsql/raft])), flock server (LU-17502 (https://jira.whamcloud.com/browse/LU-17502)), and Quota Master Target (QMT, LU-15419 (https://jira.whamcloud.com/browse/LU-15419)) from MDT0000, which may also leverage the FTM RAFT implementation.
+
+Category:Architecture
+Category:LMR

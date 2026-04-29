@@ -1,0 +1,417 @@
+Key:        LU-3542
+Summary:    deleted/unused inodes not actually cleared by e2fsck
+Link:       https://jira.whamcloud.com/browse/LU-3542
+Type:       Bug
+Priority:   Critical
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Niu Yawei
+Reporter:   Kit Westneat
+Created:    Mon, 1 Jul 2013 14:20:16 +0000
+Updated:    Fri, 13 Dec 2013 20:53:20 +0000
+Resolved:   Fri, 13 Dec 2013 20:53:20 +0000
+Attachments: e2fsck.log, e2fsck_safe_repair_ost_3.log-1, e2fsck_safe_repair_ost_3.log-2, fsck.hpfs2-eg3-oss11.ost0.2013_11_07.out1, htree.dump
+
+--- Environment ---
+Centos5, e2fsprogs-1.42.7.wc1-0redhat
+
+--- Description ---
+e2fsck doesn't actually clear deleted/unused inodes, though it claims to. I've attached a log showing what we are seeing. The customer is CalTech.
+
+--- Comment (pjones, Fri, 13 Dec 2013 20:53:20 +0000) ---
+This fix has landed for the next e2fsprogs release
+
+--- Comment (kitwestneat, Wed, 27 Nov 2013 16:35:34 +0000) ---
+http://review.whamcloud.com/#/c/8416/
+
+--- Comment (kitwestneat, Wed, 27 Nov 2013 15:50:16 +0000) ---
+ok, I can get a patch for that. 
+
+I ran gcc with -Wconversion on the source code and there are a few other cases where it converts to blk_t from blk64_t. I guess it would be good to go through them all at some point... I am not sure I know enough about ext4 to judge if the conversion is valid or not. For example, pass2.c also has a conversion on line 890:
+
+struct dx_dirblock_info {                                                           
+    int     type;                                                                   
+    blk_t       phys;                                                               
+    int     flags;                                                                  
+    blk_t       parent;                                                             
+    ext2_dirhash_t  min_hash;                                                       
+    ext2_dirhash_t  max_hash;                                                       
+    ext2_dirhash_t  node_min_hash;                                                  
+    ext2_dirhash_t  node_max_hash;                                                  
+};                                                                                  
+                                                                                    
+...
+
+        dx_db = &dx_dir->dx_block[db->blockcnt];                                    
+        dx_db->type = DX_DIRBLOCK_LEAF;                                             
+890>>   dx_db->phys = block_nr;                                                     
+        dx_db->min_hash = ~0;                                                       
+        dx_db->max_hash = 0;                                                        
+
+Should those be 64-bit? It seems like it, but I don't know. There are 103 cases of conversion to blk_t from blk64_t . The real number of conversions is probably higher since there are also some like:
+
+fileio.c:164: warning: conversion to ‘blk_t’ from ‘__u64’ may alter its value
+res_gdt.c:140: warning: conversion to ‘blk_t’ from ‘long long unsigned int’ may alter its value
+pass2.c:687: warning: conversion to ‘blk_t’ from ‘e2_blkcnt_t’ may alter its value
+
+--- Comment (niu, Wed, 27 Nov 2013 03:57:22 +0000) ---
+Yes, I think that's probably the reason of the entries are not fixed. check_dir_block() should call ext2fs_write_dir_block3() directly.
+
+--- Comment (kitwestneat, Tue, 26 Nov 2013 17:01:34 +0000) ---
+oh I think it is the definition of ext2fs_write_dir_block:
+
+errcode_t ext2fs_write_dir_block(ext2_filsys fs, blk_t block,                       
+                 void *inbuf)                                                       
+
+typedef __u32       blk_t;                                                          
+typedef __u64       blk64_t;
+
+It seems like that should be blk64_t? It looks like ext2fs_write_dir_block3 uses blk64_t, but the call to ext2fs_write_dir_block already casts it down to blk_t
+
+Breakpoint 1, check_dir_block (fs=, db=0x7ffff7f14a00, priv_data=0x7fffffffe180) at pass2.c:1219
+1219                    cd->pctx.errcode = ext2fs_write_dir_block(fs, block_nr, buf);
+(gdb) p block_nr
+$35 = 4966058603
+(gdb) cont
+Continuing.
+
+Breakpoint 3, ext2fs_write_dir_block3 (fs=0x647420, block=671091307, inbuf=0x667270, flags=0) at dirblock.c:146
+146             return io_channel_write_blk64(fs->io, block, 1, (char *) inbuf);
+(gdb) p (blk_t)4966058603
+$36 = 671091307
+
+--- Comment (kitwestneat, Tue, 26 Nov 2013 16:48:03 +0000) ---
+It looks like the block number is wrapping around during the io_channel write:
+
+Entry '3102500' in /O/0/d4 (19398664) has deleted/unused inode 26072855.  Clear? yes
+Breakpoint 1, check_dir_block (fs=, db=0x7ffff7f14340, priv_data=0x7fffffffe180) at pass2.c:1219
+1219                    cd->pctx.errcode = ext2fs_write_dir_block(fs, block_nr, buf);
+(gdb) p block_nr
+$30 = 4966058525
+
+Breakpoint 2, raw_write_blk (channel=0x647570, data=0x648670, block=671091229, count=1, bufv=0x64f060) at unix_io.c:233
+
+(gdb) p (unsigned int)4966058525
+$33 = 671091229
+
+I thought maybe it was the cache node, but that appears to use an unsigned long long to store the block.
+
+I'll keep looking but I thought I'd pass that info along in case it helps.
+
+--- Comment (kitwestneat, Mon, 25 Nov 2013 21:34:13 +0000) ---
+It seems like this doesn't actually produce a valid raw image:
+
+e2image -r OSTnnnn.qcow OSTnnnn.raw
+
+I had to do:
+
+qemu-img convert -p  -O raw /scratch/ost000b.qcow ost000b.raw
+
+to get something that worked.
+
+--- Comment (kitwestneat, Mon, 25 Nov 2013 15:55:21 +0000) ---
+Hi Niu, 
+
+I don't think ext4 supports files greater than 16TB, so you'd need to use XFS or ZFS. 
+
+Yeah, the files on the DDN server are temporary.. I'll upload it to the Intel FTP server.
+
+Thanks,
+
+Kit
+
+--- Comment (niu, Mon, 25 Nov 2013 02:54:49 +0000) ---
+Hi Niu, I was able to convert the qcow image to a raw (sparse) image on an XFS filesystem. It uses 3.6GB, though it reports a size of 28TB:
+
+[root@oxonia-mds1 rcvy]# ls -lh
+
+total 3.6G
+
+rw------ 1 root root 28T Nov 22 10:04 ost000b.raw
+
+oh, I didn't notice it's sparse file. Then I think it can be converted on ext4 either, however, I got following error while trying to convert it on ext4 (actual size 1.6G, showed 16T):
+
+e2image: Invalid argument while trying to convert qcow2 image (ost000b.qcow) into raw image
+
+If the 3.6G file you mentioned is http://ddntsr.com/ftp/2013-10-30-lustre-ost_lfs2_36.qcow2.bz2, could you upload it to whamcloud ftp? cause I have no permission to access the ddn ftp server.
+
+--- Comment (kitwestneat, Fri, 22 Nov 2013 18:06:51 +0000) ---
+Hi Niu, I was able to convert the qcow image to a raw (sparse) image on an XFS filesystem. It uses 3.6GB, though it reports a size of 28TB:
+
+[root@oxonia-mds1 rcvy]# ls -lh
+
+total 3.6G
+
+rw------ 1 root root 28T Nov 22 10:04 ost000b.raw
+
+--- Comment (niu, Fri, 22 Nov 2013 06:41:09 +0000) ---
+The raw device of ftp.whamcloud.com/uploads/LU-3542/ost000b.qcow.bz2 is 16TB? It's hard for me to find a machine with that big drive to reproduce the problem, is there any smaller OST which has the same problem?
+
+--- Comment (dvicker, Tue, 12 Nov 2013 17:50:28 +0000) ---
+I just uploaded my qcow image to ftp.whamcloud.com/uploads/LU-3542/ost000b.qcow.bz2
+
+--- Comment (dvicker, Thu, 7 Nov 2013 22:56:54 +0000) ---
+We ran into this problem as well.  I'll attach the fsck output to this JIRA.  Email me if you'd like me to send you the qcow image.
+
+--- Comment (kitwestneat, Wed, 30 Oct 2013 16:21:10 +0000) ---
+I got a qcow image with a file exhibiting the corruption, it's available here:
+
+http://ddntsr.com/ftp/2013-10-30-lustre-ost_lfs2_36.qcow2.bz2 [295M]
+
+	e2fsck -fp /dev/mapper/ost_lfs2_36
+
+lfs2-OST0024: Entry '62977970' in /O/0/d18 (88080410) has deleted/unused inode 1051496.  CLEARED.
+
+lfs2-OST0024: 1546929/89620480 files (9.5% non-contiguous), 2367418676/5735710720 blocks
+
+	e2fsck -fp /dev/mapper/ost_lfs2_36
+
+lfs2-OST0024: Entry '62977970' in /O/0/d18 (88080410) has deleted/unused inode 1051496.  CLEARED.
+
+lfs2-OST0024: 1546929/89620480 files (9.5% non-contiguous), 2367418676/5735710720 blocks
+
+--- Comment (adilger, Thu, 24 Oct 2013 17:07:14 +0000) ---
+Even if there isn't a 100% chance that OST has the problem, it is still worthwhile to make an image of the OST. This will first give us an idea of how long it takes to generate the image, how large it is (uncompressed and compressed), and it can also be used to test the LU-4102 code.
+
+--- Comment (kitwestneat, Wed, 23 Oct 2013 18:45:32 +0000) ---
+I don't think any of the OSTs described in LU-4102 currently has the deleted/unused inodes issue. All the ones that reported it on the r/o e2fsck had previously been clean, so I think that it's just a matter of them being in use. That being said I could get an image of the OST (ost_45) that had the error before.. Do you think that might be useful? I have the e2fsck output as well.
+
+--- Comment (adilger, Wed, 23 Oct 2013 05:40:55 +0000) ---
+I looked through the relevant code in pass2.c::check_dir_block():
+
+                /* 
+                 * Offer to clear unused inodes; if we are going to be
+                 * restarting the scan due to bg_itable_unused being
+                 * wrong, then don't clear any inodes to avoid zapping
+                 * inodes that were skipped during pass1 due to an
+                 * incorrect bg_itable_unused; we'll get any real
+                 * problems after we restart.
+                 */
+                if (!(ctx->flags & E2F_FLAG_RESTART_LATER) &&
+                    !(ext2fs_test_inode_bitmap2(ctx->inode_used_map,
+                                                dirent->inode)))
+                        problem = PR_2_UNUSED_INODE;
+
+                if (problem) {
+                        if (fix_problem(ctx, problem, &cd->pctx)) {
+                                dirent->inode = 0;
+                                dir_modified++;
+                                goto next;
+
+It is easy to trigger the PR_2_UNUSED_INODE problem by setting nlink = 0 in the inode(s) via debugfs.  However, when I run e2fsck against such a filesystem (whether with small directories or large htree directories) e2fsck fixes the problem by clearing the dirent (setting inode = 0 above, and later writing out the directory block) and a second check shows it is fixed.
+
+To capture a filesystem that has a persistent case of this problem (after "e2fsck -fy" didn't fix it) so that it can be debugged and fixed, please use e2image to dump the filesystem metadata.  The dense image format can be efficiently compressed and transported, unlike the sparse variant of e2image:
+
+e2image -Q /dev/OSTnnnn OSTnnnn.qcow
+bzip2 -9 OSTnnnn.qcow
+
+Hopefully the OSTnnnn.qcow.bz2 image size is small enough for transport.  It is possible to reconstitute the (uncompressed) qcow file into a raw ext4 image file that can be tested with e2fsck, debugfs, or mounted via loopback.
+
+e2image -r OSTnnnn.qcow OSTnnnn.raw
+
+--- Comment (kitwestneat, Tue, 22 Oct 2013 13:00:22 +0000) ---
+Hi Niu,
+
+The first customer had a problem with the RAID storage which caused the ldiskfs corruption. The second customer had a power outage that we think corrupted the journal and journal replay (LU-4102). Basically when there is some kind of ldiskfs corruption, there is the possibility of getting these delete/unused inode messages, and it seems if the htrees are also corrupt, e2fsck is unable to clear them.
+
+Thanks,
+
+Kit
+
+--- Comment (niu, Tue, 22 Oct 2013 03:06:27 +0000) ---
+Kit, I didn't know they often run into the problem of "deleted/unused inode". Which Lustre version did they use? and do you know what kind of operation could possibly caused the problem? If possible, could you collect the log on OST before the problem happen? I think it might be helpful for us to figure out how this happened.
+
+I'll look into the e2fsck problem at the same time. Thank you.
+
+--- Comment (kitwestneat, Mon, 21 Oct 2013 14:18:06 +0000) ---
+Hi Niu,
+
+This has become a higher priority for us. The problem is that if deleted inodes are not cleared, the filesystem will go read-only when it encounters the inode. This can lead to a state where the filesystem goes read-only at a random time and only manual intervention with debugfs can bring it back to a healthy state. It has happened to us a couple of times now, so I think we need to explore problem #1 a little more closely. 
+
+Thanks.
+
+--- Comment (niu, Mon, 21 Oct 2013 07:58:05 +0000) ---
+Peter, the two questions Kit asked are probably e2fsck bugs. The remaining work is: 
+
+	Search to find out if the same problem was reported in Linux community before, and if there is any patch alreay. (I did an initial searching, but had no luck so far)
+
+	Try to reproduce the probelm and trace into the e2fsck code to see if it's really some bug needs be fixed. (that requires e2fsprogs expert and could be time-consuming)
+
+I agree with Kit that it's not high priority job.
+
+--- Comment (pjones, Fri, 18 Oct 2013 16:36:22 +0000) ---
+Niu
+
+Can you please see what work remains on this ticket?
+
+THanks
+
+Peter
+
+--- Comment (kitwestneat, Wed, 3 Jul 2013 18:49:24 +0000) ---
+Hi Andreas, we are doing the final lfsck to get the list of damaged files, but we can lower the severity of this ticket. There are two e2fsck behaviors that we saw during this that seem like bugs to me:
+
+	first is the not unlinking the deleted/cleared inodes
+
+	second is the movement of most files to lost+found by e2fsck -D
+
+It might not be worth the effort to explore these at any high priority, but I think we should leave the ticket open for documentation at least.
+
+Thanks again for all your help and advice.
+
+--- Comment (adilger, Wed, 3 Jul 2013 17:58:15 +0000) ---
+Kit, what is the status of this bug?  Can we lower it from Sev 1?
+
+--- Comment (adilger, Tue, 2 Jul 2013 23:18:28 +0000) ---
+I'm not sure why the original e2fsck didn't show problems with the directory blocks, but the later ones do.  Typically, e2fsck is very robust about fixing problems on the first pass, or restarting automatically in the rare cases it cannot.
+
+If the other OSTs are behaving properly, I would avoid e2fsck -fD for now.  While this fixes up the htree directory structure, it also means that the directory will need to allocate new blocks as soon as new files are being allocated there (i.e. immediately for any OST).
+
+--- Comment (kitwestneat, Tue, 2 Jul 2013 21:43:00 +0000) ---
+Ah ok, hmm. a few questions:
+
+	Should I run the -fD on all the OSTs then?
+
+	I would have expected e2fsck to uncover any corrupted directories without -fD. Should I file a new bug on that?
+
+	I was doing a read-only lfsck when the OSTs started going read-only. Is there a possibility that some of the files in the corrupt leaf nodes didn't get added to the ost DBs due to the directory corruption? Should I rerun the e2fsck object db creation step?
+
+Thanks for all your help!
+
+--- Comment (adilger, Tue, 2 Jul 2013 21:08:56 +0000) ---
+No, I think the unattached inodes are a consequence of the directory blocks being corrupted, and it is dumping all of the inodes from the corrupt leaf blocks into lost+found.  You'll need to run ll_recover_lost_found_objs to fix them.  In the not too distant future, online LFSCK in 2.5 (patch http://review.whamcloud.com/6857) will be able to do this automatically at mount time, but until then it needs to be run by hand.
+
+--- Comment (kitwestneat, Tue, 2 Jul 2013 20:38:13 +0000) ---
+ah I didn't see your response before posting. I am running this second e2fsck on a snapshot (the one with all the unattached inodes). Do you think there is any way to avoid all the Unattached inodes, or is it a necessary step at this point? Like would some combination of y/n to those i_size/i_blocks question prevent them from being lost+found?
+
+--- Comment (kitwestneat, Tue, 2 Jul 2013 20:33:52 +0000) ---
+These all appear to be directory inodes. Towards the end of the run, it is non-stop "Unattached inode ...".
+
+My snapshot ran out of space, and I was overconfident and ran it live. I'm glad the ll_recover script exists!
+
+--- Comment (adilger, Tue, 2 Jul 2013 20:31:45 +0000) ---
+It looks like a bit of both.  The "-fD" option re-sorts and compacts the htree directories to ensure all of the leaf blocks are valid.  Normally this makes the directory smaller, which is the cause of the reduction in "i_blocks" values.  Conversely, the i_size value is based on the i_blocks count, but it is fixing this before it checks the i_blocks value.  That seems to be a separate bug in e2fsck.
+
+I don't think it will be harmful to allow these problems to be fixed, but I suspect a second e2fsck run is needed to re-fix the i_size values after i_blocks has been updated, and that should resolve the problems finally.
+
+--- Comment (kitwestneat, Tue, 2 Jul 2013 20:15:49 +0000) ---
+Hi Andreas,
+
+After running the e2fsck -fD, I am getting this on e2fsck -fvy:
+
+Interior extent node level 0 of inode 148471837:
+
+Logical start 980 does not match logical start 981 at next level.  Fix? yes
+
+Inode 148471837, i_size is 2097152, should be 4022272.  Fix? yes
+
+Inode 148471837, i_blocks is 4112, should be 2856.  Fix? yes
+
+Inode 148471838, i_size is 2097152, should be 4005888.  Fix? yes
+
+Inode 148471838, i_blocks is 4112, should be 2816.  Fix? yes
+
+Inode 148471839, i_size is 2084864, should be 3952640.  Fix? yes
+
+Inode 148471839, i_blocks is 4088, should be 2832.  Fix? yes
+
+Inode 148471840, i_size is 2093056, should be 3948544.  Fix? yes
+
+Inode 148471840, i_blocks is 4104, should be 2880.  Fix? yes
+
+Inode 148471841, i_size is 2093056, should be 4001792.  Fix? yes
+
+Inode 148471841, i_blocks is 4104, should be 2800.  Fix? yes
+
+In your opinion, is this corruption created by the -fD or is it corruption uncovered by it?
+
+--- Comment (adilger, Tue, 2 Jul 2013 20:05:19 +0000) ---
+The previous "e2fsck -fD" problem was only seen on MDT devices, not on OST devices.  That said, it is my understanding that those problems were fixed in the version of e2fsck-1.42.7.wc1 that you are running, but I would have been leery to suggest it at this point if the issue was on an MDT device.
+
+If you have a snapshot, that is excellent, as it allows some margin for error if e2fsck behaves in a (more) unexpected manner.
+
+--- Comment (adilger, Tue, 2 Jul 2013 20:02:59 +0000) ---
+Kit, another option, which might allow you to get the system back up and running, if e2fsck isn't fixing the problem, is to mount the OST with "-o errors=continue" which would at least avoid the OST from going read-only when it hit this error.
+
+Unfortunately, it seems that the "-o errors=continue" option in 2.4 is placed before "errors=remount-ro" in the mount options line, so it is overridden (which is itself a bug).  I'm not sure if this is handled correctly in 2.1, but worthwhile to try (I don't have a 2.1 system handy to test this right now).
+
+--- Comment (kitwestneat, Tue, 2 Jul 2013 18:48:08 +0000) ---
+Hi Andreas, I was trying to use clri to simulate the failure. I tested the unlink/rm through debugfs on a snapshot and it seemed to work well. I just saw all the htree corruption and got worried about running it on the real device. 
+
+I'll try running e2fsck -fD on the snapshot to see how it does. I have been wary of it since there used to be bugs, but it looks like all those have been fixed in this version. 
+
+Thanks.
+
+--- Comment (adilger, Tue, 2 Jul 2013 18:38:12 +0000) ---
+Kit, it isn't clear from your comment whether your use of clri  is intended as a workaround (i.e. this allows e2fsck to correctly clean up the inode), or if you are trying (unsuccessfully) to reproduce the problem on a test filesystem to allow debugging e2fsck?
+
+It definitely seems possible to use debugfs to to mark the affected inodes as deleted and remove the name entries, e.g. "clri " and "unlink /O/0/d10/29584586".  In theory "rm /O/0/d10/29584586" should do both, but it may be there is some problem with this and maybe safer to do them separately.  I'd try this first on the ost_global_7 target, since it only has a few such objects, and then run "e2fsck -fy" to see if this fixed the problem.
+
+You could also try running "e2fsck -fD" on ost_global_7, which should rebuild the htree directory structure on the OST, since it seems there may a problem with this as well.  This isn't a requirement if it is working fine after the first e2fsck, and maybe better left to a scheduled downtime in the future.
+
+--- Comment (kitwestneat, Tue, 2 Jul 2013 16:12:42 +0000) ---
+here are the e2fsck -p outputs from the first and second runs on ost_3 (also exhibiting the same behavior)
+
+--- Comment (kitwestneat, Tue, 2 Jul 2013 16:11:32 +0000) ---
+hey Andreas, some how I missed your comment till now, here is the htree dump
+
+--- Comment (kitwestneat, Tue, 2 Jul 2013 15:35:30 +0000) ---
+Also if I do a clri  with debugfs to simulate the problem, e2fsck seems to do the right thing, so I'm not sure what is weird about this filesystem.
+
+Very first:
+
+e2fsck -v -f -p /dev/mapper/ost_global_7MMP interval is 10 seconds and total wait time is 42 seconds. Please wait...
+
+global-OST0007: recovering journal
+
+global-OST0007: Entry '29584587' in /O/0/d11 (148471827) has deleted/unused inode 153961358.  CLEARED.
+
+global-OST0007: Entry '29584575' in /O/0/d31 (148471847) has deleted/unused inode 153961348.  CLEARED.
+
+global-OST0007: Entry '29584573' in /O/0/d29 (148471845) has deleted/unused inode 153961346.  CLEARED.
+
+global-OST0007: Entry '29584407' in /O/0/d23 (148471839) has deleted/unused inode 153961200.  CLEARED.
+
+global-OST0007: Entry '29584406' in /O/0/d22 (148471838) has deleted/unused inode 153961199.  CLEARED.
+
+global-OST0007: Entry '29584589' in /O/0/d13 (148471829) has deleted/unused inode 153961359.  CLEARED.
+
+global-OST0007: Directory inode 148471835, block #360, offset 0: directory corrupted
+
+I will try to find the e2fsck -y log.
+
+--- Comment (adilger, Tue, 2 Jul 2013 15:33:30 +0000) ---
+Kit, can you please run:
+
+debugfs -c -R "htree_dump O/0/d10" /dev/mapper/ost_global_7
+
+--- Comment (bfaccini, Tue, 2 Jul 2013 15:31:34 +0000) ---
+Yes, I confirm that. I just tested it too and it seems to work fine!!... What puzzle me is that e2fsck does not propose/do it ...
+
+Would be also interesting if you can provide the 1st e2fsck log it still available ??
+
+--- Comment (kitwestneat, Tue, 2 Jul 2013 15:24:11 +0000) ---
+ok I think I figured out how to workaround the problem. If I use debugfs, I can unlink all the troublesome files and it works ok. Is there anything I should get to try to debug the e2fsprogs issue before I unlink everything?
+
+--- Comment (bfaccini, Tue, 2 Jul 2013 14:00:00 +0000) ---
+Raised priority to blockern and severity to 1, after Kit's last update on this problem 
+
+We running into a problem trying to restart Lustre after a Sev1. We have run e2fsck several times on a filesystem hit by catastrophic disk failure and cleaned up most of the corruption. However, there are a bunch of referenced deleted/cleared inodes that are not getting cleaned up. e2fsck claims to clear them, but when you rerun it, it's still there.
+
+When the OSTs hit these inodes in production, the OSTs go read-only, bringing Lustre down. So due to this, we are in Sev1 until the fs is 100% clean.
+
+I put the most recent e2fsck logs in LU-3542. Anything else I should get?
+
+--- Comment (kitwestneat, Tue, 2 Jul 2013 03:50:09 +0000) ---
+I need to increase the priority on this one. The OSTs are stopping with "ldiskfs_lookup: deleted inode referenced." Do you have any ideas for how to fix it? I assume this means that the dentries are corrupted, but it seems weird that the files don't show up when I try to ls them. Is it possible that it's something with the HTREE? There were some HTREE messages in the original e2fsck.
+
+Thanks.
+
+--- Comment (pjones, Mon, 1 Jul 2013 14:33:35 +0000) ---
+Nathaniel
+
+Could you please look into this one?
+
+Thanks
+
+Peter

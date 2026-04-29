@@ -1,0 +1,219 @@
+Title:        Lustre Server Fault Isolation with Pacemaker Node Fencing
+URL:          https://wiki.lustre.org/Lustre_Server_Fault_Isolation_with_Pacemaker_Node_Fencing
+Page ID:      1244
+Last Updated: 2017-09-08T05:16:07Z
+Last Editor:  Malcolm
+
+--- Content (MediaWiki markup) ---
+== Overview ==
+
+When a server or a software application develops a fault in a high-availability software framework, it is essential to isolate the affected component and remove it from operation in order to protect the integrity of the cluster as a whole, and to protect data hosted by the cluster from corruption. In shared-storage HA clusters, such as those running Lustre storage services, data corruption is most likely to occur when multiple services on different nodes try to access the same data storage concurrently. Each service assumes that it has exclusive access to the data, which leads to a risk that one service might overwrite information committed by another service on a different cluster node. There are some protections in place in Ldiskfs (and to a lesser extent ZFS) that minimize the risk of concurrent access, but HA software frameworks such as Pacemaker provide additional protections to further reduce exposure to this risk.
+
+The mechanism for isolating a failed component is called fencing. Fencing is the means by which a node in a cluster is prevented from accessing the shared storage. This is usually achieved by forcing the failed node to power off. In Pacemaker, once a fault is detected, healthy nodes that are able to form a quorum create a new cluster configuration with the faulty node removed. The faulty node is then fenced, and any services that were running on the now isolated server are migrated to the surviving node or nodes.
+
+In Pacemaker, the node fencing mechanism is referred to as STONITH, which stands for Shoot the Other Node in the Head. STONITH relies on healthy cluster nodes detecting a fault or failure in another node, and forcibly removing that faulted node from the cluster using a brute force mechanism such as power cycling the host.
+
+Pacemaker has a set of software components called fencing agents that are used for this purpose. There are several such agents available, but most conform to the same basic principal of fault isolation through power control. All such agents rely on supporting infrastructure to facilitate power control, and each has its own specific requirements and parameters. Some agents, such as <code>fence_apc</code>, provide an interface to intelligent power distribution units (PDUs). These are vendor-specific interfaces, and provide a high level of reliability in the mechanism, because they require only that there is access to the PDU control interface.
+
+There are also vendor-specific BMC (Baseboard Management Controller) fence agents and a generic, hardware-agnostic IPMI agent; these are also reliable but require that the BMC is itself responsive in order to work. i.e., The BMC must have a supply of power and an accessible network interface.
+
+There are several RPMs available that contain fencing agents. It is simplest to just install the superset meta RPM package, called <code>fence-agents-all</code> (Note: the YUM package name <code>fence-agents</code> is an alias for </code>fence-agents-all</code>). This will mark all of the fence agents in the RHEL OS repositories for installation.
+
+To obtain a full list of the available agents installed on a host with the PCS software installed:
+
+<pre style="overflow-x:auto;">
+pcs stonith list
+</pre>
+
+To get more detailed information about a specific agent:
+
+<pre style="overflow-x:auto;">
+pcs stonith describe <agent>
+</pre>
+
+Fencing is notoriously difficult to configure correctly, as it is difficult to anticipate and test all of the potential failure modes. If the fencing agent does not exit cleanly and without reporting an error, then the fencing operation will be regarded by Pacemaker as failed, and the resources hosted by the failed node will not be migrated to a healthy cluster node. This is because the agent did not report success when isolating the affected node. Rather than risk compromising the integrity of any data associated with the resources by potentially running multiple services on both the healthy and unhealthy cluster nodes, Pacemaker will refuse to migrate resources until it can be sure that the faulty node has been isolated.
+
+Fencing is a complex topic and there are a number of parameters that can be set to control the behavior of fencing in a Pacemaker cluster. This guide is not a comprehensive reference on the topic, but provides an introduction to the basic mechanisms, illustrated by some examples.
+
+== Configuring the IPMI Fence Agent ==
+
+The fence_ipmilan agent is one of the more versatile fencing agents available in the standard cluster software distribution because it uses the generic IPMI interface to access a server's BMC. The typical syntax for creating an IPMI fencing agent for a Pacemaker cluster is:
+
+<pre style="overflow-x:auto;">
+pcs stonith create <resource name> fence_ipmilan \
+  ipaddr="A.B.C.D" \
+  [ lanplus=true ] \
+  login="<username>" \
+  passwd="<password>" | passwd_script="<path to script>" \
+  pcmk_host_list="<cluster node>"
+</pre>
+
+The command must be run for each node in the cluster (each cluster node must have its own fence agent resource) but the commands can be run from a single node.
+
+* <code><resource name></code> should be descriptive and is usually the cluster node name with the suffix <code>ipmi</code>
+* <code>fence_ipmilan</code> is the name of the fence agent application
+* <code>ipaddr</code> is the IP address of the BMC or equivalent target that will receive the IPMI request from the agent. It is not the IP address of the host that will be fenced.
+* <code>lanplus</code> is optional but usually required by newer devices that support IPMI, as it represents an update to the protocol that improves the security of the connection. It should always be used unless the IPMI target does not support <code>lanplus</code>.
+* <code>login</code> and <code>passwd</code> are used to supply the login credentials to the IPMI device. <code>passwd_script</code> is a command line application that when run prints the password on stdout, and can be used instead of <code>passwd</code>.
+* <code>pcmk_host_list</code> is the name of the host registered in the Pacemaker configuration that will be controlled by this fencing agent. Some agents are able to control multiple nodes using a single agent, which is why the parameter has the suffix <code>_list</code>. However, for IPMI, there is a 1:1 correlation between the agent and the node to be fenced.
+
+Examples:
+
+<pre style="overflow-x:auto;">
+pcs stonith create rh7z-mds1-ipmi fence_ipmilan ipaddr="10.10.10.111" \
+  lanplus=true login="admin" passwd="newroot" \
+  pcmk_host_list="rh7z-mds1.lfs.intl"
+
+pcs stonith create rh7z-mds2-ipmi fence_ipmilan ipaddr="10.10.10.112" \
+  lanplus=true login="admin" passwd="newroot" \
+  pcmk_host_list="rh7z-mds2.lfs.intl"
+</pre>
+
+Be aware that the password will be recorded into the cluster’s configuration data in clear text. This means that a user with suitable privileges on a cluster node will be able to retrieve the password of the IPMI user. If this is a concern, there is an option, <code>passwd_script</code>, to supply the password via a script.
+
+Use the following command to review the available options:
+
+<pre style="overflow-x:auto;">
+pcs stonith describe fence_ipmilan
+</pre>
+
+== Configuring the APC Power Fence Agent ==
+
+The APC fence agent, <code>fence_apc</code>, provides an interface to manage APC branded power distribution units (PDUs). APC power systems are commonly deployed in data centres, and <code>fence_apc</code> is a good reference for demonstrating some of the additional features of a fencing agent.
+
+There are two APC agents available, <code>fence_apc</code>, and <code>fence_apc_snmp</code>. This section will use <code>fence_apc</code> for the examples but the syntax for each is very similar.
+
+The syntax for creating an APC PDU fence agent is:
+
+<pre style="overflow-x:auto;">
+pcs stonith create <resource name> fence_apc \
+  ipaddr="<A.B.C.D|FQDN>" \
+  [ secure [ ssh_options="..." ] ] \
+  login="<username>" \
+  passwd="<password>" |  passwd_script="<path to script>" \
+  pcmk_host_list="<cluster node>[,<cluster node> ...]" \
+  pcmk_host_check="static-list" \
+  pcmk_host_map="<node>:<PDU port #>[;<node>:<PDU port #> ...]" \
+  [...]
+</pre>
+
+* <code><resource name></code> should be descriptive and is usually the cluster node name with the suffix <code>apc</code>
+* <code>fence_apc</code> is the name of the fence agent application
+* <code>ipaddr</code> is the IP address of the APC PDU controller. It is not the IP address of the host that will be fenced.
+* <code>secure</code> is an optional argument that enables an SSH connection. Use <code>ssh_options</code> to supply additional command line arguments to  <code>ssh</code>.
+* <code>login</code> and <code>passwd</code> are used to supply the login credentials to the APC PDU controller. <code>passwd_script</code> is a command line application that when run prints the password on stdout, and can be used instead of <code>passwd</code>.
+
+The <code>fence_apc</code> agent is able to control multiple nodes from a single instance. The list of nodes is managed through the following options:
+
+* <code>pcmk_host_list</code> is a comma-separated list of the nodes registered in the Pacemaker configuration that will be controlled by this fencing agent.
+* <code>pcmk_host_map</code> maps the node name in Pacemaker to a port number on the PDU (representing the physical power socket). Each entry in the list is in the format <code><node name>:<PDU port #></code> (a colon separates node from port), and entries are separated by a semi-colon.
+* <code>pcmk_host_check</code> is optional, and is used to determine how the agent discovers the machines that are controlled by the PDU. When the <code>pcmk_host_list</code> is defined, <code>pcmk_host_check</code> should be set to <code>"static-list"</code>. This is the easiest behaviour to understand and debug.
+
+There are several more options and features available. Refer to the man page or run the following command to get the full list of parameters:
+
+<pre style="overflow-x:auto;">
+pcs stonith describe fence_apc
+</pre>
+
+The following is a complete example for a two-node cluster where the servers each have a single power supply connected to a single APC PDU:
+
+<pre style="overflow-x:auto;">
+pcs stonith create oss01-02-power-apc fence_apc \
+  ipaddr="10.99.10.11" \
+  login="apc" \
+  passwd="apc" \
+  pcmk_host_list="rh7-oss1.lfs.intl,rh7-oss2.lfs.intl" \
+  pcmk_host_check="static-list" \
+  pcmk_host_map="rh7-oss1.lfs.intl:7;rh7-oss2.lfs.intl:8"
+</pre>
+
+=== Fencing Computers with Redundant Power Supplies and Multiple PDUs ===
+
+When servers have redundant power supplies with multiple power connections, it is essential that the Pacemaker cluster is able to cut the power to all of the power supply units in the machine when attempting to fence a node. 
+
+To do this, there must be a fencing agent definition for each PDU that supplies power to the nodes in the cluster.
+
+In the following example, two APC fencing agents are defined:
+
+<pre style="overflow-x:auto;">
+pcs stonith create oss01-02-power-apc1 fence_apc \
+  ipaddr="10.99.10.11" \
+  login="apc" \
+  passwd="apc" \
+  pcmk_host_list="rh7-oss1.lfs.intl,rh7-oss2.lfs.intl" \
+  pcmk_host_check="static-list" \
+  pcmk_host_map="rh7-oss1.lfs.intl:7;rh7-oss2.lfs.intl:8"
+
+pcs stonith create oss01-02-power-apc2 fence_apc \
+  ipaddr="10.99.10.12" \
+  login="apc" \
+  passwd="apc" \
+  pcmk_host_list="rh7-oss1.lfs.intl,rh7-oss2.lfs.intl" \
+  pcmk_host_check="static-list" \
+  pcmk_host_map="rh7-oss1.lfs.intl:7;rh7-oss2.lfs.intl:8"
+</pre>
+
+In the example, each machine is connected to the same power socket port on each of the PDUs. This may not always be the case, so make sure that <code>pcmk_host_map</code> reflects the physical configuration of each PDU.
+
+To ensure that all of the defined power ports of each PDU are powered off at the same time, the fencing agents need to be grouped into a fencing level. A level is a comma-separated list of fencing resources that need to be executed to isolate (power off) a cluster node. There can be multiple levels, depending on the complexity of the cluster and the number of fencing options available. Each level is self-contained and fencing execution stops when all the fencing agents in a given level returns with a successful exit code.
+
+If there are multiple agents defined in a STONITH level, all agents must exit successfully, although they do not necessarily need to run simultaneously.
+
+STONITH levels must be defined for each node in the cluster. The syntax is:
+
+<pre style="overflow-x:auto;">
+pcs stonith level add <n> <cluster node> \
+<fence resource name>[,<fence resource name>]
+</pre>
+
+Building on the previous example, the STONITH levels can be defined as follows:
+
+<pre style="overflow-x:auto;">
+pcs stonith level add 1 rh7-oss1.lfs.intl \
+oss01-02-power-apc1,oss01-02-power-apc2
+
+pcs stonith level add 1 rh7-oss2.lfs.intl \
+oss01-02-power-apc1,oss01-02-power-apc2
+</pre>
+
+== Storage-based Fencing with SCSI Persistent Reservations ==
+
+Nearly all Pacemaker clusters make use of some form of power-control agent to fence nodes in a cluster. However, there are other fencing strategies, and in particular, there is a feature of the SCSI-3 protocol called "persistent reservations" that is used in high-availability clusters to control access to a shared storage resource.
+
+In Pacemaker, there is an agent called <code>fence_scsi</code> that uses SCSI-3 persistent reservations (PR) to isolate cluster nodes that have failed.
+
+'''Note:''' <code>fence_scsi</code> is not used very widely, and it may not always behave as consistently as power-based fencing methods. Support for the agent also varies across the OS distributions. It is presented here as an interesting idea for fencing cluster nodes, with potential to be used as an alternative to power-based fencing strategies, but there is not sufficient evidence regarding its effectiveness for <code>fence_scsi</code> to be recommended.
+
+With PR, each node in the cluster registers a unique key with a shared storage device. The registered nodes form a membership and create a reservation – only the nodes that are listed in the reservation can write to the device. This form of reservation is called "Write Exclusive Registrants Only", or WERO. If a node develops a fault, its registration key is removed from the device. Once removed, the failed node is no longer able to write to the device.
+
+Nodes that are isolated by the SCSI-3 PR mechanism are not powered off – they are prevented from accessing the storage resources in the cluster. To restore the node to the cluster, it must be rebooted manually.
+
+This form of fencing can be an effective alternative to power-control fencing, as it does not require any additional infrastructure beyond a shared storage enclosure. However, the storage devices must support the SCSI-3 protocol, and in particular, persistent reservations.
+
+One of the downsides of storage-based fencing is that every storage device in the shared storage must be listed in the fencing configuration. If the cluster is using JBODs (which is typically the case for ZFS-based storage servers)), there will be a large number of devices to manage.
+
+A single instance of the <code>fence_scsi</code> agent can manage the reservations of more than device. It is suggested that when using <code>fence_scsi</code> with ZFS pools, that each instance contains the devices for a single ZFS pool.
+
+The <code>fence_scsi</code> agent requires the <code>sg3_utils</code> package.
+
+The format of the command to configure a <code>fence_scsi</code> resource is:
+
+<pre style="overflow-x:auto;">
+pcs stonith create <resource name> fence_scsi \
+devices="<dev>[,<dev> ...]" \
+meta provides="unfencing"
+</pre>
+
+The <code>meta provides="unfencing"</code> command line parameter is required in order to allow a node that has been isolated to rejoin the cluster after a reboot. It will also ensure that an isolated node cannot be re-enabled until it has been rebooted.
+
+If multiple <code>fence_scsi</code> resources are defined, they will need to be grouped into a common STONITH level. The syntax is:
+
+<pre style="overflow-x:auto;">
+pcs stonith level add <n> <cluster node> \
+<fence resource name>[,<fence resource name>]
+</pre>
+
+This command must be repeated for each cluster node.
+
+[[Category:Lustre High Availability]]
+[[Category:Lustre Systems Administration]]

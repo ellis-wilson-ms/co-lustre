@@ -1,0 +1,88 @@
+Key:        LU-9885
+Summary:    Huge amount of costs in ptlrpc_wait_event() at file creation
+Link:       https://jira.whamcloud.com/browse/LU-9885
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Peter Jones
+Reporter:   Shuichi Ihara
+Created:    Wed, 16 Aug 2017 04:14:33 +0000
+Updated:    Wed, 1 Sep 2021 17:25:29 +0000
+Links:      Related: is related to LU-14976
+
+--- Description ---
+After metadata performance improvements on LU-9796, we are hitting Lustre level bottleneck at File creation for scale.
+
+collected cost of all Lustre functions at file creation, ptlrpc_wait_event() took huge a mount of time cost.
+
+[root@mds05 ~]# /work/ihara/perf-tools/bin/funccost -L
+Start setting lustre functions...
+Setting lustre functions done...
+Tracing "[lustre modules functions]"... Ctrl-C to end.
+/work/ihara/perf-tools/bin/funccost: line 158: tracing_enabled: Permission denied
+^C
+FUNC                           TOTAL_TIME(us)       COUNT        AVG(us)       
+ptlrpc_wait_event              1299908760           1745217      744.84      
+ptlrpc_server_handle_request   279979924            876419       319.46      
+tgt_request_handle             268911684            637004       422.15      
+tgt_enqueue                    230880245            318456       725.00      
+ldlm_lock_enqueue              230872744            1273842      181.24      
+ldlm_handle_enqueue0           230791830            318456       724.72      
+mdt_intent_policy              224904050            318456       706.23      
+mdt_intent_opc                 223658324            318456       702.32      
+mdt_intent_reint               223196495            318456       700.87      
+
+Why is ptlrpc_wait_event() taking a ot costs here?
+
+--- Comment (ihara, Fri, 18 Aug 2017 04:16:51 +0000) ---
+Thanks Andreas and Patrick
+
+Yes, we just used a simple tool perf-tool to confirm whether if there are any places where are a lot of CPU consuming. Agreed, for now, we need to break down of each function for each CPU time. will try perftool to find what exact places for it.
+
+--- Comment (paf, Fri, 18 Aug 2017 02:37:56 +0000) ---
+For what it's worth, I often see a lot of time spent here when dealing with high rates of small messages.  In my experience, when looking more closely, the culprit is the time spent doing the sleep/wake.  My data is client side, but the code is the same.
+
+I'm not familiar with the tool you're using, does it break down the time spent in that function further (especially in what that function calls)?  If not, I'd suggest using perf record/perf report (the flame graphs Andreas mentioned are a way to visualize the sort of data it generates) - it makes it easy to see where time is spent in a function and functions called from it.  If you are just charting time spent, then if the time is spread out between a few sub calls, they could be far down the list but together account for the time in that function.
+
+--- Comment (adilger, Thu, 17 Aug 2017 17:54:50 +0000) ---
+I was looking into the ptlrpc_wait_event() code, and the only part that can take a lot of CPU time is:
+
+        l_wait_event_exclusive_head(svcpt->scp_waitq,
+                                ptlrpc_thread_stopping(thread) ||
+                                ptlrpc_server_request_incoming(svcpt) ||
+                                ptlrpc_server_request_pending(svcpt, false) ||
+                                ptlrpc_rqbd_pending(svcpt) ||
+                                ptlrpc_at_check(svcpt), &lwi);
+
+and of all those checks, the only one that is not just a simple variable/flag check is ptlrpc_server_request_pending(). It looks like this may be hooking into the NRS code. Is it possible you have some NRS TBF patches/policies on this system that are causing this function to be slow? Alternately, it may be that if there is memory pressure on the MDS it may be that the ptlrpc_wait_event() is just being called a lot due to the 0.1s timeout being set in this case:
+
+                if (ptlrpc_rqbd_pending(svcpt) &&
+                    ptlrpc_server_post_idle_rqbds(svcpt) for a timeout (unless something else
+                         * happens) before I try again */
+                        svcpt->scp_rqbd_timeout = cfs_time_seconds(1) / 10;
+                        CDEBUG(D_RPCTRACE, "Posted buffers: %d\n",
+                               svcpt->scp_nrqbds_posted);
+                }
+
+What would be useful here is a flame graph which shows where the CPU time is actually being spent.[
+
+http://www.brendangregg.com/flamegraphs.html%20flame%20graph]
+
+--- Comment (pjones, Thu, 17 Aug 2017 17:31:51 +0000) ---
+Do you see the same behaviour with Lustre 2.10?
+
+--- Comment (jhammond, Wed, 16 Aug 2017 13:37:10 +0000) ---
+Is this on 2.7.0 or a descendant? Could you describe the exact lustre revision and test used here?
+
+--- Comment (wangshilong, Wed, 16 Aug 2017 10:03:12 +0000) ---
+Hi Andreas,
+
+   We used ftrace function profile which should not include sleep time, profile results
+
+here should be CPU time.
+
+--- Comment (adilger, Wed, 16 Aug 2017 07:53:39 +0000) ---
+Is this CPU time or elapsed wall clock time?  The client threads are all sleeping in ptlrpc_wait_event() for the reply from the MDS. Having more RPCs in flight means that more threads will be waiting in parallel, even if it increases the aggregate create rate. 
+
+If this is elapsed wall-clock time, then that is normal and not much can be done about it. If this is CPU time, then it might be made more efficient.

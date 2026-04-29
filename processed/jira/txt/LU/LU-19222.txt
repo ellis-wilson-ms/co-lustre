@@ -1,0 +1,81 @@
+Key:        LU-19222
+Summary:    'umount -f' of bind mount marks all imports inactive
+Link:       https://jira.whamcloud.com/browse/LU-19222
+Type:       Bug
+Priority:   Critical
+Status:     Open
+Resolution: Unresolved
+Assignee:   Andreas Dilger
+Reporter:   Andreas Dilger
+Created:    Fri, 1 Aug 2025 17:45:34 +0000
+Updated:    Thu, 11 Sep 2025 05:39:35 +0000
+Attachments: umount-f.debug.txt.bz2, umount-f.strace.txt, umount.debug.txt, umount.strace.txt
+
+--- Description ---
+Unmounting a bind mount to a client filesystem with the "-f" (force) option causes the unmount process to mark all of the MDT and OST imports on the client as inactive, resulting in the other bind and regular mounts to become inoperative:
+
+# mount -t lustre mookie-gig:/myth /myth
+# mount --bind /myth /mnt/tmp
+# umount -f /mnt/tmp
+Lustre: setting import myth-MDT0000_UUID INACTIVE by administrator request
+# lctl get_param *.*.active
+mdc.myth-MDT0000-mdc-ffff9a4ee3146800.active=0
+mdc.myth-MDT0001-mdc-ffff9a4ee3146800.active=0
+osc.myth-OST0000-osc-ffff9a4ee3146800.active=0
+osc.myth-OST0001-osc-ffff9a4ee3146800.active=0
+osc.myth-OST0002-osc-ffff9a4ee3146800.active=0
+osc.myth-OST0003-osc-ffff9a4ee3146800.active=0
+osc.myth-OST0004-osc-ffff9a4ee3146800.active=0
+# df /myth
+LustreError: 1029578:0:(file.c:5579:ll_inode_revalidate_fini()) myth: revalidate FID [0x208001:0x1c08b680:0x0] error: rc = -108
+df: /myth: Cannot send after transport endpoint shutdown
+
+--- Comment (gerrit, Thu, 11 Sep 2025 05:39:35 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/61257
+
+Subject: LU-19222 llite: disable container 'unmount -f'
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: cd8aa1fc8c6bcf41a107cab50398ae8f77ebd63c
+
+--- Comment (adilger, Fri, 1 Aug 2025 20:03:28 +0000) ---
+Full debug log attached, collected with:
+
+# lctl set_param debug=all debug_mb=512
+# mount --bind /myth /mnt/tmp
+# lctl clear; lctl mark "umount BEGIN"; strace -o /tmp/umount.strace.txt -tt umount /mnt/tmp; \
+  lctl mark "umount END"; lctl dk /tmp/umount.debug.txt
+# mount --bind /myth /mnt/tmp
+# lctl clear; lctl mark "umount -f BEGIN"; strace -o /tmp/umount-f.strace.txt -tt umount -f /mnt/tmp; \
+  lctl mark "umount -f END"; lctl dk /tmp/umount-f.debug.txt
+# umount /myth   ### because this mountpoint is now broken
+# mount /myth
+
+The ll_umount_begin() marking imports inactive happens almost immediately in the umount-f.debug.txt.bz2 file, but is not called at all in the umount.debug.txt log.
+
+It looks like the trick now is to determine if a bind mount is being unmounted instead of the main/last mountpoint...
+
+--- Comment (adilger, Fri, 1 Aug 2025 19:32:18 +0000) ---
+It looks like the problem here is that the "umount -f" process is calling ll_umount_begin() on every unmount which marks all of the imports inactive, instead of only when the superblock is being cleaned up and the connections dropped.  It looks like this should be done when the superblock is being cleaned up, not when only a refcount to the existing mountpoint is dropped.
+
+/* umount -f client means force down, don't save state */
+void ll_umount_begin(struct super_block *sb)
+{
+        :
+        obd = class_exp2obd(sbi->ll_md_exp);
+        obd->obd_force = 1;
+
+        obd = class_exp2obd(sbi->ll_dt_exp);
+        obd->obd_force = 1;
+
+        if (ioc_data) {
+                obd_iocontrol(OBD_IOC_SET_ACTIVE, sbi->ll_md_exp,
+                              sizeof(*ioc_data), ioc_data, NULL);
+                obd_iocontrol(OBD_IOC_SET_ACTIVE, sbi->ll_dt_exp,
+                              sizeof(*ioc_data), ioc_data, NULL);
+        }

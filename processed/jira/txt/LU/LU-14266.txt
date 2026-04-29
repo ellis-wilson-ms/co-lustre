@@ -1,0 +1,133 @@
+Key:        LU-14266
+Summary:    Common methods about collecting and analyzing logs for evictions related to lock timeouts
+Link:       https://jira.whamcloud.com/browse/LU-14266
+Type:       Question/Request
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Oleg Drokin
+Created:    Sat, 19 Dec 2020 09:31:25 +0000
+Updated:    Fri, 26 Aug 2022 18:03:01 +0000
+
+--- Description ---
+One of the common bug report types is a client eviction due to lock contention or improper lock handling. This typically manifests in I/O errors on the client accompanied by kernel log messages about:
+
+LustreError: 167-0: testbed01-OST0001-osc-ffff9bcb5c37c000: This client was evicted by testbed01-OST0001; in progress operations using this service will fail.
+
+This is accompanied by server side messages like this:
+
+lock callback timer expired after 100s: evicting client at ...
+
+The underlying reason is as stated - a lock that was held by a client was contended (a conflicting lock requested by another client or server thread) and the client did not release it in time for some reason. The reasons might be multiple, from the callbacks not being delivered to client, having a bug that does not let it release the lock, to server being too slow to accept the data flushes, to network losing the client->server communication (or vice versa) that prevents either the data writes reaching the server or the final lock cancel request.
+
+If this happens in a reproducible manner, it's possible to increase debug levels and collect information on servers and clients to pinpoint the exact reason.
+
+At the very minimum you need these debug levels enabled: "dlmtrace rpctrace vfstrace". If the eviction is concerning OST locks "cache" level might be helpful, and for an MDS lock "inode super" levels might be helpful. Depending on overall activity level full debug ("-1" or "all") might be feasible and should be then used.
+
+Named levels could be set on the client and server with a command like this (the leading "#" indicates a command run as the root user from the command-line and should not be included in the command):
+
+# lctl set_param debug=+dlmtrace+rpctrace+vfstrace
+
+To set full debug (carries a significant performance penalty):
+
+# lctl set_param debug=-1
+
+It needs to be executed on every node you are gathering logs on and needs to be repeated after every reboot or Lustre modules reload.
+
+Another important setting is "debug_mb" - this is the amount of memory reserved for these debug logs and the value is in megabytes. In general it's a good idea to give a lot of memory (like say 10240, if you can allow 10GB of RAM to be used for log collection).  Modern systems have many CPU cores and the buffer is not monolithic, but split into progressively smaller 3-level sub-buffers per CPU, and some data might still be discarded even if the total buffer volume was not reached, leading to incomplete logs.
+
+The setting could be set on all nodes with a command like this:
+
+# lctl set_param debug_mb=10240
+
+It's also important to try to isolate system activity to just the operations necessary to trigger the eviction event, if possible.  That will cut down on the amount of logs produced, easing some of the collection and debugging efforts.
+
+Still, in many cases the activity level reduction is not feasible and logs don't fit into memory completely or have gaps.
+
+The way to overcome this is "debug daemon".  It can be enabled with commands (separately on every node), first clearing old debugging logs, then starting the daemon to record up to 10GB (10240 MB) of logs into the specified filename:
+
+# lctl clear
+# lctl debug_daemon start /path/lustrelog.bin 10240
+
+The lustrelog.bin file must be located on some pretty fast and large local storage and definitely not on the lustre filesystem. This might pose a challenge on diskless nodes, but if there is significant RAM you can place the file on /tmp and just reduce the debug_mb to the value where there's no messages drop.
+
+The number at the end is the maximum log size in megabytes, currently there is a limit at 20480 MB (20 GB).
+
+Since the debug daemon log file is written in a circular fashion you still get the most recent messages, instead of the daemon stopping when the log is filled.
+
+In all cases it's still important to stop debug daemon as soon as the eviction happens with this command:
+
+# lctl debug_daemon stop
+
+on every node that has it running.
+
+When debug daemon is in operation check kernel messages (dmesg) to ensure there's no message loss due to daemon writes not being fast enough, indicated by
+
+debug daemon buffer overflowed; discarding 10% of pages
+
+appearing in the dmesg or /var/log/messages on the node.
+
+messages. Try increasing debug_mb value until these messages disappear.
+
+Another tactic to preserve logs on evictions/timeouts is to use automatic "dump on eviction"/dump on timeout" settings.
+
+On the clients you could run
+
+lctl set_param dump_on_eviction=1
+
+and on the server:
+
+lctl set_param dump_on_timeout=1
+
+This will respectively dump current lustre debug log buffer to a file in /tmp/ in case of a client eviction, the name of hte file is printed in kernel messages (dmesg)
+
+The debug logs that are dumped automatically and the ones produced with debug_daemon are in binary form and need to be processed to become readable with the command like below:
+
+lctl df lustrelog.bin lustrelog.txt
+
+So now after you run your reproducer you will have a set of lustre debug logs from all the clients and the servers + kernel messages (important on the servers).
+
+Find the eviction message in a server log first:
+
+[Tue Nov 10 02:27:42 2020] LustreError: 5291:0:(ldlm_lockd.c:256:expired_lock_main()) ### lock callback timer expired after 99s: evicting client at 10.27.22.97@tcp  ns: mdt-hotel-MDT0000_UUID lock: ffff9eeb2212a640/0x4e584d0fc200cfc4 lrc: 3/0,0 mode: PR/PR res: [0x20002e9d4:0xd048:0x0].0x0 bits 0x20/0x0 rrc: 4 type: IBT flags: 0x60200400000020 nid: 10.27.22.97@tcp remote: 0x2abd224b35538a16 expref: 3653940 pid: 25094 timeout: 885030 lvb_type: 0
+
+The important bits are that the client we need logs from is at the address "10.27.22.97@tcp" and the lock handle on the client side is 2abd224b35538a16 while locally it's 4e584d0fc200cfc4
+
+Now is a good time to run a quick sanity check that the logs contain enough useful information.
+
+Format of the debug log is described in the manual: https://doc.lustre.org/lustre_manual.xhtml#dbdoclet.50438274_57177
+
+do a grep on the lock handle in both the client and server lock handle in client/server lustre debug logs respectively to make sure there's more than a couple of entries.
+
+Ideally client side should contain the AST arrival in the form of
+
+ldlm_handle_bl_callback()) ### client blocking AST callback handler
+
+there could be up to two such messages for the given log handle. If you see none that either means the message was not delivered to the client or the log is incomplete (either too short - you can check this by comparing timestamp of the very first message in the log with the expected time or arrival of the server message (= time of the eviction message on the server less the timeout - in the example above "Tue Nov 10 02:27:42 2020" = unix time 1604955462 in the local timezone less 99 = 1604955363 and allow for some time skew between nodes so ideally you want your first message to be earlier than 1604955340)
+
+if the logs look good, grep the client log for the remote handle from the server eviction message and redirect output to some file. Now check the file content paying attention to the timestamp.
+
+First of all do you see one or two AST messages? If there's only one that means the cancel message was not even prepared by the client, if there's two then it was.
+
+See where the timestamp gap for this log handle, likely it'll look something like this:
+
+00010000:00010000:11.0:1604955357.799293:0:11298:0:(ldlm_request.c:1268:ldlm_cli_cancel_local()) ### client-side cancel ns: hotel-MDT0000-mdc-ffff8ced28a0a800 lock: ffff8cf9e7fcf080/0x2abd224b35538a16 lrc: 3/0,0 mode: PR/PR res: [0x20002e9d4:0xd048:0x0].0x0 bits 0x20/0x21 rrc: 3 type: IBT flags: 0x408400000000 nid: local remote: 0x4e584d0fc200cfc4 expref: -99 pid: 16706 timeout: 0 lvb_type: 0
+00000020:00000040:11.0:1604955357.799310:0:11298:0:(lustre_handles.c:113:class_handle_unhash_nolock()) removing object ffff8cf9e7fcf080 with handle 0x2abd224b35538a16 from hash
+00010000:00010000:13.0:1604955464.592275:0:11298:0:(ldlm_lockd.c:1770:ldlm_handle_bl_callback()) ### client blocking callback handler END ns: hotel-MDT0000-mdc-ffff8ced28a0a800 lock: ffff8cf9e7fcf080/0x2abd224b35538a16 lrc: 1/0,0 mode: --/PR res: [0x20002e9d4:0xd048:0x0].0x0 bits 0x20/0x21 rrc: 3 type: IBT flags: 0x4c09400000000 nid: local remote: 0x4e584d0fc200cfc4 expref: -99 pid: 16706 timeout: 0 lvb_type: 0
+
+the callback handler END message after the gap is when client noticed the eviction.
+
+Now we also see that the pid of the handler was 11298 and can now grep the same client log for the pid in colons (in out example ':11298:') and output the result into some different file for examination.
+
+Note the last timestamp pre-gap in the lock handle file and find it in this new file, in our case 1604955357.799310.
+
+this will allow us to see why the process handling the lock got stuck (hopefully there are intermediate messages in the process log that would allow us to see what's it doing, higher debug levels might help here).
+
+for example the message might be "osc_check_rpcs()) obj ffff8bca96b23540 ready 0|| wr 60160|+|- rd 0|- 9 in flight" - this is a sign that outgoing RPC queue is so busy we were not able to put any RPCs for this lock on a wire (some fixes for this in LU-13131)
+
+Or it could be "sleeping for cache space" which is another issue fixed as part of LU-13131
+
+Sometimes there's no gap and you see constant activity, for example LU-13500 is like that - an optimization running wild trying to "early-cancel" unrelated locks before we get to returning the one we were asked about.
+
+Finding the definitive place where the processing stops (or if it does not - what is exactly being done in what would likely look like a loop) is the key in all these cases to find out what was wrong.

@@ -1,0 +1,208 @@
+Key:        LU-9949
+Summary:    lolnd broken
+Link:       https://jira.whamcloud.com/browse/LU-9949
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Duplicate
+Assignee:   Amir Shehata
+Reporter:   Oleg Drokin
+Created:    Wed, 6 Sep 2017 06:30:01 +0000
+Updated:    Sun, 10 Feb 2019 00:12:07 +0000
+Resolved:   Wed, 22 Aug 2018 17:48:54 +0000
+Links:      Duplicate: duplicates LU-9992; Related: is related to  LU-9992
+
+--- Description ---
+It looks like "LU-9480 lnet: implement Peer Discovery" commit 0f1aaad4c1b4447ee5097b8bb79a49d09eaa23c2 broke lolnd (suggested by git bisect)
+
+This manifests in e.g. sanity test 101b hanging with this in logs:
+
+[  215.914245] Lustre: DEBUG MARKER: == sanity test 101b: check stride-io mode read-ahead ================================================= 01:32:15 (1504675935)
+[  215.985320] Lustre: lfs: using old ioctl(LL_IOC_LOV_GETSTRIPE) on [0x200000401:0x5:0x0], use llapi_layout_get_by_path()
+[  256.717500] LNet: Service thread pid 4032 was inactive for 40.01s. The thread might be hung, or it might only be slow and will resume later. Dumping the stack trace for debugging purposes:
+[  256.720328] Pid: 4032, comm: ll_ost_io00_002
+[  256.721561] 
+Call Trace:
+[  256.723391]  [] schedule+0x29/0x70
+[  256.724533]  [] schedule_timeout+0x162/0x2a0
+[  256.725651]  [] ? process_timeout+0x0/0x10
+[  256.726859]  [] target_bulk_io+0x4ee/0xb20 [ptlrpc]
+[  256.729276]  [] ? default_wake_function+0x0/0x20
+[  256.730431]  [] tgt_brw_read+0xf38/0x1870 [ptlrpc]
+[  256.731359]  [] ? libcfs_log_return+0x24/0x30 [libcfs]
+[  256.732387]  [] ? lustre_pack_reply_v2+0x1a0/0x2a0 [ptlrpc]
+[  256.733578]  [] ? target_bulk_timeout+0x0/0xb0 [ptlrpc]
+[  256.734845]  [] ? lustre_pack_reply_flags+0x72/0x1f0 [ptlrpc]
+[  256.736719]  [] ? lustre_pack_reply+0x11/0x20 [ptlrpc]
+[  256.737931]  [] tgt_request_handle+0x93b/0x1390 [ptlrpc]
+[  256.738981]  [] ptlrpc_server_handle_request+0x251/0xae0 [ptlrpc]
+[  256.740764]  [] ptlrpc_main+0xa58/0x1df0 [ptlrpc]
+[  256.741800]  [] ? _raw_spin_unlock_irq+0x27/0x50
+[  256.742938]  [] ? ptlrpc_main+0x0/0x1df0 [ptlrpc]
+[  256.743943]  [] kthread+0xea/0xf0
+[  256.744963]  [] ? kthread+0x0/0xf0
+[  256.745913]  [] ret_from_fork+0x58/0x90
+[  256.746933]  [] ? kthread+0x0/0xf0
+
+[  256.748798] LustreError: dumping log to /tmp/lustre-log.1504675975.4032
+[  269.494952] LustreError: 2624:0:(events.c:449:server_bulk_callback()) event type 5, status -5, desc ffff8800720b3e00
+
+Easy to reproduce, just run this on a single node: ONLY=101 REFORMAT=yes sh sanity.sh
+
+--- Comment (pjones, Wed, 22 Aug 2018 17:48:54 +0000) ---
+Sounds like a duplicate
+
+--- Comment (ashehata, Tue, 19 Sep 2017 16:25:55 +0000) ---
+According to Alex: yes, it's safe as page is removed from the mapping (so another threads can't find it), but it can't get reused for anything else until last page_put() is called
+
+to summarize, the issue seems to be observed only on Oleg's VM on a single node setup running a debug kernel. It appears that calling generic_error_remove_page() which unmaps the pages before they are sent by the socklnd causes the socklnd send to succeed, but not to actually send the pages. It is still not known exactly why that happens.
+
+This issue occurred after 0f1aaad4c1b4447ee5097b8bb79a49d09eaa23c2 which discovers the loopback interface when it's initially used then due to the lolnd having no credits always prefers the other interfaces. This issue has been resolved in LU-9992.
+
+Should this still be a blocker?
+
+--- Comment (ashehata, Fri, 15 Sep 2017 17:30:04 +0000) ---
+One outstanding question that should be answered: Is it safe for  generic_error_remove_page() to be called on the pages before they are passed to the LND?
+
+--- Comment (green, Thu, 14 Sep 2017 20:55:15 +0000) ---
+Multinode setup appears to be working ok
+
+--- Comment (jhammond, Thu, 14 Sep 2017 15:03:43 +0000) ---
+> I believe that lnet is smart enough to use lolnd when it notices that the target nid is the same as its own.
+
+This is no longer the case after 0f1aaad4c1b4447ee5097b8bb79a49d09eaa23c2 LU-9480 lnet: implement Peer Discovery. Which seems like a bug.
+
+--- Comment (jhammond, Thu, 14 Sep 2017 14:41:53 +0000) ---
+Oleg have you tested this on a multiple node setup using the same debug kernel?
+
+--- Comment (ashehata, Thu, 14 Sep 2017 02:18:47 +0000) ---
+The problem happens when  read_cache_enable=0. If read_cache_enable=1 then the test passes (both 101b and John's reproducer)
+
+In the case when read_cache_enable=0 generic_error_remove_page() is being called for each page in osd_read_prep(). Looking at this function it unmaps the pages. This seems to cause a problem on Oleg's setup. After the pages are unmapped the socklnd does not seem to complete the bulk transfer. The server appears to call the kernel API to send the page, but the client socklnd (which is common with the server, since it's the same node) never receives the data. 
+
+I haven't been able to reproduce this issue on my local VM. Oleg's VM is running a debug Kernel, and I'm wondering if its behavior is different. I'll attempt to step through the code and see if the data is being dropped somewhere in the kernel call stack.
+
+--- Comment (simmonsja, Thu, 14 Sep 2017 01:26:03 +0000) ---
+I'm seeing this from time to time which is preventing me from mounting a test file system.
+
+00000020:00000080:4.0:1505255706.626213:0:6697:0:(obd_config.c:431:class_attach()) OBD: dev 1 attached type mgc with refcount 1
+
+00000020:00000080:4.0:1505255706.626217:0:6697:0:(obd_config.c:1138:class_process_config()) processing cmd: cf003
+
+00000100:00000100:5.0:1505255706.627789:0:6697:0:(client.c:96:ptlrpc_uuid_to_connection()) cannot find peer MGC10.37.248.196@o2ib1
+
+_0!
+
+00010000:00080000:5.0:1505255706.627791:0:6697:0:(ldlm_lib.c:74:import_set_conn()) can't find connection MGC10.37.248.196@o2ib1_0
+
+00010000:00020000:5.0:1505255706.627793:0:6697:0:(ldlm_lib.c:483:client_obd_setup()) can't add initial connection
+
+00000020:00000080:1.0:1505255706.638190:0:6711:0:(genops.c:1204:class_import_destroy()) destroying import ffff88101ff0a000 for MGC
+
+10.37.248.196@o2ib1
+
+00000020:00020000:6.0:1505255706.639014:0:6697:0:(obd_config.c:563:class_setup()) setup MGC10.37.248.196@o2ib1 failed (-2)
+
+00000020:00020000:6.0:1505255706.650104:0:6697:0:(obd_mount.c:202:lustre_start_simple()) MGC10.37.248.196@o2ib1 setup error -2
+
+00000020:00000080:6.0:1505255706.661495:0:6697:0:(obd_config.c:1138:class_process_config()) processing cmd: cf002
+
+Is this the same bug or such I open another ticket?
+
+--- Comment (jhammond, Wed, 13 Sep 2017 21:46:54 +0000) ---
+Simplified reproducer (on a single Oleg test node):
+
+dd if=/dev/zero of=/mnt/lustre/f1 bs=1M count=1
+lctl set_param ldlm.namespaces.*-osc-*.lru_size=clear
+lctl set_param osd-ldiskfs.*.read_cache_enable=0
+dd if=/mnt/lustre/f1 of=/dev/null bs=1M
+
+--- Comment (green, Sun, 10 Sep 2017 04:50:16 +0000) ---
+I believe that lnet is smart enough to use lolnd when it notices that the target nid is the same as its own.
+
+--- Comment (jhammond, Fri, 8 Sep 2017 13:21:49 +0000) ---
+> Prior to that there is a failure
+
+LustreError: 4252:0:(obd_config.c:1431:class_process_proc_param()) lustre-clilov-ffff88007647f800: error writing proc 'stripecount=-1'='-1': rc = -34
+
+> error is ERANGE. Is this expected in that test?
+
+This is fine.
+
+--- Comment (ashehata, Fri, 8 Sep 2017 00:10:21 +0000) ---
+I ran 101b by itself, and I'm seeing the following logs:
+
+Sep  7 19:55:58 centos6-16 kernel: Lustre: lustre-OST0001: new disk, initializing
+Sep  7 19:55:58 centos6-16 kernel: Lustre: srv-lustre-OST0001: No data found on store. Initialize space
+Sep  7 19:55:58 centos6-16 kernel: Lustre: lustre-MDT0000: Connection restored to 192.168.10.226@tcp (at 192.168.10.226@tcp)
+Sep  7 19:55:58 centos6-16 kernel: Lustre: lustre-OST0001: Imperative Recovery not enabled, recovery window 60-180
+Sep  7 19:55:59 centos6-16 kernel: LustreError: 4252:0:(obd_config.c:1431:class_process_proc_param()) lustre-clilov-ffff88007647f800: error writing proc 'stripecount=-1'='-1': rc = -34
+Sep  7 19:56:01 centos6-16 kernel: Lustre: lustre-OST0000: Connection restored to 192.168.10.226@tcp (at 192.168.10.226@tcp)
+Sep  7 19:56:01 centos6-16 rsyslogd-2013: fopen() failed: 'Read-only file system', path: '/var/lib/rsyslog/imjournal.state.tmp'#012 [try http://www.rsyslog.com/e/2013 ]
+Sep  7 19:56:06 centos6-16 kernel: Lustre: lustre-MDT0000: Connection restored to 192.168.10.226@tcp (at 192.168.10.226@tcp)
+Sep  7 19:56:06 centos6-16 kernel: Lustre: Skipped 2 previous similar messages
+Sep  7 19:56:06 centos6-16 kernel: Lustre: Mounted lustre-client
+Sep  7 19:56:08 centos6-16 kernel: Lustre: DEBUG MARKER: Using TIMEOUT=20
+Sep  7 19:56:15 centos6-16 kernel: LNetError: 2602:0:(lib-move.c:2395:lnet_parse_ack()) 192.168.10.226@tcp: Dropping ACK from 12345-192.168.10.226@tcp to invalid MD 0x14e239980d506816.0x18e5
+Sep  7 19:56:15 centos6-16 kernel: LNetError: 2602:0:(lib-move.c:2800:lnet_parse()) 192.168.10.226@tcp, src 192.168.10.226@tcp: Dropping ACK. parse_local failed: -2
+Sep  7 19:56:15 centos6-16 kernel: Lustre: DEBUG MARKER: excepting tests: 76 407 253 312 42a 42b 42c 45 68b
+Sep  7 19:56:15 centos6-16 kernel: Lustre: DEBUG MARKER: skipping tests SLOW=no: 27m 64b 68 71 115 300o
+Sep  7 19:56:16 centos6-16 kernel: Lustre: DEBUG MARKER: == sanity test 101b: check stride-io mode read-ahead ================================================= 19:56:16 (1504828576)
+
+There appears to be a dropped ACK because of no valid MD. Prior to that there is a failure 
+
+LustreError: 4252:0:(obd_config.c:1431:class_process_proc_param()) lustre-clilov-ffff88007647f800: error writing proc 'stripecount=-1'='-1': rc = -34
+
+error is ERANGE. Is this expected in that test?
+
+LNet stats:
+
+    - net type: tcp
+      local NI(s):
+        - nid: 192.168.10.226@tcp
+          status: up
+          statistics:
+              send_count: 809
+              recv_count: 808
+              drop_count: 1
+          sent_stats:
+              put: 777
+              get: 32
+              reply: 0
+              ack: 0
+              hello: 0
+          received_stats:
+              put: 758
+              get: 16
+              reply: 16
+              ack: 18
+              hello: 0
+          dropped_stats:
+              put: 0
+              get: 0
+              reply: 0
+              ack: 1
+              hello: 0
+          tunables:
+              peer_timeout: 180
+              peer_credits: 8
+              peer_buffer_credits: 0
+              credits: 256
+          lnd tunables:
+          tcp bonding: 0
+          dev cpt: -1
+          CPT: "[0]"
+
+The only issue the stats seem to point to is the dropped ACK.
+
+Please note that this is on the socklnd and not the lolnd. There appears to be no problems on the lolnd.
+
+--- Comment (pjones, Wed, 6 Sep 2017 11:53:12 +0000) ---
+Amir
+
+Can you please investigate
+
+Peter
+
+--- Comment (green, Wed, 6 Sep 2017 06:31:22 +0000) ---
+This totally breaks significant chunk of my testing with 100% failure rate. was not initially noticed because I am not well equipped to catch such hangs yet.

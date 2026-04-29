@@ -1,0 +1,144 @@
+Key:        LU-18534
+Summary:    lnet connectivity issues in certain environments with peer discovery enabled
+Link:       https://jira.whamcloud.com/browse/LU-18534
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Shane Nehring
+Created:    Wed, 11 Dec 2024 22:12:29 +0000
+Updated:    Fri, 17 Oct 2025 22:29:59 +0000
+
+--- Description ---
+Recently an older mailing list post of mine got a reply from someone seeing very similar symptoms to something I'd run into in the past. In that particular case we were hitting a different bug with opa on el8+, but the symptoms were similar; connectivity issues with clients without any obvious issues with the underlying fabric.
+
+After we worked around our issues with opa (by moving to socklnd, then ultimately away from opa to infiniband with o2iblnd) we noticed that having discovery enabled in our environment was leading to connectivity issues with clients. I chalked this up to some other eccentricity in our environment given a lack of similar issues being reported by folks and have been habitually disabling discovery on clients without a second thought since.
+
+Jesse's similar issues, coupled with them seemingly being resolved by disabling discovery does make we think there's a bug in peer discovery somewhere. Or both of us are doing things wrong, which is possible.
+
+I don't have any logs or notes left from when I experienced this first hand, hopefully Jesse can provide some, but I do have some observations from the current state of things that are weird.
+
+Our servers are configured with two nids, one tcp0 and one o2ib0, each to facilitate access to the volume by clients on both the remaining opa nodes and the ib nodes. The network the o2ib0 interfaces use is a partition on a fabric, so each node has two logical ib interfaces. I mention that just in case having multiple ib interfaces could contribute somehow.
+
+On a client that's mounted the volume I see the following peer nids:
+
+[root@amp-8 ~]# lnetctl peer list
+peer list:
+    - nid: 172.16.200.250@o2ib
+    - nid: 172.16.100.250@tcp
+    - nid: 172.16.200.251@o2ib
+    - nid: 172.16.200.252@o2ib
+    - nid: 172.16.100.251@tcp
+    - nid: 172.16.100.252@tcp
+    - nid: 172.16.200.253@o2ib
+    - nid: 172.16.100.253@tcp
+
+with the interface configured in a modprobe.d file as:
+
+[root@amp-8 ~]# cat /etc/modprobe.d/lnet.conf 
+options lnet networks=o2ib0(ibp38s0.8a51)
+options lnet lnet_peer_discovery_disabled=1
+
+The 172.16.100.0/24 network is the older opa network, the 172.16.200.0/24 network is the 8a51 pkey infiniband network.
+
+This client shouldn't have any knowledge of the opa network, it certainly doesn't have any configuration for that network or connectivity to it. But it does see the tcp nids of the servers it's connected to via o2ib. I'm wondering if, with discovery enabled, this leads to multi rail being configured incorrectly and the servers trying to send traffic down the tcp network to clients that only exist on the o2ib network or similar.
+
+--- Comment (jstroik, Fri, 31 Jan 2025 14:47:18 +0000) ---
+Okay, we've had enough stability now that I think we can rule out Multi-Rail in for my case. It looks like this was entirely due to Infinband RDMA communication problems, which i was able to observe with failed rpings and lctl pings between systems using the o2ib LND when the issue occurred. The same IP addresses given the sock LND worked fine. rping showed this useful diagnostic error:
+
+ 
+
+ibv_create_cq failed
+
+setup_qp failed: 12
+
+ 
+
+I'm not sure if Shane observed the same issue, nor do i think this is necessarily widespread. The systems in question were upgraded in place to rocky 8, and is running older ConnectX-3 IB hardware so the RDMA issue here may be specific to this paricular combination. 
+
+I resolved this issue for us by switching these specific lustre servers with ksocklnd instead of o2iblnd, using replace_nids and updating the appropriate ZFS properties, and adding both o2ib/tcp NIDs to the cluster nodes (which communicate with other IB storage and still need o2ib).
+
+--- Comment (jstroik, Thu, 9 Jan 2025 17:58:14 +0000) ---
+I suspect an issue with RDMA and not necessarily an issue with LNET at this point. Next time this issue comes up on our cluster, I will do some RDMA connectivity testing to get further information.
+
+--- Comment (jstroik, Tue, 7 Jan 2025 17:02:08 +0000) ---
+This issue continues to bedevil one of our clusters. The systems in question, like Shane's, were upgraded from Centos 7 to Rocky 8 and moved from an earlier lustre server version to 2.15.
+
+I recently upgraded the servers from 2.15.5 to 2.15.6 and still have the same experience. I don't think this is a bug in multi-rail, but perhaps it occurs more quickly if multi-rail is enabled. There is something odd about what's going on with the communication. Testing communication with lnetctl ping i observe the following:
+
+peer1 and peer2 cannot communicate to each other
+
+peer1 and peer2 can communicate to peer3 (or most others)
+
+If i reboot both peer1 and peer2, they can communicate to each other again.
+
+If i reboot one of them, then the other one can ping it. For example, if i reboot peer1 then peer2 can ping it. but peer1 still cannot ping peer2.
+
+Deleting each other's peer has no effect and i see the same behavior after doing so.
+
+--- Comment (jstroik, Mon, 23 Dec 2024 18:54:28 +0000) ---
+I'm going to give a description of what I observed with as little conjecture as possible.
+
+We have an environment with Lustre servers running on Infiniband all using o2ib. We have Infiniband clients on our compute clusters, as well as ethernet clients which represent non-cluster servers in our department. The ethernet clients access Lustre servers through Lustre routers but as far as i can tell the issue we're observing is limited to the Infiniband network.
+
+The affected servers are all running Lustre 2.15.5 on rocky 8. They were among the last systems upgraded from our Centos 7 upgrade push and so were previously running Centos 7 in the same hardware environment. These specific servers aren't accessed by the ethernet clients currently.
+
+There are two file systems (a scratch and a data for a cluster). We did spend time tracking down and cleaning up ports or cables on the IB network that were causing symbol errors or unexpected link state changes. We did also watch our subnet manager carefully and were unable to find any unexpected or inconsistent behavior from it. 
+
+When the problem was first noticed we would see asymmetric ping failures: the MDS could 'lctl ping' an OSS, but that OSS could not 'lctl ping' the MDS. Infiniband communication seemed fine when tested and pinging using ip over ib (eg: 'ping ' seemed to work fine where 'lctl ping' was failing. Additionally, the client attempting to access the file could ping some OSS servers but not one hosting that file. However, the OSS server could ping the client.
+
+With peer discovery enabled we could reproduce the issue easily. If we brought the servers up and started monitoring 'lctl ping' it would work fine until after we started lustre on the servers, they completed recovery, and they started experience client access.
+
+After several days of testing and debugging, we decided to disable peer discovery across those servers and clients that accessed those servers and clear the peer lists on the same clients and servers. Where we had been observing the issue within an hour or so after recovery completed and the file systems started getting used again, the issue stopped and did not recur for weeks.
+
+The issue did reoccur just recently. When debugging, I noticed that our robinhood policy engine server for these file systems must not have had its peer list cleared, because it was seeing peers as "multi-rail: true" and that server was unable to lctl ping some of the OSS units from one file system as well as some other clients which had also tried to access files on OSTs hosted by those specific OSS. The other clients where we observed the issue did not see any peers as "multi-rail: true" but were also unable to 'lctl ping' the OSS units in question.
+
+Again, the problem was asymmetric with the OSS units able to 'lctl ping' the clients but the clients unable to 'lctl ping' the OSS units.
+
+I'm not convinced that peer discovery / multi-rail is the cause of the problems we've observed, but disabling peer discovery does seem to at least reduce the frequency of the issue.
+
+It also seems like if a client is experiencing this issue it can affect others.
+
+--- Comment (hornc, Thu, 12 Dec 2024 16:57:52 +0000) ---
+All server NIDs are encoded in the config log when the targets are registered with the MGS. When the client mounts the filesystem it will create LNet peers corresponding to the NIDs in the config log. With peer discovery disabled there is one peer created for each NID in the config log. With peer discovery enabled, the peers are Multi-Rail and should reflect the actual LNet configuration on the servers.
+
+For example, suppose you have an OSS with these NIDs:
+
+oss ~ % lctl list_nids
+172.16.100.252@tcp
+172.16.200.252@o2ib
+oss ~ %
+
+A client mounting with peer discovery disabled will have these peer entries:
+
+client ~ % lnetctl peer show
+peer:
+    - primary nid: 172.16.200.252@o2ib
+      Multi-Rail: False
+      peer ni:
+        - nid: 172.16.200.252@o2ib
+          state: NA
+    - primary nid: 172.16.100.252@tcp
+      Multi-Rail: False
+      peer ni:
+        - nid: 172.16.100.252@tcp
+          state: NA
+client ~ %
+
+A client mounting with peer discovery enabled will have this peer entry:
+
+client ~ % lnetctl peer show
+peer:
+    - primary nid: 172.16.100.252@tcp
+      Multi-Rail: True
+      peer ni:
+        - nid: 172.16.100.252@tcp
+          state: NA
+        - nid: 172.16.200.252@o2ib
+          state: NA
+client ~ % lnetctl peer show
+
+I'm wondering if, with discovery enabled, this leads to multi rail being configured incorrectly and the servers trying to send traffic down the tcp network to clients that only exist on the o2ib network or similar.
+
+No, this will not happen. An LNet peer can only send traffic to a tcp endpoint using a local tcp interface, an o2ib endpoint with a local o2ib interface, etc. LNet will never attempt to send to an o2ib NID from a tcp NID and vice versa.

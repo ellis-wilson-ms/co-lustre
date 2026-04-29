@@ -1,0 +1,387 @@
+Key:        LU-7903
+Summary:    recovery-small test_23: hang on umount
+Link:       https://jira.whamcloud.com/browse/LU-7903
+Type:       Bug
+Priority:   Critical
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Niu Yawei
+Reporter:   Maloo
+Created:    Tue, 22 Mar 2016 15:52:52 +0000
+Updated:    Mon, 12 Dec 2016 20:21:56 +0000
+Resolved:   Fri, 14 Oct 2016 00:56:51 +0000
+Links:      Related: is related to  LU-7022; Related: is related to  LU-7172; Related: is related to  LU-7858
+
+--- Description ---
+This issue was created by maloo for Bob Glossman 
+
+This issue relates to the following test suite run: https://testing.hpdd.intel.com/test_sets/f72c79d4-efbb-11e5-8ddc-5254006e85c2.
+
+The sub-test test_23 failed with the following error:
+
+test failed to respond and timed out
+
+Please provide additional information about the failure here.
+
+Info required for matching: recovery-small 23
+
+--- Comment (pjones, Fri, 14 Oct 2016 00:56:51 +0000) ---
+Landed for 2.9
+
+--- Comment (gerrit, Thu, 13 Oct 2016 23:36:24 +0000) ---
+Oleg Drokin (oleg.drokin@intel.com) merged in patch http://review.whamcloud.com/22696/
+
+Subject: LU-7903 ptlrpc: leaked rs on difficult reply
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: bd1441b92e31cd3c01cc2453aa627d139a1207f7
+
+--- Comment (niu, Fri, 23 Sep 2016 05:27:12 +0000) ---
+The patch http://review.whamcloud.com/#/c/12530/ is merged in master on Jan 29, 2016, then we search the maloo failures:
+
+https://testing.hpdd.intel.com/test_sets/query?commit=Update+results&hosts=&page=9&query_bugs=&status%5B%5D=TIMEOUT&test_node%5Barchitecture_type_id%5D=&test_node%5Bdistribution_type_id%5D=&test_node%5Bfile_system_type_id%5D=&test_node%5Blustre_branch_id%5D=24a6947e-04a9-11e1-bb5f-52540025f9af&test_node%5Bos_type_id%5D=&test_node_network%5Bnetwork_type_id%5D=&test_session%5Bend_date%5D=&test_session%5Bquery_recent_period%5D=&test_session%5Bstart_date%5D=&test_session%5Buser_id%5D=&test_set%5Btest_set_script_id%5D=f36cabd0-32c3-11e0-a61c-52540025f9ae&utf8=%E2%9C%93&warn%5Bnotice%5D=true
+
+This bug showed up immediately after that time point (was reported as LU-7172 before, so I think LU-7172 is dup of this).
+
+--- Comment (laisiyao, Fri, 23 Sep 2016 05:24:20 +0000) ---
+Indeed, this occurs when REPLY-ACK is disabled.
+
+In http://review.whamcloud.com/#/c/12530/, to save local locks, REPLY-ACK is disabled, however for local operations, Commit-on-Sharing doesn't take effect, therefore we may not be able to replay in transno order if reply is lost. This is another issue, I'll fix it in another ticket.
+
+--- Comment (gerrit, Fri, 23 Sep 2016 04:10:31 +0000) ---
+Niu Yawei (yawei.niu@intel.com) uploaded a new patch: http://review.whamcloud.com/22696
+
+Subject: LU-7903 ptlrpc: leaked rs on difficult reply
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 802f41d1a78f588ab99ef8e1d081ac3da7cb8551
+
+--- Comment (niu, Fri, 23 Sep 2016 04:03:04 +0000) ---
+Looks there is a race can cause export reference leak on difficult reply (and when rs_no_ack enabled):
+
+MDT umount calls server_disconnect_export() to disconnects it's export, server_disconnect_exports() tries to complete all it's outstanding (difficult) replies, that'll call into ptlrpc_handle_rs() at the end, where the reply sate is removed from uncommited list, and LNetMDUnlink() is called to trigger an unlink event, reply_out_callback() catches the event and try to finialize the reply sate (where the export hold by reply state will be released) by following code:
+
+                spin_lock(&svcpt->scp_rep_lock);
+                spin_lock(&rs->rs_lock);
+
+                rs->rs_on_net = 0;
+                if (!rs->rs_no_ack ||
+                    rs->rs_transno rs_export->exp_obd->obd_last_committed)
+                        ptlrpc_schedule_difficult_reply(rs);
+
+                spin_unlock(&rs->rs_lock);
+                spin_unlock(&svcpt->scp_rep_lock);
+
+We can see if rs_no_ack is false (COS not enabled), or the transaction has been committed, the reply state is finalized here, otherwise, it relies on commit callback, however, for the export already been disconnected by umount or whatever reason, the reply state is already being removed from the uncommitted list, so nobody will execute the reply state (until unload ptlrpc module). I think adding one more check here to see if the reply state is still on uncommitted list is necessary.
+
+COS is usually not enabled, so this defect won't be triggered easily, however by the change of LU-3538, rs_no_ack is set unpurposely no matter if COS is enabled:
+
+@@ -2530,24 +2589,27 @@ static void mdt_save_lock(struct mdt_thread_info *info, struct lustre_handle *h,
+                        struct mdt_device *mdt = info->mti_mdt;
+                        struct ldlm_lock *lock = ldlm_handle2lock(h);
+                        struct ptlrpc_request *req = mdt_info_req(info);
+-                       int no_ack = 0;
++                       int cos;
++
++                       cos = (mdt_cos_is_enabled(mdt) ||
++                              mdt_slc_is_enabled(mdt));
+
+                        LASSERTF(lock != NULL, "no lock for cookie "LPX64"\n",
+                                 h->cookie);
++
+                        /* there is no request if mdt_object_unlock() is called
+                         * from mdt_export_cleanup()->mdt_add_dirty_flag() */
+                        if (likely(req != NULL)) {
+                                CDEBUG(D_HA, "request = %p reply state = %p"
+                                       " transno = "LPD64"\n", req,
+                                       req->rq_reply_state, req->rq_transno);
+-                               if (mdt_cos_is_enabled(mdt)) {
+-                                       no_ack = 1;
++                               if (cos) {
+                                        ldlm_lock_downgrade(lock, LCK_COS);
+                                        mode = LCK_COS;
+                                }
+-                               ptlrpc_save_lock(req, h, mode, no_ack);
++                               ptlrpc_save_lock(req, h, mode, cos);
+                        } else {
+-                               ldlm_lock_decref(h, mode);
++                               mdt_fid_unlock(h, mode);
+                        }
+
+That could be the reason why it can be triggered more easily today.
+
+--- Comment (adilger, Tue, 20 Sep 2016 14:10:12 +0000) ---
+Is this bug a duplicate of LU-7858?
+
+--- Comment (niu, Mon, 19 Sep 2016 02:58:27 +0000) ---
+Thank you for the information, James, I'm looking at this issue. The console log shows that there is no pending RPC, locks, or commit callback is holding the export, so I'm wondering if it because someone missed puting reference.
+
+--- Comment (jamesanunez, Tue, 13 Sep 2016 18:02:30 +0000) ---
+Niu, 
+
+Here is a failure that should include your debug patch: https://testing.hpdd.intel.com/test_sets/38e4f102-79bf-11e6-b08e-5254006e85c2
+
+From the MDS 1 log:
+
+09:49:55:[26605.283675] Lustre: lustre-MDT0000-osp-MDT0002: Connection to lustre-MDT0000 (at 0@lo) was lost; in progress operations using this service will wait for recovery to complete
+09:49:55:[26605.288046] Lustre: Skipped 24 previous similar messages
+09:49:55:[26607.056252] LustreError: 30936:0:(client.c:1168:ptlrpc_import_delay_req()) @@@ IMP_CLOSED   req@ffff880046125200 x1545343953854000/t0(0) o13->lustre-OST0005-osc-MDT0000@10.9.4.148@tcp:7/4 lens 224/368 e 0 to 0 dl 0 ref 1 fl Rpc:/0/ffffffff rc 0/-1
+09:49:55:[26607.064057] LustreError: 30936:0:(client.c:1168:ptlrpc_import_delay_req()) Skipped 23 previous similar messages
+09:49:55:[26618.703121] Lustre: lustre-MDT0000 is waiting for obd_unlinked_exports more than 8 seconds. The obd refcount = 5. Is it stuck?
+09:49:55:[26618.711819] Lustre: lustre-MDT0000: UNLINKED ffff8800471ee000 dbac7ff5-8b18-2c65-a249-73e04ce7d6a8 10.9.4.146@tcp 1 (0 0 0) 1 0 0 0:           (null)  4294967369 stale:0
+09:49:55:[26634.716121] Lustre: lustre-MDT0000 is waiting for obd_unlinked_exports more than 16 seconds. The obd refcount = 5. Is it stuck?
+09:49:55:[26634.723386] Lustre: lustre-MDT0000: UNLINKED ffff8800471ee000 dbac7ff5-8b18-2c65-a249-73e04ce7d6a8 10.9.4.146@tcp 1 (0 0 0) 1 0 0 0:           (null)  4294967369 stale:0
+09:49:55:[26666.728048] Lustre: lustre-MDT0000 is waiting for obd_unlinked_exports more than 32 seconds. The obd refcount = 5. Is it stuck?
+09:49:55:[26666.734510] Lustre: lustre-MDT0000: UNLINKED ffff8800471ee000 dbac7ff5-8b18-2c65-a249-73e04ce7d6a8 10.9.4.146@tcp 1 (0 0 0) 1 0 0 0:           (null)  4294967369 stale:0
+09:49:55:[26680.276322] Lustre: lustre-MDT0000: Not available for connect from 0@lo (stopping)
+09:49:55:[26680.281813] Lustre: Skipped 231 previous similar messages
+09:49:55:[26730.739132] Lustre: lustre-MDT0000 is waiting for obd_unlinked_exports more than 64 seconds. The obd refcount = 5. Is it stuck?
+09:49:55:[26730.745251] Lustre: lustre-MDT0000: UNLINKED ffff8800471ee000 dbac7ff5-8b18-2c65-a249-73e04ce7d6a8 10.9.4.146@tcp 1 (0 0 0) 1 0 0 0:           (null)  4294967369 stale:0
+09:49:55:[26831.719420] Lustre: lustre-MDT0000: Not available for connect from 10.9.4.146@tcp (stopping)
+09:49:55:[26831.723246] Lustre: Skipped 481 previous similar messages
+09:49:55:[26858.750122] Lustre: lustre-MDT0000 is waiting for obd_unlinked_exports more than 128 seconds. The obd refcount = 5. Is it stuck?
+09:49:55:[26858.761521] Lustre: lustre-MDT0000: UNLINKED ffff8800471ee000 dbac7ff5-8b18-2c65-a249-73e04ce7d6a8 10.9.4.146@tcp 1 (0 0 0) 1 0 0 0:           (null)  4294967369 stale:0
+09:49:55:[27000.758142] INFO: task umount:13385 blocked for more than 120 seconds.
+09:49:55:[27000.762771] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+09:49:55:[27000.765657] umount          D 000000000000f918     0 13385  13384 0x00000080
+
+Another at https://testing.hpdd.intel.com/test_sets/1dbc2ffc-7b23-11e6-8afd-5254006e85c2
+
+--- Comment (yong.fan, Tue, 13 Sep 2016 04:25:38 +0000) ---
+Another failure instance on master:
+
+https://testing.hpdd.intel.com/test_sets/62e575f2-7682-11e6-b08e-5254006e85c2
+
+--- Comment (niu, Thu, 8 Sep 2016 05:20:51 +0000) ---
+The landed patch is to improve the debug information, not fixing the real problem.
+
+--- Comment (pjones, Thu, 8 Sep 2016 04:17:24 +0000) ---
+Landed for 2.9
+
+--- Comment (gerrit, Thu, 8 Sep 2016 02:05:43 +0000) ---
+Oleg Drokin (oleg.drokin@intel.com) merged in patch http://review.whamcloud.com/21599/
+
+Subject: LU-7903 mdt: dump exports information on console
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: f1c9166dc3172beecbd659686fe419f52138cefd
+
+--- Comment (niu, Wed, 24 Aug 2016 16:10:55 +0000) ---
+Bruno, indeed, I agree with you, it's not necessary caused by the reference leak in hsm code, I've updated the debug patch and hope it can get us more useful information once it's hit again.
+
+--- Comment (bfaccini, Mon, 22 Aug 2016 14:34:32 +0000) ---
+Hello Niu,
+
+I also encountered a similar problem with one of my master review at https://testing.hpdd.intel.com/test_sessions/4168f756-60ec-11e6-b2e2-5254006e85c2f. The failed session had been linked to this ticket as the cause. But looking into the whole tests suite/sequence, there was no previous execution of sanity-hsm and my own/concerned change is only affecting conf-sanity/test_41c that had been run before but with multiple MDT stop/fail successful in between. So I may be wrong, but unless there is some HSM activity outside sanity-hsm in others tests suites, I wonder if, as you already suspected, there may be other places in our code where we miss to put an export reference.
+
+--- Comment (gerrit, Mon, 22 Aug 2016 03:45:06 +0000) ---
+Oleg Drokin (oleg.drokin@intel.com) merged in patch http://review.whamcloud.com/21942/
+
+Subject: LU-7903 hsm: leaked export refcount
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 6d57484b718a986aea0ac83802b1b966df576ed8
+
+--- Comment (yong.fan, Sat, 20 Aug 2016 00:07:35 +0000) ---
+Another failure instance on master:
+
+https://testing.hpdd.intel.com/test_sets/db682194-6662-11e6-aa74-5254006e85c2
+
+--- Comment (gerrit, Tue, 16 Aug 2016 09:02:07 +0000) ---
+Niu Yawei (yawei.niu@intel.com) uploaded a new patch: http://review.whamcloud.com/21942
+
+Subject: LU-7903 hsm: leaked export refcount
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: dab8cd2e6918eb11a5d656ff2687ff9067620786
+
+--- Comment (niu, Tue, 16 Aug 2016 08:52:50 +0000) ---
+The debug message shows the export refcount is only 1, which means no locks attached to the export, I'm afraid that we missed putting export reference somewhere. This is one place in the hsm code:
+
+diff --git a/lustre/mdt/mdt_hsm_cdt_agent.c b/lustre/mdt/mdt_hsm_cdt_agent.c
+index 38bc739..dc8e9ad 100644
+--- a/lustre/mdt/mdt_hsm_cdt_agent.c
++++ b/lustre/mdt/mdt_hsm_cdt_agent.c
+@@ -574,6 +574,8 @@ int mdt_hsm_agent_send(struct mdt_thread_info *mti,
+         */
+        exp = cfs_hash_lookup(mdt2obd_dev(mdt)->obd_uuid_hash, &uuid);
+        if (exp == NULL || exp->exp_disconnected) {
++               if (exp != NULL)
++                       class_export_put(exp);
+                /* This should clean up agents on evicted exports */
+                rc = -ENOENT;
+                CERROR("%s: agent uuid (%s) not found, unregistering:"
+
+Not sure if it the real cause of this failure, but it needs be fixed anyway.
+
+--- Comment (niu, Mon, 15 Aug 2016 15:18:27 +0000) ---
+The problem is reproduced with more debug information: https://testing.hpdd.intel.com/test_sets/34ddc070-605b-11e6-906c-5254006e85c2
+
+02:35:51:[ 1394.285106] Lustre: lustre-MDT0000 is waiting for obd_unlinked_exports more than 8 seconds. The obd refcount = 5. Is it stuck?
+02:35:51:[ 1394.295103] Lustre: lustre-MDT0000: UNLINKED ffff8800429cb400 ec87ba17-1f41-6540-2071-22cb49f34d84 10.9.5.174@tcp 1 (0 0 0) 1 0 0 0:           (null)  4294967369
+
+Looks 10.9.5.174 is a Lustre client, probably the export is held by some lock? I'll scrutinize that part of code later.
+
+--- Comment (bfaccini, Sat, 13 Aug 2016 14:29:27 +0000) ---
++1 on master : https://testing.hpdd.intel.com/test_sets/7d8efe92-60ec-11e6-b2e2-5254006e85c2
+
+--- Comment (emoly.liu, Fri, 12 Aug 2016 02:47:35 +0000) ---
+Hit on master: https://testing.hpdd.intel.com/test_sets/d7dfaba2-5e1d-11e6-b2e2-5254006e85c2
+
+--- Comment (yong.fan, Fri, 12 Aug 2016 02:33:46 +0000) ---
+Hit it on master:
+
+https://testing.hpdd.intel.com/test_sets/202938f2-600c-11e6-906c-5254006e85c2
+
+--- Comment (niu, Fri, 29 Jul 2016 07:05:44 +0000) ---
+Unfortunately, the exports information were always being truncated. I cooked a debug patch which dump the exports information on console: http://review.whamcloud.com/21599
+
+--- Comment (gerrit, Fri, 29 Jul 2016 07:02:07 +0000) ---
+Niu Yawei (yawei.niu@intel.com) uploaded a new patch: http://review.whamcloud.com/21599
+
+Subject: LU-7903 mdt: dump exports information on console
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 0fd2cb8ad3591fc1db3f077ba466b26d0a6171e8
+
+--- Comment (jgmitter, Fri, 29 Jul 2016 05:22:34 +0000) ---
+Niu will be cooking a debug patch.
+
+--- Comment (emoly.liu, Tue, 26 Jul 2016 08:05:29 +0000) ---
+Another failure on master:
+
+https://testing.hpdd.intel.com/test_sets/9e634b92-5263-11e6-bf87-5254006e85c2
+
+--- Comment (bfaccini, Tue, 26 Jul 2016 07:44:29 +0000) ---
++1 on master at https://testing.hpdd.intel.com/test_sets/ce2d9280-52fc-11e6-bf87-5254006e85c2
+
+--- Comment (bogl, Mon, 18 Jul 2016 14:16:00 +0000) ---
+another on master:
+
+https://testing.hpdd.intel.com/test_sets/5e5bed64-4ce7-11e6-a80f-5254006e85c2
+
+--- Comment (bfaccini, Mon, 4 Jul 2016 15:05:07 +0000) ---
++1 on master : https://testing.hpdd.intel.com/test_sets/0709014c-407f-11e6-acf3-5254006e85c2
+
+--- Comment (laisiyao, Tue, 14 Jun 2016 08:45:57 +0000) ---
+Jun  5 15:27:19 trevis-10vm4 kernel: INFO: task umount:3347 blocked for more than 120 seconds.
+Jun  5 15:27:19 trevis-10vm4 kernel: "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+Jun  5 15:27:19 trevis-10vm4 kernel: umount          D 000000000000d918     0  3347   3346 0x00000080
+Jun  5 15:27:19 trevis-10vm4 kernel: ffff88004d367aa0 0000000000000082 ffff880029f20b80 ffff88004d367fd8
+Jun  5 15:27:19 trevis-10vm4 kernel: ffff88004d367fd8 ffff88004d367fd8 ffff880029f20b80 ffffffff81daaa00
+Jun  5 15:27:19 trevis-10vm4 kernel: ffff88004d367ad0 0000000101bb1f02 ffffffff81daaa00 000000000000d918
+Jun  5 15:27:19 trevis-10vm4 kernel: Call Trace:
+Jun  5 15:27:19 trevis-10vm4 kernel: [] schedule+0x29/0x70
+Jun  5 15:27:19 trevis-10vm4 kernel: [] schedule_timeout+0x175/0x2d0
+Jun  5 15:27:19 trevis-10vm4 kernel: [] ? internal_add_timer+0x70/0x70
+Jun  5 15:27:19 trevis-10vm4 kernel: [] obd_exports_barrier+0xc4/0x1a0 [obdclass]
+Jun  5 15:27:19 trevis-10vm4 kernel: [] mdt_device_fini+0x310/0xfc0 [mdt]
+Jun  5 15:27:19 trevis-10vm4 kernel: [] class_cleanup+0x8dc/0xd70 [obdclass]
+Jun  5 15:27:19 trevis-10vm4 kernel: [] class_process_config+0x1e2c/0x2f70 [obdclass]
+Jun  5 15:27:19 trevis-10vm4 kernel: [] ? libcfs_debug_msg+0x57/0x80 [libcfs]
+Jun  5 15:27:19 trevis-10vm4 kernel: [] class_manual_cleanup+0xef/0x810 [obdclass]
+Jun  5 15:27:19 trevis-10vm4 kernel: [] server_put_super+0x8de/0xcd0 [obdclass]
+Jun  5 15:27:19 trevis-10vm4 kernel: [] generic_shutdown_super+0x56/0xe0
+Jun  5 15:27:19 trevis-10vm4 kernel: [] kill_anon_super+0x12/0x20
+Jun  5 15:27:19 trevis-10vm4 kernel: [] lustre_kill_super+0x32/0x50 [obdclass]
+Jun  5 15:27:19 trevis-10vm4 kernel: [] deactivate_locked_super+0x49/0x60
+Jun  5 15:27:19 trevis-10vm4 kernel: [] deactivate_super+0x46/0x60
+Jun  5 15:27:19 trevis-10vm4 kernel: [] mntput_no_expire+0xc5/0x120
+Jun  5 15:27:19 trevis-10vm4 kernel: [] SyS_umount+0x9f/0x3c0
+Jun  5 15:27:19 trevis-10vm4 kernel: [] system_call_fastpath+0x16/0x1
+
+MDT umount hung, but I don't find anything useful in the logs, and dump_exports() was called long before log dump, so they are missing in the logs, I'm wondering whether this can be improved.
+
+Besides, I can't reproduce it in local test environment.
+
+--- Comment (yujian, Mon, 6 Jun 2016 12:54:16 +0000) ---
+More failures on master branch:
+
+https://testing.hpdd.intel.com/test_sets/54653454-2ba5-11e6-80b9-5254006e85c2
+
+https://testing.hpdd.intel.com/test_sets/61f7efde-2b3d-11e6-a0ce-5254006e85c2
+
+--- Comment (standan, Tue, 31 May 2016 19:20:22 +0000) ---
+Another failure on master , from review-dne-part-1 : 
+
+https://testing.hpdd.intel.com/test_sets/48332280-248f-11e6-aac3-5254006e85c2
+
+This issue has occurred around 46 times in past 30 days.
+
+--- Comment (rhenwood, Tue, 26 Apr 2016 17:35:33 +0000) ---
+another failure on master, from review-dne-part-1 
+
+https://testing.hpdd.intel.com/test_sets/7d9d1360-0b0b-11e6-855a-5254006e85c2
+
+--- Comment (bogl, Fri, 22 Apr 2016 14:12:50 +0000) ---
+another on master:
+
+https://testing.hpdd.intel.com/test_sets/d2808eda-086c-11e6-9e5d-5254006e85c2
+
+--- Comment (emoly.liu, Fri, 22 Apr 2016 13:54:07 +0000) ---
+Another failure at https://testing.hpdd.intel.com/test_sets/5626d550-0845-11e6-9e5d-5254006e85c2
+
+--- Comment (bfaccini, Fri, 22 Apr 2016 11:47:00 +0000) ---
++1 at https://testing.hpdd.intel.com/test_sets/4e388a9a-0869-11e6-b5f1-5254006e85c2 during a master patch review.
+
+--- Comment (rhenwood, Mon, 4 Apr 2016 15:58:50 +0000) ---
+just seen on Master running review-dne-part-1: 
+
+https://testing.hpdd.intel.com/test_sets/47205c78-f91f-11e5-a22e-5254006e85c2
+
+I've just seen this and it doesn't look like a dup of LU-7172 to me: the call trace from the MDT starts:
+
+22:02:10:Call Trace:
+22:02:10: [] schedule_timeout+0x192/0x2e0
+22:02:10: [] ? process_timeout+0x0/0x10
+22:02:10: [] obd_exports_barrier+0xb6/0x190 [obdclass]
+22:02:10: [] mdt_device_fini+0x6ab/0x12e0 [mdt]
+22:02:10: [] ? class_disconnect_exports+0x17d/0x2f0 [obdclass]
+22:02:10: [] class_cleanup+0x572/0xd20 [obdclass]
+22:02:10: [] ? class_name2dev+0x56/0xe0 [obdclass]
+22:02:10: [] class_process_config+0x1b66/0x24c0 [obdclass]
+22:02:10: [] ? libcfs_debug_msg+0x41/0x50 [libcfs]
+22:02:10: [] class_manual_cleanup+0x4bf/0xc90 [obdclass]
+22:02:10: [] ? class_name2dev+0x56/0xe0 [obdclass]
+22:02:10: [] server_put_super+0x8bc/0xcd0 [obdclass]
+22:02:10: [] generic_shutdown_super+0x5b/0xe0
+22:02:10: [] kill_anon_super+0x16/0x60
+22:02:10: [] lustre_kill_super+0x36/0x60 [obdclass]
+22:02:10: [] deactivate_super+0x57/0x80
+22:02:10: [] mntput_no_expire+0xbf/0x110
+22:02:10: [] sys_umount+0x7b/0x3a0
+22:02:10: [] system_call_fastpath+0x16/0x1b
+22:37:59:********** Timeout by autotest system **********
+
+--- Comment (bogl, Tue, 22 Mar 2016 15:53:31 +0000) ---
+this may be a dup of LU-7172

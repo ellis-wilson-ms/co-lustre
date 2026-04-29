@@ -1,0 +1,427 @@
+Key:        LU-13197
+Summary:    e2fsck fails with 'Internal error: couldn't find dir_info for 1222630503'
+Link:       https://jira.whamcloud.com/browse/LU-13197
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Andreas Dilger
+Reporter:   Andreas Dilger
+Created:    Tue, 4 Feb 2020 05:31:38 +0000
+Updated:    Wed, 21 Oct 2020 18:14:57 +0000
+Resolved:   Sun, 24 May 2020 18:48:31 +0000
+Labels:     e2fsck
+Links:      Related: is related to LU-13452; Related: is related to LU-14056; Related: is related to LU-13604; Related: is related to LU-13558
+
+--- Description ---
+Running e2fsck on a large MDT filesystem fails with an internal error.
+
+e2fsck 1.45.2.wc1 (27-May-2019)
+MMP interval is 9 seconds and total wait time is 38 seconds. Please wait...
+lfs-MDT0000 contains a file system with errors, check forced.
+Pass 1: Checking inodes, blocks, and sizes
+Pass 2: Checking directory structure
+lfs-MDT0000: Deleted inode 813447929 has zero dtime. FIXED.
+lfs-MDT0000: Internal error: couldn't find dir_info for 1222630503.
+lfs-MDT0000: ***** FILE SYSTEM WAS MODIFIED *****
+
+Restarting the e2fsck reports the same problem with the same inode number.  The inode itself appears to be a valid directory:
+
+debugfs: stat 
+Inode: 1222630503 Type: directory Mode: 02700 Flags: 0x0
+Generation: 3227604132 Version: 0x00000172:b0d4e94e
+User: 123375 Group: 130793 Project: 0 Size: 4096
+File ACL: 0
+Links: 2 Blockcount: 8
+Fragment: Address: 0 Number: 0 Size: 0
+ctime: 0x5dfcc8e7:00000000 - Fri Dec 20 13:13:11 2019
+atime: 0x5e13b95f:00000000 - Mon Jan 6 22:49:03 2020
+mtime: 0x5dfcc8e7:00000000 - Fri Dec 20 13:13:11 2019
+crtime: 0x5dfcc88a:5e4ca20c - Fri Dec 20 13:11:38 2019
+Size of extra inode fields: 32
+Extended attributes:
+trusted.lma (24) = 00 00 00 00 00 00 00 00 bb 87 14 00 02 00 00 00 fb 18 00 00 00 00 00 00
+lma: fid=[0x2001487bb:0x18fb:0x0] compat=0 incompat=0
+trusted.link (44)
+BLOCKS:
+(0):763955436
+TOTAL: 1 
+
+debugfs: ls 
+1222630503 (12) . 1162861665 (28) .. 1222214101 (36) 20.1.crd
+1222214102 (36) 20.2.crd 1222214103 (36) 20.3.crd
+1222214104 (36) 20.4.crd 1222214105 (36) 20.5.crd
+:
+
+Clearing this inode with "debugfs -w -R 'clri '" results in a different directory inode reporting an error, and that continues after clearing several such inodes.
+
+The filesystem is 6TB with 2.3B inodes, about 1.8B of which are in use, and 380M directories, for an average of only 4 entries per directory.  The inode numbers reporting problems are in the range of 1.2B.  e2fsck is using about 45GB of RAM (with some swap on an NVMe SSD, so much faster than the HDD the filesystem image is on).  It takes about 3-4h to hit this problem.
+
+I was able to run e2fsck under gdb, though this slows down e2fsck significantly (10-100x slower), if there are conditional breakpoints since they need to be evaluated for each inode, which makes it impossible to use this way.
+
+What I've discovered is quite interesting.  The ctx->dir_info->array is filled in properly for the bad inode, and the array is OK at the start of pass2 ($66 holds the bad inode number):
+
+    (gdb) p e2fsck_get_dir_info(ctx, 2)
+    $171 = (struct dir_info *) 0x7ffabf2bd010
+    (gdb) p *$171
+    $172 = {ino = 2, dotdot = 0, parent = 2}
+    (gdb) p $66
+    $173 = 1222630490
+    (gdb) p e2fsck_get_dir_info(ctx, $66)
+    $174 = (struct dir_info *) 0x7ffb3d327f54
+    (gdb) p *$174
+    $175 = {ino = 1222630490, dotdot = 0, parent = 0}
+
+The dir_info array itself is over 4GB in size, with 380M directories each with a 12-byte entry, but the bad inode is only about half way through the array ($140 is the index of the problematic entry:
+
+    (gdb) p $140
+    $176 = 176197275
+    (gdb) p p ctx->dir_info->array[$140]
+    $177 = {ino = 1222630490, dotdot = 0, parent = 0}
+    (gdb) p *ctx->dir_info
+    $178 = {count = 381539950, size = 381539965,
+      array = 0x7ffabf2bd010, last_lookup = 0x0,
+      tdb_fn = 0x0, tdb = 0x0}
+    (gdb) p $178.count * sizeof(ctx->dir_info->array[0])
+    $179 = 4578479400
+
+I put a hardware watchpoint on the ".parent" and ".dotdot" fields of this entry so that I could watch as e2fsck_dir_info_set_dotdot() updated it, but I didn't think to put one on the ".ino" field, since I thought it would be static.
+
+    (gdb) info break
+    Num     Type           Disp Enb Address    What
+    15      hw watchpoint  keep y              -location $177->parent
+    16      hw watchpoint  keep y              -location $177->dotdot
+
+The watchpoint triggered, and showed that the entry was changed by qsort_r(), which seemed plausible because the dir_info array needs to be sorted, because a binary search is used during lookups.  However, the array is created in order during the inode table scan and does not need to be sorted.  As can be seen from the stack, it is another array that is being sorted that overwrites the dir_info entry:
+
+    Hardware watchpoint 16: -location $177->dotdot
+
+    Old value = 0
+    New value = 1581603653
+    0x0000003b2ea381f7 in _quicksort ()
+       from /lib64/libc.so.6
+    (gdb) p $141
+    $179 = {ino = 1222630490, dotdot = 0, parent = 0}
+    (gdb) bt
+    #0  0x0000003b2ea381e1 in _quicksort ()
+      from /lib64/libc.so.6
+    #1  0x0000003b2ea38f82 in qsort_r ()
+      from /lib64/libc.so.6
+    #2  0x000000000045447b in ext2fs_dblist_sort2 (
+        dblist=0x6c9a90,
+        sortfunc=0x428c3d )
+        at dblist.c:189
+    #3  0x00000000004285bc in e2fsck_pass2 (
+        ctx=0x6c4000) at pass2.c:180
+    #4  0x000000000041646b in e2fsck_run (ctx=0x6c4000)
+        at e2fsck.c:253
+    #5  0x0000000000415210 in main (argc=4,
+        argv=0x7fffffffe088) at unix.c:2047
+    (gdb) p ctx->dir_info->array[$140]
+    $207 = {ino = 0, dotdot = 1581603653, parent = 0}
+    (gdb) f 3
+    #3  0x00000000004285bc in e2fsck_pass2 (
+        ctx=0x6c4000) at pass2.c:180
+    180       ext2fs_dblist_sort2(fs->dblist, special_dir_block_cmp);
+
+The ext2fs_dblist_sort2() is for the directory blocks, and should not be changing the dir_info array at all.  It can be observed from the above dumps that the fs->dblist.list address is right in the middle of the dir_info array address range:
+
+    (gdb) p *fs->dblist
+    $210 = {magic = 2133571340, fs = 0x6c4460,
+      size = 763079922, count = 388821313, sorted = 0,
+      list = 0x7ffad011e010}
+    (gdb) p &ctx->dir_info->array[0]
+    $211 = (struct dir_info *) 0x7ffabf2bd010
+    (gdb) p &ctx->dir_info->array[$140]
+    $212 = (struct dir_info *) 0x7ffb3d327f54
+
+The problem ends up being that e2fsck_allocate_memory() takes an unsigned int size as an argument instead of unsigned long, which means that the large allocations for dir_info and dblist overflow and actually allocates a small array.  What is surprising is that e2fsck didn't fail much earlier.
+
+--- Comment (adilger, Sun, 24 May 2020 18:48:31 +0000) ---
+All patches for this issue are landed, will tag this release as 1.45.2.wc2 in the repo.
+
+--- Comment (gerrit, Sun, 24 May 2020 16:05:45 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) merged in patch https://review.whamcloud.com/37441/
+
+Subject: LU-13197 e2fsck: consistently use ext2fs_get_mem()
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 
+
+Commit: cad09f5e6107df65f7927a1d8e104de74cbb16d5
+
+--- Comment (gerrit, Sun, 24 May 2020 16:05:35 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) merged in patch https://review.whamcloud.com/37440/
+
+Subject: LU-13197 e2fsck: fix overflow if more than 4B inodes
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 
+
+Commit: 9450cab0c2398871f026afcb56a3eab02ed78b40
+
+--- Comment (gerrit, Sun, 24 May 2020 16:05:24 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) merged in patch https://review.whamcloud.com/37439/
+
+Subject: LU-13197 misc: handle large files with filefrag
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 
+
+Commit: bd3c5a11044c9427066a0b2a3122787a269ddeb0
+
+--- Comment (gerrit, Sun, 24 May 2020 05:48:13 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) merged in patch https://review.whamcloud.com/37443/
+
+Subject: LU-13197 e2fsck: reduce memory usage for directories
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 
+
+Commit: 4eaf6ab403bbcab0036938ad1a6b9ec6d69734a0
+
+--- Comment (gerrit, Sat, 23 May 2020 23:03:07 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) merged in patch https://review.whamcloud.com/37442/
+
+Subject: LU-13197 debugfs: print inode numbers as unsigned
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 
+
+Commit: f4f013381df959141803cadd709d2301c176a204
+
+--- Comment (gerrit, Sat, 23 May 2020 23:02:55 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) merged in patch https://review.whamcloud.com/37438/
+
+Subject: LU-13197 debugfs: allow comment lines in command file
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 
+
+Commit: 8c041aaa224cf2349c4df9718bc42d8925425ffa
+
+--- Comment (gerrit, Sat, 23 May 2020 23:02:37 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) merged in patch https://review.whamcloud.com/37436/
+
+Subject: LU-13197 e2fsck: avoid mallinfo() if over 2GB allocated
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 
+
+Commit: 039b852c6a40e12bec0d621bf7aa4f9b554a8dbc
+
+--- Comment (gerrit, Fri, 22 May 2020 06:45:49 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) merged in patch https://review.whamcloud.com/37437/
+
+Subject: LU-13197 e2fsck: avoid overflow with very large dirs
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 
+
+Commit: 8051687bc488a00fb3e17554064c308add13cbcf
+
+--- Comment (gerrit, Fri, 22 May 2020 06:29:54 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) merged in patch https://review.whamcloud.com/37424/
+
+Subject: LU-13197 e2fsck: use proper types for variables
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 
+
+Commit: 77bccf803dea6cb9a69cfd334619c7552143f3cf
+
+--- Comment (gerrit, Fri, 22 May 2020 06:18:24 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) merged in patch https://review.whamcloud.com/37423/
+
+Subject: LU-13197 e2fsck: fix e2fsck_allocate_memory() overflow
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 
+
+Commit: 007512516f96292f29cf8c3ea1534880a7802081
+
+--- Comment (gerrit, Fri, 22 May 2020 06:18:10 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) merged in patch https://review.whamcloud.com/37489/
+
+Subject: LU-13197 misc: update build version to 1.45.2.wc2
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 
+
+Commit: 815b2a77c913198181284dba2130e1802c881182
+
+--- Comment (gerrit, Sat, 8 Feb 2020 15:00:38 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/37489
+
+Subject: LU-13197 misc: update build version to 1.45.2.wc2
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 1
+
+Commit: 9574611bb51c5671f111e0a555e23e46391eb132
+
+--- Comment (gerrit, Wed, 5 Feb 2020 05:39:05 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/37443
+
+Subject: LU-13197 e2fsck: reduce memory usage for directories
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 1
+
+Commit: ee8acbe15a3bd8b2c01b0bb21114bf0b3348e382
+
+--- Comment (gerrit, Wed, 5 Feb 2020 05:39:04 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/37441
+
+Subject: LU-13197 e2fsck: consistently use ext2fs_get_mem()
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 1
+
+Commit: 415915e6bc4d1f17571f41787d7abc4605e11919
+
+--- Comment (gerrit, Wed, 5 Feb 2020 05:39:04 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/37440
+
+Subject: LU-13197 e2fsck: fix overflow if more than 4B inodes
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 1
+
+Commit: 3efa3970c95e8d3b0e76ff8be590392b666c6fcf
+
+--- Comment (gerrit, Wed, 5 Feb 2020 05:39:03 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/37439
+
+Subject: LU-13197 misc: handle large files with filefrag
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 1
+
+Commit: 1c05bd761fbda4af1bf0315041ac4eeb0a635889
+
+--- Comment (gerrit, Wed, 5 Feb 2020 05:39:03 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/37438
+
+Subject: LU-13197 debugfs: allow comment lines in command file
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 1
+
+Commit: 143bc14353ad8ab68117fb9c37ad8468fc91e33a
+
+--- Comment (gerrit, Wed, 5 Feb 2020 05:39:02 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/37437
+
+Subject: LU-13197 e2fsck: avoid overflow with very large dirs
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 1
+
+Commit: ad71b28b0e6a7fd9ec6675894938c450a6227759
+
+--- Comment (gerrit, Wed, 5 Feb 2020 05:39:01 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/37442
+
+Subject: LU-13197 debugfs: print inode numbers as unsigned
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 1
+
+Commit: 4257f5a600580910d5ec836174e63568d3ce67ab
+
+--- Comment (gerrit, Wed, 5 Feb 2020 03:32:25 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/37436
+
+Subject: LU-13197 e2fsck: avoid mallinfo() if over 2GB allocated
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 1
+
+Commit: 5de21015eb5be71eb9cf4649ca78302764d87330
+
+--- Comment (gerrit, Tue, 4 Feb 2020 09:16:19 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/37424
+
+Subject: LU-13197 e2fsck: use proper types for variables
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 1
+
+Commit: 20dffb9334d09230fa370ec1a9959f3d85b8498b
+
+--- Comment (gerrit, Tue, 4 Feb 2020 09:16:19 +0000) ---
+Andreas Dilger (adilger@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/37423
+
+Subject: LU-13197 e2fsck: fix e2fsck_allocate_memory() overflow
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 1
+
+Commit: 57b3af688e57cf9b3f7417831feeb1ed72dcaf24

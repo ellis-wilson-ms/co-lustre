@@ -1,0 +1,251 @@
+Key:        LU-5145
+Summary:    kernel slab data memory coruption on MDS due to a file with truncated link extended attribute
+Link:       https://jira.whamcloud.com/browse/LU-5145
+Type:       Bug
+Priority:   Critical
+Status:     Resolved
+Resolution: Duplicate
+Assignee:   Bruno Faccini
+Reporter:   Sebastien Buisson
+Created:    Thu, 5 Jun 2014 12:48:35 +0000
+Updated:    Wed, 6 May 2020 23:25:25 +0000
+Resolved:   Wed, 6 May 2020 23:25:25 +0000
+Links:      Related: is related to LU-3474
+Attachments: crash_output.txt, debugfs.pdf, trace_debug_lascaux110_corrupt_slab_mdt_get_info.txt
+
+--- Description ---
+Hi,
+
+CEA had 3 consecutive crashes of MDS server due to a corruption of kernel slab, and these crashes were concomitant to Robinhood startup.
+
+In fact in the Lustre Changelogs we can see a line like:
+
+4281746500 01CREAT 17:47:33.690285184 2014.03.25 0x0 t=[0x22cb19e89:0x1f9c9:0x0] p=[0x22cb19e89:0x1f9c8:0x0] GRANDEURS_CENTREES
+
+And this is because Robinhood tried to process this Changelog entry that we crashed the MDS. Indeed, looking at the MDT with debugfs, we found out that this file was under the /OBJECTS directory (it used to be a regular file, that was moved here by Lustre for an unkown reason), and that its link EA was containing zero fid (link = "df f1 ea 11 00 00 00 00 18 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 " (24)).
+
+This issue can be reproduced by doing the following on a Lustre filesystem originally formatted with Lustre 2.1, and upgraded to Lustre 2.4:
+
+	on a Lustre client :
+
+	touch /file
+
+	lfs path2fid /file
+
+	stop the file system and mount the MDT with ldiskfs
+
+	move the file from /ROOT/file to /OBJECTS directory
+
+	with setfattr change the link EA to remove all links :
+
+	setfattr -n trusted.link -v 0xdff1ea110000000018000000000000000000000000000000 /OBJECTS/file
+
+	umount ldiskfs MDT and restart the file system
+
+	on a Lustre client :
+
+	lfs fid2path  
+
+	the MDS server crashes
+
+The crash can be avoided with the patch from LU-3474 at http://review.whamcloud.com/10464 .
+
+But the scenario at CEA is worst that the error case found by Andreas (lfs fid2path on old IGIF FIDs) because here it crashes the MDS.
+
+So at first we would need this patch to be landed to b2_4, or at least to know if this patch is suitable for use in production with Lustre 2.4.3.
+
+Secondly, given that a file system at CEA has more than 5,000 files in the OBJECTS directory, we are wondering:
+
+a) why some regular files are moved to OBJECTS directory? what is the Lustre mechanism leading to this?
+
+b) why link EA contains zero fid when files are moved to OBJECTS directory?
+
+c) why moving files to OBJECTS directory generates an entry in Lustre Changelogs?
+
+TIA,
+
+Sebastien.
+
+--- Comment (adilger, Wed, 6 May 2020 23:25:25 +0000) ---
+Fixed with patch https://review.whamcloud.com/6772 in 2.5.0 and 2.4.1.
+
+--- Comment (apercher, Sun, 6 Jul 2014 09:50:54 +0000) ---
+I do this -ENOENT return because in this case, I want to be sure that
+
+  the return will be not -EAGAIN, maybe that is not a good idea, My inspiration
+
+  come from the mdt_object_find() call on mdt_fid2path() function :
+
+ 
+"lustre/mdt/mdt_handler.c" :
+5814         obj = mdt_object_find(info->mti_env, mdt, &fp->gf_fid);
+5815         if (obj == NULL || IS_ERR(obj)) {
+5816                 CDEBUG(D_IOCTL, "no object "DFID": %ld\n", PFID(&fp->gf_fid),
+5817                        PTR_ERR(obj));
+5818                 RETURN(-EINVAL);
+5819         }
+ 
+
+  You can remove this part of my patch ...
+
+  Did you test a fid2path on a file modified by my proposal command the 06/Jun/14 9:18 ?
+
+  in that case the lee_reclen is zero ... and in this case the only way to protect the strcpy
+
+  is to verify ln_namelen is no equal to zero
+
+  You miss this part of my patch that also could useful
+
+ 
+@@ -5701,7 +5701,7 @@ static int mdt_path_current(struct mdt_t
+                rc = mdt_links_read(info, mdt_obj, &ldata);
+                mdt_object_put(info->mti_env, mdt_obj);
+                if (rc != 0)
+-                       GOTO(out, rc = PTR_ERR(buf));
++                       GOTO(out, rc);
+
+--- Comment (bfaccini, Fri, 4 Jul 2014 13:59:44 +0000) ---
+Hello Antoine and Sebastien, I spent some time to review the enhanced patch version (provided at the end of trace_debug_lascaux110_corrupt_slab_mdt_get_info.txt attachment for this ticket) from Antoine vs the current one for LU-3474 (ie, my patch at http://review.whamcloud.com/6772).
+
+Basically and as far as I understand, Antoine's version has 2 additional hunks :
+
+@@ -5688,7 +5688,7 @@ static int mdt_path_current(struct mdt_t
+ 		mdt_obj = mdt_object_find(info->mti_env, mdt,
+ 					  &pli->pli_fids[pli->pli_fidcount]);
+ 		if (IS_ERR(mdt_obj))
+-			GOTO(out, rc = PTR_ERR(mdt_obj));
++			GOTO(out, rc = -ENOENT);
+ 		if (mdt_object_remote(mdt_obj)) {
+ 			mdt_object_put(info->mti_env, mdt_obj);
+ 			GOTO(remote_out, rc = -EREMOTE);
+
+and
+
+@@ -5726,6 +5726,8 @@ static int mdt_path_current(struct mdt_t
+ 		ptr -= tmpname->ln_namelen;
+ 		if (ptr - 1 pli_path)
+ 			GOTO(out, rc = -EOVERFLOW);
++               if (tmpname->ln_namelen ln_name, tmpname->ln_namelen);
+ 		*(--ptr) = '/';
+ 
+
+both in mdt_path_current()/mdt_handler.c routine/file.
+
+My opinion, and you 2 may want to discuss it further, is that with the common patch part for our 2 changes, which now enables correct error from mdt_links_read()/linkea_init() return+handling, the second additional hunk is not needed since due to leh_reccount being 0 in a link-EA with no parent-fid, linkea_init() will return ENODATA that will now be correctly forwarded by mdt_links_read() that will be handled in mdt_path_current() to not continue further+wrongly in trying to decode non-existing Link-EA entry, which has leaded to the unexpected behavior you have encountered (memory corruption due to a negative length passed to strcpy() when trying to extract parent-FID from un-exiting Link-EA entry).
+
+Concerning the 1st additional hunk, and we may already have discussed about it off-line ..., but I don't understand the reason why you want to unconditionally return -ENOENT upon mdt_object_find() error return.
+
+--- Comment (sebastien.buisson, Fri, 27 Jun 2014 13:22:30 +0000) ---
+Hi Bruno,
+
+Did you have the opportunity to look at the enhanced fix proposal from Antoine?
+
+Cheers,
+
+Sebastien.
+
+--- Comment (yong.fan, Fri, 13 Jun 2014 00:10:59 +0000) ---
+OI scrub will only update the OI mapping files, it may also move the orphans from /lost+found to /O/xxxx/ for OST device. It will not change other directory structure.
+
+--- Comment (apercher, Thu, 12 Jun 2014 20:09:17 +0000) ---
+Sorry for the delay
+
+add debugfs trace for OBJECTS and PENDING stat information in debugfs.pdf 
+
+answer about lustre downgrade : No, we never downgrade own lustre distribution 
+
+between 2.4 and 2.&. the fs was created with 
+
+lustre 2.[01] in Marsh 2012  and after wa have upgrade in 2.4.2 
+
+in Marsh 17th and after we have upgraded in 2.4.3.
+
+The crtime of all user file in /OBJECTS have a date between Mars 19th
+
+and April 6th. Around April 6th we decide to stop OI_scrub. Is it
+
+possible that OI-scrub could put file on /OBJECTS directories ?
+
+--- Comment (yong.fan, Fri, 6 Jun 2014 15:04:29 +0000) ---
+From the file name format, it seems more like that those files have been "created" under b2_1, but not been "moved" to /OBJECTS. Have you ever downgraded to b2_1 after upgraded to b2_4?
+
+Generally, the files under /OBJECTS should not be visible to client, and they should not be found in the Changelog, then whether it has valid linkEA will not affect the Robinhood. So would you please to verify whether those files under the /OBJECTS are users' normal files or not?
+
+--- Comment (apercher, Fri, 6 Jun 2014 09:18:52 +0000) ---
+Bruno, Here is a badly link example that could reproduce the corrupt with the patch 10464 
+
+setfattr -n trusted.link -v 0xdff1ea11000000002f00000000000000000000000000000000000000000200002b10000000010000000066696c6531 /OBJECTS/file
+
+as you know, never trust data on disk
+
+--- Comment (bfaccini, Fri, 6 Jun 2014 08:06:09 +0000) ---
+Antoine, thanks for your help+work on this !!
+
+Also, I will have a look to your enhanced fix proposal.
+
+--- Comment (apercher, Fri, 6 Jun 2014 07:07:39 +0000) ---
+I will check, I just can add that all files name in OBJECTS has 
+
+the format :
+
+and some of them have empty link attr but some other have 
+
+a good link attribute with good informations but each time I check
+
+the link parent fid  does not exist anymore. and some other was symlink files.
+
+--- Comment (adilger, Fri, 6 Jun 2014 06:31:42 +0000) ---
+I verified that the 10464 patch is matching the fix that was landed for 2.5.0 (in 2.4.52, just after b2_4 was branched off master).  I believe the patch should be safe for your production use in 2.4 (and we are planning to land it for the next 2.4.x release).
+
+As for files in OBJECTS, that is confusing since this directory should only be used for nameless objects such as the quota admin files, and such.  Regular files should not end up there.  It appears almost as if the OBJECTS directory was being confused with the PENDING directory, for files that are open but unlinked.  In that case, it would make sense that the "link" xattr has no links anymore, since there are no names for this file anymore.  If possible, could you please check the FIDs on both the /OBJECTS and /PENDING to see if they conflict?  You can do this while the MDT is mounted using:
+
+debugfs -c -f /dev/stdin /dev/\{mdsdev\}
+
+--- Comment (apercher, Thu, 5 Jun 2014 15:32:42 +0000) ---
+Hi Bruno 
+
+ Agree with Sebastien the patch  http://review.whamcloud.com/10464 could resolve the issue 
+
+ But for me that's not enough and I attach my full crash analyze report with my proposal fix
+
+ to fix definitivly all corupt strcpy risk ...
+
+ I confirm also that the CREAT changelog entry is the entry when the file was created the 2014.03.25
+
+ And I don't know when the file was moved on the OBJECTS directory
+
+Antoine
+
+--- Comment (sebastien.buisson, Thu, 5 Jun 2014 15:09:48 +0000) ---
+Here is the information from the crash dump, get by Antoine.
+
+--- Comment (sebastien.buisson, Thu, 5 Jun 2014 15:04:19 +0000) ---
+Hey Bruno!
+
+a) lfsck was run on the file system, but many files under /OBJECTS directory have a creation date later that the time when lfsck was run. So lfsck is not responsible for this.
+
+b) indeed, EA fid zeroing could have occurred before. But all files under /OBJECTS have a link EA containing zero fid, so both events must be related.
+
+c) I will ask people on Site if the entry in the Changelogs corresponds to the initial regular file creation, or if it matches its move to /OBJECTS. But as Robinhood consumes Changelog entries as they appear, it would be surprising if the entry corresponds to its initial creation, as it could have occurred a long time before its move to /OBJECTS.
+
+Concerning the ticket's priority, I would need to know if the patch at http://review.whamcloud.com/10464 can be used in production before lowering priority.
+
+Sebastien.
+
+--- Comment (bfaccini, Thu, 5 Jun 2014 14:40:24 +0000) ---
+Sebastien, you speak about a corruption of Kernel slabs, can you better detail this ? Do you have at least a panic stack ?
+
+Fan Yong, just in case, do you have any idea why/how files can be "moved" to OBJECTS directory ?
+
+--- Comment (bfaccini, Thu, 5 Jun 2014 14:24:48 +0000) ---
+Hello Sebastien,
+
+Thanks for this report, but I have more comments/questions in mind :
+
+     a) I agree, we need to find this.
+
+     b) what let's you think that link EA fid/name zeroing occurs during the "move" to OBJECTS directory ?
+
+     c) similarly, why do you think this "move" is responsible of an entry in Lustre ChangeLogs ? Could it not be possible that the entry comes from the earlier file creation in the name-space and then it has been later used/referenced by RobinHood, finally causing the LBUG ?
+
+Last, since you identified that patch from LU-3474 at http://review.whamcloud.com/10464, that unfortunately was missing to be merged in b2_4 until recently, can we decrease the priority of this ticket ?

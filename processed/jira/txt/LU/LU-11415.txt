@@ -1,0 +1,192 @@
+Key:        LU-11415
+Summary:    ksocklnd performance improvement on 40Gbps ethernet
+Link:       https://jira.whamcloud.com/browse/LU-11415
+Type:       Improvement
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Amir Shehata
+Reporter:   Jinshan Xiong
+Created:    Fri, 21 Sep 2018 20:27:22 +0000
+Updated:    Mon, 8 Apr 2019 14:10:59 +0000
+Resolved:   Fri, 4 Jan 2019 05:28:13 +0000
+
+--- Description ---
+Recently I'm benchmarking a newly setup lustre servers with 40Gbps ethernet network connection. Jumbo frame is enabled and MTU is set to 9000 for both NICs on the client and server side. The connection between client and server is really simple, they are under the same TOR switch, no routers in between.
+
+Firstly I used iperf3 to verify the throughput between client and server, and the throughput is stable at 30~32gib/s from either direction. However, when I launched lnet selftest, I usually see less throughput than perf3, which is about ~2500MiB/s.
+
+After speaking with Amir and Doug, I monitored ksocklnd threads on both client and server side, the problem we're seeing is that when lnet selftest is performing reading test, there is only one ksocklnd thread consuming 100% CPU time, while the other threads don't take any workload; write test is similar but only one server ksocklnd thread is busy doing work. The workload doesn't seem to spread out to all threads in the pool.
+
+ 
+
+It would be possible that the only thread is enough to handle all the traffic so there is no need to launch the workload to the other threads, but it's also possible that there are some scheduling problems in the implementation of ksocklnd. Doug mentioned that o2iblnd could spread the workload well.
+
+--- Comment (gerrit, Mon, 8 Apr 2019 06:27:39 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/34299/
+
+Subject: LU-11415 socklnd: improve scheduling algorithm
+
+Project: fs/lustre-release
+
+Branch: b2_12
+
+Current Patch Set: 
+
+Commit: ec964395b249087c28e82b1afa1db4a7c9322196
+
+--- Comment (gerrit, Mon, 25 Feb 2019 17:23:49 +0000) ---
+Minh Diep (mdiep@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/34299
+
+Subject: LU-11415 socklnd: improve scheduling algorithm
+
+Project: fs/lustre-release
+
+Branch: b2_12
+
+Current Patch Set: 1
+
+Commit: 35864dd4370c4ece26198033beced450ed6443d0
+
+--- Comment (pjones, Fri, 4 Jan 2019 05:28:13 +0000) ---
+Landed for 2.13
+
+--- Comment (gerrit, Fri, 4 Jan 2019 04:48:25 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/33740/
+
+Subject: LU-11415 socklnd: improve scheduling algorithm
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 89df5e712ffd40064f1d4ce2f00f9156f68a2262
+
+--- Comment (ashehata, Wed, 28 Nov 2018 02:12:31 +0000) ---
+Hey Jinshan, can you try this patch? run a 1-1 selftest and monitor the socknal_sd_* threads' CPU usage.
+
+thanks
+
+--- Comment (gerrit, Wed, 28 Nov 2018 02:10:38 +0000) ---
+Amir Shehata (ashehata@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/33740
+
+Subject: LU-11415 socklnd: improve scheduling algorithm
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 69fbcfc89f165ba4238286afcbcd3a2059615b4f
+
+--- Comment (ashehata, Fri, 23 Nov 2018 00:18:53 +0000) ---
+Summarized the issue and the proposed solution here:
+
+https://wiki.whamcloud.com/display/LNet/Socklnd+Scheduler+Improvements
+
+Will try and get a patch in soon.
+
+--- Comment (jinshan, Wed, 21 Nov 2018 04:13:38 +0000) ---
+I will be happy to try that out. Thanks.
+
+--- Comment (ashehata, Wed, 21 Nov 2018 02:31:05 +0000) ---
+I think I found the issue in the code. In slocklnd.c:ksocknal_choose_scheduler_locked():
+
+ 683 select_sched:
+ 684 »·······sched = &info->ksi_scheds[0];
+ 685 »·······/*
+ 686 »······· * NB: it's safe so far, but info->ksi_nthreads could be changed
+ 687 »······· * at runtime when we have dynamic LNet configuration, then we
+ 688 »······· * need to take care of this.
+ 689 »······· */
+ 690 »·······CDEBUG(D_NET, "info->ksi_nthreads = %d \n", info->ksi_nthreads);
+ 691 »·······for (i = 1; i ksi_nthreads; i++) {
+ 692 »·······»·······CDEBUG(D_NET, "sched->kss_nconns = %d info->ksi_scheds[%d].kss_nconns = %d\n",
+ 693 »·······»·······       sched->kss_nconns, i, info->ksi_scheds[i].kss_nconns);
+ 694 »·······»·······if (sched->kss_nconns > info->ksi_scheds[i].kss_nconns)
+ 695 »·······»·······»·······sched = &info->ksi_scheds[i];
+ 696 »·······}
+ 697 
+ 698 »·······return sched;
+
+When running an lnet_selftest script the connection is created once and is used for the duration of the run. This will result in using the same scheduler continuously for the same connection. This algorithm works if you have multiple connections, each connection will use a different scheduler thread. But if most of the traffic is between the same two peers we will not change the scheduler thread and we will run into this bottle neck.
+
+Seems like we ought to be balancing the traffic not in connection creation time only, but when receiving a new message. I'm gonna create a patch within the next day or so. Would you be able to test it and see if it performs better?
+
+--- Comment (jinshan, Tue, 20 Nov 2018 03:57:29 +0000) ---
+These are all the threads:
+
+# ps ax | grep sock
+
+{{ 43583 pts/0 S+ 0:00 grep --color=auto sock}}
+
+{{ 44194 ? S 0:00 [socknal_cd00]}}
+
+{{ 44195 ? S 0:00 [socknal_cd01]}}
+
+{{ 44196 ? S 0:00 [socknal_cd02]}}
+
+{{ 44197 ? S 0:00 [socknal_cd03]}}
+
+{{ 44198 ? S 0:03 [socknal_reaper]}}
+
+{{ 44199 ? S 42:59 [socknal_sd00_00]}}
+
+{{ 44200 ? S 0:00 [socknal_sd00_01]}}
+
+{{ 44201 ? S 584:14 [socknal_sd00_02]}}
+
+{{ 44202 ? S 0:00 [socknal_sd00_03]}}
+
+{{ 44203 ? S 0:00 [socknal_sd00_04]}}
+
+{{ 44204 ? S 0:00 [socknal_sd00_05]}}
+
+{{ 44205 ? S 0:27 [socknal_sd01_00]}}
+
+{{ 44206 ? S 0:00 [socknal_sd01_01]}}
+
+{{ 44207 ? S 0:00 [socknal_sd01_02]}}
+
+{{ 44208 ? S 0:26 [socknal_sd01_03]}}
+
+{{ 44209 ? S 0:00 [socknal_sd01_04]}}
+
+{{ 44210 ? S 0:00 [socknal_sd01_05]}}
+
+--- Comment (ashehata, Mon, 19 Nov 2018 23:24:56 +0000) ---
+How many socklnd threads were started?
+
+--- Comment (jinshan, Sat, 17 Nov 2018 23:03:58 +0000) ---
+Everything is default there is no settings in `lnet.conf` other than specifying NIC for Lustre.
+
+This node has 2 NUMA node with 24 cores, what would be the recommended configuration for CPT?
+
+--- Comment (ashehata, Sat, 17 Nov 2018 02:10:56 +0000) ---
+I looked at the socklnd scheduling code and it's very similar to the o2iblnd code. There is a scheduler created per CPT. A thread is created for each cpu in the CPT (if the number of threads is not explicitly configured). When creating a connection, the CPT is derived from the peer nid using: lnet_cpt_of_nid() hashing function. The CPT is used to grab the appropriate scheduler and assign it to the connection. All operations on the connection uses the assigned scheduler. Which means if we're running a 1-1 testing, then the same scheduler will always be used. If there are multiple threads in the scheduler then we should round robin over them.
+
+In the MLX o2iblnd case most of the work is offloaded to the HW. In case of OPA I believe the HFI driver has its own set of threads which do the work. But in socklnd all the work is done in the socklnd scheduler thread, which causes the thread to consume a lot of the CPU resources if it's the only thread in the scheduler.
+
+In the test above how many CPUs are in each CPT?
+
+--- Comment (jinshan, Fri, 21 Sep 2018 21:46:21 +0000) ---
+Typically this is what I have seen from the server side when doing write test:
+
+{{top - 21:45:16 up 21:57, 1 user, load average: 11.02, 7.19, 5.00}}
+
+{{ Tasks: 1175 total, 3 running, 1172 sleeping, 0 stopped, 0 zombie}}
+
+{{ %Cpu(s): 0.0 us, 11.3 sy, 0.0 ni, 80.5 id, 6.9 wa, 0.0 hi, 1.3 si, 0.0 st}}
+
+{{ KiB Mem : 13174288+total, 56613536 free, 68320632 used, 6808716 buff/cache}}
+
+{{ KiB Swap: 4194300 total, 4194300 free, 0 used. 62550556 avail MemPID USER PR NI VIRT RES SHR S %CPU %MEM TIME+ COMMAND}}
+
+{{ 21319 root 20 0 0 0 0 R 100.0 0.0 15:11.80 socknal_sd00_02}}
+
+{{ 2 root 20 0 0 0 0 S 9.2 0.0 4:09.04 kthreadd}}
+
+{{ 1734 root 0 -20 0 0 0 R 5.6 0.0 2:25.93 spl_dynamic_tas}}

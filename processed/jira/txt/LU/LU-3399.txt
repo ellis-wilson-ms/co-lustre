@@ -1,0 +1,264 @@
+Key:        LU-3399
+Summary:    MDT don't update client last commited correctly so produce OOM on client
+Link:       https://jira.whamcloud.com/browse/LU-3399
+Type:       Bug
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   Bob Glossman
+Reporter:   Alexey Lyashkov
+Created:    Sun, 26 May 2013 20:56:30 +0000
+Updated:    Tue, 2 Dec 2014 15:59:58 +0000
+Labels:     patch
+Links:      Duplicate: duplicates LU-2613
+
+--- Environment ---
+lustre mounted with noatime or relatime mount option.
+
+--- Description ---
+Cray customer hit a OOM with using a lustre and Robin-Hood application.
+
+Per internal investigation - application issued a ls -lRa /mnt/lustre for a lustre mount with noatime option. In that case all open/close requests lives in replay cache and wait until it's committed (in cray case ~100k .. 200k requests lives in slab cache). These requests wait a commit from MDT side but none have as client have a open/close/getattr request don't generate a any real transaction. 
+
+it's easy replicated with - prepare a fs with large number a directories, stop lustre, run
+
+1) MOUNTOPT="-o user_xattr,flock,noatime" PTLDEBUG=-1 SUBSYSTEM=-1 DEBUG_SIZE=800 NOFORMAT=yes sh llmount.sh 
+
+2) Starting client: rhel6-64.shadowland: -o user_xattr,flock,noatime rhel6-64.shadowland@tcp:/lustre /mnt/lustre
+
+Using TIMEOUT=20
+
+disable quota as required
+
+[root@rhel6-64 tests]# lctl dk log1
+
+Debug log: 148739 lines, 148739 kept, 0 dropped, 0 bad.
+
+[root@rhel6-64 tests]# ls -lRa /mnt/lustre > /dev/null
+
+[root@rhel6-64 tests]# mount -t lustre -o user_xattr,flock,noatime rhel6-64.shadowland@tcp:/lustre /mnt/lustre2
+
+[root@rhel6-64 tests]# grep rpc_cache /proc/slabinfo 
+
+rpc_cache           2466   2695   1168    7    2 : tunables   24   12    8 : slabdata    385    385      0 : globalstat   11338   2695   389    3 				   0   10    0    0    0 : cpustat  29477   1686  27471   1238
+
+(patch to move ptlrpc request in slab -  wait a WC/Intel review).
+
+so after simple ls -lRa we have 2500 active requests...
+
+bug hit.
+
+to flush these requests need touch $some_file_on_lustre.
+
+but any touch in different mount point don't flush a request cache.
+
+per additional investigation - I found MDT send a zero as last committed to the affected client, where client2 have a correct last committed updates. 
+
+As i see, target_to_commited_req send a just per export committed info to the client, instead of use a global data. In that case buggy client don't able to commit a requests in base of different client activity. 
+
+Can someone explain why it's used instead of global obd_last_commited?
+
+simple patch have reduce problem for my.
+
+diff --git a/lustre/ldlm/ldlm_lib.c b/lustre/ldlm/ldlm_lib.c
+index 31ffbc9..99f2f26 100644
+--- a/lustre/ldlm/ldlm_lib.c
++++ b/lustre/ldlm/ldlm_lib.c
+@@ -2529,7 +2529,8 @@ int target_committed_to_req(struct ptlrpc_request *req)
+ 
+         if (likely(!exp->exp_obd->obd_no_transno && req->rq_repmsg != NULL)) {
+                 lustre_msg_set_last_committed(req->rq_repmsg,
+-                                              exp->exp_last_committed);
++                                               exp->exp_obd->obd_last_committed);
++//                                              exp->exp_last_committed);
+         } else {
+                 DEBUG_REQ(D_IOCTL, req, "not sending last_committed update (%d/"
+                           "%d)", exp->exp_obd->obd_no_transno,
+@@ -2537,8 +2538,8 @@ int target_committed_to_req(struct ptlrpc_request *req)
+                ret = 0;
+        }
+ 
+-        CDEBUG(D_INFO, "last_committed "LPU64", transno "LPU64", xid "LPU64"\n",
+-               exp->exp_last_committed, req->rq_transno, req->rq_xid);
++        CDEBUG(D_INFO, "last_committed "LPU64"/"LPU64", transno "LPU64", xid "LPU64"\n",
++               exp->exp_last_committed, exp->exp_obd->obd_last_committed, req->rq_transno, req->rq_xid);
+        return ret;
+ }
+ EXPORT_SYMBOL(target_committed_to_req);
+
+cache have reduced after next ping.
+
+--- Comment (bzzz, Tue, 28 May 2013 09:33:17 +0000) ---
+(gdb) p sizeof(struct lsd_client_data)
+
+$1 = 128
+
+so, it should be nearly 320000 clients very evenly distributed over last_rcvd to consume 10K blocks. which is very unlikely.
+
+with just 10K clients all doing "this", it's just 10000*128/4096=313 blocks. and this is essentially the only activity...
+
+--- Comment (shadow, Tue, 28 May 2013 09:27:24 +0000) ---
+with 10k clients - it's eats 10k blocks each 5s - so it's will eat 1/6 of journal size will used to store a fake commits.
+
+--- Comment (bzzz, Tue, 28 May 2013 09:09:30 +0000) ---
+Niu's patch will "eat" one block every 5s per client at most. with 1GB journal, a transaction limit is 65536 blocks.
+
+--- Comment (shadow, Tue, 28 May 2013 07:38:18 +0000) ---
+Tappro,
+
+Niu patch eats space in journal, that is one more objection and we may don't have 1000 commits to trigger a Niu exp_last_commited updates. I will be happy if patch will add's a just commit callback to update a per export value and don't touch disk for each fake commit, may be we need additional API or just move some logic to MDD layer.
+
+as about using obd_last_committed, from my point view - it's not a differences between have a snapshot of committed ID via introducing a fake commits, and take same info from a global variable - anyway it's point to same data, but i think it's easy because client will be get a last committed updates early, and it's may affect a BRW requests also - as they may don't have any real transaction but need to be know about last committed to release own resources (it's my idea, but i really don't check in code - just reading long long time Adilger commit - why obd_last_committed used).
+
+--- Comment (tappro, Tue, 28 May 2013 07:10:12 +0000) ---
+yes, you are right about memory value, I had impression we are talking about disk.
+
+'Happens rarely' was about extra disk load happens with Niu patch, it happens once per 1000 opens and if there are no more other updates, this is rare case.
+
+Speaking about using obd_last_committed, it breaks VBR features because whole idea was about each client may recover independently from others, so each client maintain own state of committed transaction, it is not cluster-wide since VBR was introduced. Independent client recovery opens way to better server recovery mechanisms like delayed recovery and parallel recovery, that is why I don't want to break this now if there is another way, just because we will return to this problem again in future and will solve it again. I'd prefer to solve it properly now. As I can see Niu patch in LU-2613 can do the job keeping the using exp_last_committed usage in target_committed_to_req() but bumping it time to time to helps client with stuck open requests. Do you think that patch is not enough?
+
+--- Comment (shadow, Mon, 27 May 2013 19:29:28 +0000) ---
+> obd_last_committed is not updated per each transaction..
+
+> That is why you cannot use only obd_last_committed, it is NOT the latest value.
+
+really?
+
+static inline void obd_transno_commit_cb(struct obd_device *obd, __u64 transno,
+                                         struct obd_export *exp, int error)
+{
+        if (error) {
+                CERROR("%s: transno "LPU64" commit error: %d\n",
+                       obd->obd_name, transno, error);
+                return;
+        }
+        if (exp && transno > exp->exp_last_committed) {
+                CDEBUG(D_HA, "%s: transno "LPU64" committed\n",
+                       obd->obd_name, transno);
+                exp->exp_last_committed = transno;
+                ptlrpc_commit_replies(exp);
+        } else {
+                CDEBUG(D_INFO, "%s: transno "LPU64" committed\n",
+                       obd->obd_name, transno);
+        }
+        if (transno > obd->obd_last_committed)
+                obd->obd_last_committed = transno;
+}
+
+or for master
+
+void tgt_cb_last_committed(struct lu_env *env, struct thandle *th,
+                           struct dt_txn_commit_cb *cb, int err)
+{
+        struct tgt_last_committed_callback *ccb;
+
+        ccb = container_of0(cb, struct tgt_last_committed_callback, llcc_cb);
+
+        LASSERT(ccb->llcc_tgt != NULL);
+        LASSERT(ccb->llcc_exp->exp_obd == ccb->llcc_tgt->lut_obd);
+
+        spin_lock(&ccb->llcc_tgt->lut_translock);
+        if (ccb->llcc_transno > ccb->llcc_tgt->lut_obd->obd_last_committed)
+                ccb->llcc_tgt->lut_obd->obd_last_committed = ccb->llcc_transno;
+                
+        LASSERT(ccb->llcc_exp);
+        if (ccb->llcc_transno > ccb->llcc_exp->exp_last_committed) {
+                ccb->llcc_exp->exp_last_committed = ccb->llcc_transno;
+                spin_unlock(&ccb->llcc_tgt->lut_translock);
+                ptlrpc_commit_replies(ccb->llcc_exp);
+        } else {
+                spin_unlock(&ccb->llcc_tgt->lut_translock);
+        }
+        class_export_cb_put(ccb->llcc_exp);
+        if (ccb->llcc_transno)
+                CDEBUG(D_HA, "%s: transno "LPD64" is committed\n",
+                       ccb->llcc_tgt->lut_obd->obd_name, ccb->llcc_transno);
+        OBD_FREE_PTR(ccb);
+}
+
+so it's updated in same time as exp_last_commited does. I don't see why it's don't have lasts data.
+
+> That way we have no contention on last_rcvd header, each client updates only own slot in most cases.
+
+again. I don't talk about on disk updates - i talk about runtime.
+
+> I don't think that extra disk load is a problem, it happens rarely.
+
+You really think 'ls' tool is rare used? or any readdir() users.
+
+--- Comment (tappro, Mon, 27 May 2013 13:37:30 +0000) ---
+obd_last_committed is not updated per each transaction, it is used just as 'reserve' storage for cases when we cannot write transno at client data, e.g. client umount. That way we have no contention on last_rcvd header, each client updates only own slot in most cases. Therefore per-client last_committed usually bigger then obd one. That is why you cannot use only obd_last_committed, it is NOT the latest value.
+
+ The patch in LU-2613 might be acceptable solution for now, maybe we can even decrease number of transaction to 100. I don't think that extra disk load is a problem, it happens rarely.
+
+--- Comment (shadow, Mon, 27 May 2013 13:28:47 +0000) ---
+> "per export committed info always less or same for a cluster wide info" - this is not true as we do NOT want to maintain global last_committed to improve SMP scalability.
+
+Single thread have updates - many threads have reads - where you find a scalability problem in that case?
+
+that is totally lock less work.
+
+> the original point was that "per-MDT" last committed is not enough to fix the issue if another clients aren't generating new transno. so another solution (already implemented by Niu) is needed.
+
+first of all, it's add's additional disk load - so it's too bad by definition - because disk is most slow part and mostly contended. I may be agree with fake commit callback assigned without disk updates but just update a per export value.
+
+--- Comment (bzzz, Mon, 27 May 2013 13:08:12 +0000) ---
+"per export committed info always less or same for a cluster wide info" - this is not true as we do NOT want to maintain global last_committed to improve SMP scalability.
+
+the original point was that "per-MDT" last committed is not enough to fix the issue if another clients aren't generating new transno.
+
+so another solution (already implemented by Niu) is needed.
+
+--- Comment (shadow, Mon, 27 May 2013 13:03:53 +0000) ---
+I don't ask about "why per-export last_commited info is need", i understand it - question about client side updates.
+
+per obd_commited_cb() per export committed info always less or same for a cluster wide info, but it's in run time and generic recovery.
+
+as about recovery - we need correctly track a higher commits number in last_rcvd anyway, if i correctly understand - you talk about VBR with clients connected after recovery window closed? but it's should be replayed with using a lock/inode version as base and don't rely to transaction info in recovery.
+
+I agree about complex solution, but it fix created just to fix for 2.4 and continue to create a final solution in next release. May be we need both patches from LU-2613 and it, but i think 2613 generate additional disk load
+
+--- Comment (tappro, Mon, 27 May 2013 12:18:04 +0000) ---
+That was done to reduce contention on last_rcvd header update, per-export last_committed track also is needed for VBR and delayed recovery specifically, each export may recover without affecting whole server data but using only own client data.
+
+In our case the simplest way to fix that would be using max(exp_last_committed, obd_last_committed) in target_committed_to_req() function. This will give us the highest value. Strictly speaking this breaks 'delayed recovery' feature but it was never finished to be real product feature so we may don't care about it.
+
+Meanwhile this is also not full solution, consider the case when many clients do only opens and there is no disk update on server at all. I don't even think it is right to solve that on server. I wrote some thoughts in LU-2613 what can be done, we need to solve that on client, IMHO, but this is long way and it requires more effort.
+
+--- Comment (shadow, Mon, 27 May 2013 11:25:21 +0000) ---
+finally identified as bug in VBR patch.
+
+https://projectlava.xyratex.com/show_bug.cgi?id=16353
+
+https://projectlava.xyratex.com/attachment.cgi?id=21306
+
+--- Comment (shadow, Mon, 27 May 2013 10:26:08 +0000) ---
+well, 
+
+bug introduced before 1.8.0 in b1_8_gate branch, but i don't find a corresponding commit (cvs ver 1.96.6.38.2.3).
+
+1.90         (nathan   10-Feb-07): void target_committed_to_req(struct ptlrpc_request *req)
+1.90         (nathan   10-Feb-07): {
+1.96.6.38.2.3 (johann   18-Dec-08):         struct obd_export *exp = req->rq_export;
+1.96.6.38.2.3 (johann   18-Dec-08):         if (!exp->exp_obd->obd_no_transno && req->rq_repmsg != NULL) {
+1.90         (nathan   10-Feb-07):                 lustre_msg_set_last_committed(req->rq_repmsg,
+1.96.6.38.2.3 (johann   18-Dec-08):                                               exp->exp_last_committed);
+
+before it change we always use a obd_last_commited to send to client.
+
+void target_committed_to_req(struct ptlrpc_request *req)
+{
+        struct obd_device *obd = req->rq_export->exp_obd;
+
+        if (!obd->obd_no_transno && req->rq_repmsg != NULL)
+                req->rq_repmsg->last_committed = obd->obd_last_committed
+
+...
+
+that bug may produce OOM on client, as may block a release a BRW rpc from replay queue also.
+
+--- Comment (aboyko, Mon, 27 May 2013 06:19:11 +0000) ---
+patch http://review.whamcloud.com/#change,6456
+
+--- Comment (bzzz, Mon, 27 May 2013 03:32:55 +0000) ---
+I think this is a dup of LU-2613

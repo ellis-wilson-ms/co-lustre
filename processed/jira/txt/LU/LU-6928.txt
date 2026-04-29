@@ -1,0 +1,116 @@
+Key:        LU-6928
+Summary:    Version mismatch during DNE replay
+Link:       https://jira.whamcloud.com/browse/LU-6928
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Duplicate
+Assignee:   Niu Yawei
+Reporter:   Di Wang
+Created:    Thu, 30 Jul 2015 15:03:17 +0000
+Updated:    Thu, 27 Aug 2015 16:41:25 +0000
+Resolved:   Thu, 27 Aug 2015 16:41:25 +0000
+Links:      Related: is related to LU-6831
+
+--- Description ---
+During 24 hours DNE failover test, one of client fails because of Version mismatch during replay.
+
+Lustre: 7977:0:(client.c:2828:ptlrpc_replay_interpret()) @@@ Version mismatch during replay
+  req@ffff8806698209c0 x1508081941826144/t21475879788(21475879788) o36->lustre-MDT0001-mdc-ffff880821cfdc00@192.168.2.126@o2ib:12/10 lens 608/424 e 1 to 0 dl 1438262329 ref 2 fl Interpret:R/4/0 rc -75/-75
+Lustre: 7977:0:(import.c:1301:completed_replay_interpret()) lustre-MDT0001-mdc-ffff880821cfdc00: version recovery fails, reconnecting
+LustreError: 167-0: lustre-MDT0001-mdc-ffff880821cfdc00: This client was evicted by lustre-MDT0001; in progress operations using this service will fail.
+LustreError: 9213:0:(vvp_io.c:1475:vvp_io_init()) lustre: refresh file layout [0x240002341:0x1d74:0x0] error -5.
+LustreError: 29913:0:(lmv_obd.c:1332:lmv_fid_alloc()) Can't alloc new fid, rc -19
+Lustre: lustre-MDT0001-mdc-ffff880821cfdc00: Connection restored to lustre-MDT0001 (at 192.168.2.126@o2ib)
+Lustre: DEBUG MARKER: ==== Checking the clients loads BEFORE failover -- failure NOT OK ELAPSED=43433 DURATION=86400 PERIOD=1800
+Lustre: DEBUG MARKER: Client load failed on node c01, rc=1
+Lustre: DEBUG MARKER: Duration: 86400
+Lustre: Unmounted lustre-client
+
+--- Comment (di.wang, Thu, 27 Aug 2015 16:41:25 +0000) ---
+Duplicate with LU-5951
+
+--- Comment (niu, Thu, 27 Aug 2015 07:01:10 +0000) ---
+Yes, the patch for LU-5951 (http://review.whamcloud.com/#/c/15473/) will fix this problem.
+
+--- Comment (di.wang, Fri, 14 Aug 2015 21:16:43 +0000) ---
+Niu: could you please confirm if your patch can fix this problem? Thanks
+
+--- Comment (gerrit, Thu, 30 Jul 2015 22:00:07 +0000) ---
+wangdi (di.wang@intel.com) uploaded a new patch: http://review.whamcloud.com/15812
+
+Subject: LU-6928 ptlrpc: Do not pack min XID for connect req
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: acb892354ac119dfe80edf60f5f2a2923cdcc980
+
+--- Comment (di.wang, Thu, 30 Jul 2015 20:58:44 +0000) ---
+Hmm, I think this is what happened
+
+During replay
+
+1. client send replay request to MDS01, and MDS01 did not handle it in time. 
+
+2. So client did not get reply, so it expires and reconnects the import.  And during sending this CONNECT request, it will first find out the min XID first, 
+
+but it only tries to find such XID in sending and replay list, which is wrong, because the replay request (just timeout) are not in these list (see ptlrpc_check_set()) .  So usually, it will get the xid of this connect request, which is obviously larger than the xid of replay request.
+
+        /* find the lowest unreplied XID */
+        list_for_each(tmp, &imp->imp_delayed_list) {
+                struct ptlrpc_request *r;
+                r = list_entry(tmp, struct ptlrpc_request, rq_list);
+                if (r->rq_xid rq_xid;
+        }
+        list_for_each(tmp, &imp->imp_sending_list) {
+                struct ptlrpc_request *r;
+                r = list_entry(tmp, struct ptlrpc_request, rq_list);
+                if (r->rq_xid rq_xid;
+        }
+
+Delete req from sending list after req failure.
+
+   /* Request already may be not on sending or delaying list. This
+                 * may happen in the case of marking it erroneous for the case
+                 * ptlrpc_import_delay_req(req, status) find it impossible to
+                 * allow sending this rpc and returns *status != 0. */
+                if (!list_empty(&req->rq_list)) {
+                        list_del_init(&req->rq_list);
+                        atomic_dec(&imp->imp_inflight);
+                }
+                spin_unlock(&imp->imp_lock);
+
+3. And MDT handle that replay request (mentioned in 1) at this time, which will add the lrd of this req into the reply_list.
+
+4. Then connect request arrives, and it has bigger reply XID, which then delete the lrd created in step 3
+
+5. After connect, client will resend the replay request, but server can not identify it as a already received request,  because lrd has been deleted in 3. So the replay request has been executed twice, then it causes this Version mismatch issue. 
+
+so the fix might be in step 2, i.e. we need consider the expired request when finding this min XID, or we just do not pack this min xid for CONNECT request.
+
+--- Comment (di.wang, Thu, 30 Jul 2015 20:20:05 +0000) ---
+Yes, looks like same issue, I believe it is a bug caused by multiple slot patch. I will cook a patch.
+
+--- Comment (jamesanunez, Thu, 30 Jul 2015 17:27:48 +0000) ---
+Di - I'm seeing a very similar error in replay-single test 48 in review-dne-part-2. Do you think this is the same issue? The logs are at: https://testing.hpdd.intel.com/test_sets/8281843c-365f-11e5-830b-5254006e85c2
+
+The client console shows:
+
+18:10:31:Lustre: DEBUG MARKER: == replay-single test 48: MDS->OSC failure during precreate cleanup (2824) == 18:08:48 (1438193328)
+18:10:31:Lustre: DEBUG MARKER: mcreate /mnt/lustre/fsa-$(hostname); rm /mnt/lustre/fsa-$(hostname)
+18:10:31:Lustre: DEBUG MARKER: if [ -d /mnt/lustre2 ]; then mcreate /mnt/lustre2/fsa-$(hostname); rm /mnt/lustre2/fsa-$(hostname); fi
+18:10:31:Lustre: DEBUG MARKER: local REPLAY BARRIER on lustre-MDT0000
+18:10:31:LustreError: 7733:0:(client.c:2816:ptlrpc_replay_interpret()) request replay timed out, restarting recovery
+18:10:31:Lustre: 7733:0:(client.c:2828:ptlrpc_replay_interpret()) @@@ Version mismatch during replay
+18:10:31:  req@ffff8800379e8c80 x1508053244555028/t197568495717(197568495717) o36->lustre-MDT0000-mdc-ffff88007b65b000@10.1.4.62@tcp:12/10 lens 640/416 e 2 to 0 dl 1438193365 ref 1 fl Interpret:R/6/0 rc -75/-75
+18:10:31:Lustre: 7733:0:(import.c:1306:completed_replay_interpret()) lustre-MDT0000-mdc-ffff88007b65b000: version recovery fails, reconnecting
+18:10:31:LustreError: 167-0: lustre-MDT0000-mdc-ffff88007b65b000: This client was evicted by lustre-MDT0000; in progress operations using this service will fail.
+18:10:31:LustreError: Skipped 1 previous similar message
+18:10:31:LustreError: 13949:0:(lmv_obd.c:1473:lmv_statfs()) can't stat MDS #0 (lustre-MDT0000-mdc-ffff88007b65b000), error -5
+18:10:31:LustreError: 13949:0:(llite_lib.c:1707:ll_statfs_internal()) md_statfs fails: rc = -5
+18:10:31:Lustre: DEBUG MARKER: /usr/sbin/lctl mark  replay-single test_48: @@@@@@ FAIL: client_up failed 
+18:10:31:Lustre: DEBUG MARKER: replay-single test_48: @@@@@@ FAIL: client_up failed

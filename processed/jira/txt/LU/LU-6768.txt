@@ -1,0 +1,177 @@
+Key:        LU-6768
+Summary:    Data corruption when write and truncate in parallel in a almost-full file system
+Link:       https://jira.whamcloud.com/browse/LU-6768
+Type:       Bug
+Priority:   Critical
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Alex Zhuravlev
+Reporter:   Jingwang Zhang
+Created:    Fri, 26 Jun 2015 02:00:22 +0000
+Updated:    Mon, 14 Sep 2015 14:37:27 +0000
+Resolved:   Mon, 3 Aug 2015 15:09:42 +0000
+Links:      Related: is related to LU-6925
+
+--- Environment ---
+Reproduced in a virtual machine using loop device as OSD-ldiskfs disk.
+
+--- Description ---
+In order to test the stability of the Lustre file system under continuous workload and extreme resource usage, I wrote a tool to write data to files continuously unless 'ENOSPC' occurs, then the tool will truncate and delete some old files to free the space and continue to write the files. Before the file is truncated, its content will be verified. The problem is that after running the tool for a while, the content of some file would be wrong.
+
+If the data is corrupted, it will fail with:
+
+yaft: main.cpp:81: void check_file_content(const std::string&): Assertion `rbuf.checkAt(pos)' failed.
+
+Aborted
+
+You can get the tool at:
+
+https://github.com/zhang-jingwang/yaft.git
+
+--- Comment (yujian, Thu, 6 Aug 2015 21:28:04 +0000) ---
+Hi Jay,
+
+The patch is only needed by server.
+
+--- Comment (gerrit, Thu, 6 Aug 2015 21:21:56 +0000) ---
+Jian Yu (jian.yu@intel.com) uploaded a new patch: http://review.whamcloud.com/15904
+
+Subject: LU-6768 lvfs: unmap reallocated blocks
+
+Project: fs/lustre-release
+
+Branch: b2_5
+
+Current Patch Set: 1
+
+Commit: c8448bce0ad13aeb65c48905e080ddb0c536fc91
+
+--- Comment (jaylan, Thu, 6 Aug 2015 21:14:19 +0000) ---
+Is the patch needed by server or client, or both?
+
+Looks like a server patch.
+
+--- Comment (jaylan, Tue, 4 Aug 2015 22:51:43 +0000) ---
+This may help us on LU-6925. Can we get a b2_5 back port? Thanks!
+
+--- Comment (pjones, Mon, 3 Aug 2015 15:09:42 +0000) ---
+Landed for 2.8
+
+--- Comment (gerrit, Mon, 3 Aug 2015 01:54:38 +0000) ---
+Oleg Drokin (oleg.drokin@intel.com) merged in patch http://review.whamcloud.com/15593/
+
+Subject: LU-6768 osd: unmap reallocated blocks
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: bcef61a80ab4fa6cee847722184738ba4deeb971
+
+--- Comment (bzzz, Tue, 14 Jul 2015 09:55:33 +0000) ---
+thanks for the report and testing. please, inspect the patch and help to move it forward.
+
+--- Comment (jingwang, Tue, 14 Jul 2015 09:41:09 +0000) ---
+I run the reproducer for 7 hours and it didn't fail after applying the patch, where it will fail in minutes without the patch, so I believe that the problem is fixed.
+
+--- Comment (jingwang, Tue, 14 Jul 2015 02:14:16 +0000) ---
+Thanks for looking into this.
+
+I'm using CentOS 6.5 with kernel version 2.6.32.431.29.2. And I will try the fix and get back to you later.
+
+--- Comment (bzzz, Mon, 13 Jul 2015 20:40:14 +0000) ---
+Jingwang, would you mind to try http://review.whamcloud.com/15593 please?
+
+--- Comment (gerrit, Mon, 13 Jul 2015 20:39:32 +0000) ---
+Alex Zhuravlev (alexey.zhuravlev@intel.com) uploaded a new patch: http://review.whamcloud.com/15593
+
+Subject: LU-6768 osd: unmap reallocated blocks
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: facf7f47ced7debdbaf0d814158661857176b4bf
+
+--- Comment (bzzz, Mon, 13 Jul 2015 13:58:35 +0000) ---
+what kernel version do you use?
+
+--- Comment (bzzz, Mon, 13 Jul 2015 13:34:30 +0000) ---
+> 1.	A file got truncated, and its extent blocks are updated to complete the truncation. So those blocks became dirty.
+
+> 2.	The file is deleted, so all its metadata blocks are free now.
+
+> 3.	One of the metadata blocks is used as data block to hold client’s data. It will be updated by osd_submit_bio().
+
+(2) is not quite correct, metadata blocks aren't freed immediately, instead they are scheduled for release up on commit.
+
+see ldiskfs_mb_free_blocks() for the details - when metadata != 0.
+
+also, we already have calls to unmap_underlying_metadata() which is supposed to do what you suggested.
+
+I'm still looking at the code.
+
+--- Comment (pjones, Fri, 3 Jul 2015 18:11:33 +0000) ---
+Alex
+
+Could you please advise on this issue?
+
+Thanks
+
+Peter
+
+--- Comment (jingwang, Fri, 26 Jun 2015 02:03:28 +0000) ---
+My analysis about this problem in an email:
+
+During our tests on Lustre, we found a data corruption when we write to files and truncating/deleting other files at the same time. Usually we could find that one block in the file will contain wrong data which seems very likely to be a metadata block (ext4 extents).
+
+And after a long time investigation, we finally found out the root cause for the problem. In short, this is due to a race condition between the data IO (Lustre performs them directly to the block device by submit_bio()) and the metadata IO (ldiskfs performs metadata IO to the block device, which might be cached in the block device’s page cache).
+
+Lustre would commit data IO from clients by the osd_submit_bio() function in osd-ldiskfs/osd_io.c :
+
+osd_io.c
+
+241 static void osd_submit_bio(int rw, struct bio *bio)
+242 {
+243         LASSERTF(rw == 0 || rw == 1, "%x\n", rw);
+244         if (rw == 0)
+245                 submit_bio(READ, bio);
+246         else
+247                 submit_bio(WRITE, bio);
+248 }
+
+However, there might be dirty data in the block’s page cache. It’s rare but it does might happen if things happen as following order:
+
+1.	A file got truncated, and its extent blocks are updated to complete the truncation. So those blocks became dirty.
+
+2.	The file is deleted, so all its metadata blocks are free now.
+
+3.	One of the metadata blocks is used as data block to hold client’s data. It will be updated by osd_submit_bio().
+
+4.	Then the kernel decides to flush the dirty pages, the data block will be overwritten by the dirty metadata and the data is corrupted.
+
+So I think this is a problem and I think the right thing to do is to invalidate the corresponding pages in the block device’s page cache before we issue the bio to make sure that there aren’t any dirty pages, which might overwrite our data later. So we propose to make the following change on osd_submit_bio() to invalidate the page cache.
+
+osd_io.c
+
+static void osd_submit_bio(int rw, struct bio *bio)
+{
+        struct inode *bdinode = bio->bi_bdev->bd_inode;
+
+        LASSERTF(rw == 0 || rw == 1, "%x\n", rw);
+        if (rw == 0) {
+                submit_bio(READ, bio);
+        } else {
+                loff_t start = bio->bi_sector bi_size - 1;
+
+                /* Invalidate the page cache in the block device, otherwise
+                 * the dirty data in block device's page cache might corrupt
+                 * the data we are going to write. */
+                truncate_pagecache_range(bdinode, start, endbyte);
+                submit_bio(WRITE, bio);
+        }
+}

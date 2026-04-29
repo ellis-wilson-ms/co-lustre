@@ -1,0 +1,176 @@
+Title:        File Level Redundancy Solution Architecture
+URL:          https://wiki.lustre.org/File_Level_Redundancy_Solution_Architecture
+Page ID:      1262
+Last Updated: 2019-09-19T19:42:08Z
+Last Editor:  Adilger
+Edit Comment: /* Phase 4: Erasure Coded Striped Files */ clarify descriptions
+
+--- Content (MediaWiki markup) ---
+=Introduction=
+Lustre was originally designed and implemented for HPC use. It has been working well on high-end storage with internal redundancy (RAID) and fault-tolerance (dual-ported storage). However, no matter how good the underlying storage hardware is, applications using Lustre still can experience failures (short- or long-term data unavailability, or total data loss) due to hardware errors or OST filesystem corruption. Lustre currently lacks an internal mechanism to provide data redundancy, so its reliability cannot currently be better than that of the underlying hardware.
+
+The Lustre software currently supports striping, a.k.a [https://en.wikipedia.org/wiki/Standard_RAID_levels#RAID_0 RAID-0] across OST objects. To add redundancy, we can build up complex file layout in two different methods:
+
+* striping with first as with existing files and then replicating as [https://en.wikipedia.org/wiki/Nested_RAID_levels#RAID_01_(RAID_0+1) RAID-0+1]
+* replicating first and then striping as [https://en.wikipedia.org/wiki/Nested_RAID_levels#RAID_10_(RAID_1+0) RAID-1+0]
+
+[[File:RAID_01.png]] [[File:RAID_10.png]]
+
+For practical reasons, file redundancy will initially be implemented as RAID-0+1 in this initial phase so that replicas can easily be created from userspace, and can be heterogeneous across different storage types.  This also allows redundancy to be added to existing RAID-0 files
+
+In the rest of this document, in order to describe the file layout easier, we’re going to use mirroring interchangeably with redundancy. The individual replicas of RAID-0+1 could be single OST objects, or RAID-0 striping of OST objects. Anyway, they are mirrored files and won’t be distinguished in this document.
+
+With Lustre File Level Redundancy (FLR), a user or administrator can store the same file data on multiple independent OSTs so that these files can avoid a single point of failure and transparently tolerate short- or long-term storage unavailability with lower latency than HA failover, or permanent loss of an OST filesystem. File availability is improved because the client can choose any replica of the data to read.  As well, files that are concurrently read by many clients, such as input decks or executables, can improve aggregate parallel file read performance via redundant data copies on many OSS nodes.  The term ''Redundancy'' is used in preference to ''Replication'', since later phases of FLR can provide erasure coding for striped files, in addition to the mirroring available in the first phases.
+
+A complete solution of data redundancy takes time to implement, so a phased approach will be used to leverage FLR functionality earlier, if it matches customer use cases, and ensure completed development efforts are available before the full feature is implemented. Even though FLR phases are listed with distinct components, in most cases it is possible to do component implementation in any order, as required for specific systems or based upon developer availability/interest.
+
+=Overview=
+The full design of FLR is described in the [[File Level Replication High Level Design|File Level Redundancy High Level Design]] document. The primary design decision for the FLR feature is that the redundancy of a file is determined, as with Lustre file striping, on a per-file basis at the Lustre client.  This leverages existing Lustre infrastructure and provides maximum flexibility to allow some (or all) files to be mirrored on multiple similar OSTs, mirrored between different types of OSTs, mirrored many times, erasure coded, or not be redundant at all.
+
+Allowing the redundancy to be selected on a per-file basis provides the maximum flexibility to choose the desired performance/availability for data, without imposing unnecessary space and performance overhead for cases where it is not needed.  This is particularly important for very large filesystems, where double- or triple-mirroring all data is prohibitive for capital cost, power, space, and performance reasons.  The FLR implementation ''allows'' all files in a filesystem to be redundant, but does not ''require'' it.  In some cases (e.g. checkpoint or other temporary files) it is desirable to '''not''' add redundancy to the file to maximize write bandwidth and minimize application IO time, and then selectively add redundancy to a subset of these files in the background.
+
+Please note that FLR does '''not''' provide MDT redundancy.  That needs its own development effort, which can use work done for DNE2 and is largely independent of FLR.  For many HPC systems, having only data redundancy is acceptable as there may be hundreds of OSTs in one filesystem, but only a few MDTs, so the number of MDT failures is a fraction of OST failures.  Also, the MDT is small enough to be fully backed up for disaster recovery, which is often not possible for all data.  The MDT is usually on more reliable SSDs, while OSTs are on less reliable HDDs, so the MDT is also less likely to suffer hardware failure.
+
+==Development dependencies==
+It is worthwhile to note that while the FLR development is split into several phases, these phases are largely independent and later phases could be implemented in any order once the initial Phase 1 replica read functionality is implemented.  Components of different phases could also be combined to provide required user- and application-level functionality without implementing the whole phase (e.g. read-only erasure-coded files with delayed resync, without immediate write support). The implementation phases are provided as an initial estimate of development ordering, and could be modified once feedback is received on which use cases are of interest to users.
+
+=Phase 1: Delayed Mirroring =
+The initial implementation phase is intended for usage on read-mostly files with mirrored layouts, with limited (but functional) support for modifying then resyncing mirrored files that are stale.  This will allow layouts with multiple copies of the same data (using [[Layout_Enhancement_Solution_Architecture|Composite Layouts]] as implemented in the PFL project).
+
+Mirrored file layouts work in the same way as Lustre file layouts do today - they can be specified explicitly for each file, or they can be inherited from the parent directory or root directory. It is possible to set in the layout which mirror is preferred (e.g. read/write first to an NVMe/SSD burst buffer and then mirror to HDD OSTs later).
+
+Since FLR will be in addition to device-level redundancy (RAID-6, RAID-Z, dRAID) during the initial development and deployment phases, there will not be a hard requirement for immediate resync of files if one of the mirrors is lost, as OSTs would still have RAID/HA as they do today (i.e. FLR availability will not be worse than what exists today).  Once we have more experience with FLR, and improved resync tools to efficiently resync a whole OST upon failure it would be more practical to have full-filesystem redundancy using only FLR, instead of FLR + OST device-level redundancy.
+
+==Use Cases==
+===Mirrored Input Files for Availability===
+One of the earlier HPC/Lustre use cases for FLR was proposed in "[http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.218.1560 Improving the availability of supercomputer job input data using temporal replication]" to replicate files in the job queue to avoid job startup errors in case of OST failure at the time of job launch. Since large jobs may wait days or weeks in the input queue for a large test run, any read errors at job launch would cause the job to fail and need to be re-queued again.  The use of FLR to mirror input files will transparently mask read errors and temporary or permanent OST failures from applications. Unlike [[#Mirrored Input Files/Executables for Performance]] (below), this is primarily focused on availability of the input files and not necessarily performance, though if a mirrored input file is accessed from many clients then read performance can also be improved.  File mirror(s) can be on any kind of OST storage (either SSD or HDD) in order to benefit from the added redundancy.
+
+===Mirrored Input Files/Executables for Performance===
+HPC jobs may read input files in small or non-sequential requests to map data into the CPU cores the job is running on. Prestaging input files on flash storage would allow high-IOPS access to input files from a large number of clients at one time. FLR can be used with job directives to mirror input files onto flash OSTs that are preferentially read by clients.
+Jobs may read the same input file from thousands of clients concurrently, and can benefit from mirroring the data across many OSS nodes so clients can read the file faster than a single OSS can provide.
+Since the mirror copies are tied to the job, the resync steps can be driven by the job scheduler and avoid the need for a policy engine.  Since the redundancy is primarily for performance of read-only files, there is not a strong requirement for resync tools for stale files, since the replication itself is short lived.
+
+===Checkpoint Burst Buffer===
+Another use case for Phase 1 is as a burst buffer (transparent write cache) for checkpoint or other output files in an HPC system. The filesystem could be configured with a default layout that allocates all new files on flash-based OSTs, and then replicates these files over to disk-based OSTs after they are finished writing.  Moving all files from flash OSTs to disk OSTs avoids namespace scanning or a policy engine, allowing a simple ChangeLog monitor to handle migration since all new files would be migrated off the flash OSTs shortly after creation.  It may be possible for jobs to specify that some checkpoints would be deleted rather than mirrored/migrated from the burst buffer.  Note that this could be configured to be transparent to applications, so there would not be a requirement for them to write to a special directory.
+
+===Extra Redundancy of Important Files===
+It would be possible for users or administrators to explicitly specify added redundancy for specific files.  For example, the user/job could mirror one checkpoint file per day out of 24 hourly checkpoints, so that the job is able to restart even when an OST is unavailable/lost.  Similarly, important input or data files could be permanently mirrored, which would still provide better redundancy/availability than exists today.
+
+===File Versioning (optional)===
+It would be possible to keep past versions of files available for user recovery by making mirror copies of the file and then marking the mirror "do not resync" and never updating it again.  While this would multiply space consumption for each file version, so not as space efficient as snapshots at the OST level, this has the benefit that the file versions would be stored independently of the primary copy (for higher availability in case an OST holding the original file and its snapshots is permanently lost), and could be done on a per-file basis unlike MDT/OST-level snapshots.  Users could access the old file versions (read-only?) via the lfs tool, or potentially at some point in the future via a "special filename" handled by the MDT (e.g. '''filename.~1''' or similar).
+
+==Required Lustre Functionality==
+===Mirrored File Reads===
+Clients will be able to autonomously determine which mirror to read from, and when to read from another mirror.  There will be client-side heuristics to maximize the aggregate OSS network and disk bandwidth when many clients are reading from the same file with redundant copies.  Mirror(s) marked "preferred" will be used for reads in preference to other mirrors, unless they are not accessible.  Implemented for 2.11 via [https://jira.hpdd.intel.com/browse/LU-9771 LU-9771].
+
+===Adding Mirror to Existing Files===
+Data redundancy may be added to files via userspace tools after the file is closed. Phase 1 provides APIs and changes to lfs to do this on a per-file basis, which can be leveraged by other tools. The MDS allocates OST objects for mirror copies on different OSTs from those already used by the file, and can avoid allocating mirror copies on the same OSS or its failover partner to avoid shared back-end storage).  Implemented for 2.11 via [https://jira.hpdd.intel.com/browse/LU-9771 LU-9771].
+
+===Mirrored File Write Invalidation===
+New files that are initially created with a mirrored layout, or are modified after being replicated, will have all but one of the mirrors marked as stale, and a record will be added to the ChangeLog for the file.  If a mirror is marked as "preferred" then it will be used for the write, unless it is not accessible from the client.  Implemented for 2.11 via [https://jira.hpdd.intel.com/browse/LU-9771 LU-9771].
+
+===Resync File Tools===
+The userspace resync tool can recover files marked stale in the Lustre ChangeLog, or manually at the direction of a user or script.  In its simplest form, the resync tool will generate a list of stale files from the ChangeLog, and sync the data to the stale mirror copies.  Implemented for 2.11 via [https://jira.hpdd.intel.com/browse/LU-9771 LU-9771].
+
+===Fault-Domain Aware OST Object Allocation (optional)===
+To avoid mirrored files allocating stripes from the same OST or OSS on both sides of the mirror, which could result in both replicas being unavailable (depending on layouts).  Instead, the MDS should avoid allocations for different replicas on the same OSS nodes (as determined by the OSS NIDs), and in particular on the same OSTs (as determined by the OST index).  In advance of implementing such functionality in the MDS, it is possible to constrain the allocation manually or via default directory layouts using non-overlapping OST pools for each of the replicas.  This would also happen naturally when using OST pools that are in different storage classes (e.g. HDD and SSD).  There is some functionality implemented in PFL that avoids selecting objects from the same OSTs for different components in the same file, which will avoid this issue to some extent, but as yet it does not avoid allocations on the same OSS, nor does it have any understanding of other fault domains (rack, enclosure, RAID controller, PSU).
+
+===File Versioning (optional)===
+To implement file versioning, essentially only a "do not resync" flag needs to be added to components, and a userspace policy/option to the resync tool to indicate when/which components should be marked as such.  File versioning would be notified/created for modified files via ChangeLog, in the same manner as mirrored files, and are not mutually exclusive. There would need to be an interface for userspace to get the age of a file version (OST-only timestamps). There would be an upper limit on how often a file version could be created, (depending on how busy the resync engine is), and how many versions could be kept (limited by the file layout size).  A sophisticated resync tool could keep versions at different granularities ala Time Machine (e.g. daily for a week, weekly for two months, monthly until out of space).
+
+===MDT File Listing Interface (optional)===
+For more efficient MDT scanning of all files in the filesystem (e.g. for Phase 1 OST replacement, resync, or purging), it would be useful to leverage the existing LFSCK inode scanning engine to provide an efficient userspace interface to list all files on the MDT.  This could also be useful for RobinHood during initial scanning, and other scanning tools such as lfs, etc.  Note that this is NOT the same as [[#MDT Object Inventory]] in Phase 2, which would store a separate list of files stored on each OST.
+
+===OST File Listing Interface (optional)===
+For Burst Buffer and other use cases such as efficient balancing of OSTs, it is desirable to be able to list all of the MDT parent inode FIDs of objects residing on that OST.  This can be done efficiently by using the LFSCK inode scanning mechanism and returning a virtual index of MDT parent FIDs for all in-use objects on the OST.  While the OST needs to be available (unlike the OST Object Inventory, which is located on each MDT), it is beneficial to work with a single OST such as purging a flash OST to reduce space usage for the Burst Buffer, or because an OST is otherwise to full compared to other OSTs.
+
+==External Components==
+===Parallel Namespace Scanner and Resync Engine===
+Having multiple client nodes running resync of stale files in parallel is desirable for performance. This can be done in several ways, by running the resync process as part of the HSM copytool on agent nodes, or as part of a parallel scanning/work engine such as [https://github.com/ORNL-TechInt/lester Lester], [http://lustre.ornl.gov/ecosystem-2016/documents/tech/Loftus-NCSA-Psync.pdf NCSA's Psync], [http://wiki.lustre.org/images/0/0d/LUG2016D3_Lustre-Data-Mover_Wagner.pdf SDSC's Lustre Data Mover], [https://github.com/hpc/mpifileutils MPI Fileutils] or others.  File resync can run on any Lustre client node, potentially mounted directly on the OSS with an [[#Optimized_Client-on-Server_IO]].
+
+===Complete OST Replacement===
+In Phase 1, total OST failure will require a full MDT namespace scan to list mirrored files on that OST (unmirrored files are not recoverable), or if a policy engine like RobinHood is available it can also generate all files on the failed OST.  The list of files to resync will be passed to the [[#Parallel Resync Engine]].  This namespace scan only needs to access MDT metadata and not OSTs, so it could run relatively quickly (e.g. 100-150k files/s per MDT), likely faster than files could be resynched.  If the OST is being replaced while online, it would be possible to get a list of objects directly from the OST.
+
+Unless file mirrors are otherwise constrained during creation, OST replacement would naturally be "declustered", using bandwidth from all OST to rebuild rather than just an "OST pair".  The rebuild bandwidth consumed by the resync engine should be limited to avoid impacting running jobs.
+
+===Job Scheduler Integration===
+Integration with a job scheduler, like SLURM, would allow FLR to pre-stage files into flash-based OSTs.  This is useful for some, but not all use cases.  It would be possible and desirable to leverage the CORAL CPPR project to implement this functionality for FLR.  Alternately, this may be achieved with something as simple as a script run from the job pre- and post-script that parses the job submission to mirror files mirror via the [[#Parallel Resync Engine]].
+
+=Phase 2: Immediate Redundancy and Optimized Resync=
+This phase will add the ability for clients to generate data redundancy at the time that the file is initially being written, rather than depend on a delayed resync process in order to provide data redundancy.  This will allow redundant files to maintain redundancy during modification, and will allow files to be transparently migrated between storage classes during writes.
+
+==Use Cases==
+===Mirror Critical Output Files===
+Immediate write mirroring is useful when there are critical files that cannot wait for delayed resync or HA storage failover before they are redundant, or files that may be open for a long time.  This would include real-time data from scientific instruments, possibly during difficult to reproduce data capture events.
+
+===Read-Modify-Write Mirrored Files===
+Files that are written repeatedly during their lifetime need to avoid losing redundancy every time they are modified.  Otherwise, they would often be without a valid mirror copy, and would need multiple resync operations, which becomes very expensive for large files.
+
+===Full Filesystem Mirroring===
+Immediate write mirroring is important when using full filesystem mirroring to prevent an increasing backlog of files needing delayed resync.  All mirrors will be updated at the time the file is being modified, avoiding an extra data read during resync.
+
+===Transparent File Migration===
+By allowing files to be written without losing redundancy, it is possible to transparently migrate mirrors between OSTs even when the file is undergoing modification.  This would be important for filesystems with multiple storage tiers, such as flash- and disk-based OSTs where data movement would be more common and writes could not necessarily be excluded.  Automated space management of each tier and the migration between them require [[#Phase 3: Policy Engine Integration]], or could possibly be done with the OST Object Listing (Phase 1 option) to directly list files that are resident on the specific OSTs.
+
+==Required Lustre Functionality==
+===Mirrored File Writes===
+Clients will optionally be able to write two or mirror copies of the data immediately.  This would be implemented with multiple write RPCs from the client. If an OST becomes permanently unavailable during writes, or after the file has been written, the mirror copy will be marked stale and will require recovery using the Phase 1 external resync tools.
+
+===MDT Object Inventory (MOI)===
+To avoid scanning the whole namespace to recover from total OST failure, the MDT could efficiently store a permanent list of all files that have any objects on each OST.  This would be very similar to the current Object Index stored on the MDTs and OSTs today.  As OST objects are assigned to files as they are created, the file's FID would also be inserted into a separate index for each OST. In case of complete OST failure, the MDT Object Inventory for that OST could directly list all files with objects on the failed OST to pass to the parallel resync engine.  LFSCK should be modified to update the MOI for existing filesystems.
+
+===Optimized Client-on-Server IO===
+In order to maximize resync performance it is desirable to have an optimized I/O interface for clients mounted on the OSS node to read/write to local OSTs.  A full Lustre client is still required for resync tasks, since the client needs to understand file layouts and communicate with other OSTs, since the local OST may only provide a subset of each file's data.  At minimum, modifications are needed so that locally mounted clients do not participate in OST recovery. It may be possible to add either a direct I/O API, or optimized fast path through LNet for bulk I/O operations to reduce read/write overhead for local OSTs.
+
+==External Components==
+===Optimized Resync Tool===
+In Phase 1, in order to restore data redundancy, the resync tool will make a full copy of the file and delete the stale copy. Resynching only the stale OST object(s) in each file the total amount of data movement would be reduced significantly.  This would require a relatively small change to the client and MDS to allow replacing only a single object of a file, rather than a complete replica copy.
+
+If a file is marked stale during write, it would also be possible to record the extent of the replica that is stale, rather than marking the whole replica stale, so that a smaller part of the file needs to be resynched.  This would be most useful in conjunction with Mirrored File Writes when the client is more likely to be modifying redundant files and efficient resync will be more important.
+
+=Phase 3: Policy Engine Integration=
+Closer integration with a policy engine would provide a number of benefits.  Free space on OSTs can be monitored by RobinHood to release archived files from the OSTs to free space. This could be used to manage free space on specific OSTs or pools balance space usage in different storage classes.
+
+Using RobinHood 3.x for this task seems possible, though there may be other options such as a scanning policy engine (LiPE) for filesystems with many billions of files.  It is definitely capable to handle filesystems in the 100-500M file range, which covers a significant fraction of the Lustre install base.
+
+It would also be possible to achieve much of this functionality without the need for an external policy engine, by enhancing Lustre in specific areas to address gaps in areas such as OST replacement.
+
+==Use Cases==
+===Automatically Balanced Tiered Storage===
+Depending on the capabilities of the policy engine, users or administrators could specify policies for redundancy levels and storage classes for files within the filesystem based on the file's age, owner, pathname, filename extension, etc. 
+
+===Integration of Mirroring and Resync with Policy Engine===
+The policy engine could also be used to drive file resync in the face of complete OST failure, since it is already capable to generate a list of all files on the failed OST(s). An HSM copytool such as RobinHood is efficient at managing files, and is already capable of running on agent nodes in parallel.
+
+===External Components===
+Integration with the policy engine will primarily involve adding new policy syntax to specify redundancy policy for files.  RobinHood 3.x is extensible and can provides the infrastructure for this development. 
+
+=Phase 4: Erasure Coded Striped Files=
+Erasure coding provides a more space-efficient method for adding data redundancy than mirroring, at a somewhat higher computational cost.  This would typically be used for adding redundancy for large and longer-lived files to minimize space overhead.  For example, RAID-6 10+2 adds only 20% space overhead while allowing two OST failures, compared to mirroring which adds 100% overhead. Erasure coding can add redundancy for an arbitrary number of drive failures (e.g. any 3 drives in a group of 16).
+
+It would be possible to implement delayed erasure coding on striped files in a similar manner to Phase 1 mirrored files, by storing the parity stripes in a separate component in the file, having a layout that indicates the erasure coding algorithm, number of data and parity stripes, stripe_size (should probably match file stripe size), etc.  The encoding would be similar to [https://en.wikipedia.org/wiki/Standard_RAID_levels#RAID_4 RAID-4], with specific "data" stripes (the ''primary'' RAID-0 file layout), and one or more "parity" stripes stored in a separate component, unlike RAID-5/6 that have the parity interleaved.  For widely-striped files, there could be separate parity components for different sets of file stripes, so that data+parity would be able to use all of the OSTs in the filesystem without having double failures within a single parity group.  For very large files, it would be possible to split the parity component into smaller extents to reduce the parity reconstruction for sub-file overwrites.  Erasure coding could also be added incrementally to existing striped files, after the initial file write, or when migrating a file from an active storage tier to an archive tier.
+
+Reads from an erasure-coded file would normally use the primary RAID-0 component, as with non-redundant files. If a stripe in the primary component for the file fails, the client can read the parity component and reconstruct the data from parity on the fly, and/or depend on the mirror resync tool to reconstruct the failed stripe from parity.
+
+Writes to an erasure-coded file would mark the parity component stale, as with a regular mirrored file writes, and writes would continue on the primary RAID-0 striped file.  The main difference from a mirrored file is that the writes would always need to go to the primary component, and the parity component would always be marked stale.  It would not be possible to write to an erasure-coded file that has a failure in a primary stripe without first reconstructing it from parity.
+
+==Use Cases==
+===Space Efficient Data Redundancy===
+Erasure coding will add the ability to add full redundancy of large files or whole filesystems, rather than using full mirroring.  This will allow striped Lustre files to store redundancy in parity components that allow recovery from a specified number of OST failures (e.g. 2 OST failures per 10 stripes, or 4 OST failures per 24 stripes) in a manner similar to [https://en.wikipedia.org/wiki/Standard_RAID_levels#RAID_4 RAID-4] with fixed parity stripes.
+
+==Required Lustre Functionality==
+===Erasure Coded File Read===
+Add support for reading erasure-coded files, leveraging most of the existing functionality for reading mirrored files.  This will be handled in a similar manner as [[#Phase 1: Delayed Redundancy]], but instead of creating a whole second copy of the file data, only parity would be stored in the added file component.
+
+===Erasure Coded File Write===
+To avoid losing redundancy on erasure-coded files that are modified, the [[#Mirrored File Writes]] functionality could be used during writes to such files.  Writes to an EC file would be done to a new, sparse, mirror component.  Reads would prefer the mirror component (if data is present at that offset) and fall back to the EC component if there was a hole in the mirror.  Changes stored in the mirror component of the file would be erasure coded after the file is closed, using the Phase 1 ChangeLog consumer, and the mirror component could be removed.
+
+If Erasure Coding is considered a more important use case for FLR adoption than immediate write mirroring, then it would also be possible to mark the whole parity component stale upon write (as Phase 1 writes mark the mirror component(s) stale)) and use Phase 1 resync on the parity component when file write is complete.  In this case, as with Phase 1 writes, the redundancy lost if the file is modified after create.  It would not be possible to write to an erasure-coded parity component in lieu of an unavailable data component, as is the case with Mirrored components.
+
+==External Components==
+===Erasure Coded Resync Tool===
+The '''lfs mirror resync''' tool needs to be updated to generate the erasure code for the file striped file, storing the parity in a separate component from the main RAID-0 striped file.  There are CPU-optimized implementations of the erasure coding algorithms available, so the majority of the work would be integrating these optimized routines into the Lustre kernel modules and userspace tools.
+
+[[Category:Architecture]]
+[[Category:Layout]]
+[[Category:FLR]]

@@ -1,0 +1,65 @@
+Key:        LU-11081
+Summary:    LFSCK support for DoM file
+Link:       https://jira.whamcloud.com/browse/LU-11081
+Type:       Improvement
+Priority:   Critical
+Status:     Open
+Resolution: Unresolved
+Assignee:   Hongchao Zhang
+Reporter:   nasf
+Created:    Mon, 11 Jun 2018 14:09:08 +0000
+Updated:    Wed, 10 Sep 2025 12:44:42 +0000
+Labels:     DoM2
+
+--- Description ---
+The following three points needs to be well considered if the LOV EA of the file (that contains DoM component) is lost or corrupted, then how to rebuild the LOV EA based on related OST-objects PFID EA?
+
+1) How to know whether the file contains DoM component or not? Reading the MDT-object's blocks may be the most simple solution. If the DoM component has not been written before, then such detect will fail, then there will be a hole in the final rebuilt LOV EA. From the LFSCK view, it is not distinguishable from the case that if it is not a DoM file, but the OST-objects of the first component in the mirror are lost. To resolve such issue, we can make the layout LFSCK to record the LOV EA rebuilding, then make the 3rd phase scan for the rebuilt LOV EA, if the LOV EA contains hole at the beginning of the mirror, then handle it as DoM component. But if there are multiple mirrors contain hole at the each own mirror beginning, then only one can be handled as DoM component. The other holes will be kept there. As for which mirror may contains DoM also depends on the extent range of next non-DoM component in each mirror, because the DoM range is restricted.
+
+2) How to know the DoM component ID? It seems that we have to save the DoM component ID in another EA, the best choice is the LMA EA that is always inline data of the backend object space; otherwise, we cannot guarantee that such EA is still valid if LOV EA lost or corrupted.
+
+3) How to know the DoM component's extent range? If all the non-DoM components have been rebuilt after the 2nd cycle scanning, then we exactly to know DoM's range. But we can not know whether all the non-Dom components have been rebuilt. So we have to guess the range of DoM component based on its next non-DoM component during the 3rd phase scanning. We also need to know the LOD layer the value of lod_device::lod_dom_max_stripesize.
+
+--- Comment (sthiell, Tue, 5 Nov 2019 17:25:25 +0000) ---
+Is this something that is planned for 2.12.4? We're currently heavily relying on DoM and using 2.12.3 but I understand we cannot do a layout repair:
+
+00100000:10000000:15.0:1572924337.144465:0:34815:0:(lfsck_layout.c:374:lfsck_layout_verify_header_v1v3()) Unsupported LOV EA pattern 256 for the file [0x200029a02:0xdbb6:0x0] in the component 1
+00100000:10000000:15.0:1572924337.144468:0:34815:0:(lfsck_layout.c:374:lfsck_layout_verify_header_v1v3()) Unsupported LOV EA pattern 256 for the file [0x200029888:0x36c5:0x0] in the component 1
+00100000:10000000:15.0:1572924337.144471:0:34815:0:(lfsck_layout.c:374:lfsck_layout_verify_header_v1v3()) Unsupported LOV EA pattern 256 for the file [0x2000298bf:0x15240:0x0] in the component 1
+00100000:10000000:15.0:1572924337.144474:0:34815:0:(lfsck_layout.c:374:lfsck_layout_verify_header_v1v3()) Unsupported LOV EA pattern 256 for the file [0x200029a02:0xdbb7:0x0] in the component 1
+
+--- Comment (jgmitter, Fri, 9 Aug 2019 04:51:56 +0000) ---
+Hongchao will be picking up this work.
+
+--- Comment (adilger, Wed, 29 Aug 2018 21:23:56 +0000) ---
+Mike, I know it is late in the 2.12 release cycle, but this is really something that should be in the 2.12 release if possible, so that LFSCK can handle DoM files correctly. It doesn't necessarily have to handle every possible corruption, but at least the basic functionality of rebuilding a DoM layout component for an MDT file that has data is needed.  This would also be useful for the ability to upgrade a stand-alone ext4 or ZFS filesystem into a Lustre MDT (all existing files are DoM files) that can have OSTs added to it.
+
+NOTE Some old ldiskfs filesystems that have been upgraded may store the file size in the inode i_size field, so these large sparse files should NOT be taken as the indicator of a DoM file that replaces the existing LOV EA. Rather, it should check whether the MDT file has any allocated data blocks (NOT using only the inode->i_blocks count which may show blocks allocated to the file for xattrs).  There is not a single direct method that will work today in all cases, but luckily there is a road forward for this.  For ldiskfs, we can use FIEMAP to detect whether there are data blocks allocated to the inode, and if this returns -EOPNOTSUPP for ZFS files then DoM files will have a non-zero i_size.  This shouldn't cause problems for upgrade-ZFS-to-Lustre in the future, since FIEMAP should be included into the ZFS 0.8 release before we have such upgrade functionality for Lustre.
+
+--- Comment (yong.fan, Tue, 12 Jun 2018 01:53:29 +0000) ---
+I don't think it is important to keep the same component ID for the DoM component. Most of the time it will be 1 because it is the first component created. However, it could be assigned any value that does not conflict with existing components. Since only the DoM object will be part of this component, we don't need to worry about other OST objects being part of the same component.
+
+Before supporting mirrored file, it is true that the DoM entry usually is first one. But with mirror introduced, the original component ID is split into two parts: the mirror ID and the new component ID. Because we do not know the mirror ID, we cannot know which mirror the DoM entry belongs to.
+
+While we can use lod_device::lod_dom_max_stripesize as a hint for expanding the DoM component if the file size is smaller, it is also possible to change this limit after a file is created. If an MDT inode has file data beyond lod_dom_max_stripesize (either because the limit was changed, or local filesystem converted to Lustre), then it should be kept and used as the minimum DoM component size (rounded up to a multiple of 64KB).
+
+The lod_dom_max_stripesize can be changed after the crashed DoM file created, so the lod_dom_max_stripesize can be used as the hint, but still needs to consider its next component's range.
+
+--- Comment (adilger, Mon, 11 Jun 2018 18:52:28 +0000) ---
+1) How to know whether the file contains DoM component or not?
+
+I think there are only two cases that we really need to worry about:
+
+	MDT object has data, was upgraded from local (non-Lustre) filesystem.  This can be treated like the next case.
+
+	MDT object is intact with data, but lov xattr is lost.  In this case we can know the object has a DoM component based on the file data.  To repair this case, make a DoM component to cover the file data (rounded up to next multiple of 64KB or start of OST component (if any).  Any OST object for the second component would know the start offset of the component.  If the DoM component was never written (i.e. hole at that logical file offset and MDT inode has no data) then we don't care if it had a DoM component or not and it can be treated like the next case.
+
+	MDT object is lost along with data.  In this case, we also don't care if there was a DoM component or not, since the data is lost.  We can extend the OST component to start at offset 0 or create a new DoM component, whatever is easier.
+
+2) How to know the DoM component ID?
+
+I don't think it is important to keep the same component ID for the DoM component.  Most of the time it will be 1 because it is the first component created.  However, it could be assigned any value that does not conflict with existing components.  Since only the DoM object will be part of this component, we don't need to worry about other OST objects being part of the same component.
+
+3) How to know the DoM component's extent range?  We also need to know the LOD layer the value of lod_device::lod_dom_max_stripesize.
+
+While we can use lod_device::lod_dom_max_stripesize as a hint for expanding the DoM component if the file size is smaller, it is also possible to change this limit after a file is created.  If an MDT inode has file data beyond lod_dom_max_stripesize (either because the limit was changed, or local filesystem converted to Lustre), then it should be kept and used as the minimum DoM component size (rounded up to a multiple of 64KB).

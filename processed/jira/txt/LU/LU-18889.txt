@@ -1,0 +1,57 @@
+Key:        LU-18889
+Summary:    "lfs find -printf" optimization
+Link:       https://jira.whamcloud.com/browse/LU-18889
+Type:       Improvement
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Andreas Dilger
+Created:    Thu, 3 Apr 2025 08:18:10 +0000
+Updated:    Fri, 20 Feb 2026 11:20:01 +0000
+Labels:     easy, lug23dd, lug24dd
+Links:      Cloners: Clones LU-15837; Related: is related to  LU-5170; Related: is related to  LU-12480; Related: is related to  LU-7495; Related: is related to  LU-10378; Related: is related to  LU-15504; Related: is related to  LU-15743; Related: is related to  LU-16798; Related: is related to LU-16560; Related: is related to LU-16808; Related: is related to LU-17219; Related: is related to LU-16760
+
+--- Description ---
+Per Rick's LUG presentation, there are still a number of optimizations for "lfs find -printf" that were not included in the original patch https://review.whamcloud.com/45136 "LU-10378 utils: add formatted printf to lfs find" landing that should still be addressed:
+
+	selective fetching of metadata attributes.  In particular, fetching the projid for a file requires an extra syscall that is unnecessary if the projid is not being printed, at least until LU-12480 is implemented.  Most of the other MDT attributes are "free" once any attribute is read for a file, so it probably doesn't make sense to micro-optimize here.
+
+	pre-parsing of the -printf argument string (assuming this actually shows up in the CPU profile, I'm not sure if it is actually important vs. stat/RPC overhead)
+
+	maybe others, I didn't catch all of them
+
+--- Comment (adilger, Thu, 3 Apr 2025 08:19:16 +0000) ---
+Looking at the strace output for regular file processing it seems like it is doing far too much for most files:
+
+# strace -ttt -T lfs find /mnt/testfs/dir
+:
+:
+1683657120.708615 getdents(4, /* 102 entries */, 32768) = 6448 
+1683657120.709513 ioctl(4, _IOC(_IOC_READ|_IOC_WRITE, 0x69, 0x16, 0x140), 0xea2040) = 0 
+1683657120.712309 open("/mnt/testfs/dir/filename_is_long-15", O_RDONLY) = 3 
+1683657120.715904 ioctl(3, _IOC(_IOC_READ, 0x66, 0xaf, 0x4), 0x7ffc0a9b3ba0) = 0 
+1683657120.716106 ioctl(3, FS_IOC_FSGETXATTR, 0x7ffc0a9b37d0) = 0 
+1683657120.716243 newfstatat(4, "filename_is_long-15", {st_mode=S_IFREG|0644, st_size=0, ...}, AT_SYMLINK_NOFOLLOW) = 0 
+1683657120.717022 write(1, "/mnt/testfs/dir/filename_is_long-15", 36) = 36  /mnt/testfs/dir/filename_is_long-15
+1683657120.717386 close(3) = 0 
+
+The ioctl(4, _IOC(_IOC_READ|_IOC_WRITE, 0x69, 0x16, 0x140) = IOC_MDC_GETFILEINFO_V2) is expected for every file, since it gets the file layout and MDT attributes from the parent directory but we definitely should not be doing open() and ioctl(FS_IOC_FSGETXATTR) (to get projid) and newfstatat() (not sure why?) on every file when we are only printing the pathname.  That is a lot of overhead (more than double the original ioctl(IOC_MDC_GETFILEINFO_V2) call).
+
+Running without -printf "%p" shows none of that overhead:
+
+1683657295.265889 getdents(4, /* 102 entries */, 32768) = 6448 
+1683657295.266362 write(1, "/mnt/testfs/dir/filename_is_long-15"..., 36) = 36  /mnt/testfs/dir/filename_is_long-15
+1683657295.266446 write(1, "/mnt/testfs/dir/filename_is_long-44"..., 36) = 36  /mnt/testfs/dir/filename_is_long-44
+
+I'm thinking that "gather_all" should be changed to be a STATX_ bitmask to indicate which fields are needed, and then the code could be changed to check the bitmask when the attributes are being fetched:
+
+#ifndef STATX_PROJID
+
+#define STATX_PROJID 0x40000000 /* only used internally */
+
+#endif
+
+        if (param->fp_check_projid || gather_printf & STATX_PROJID)
+
+The definition of STAX_PROJID would only be used internally until the kernel could itself return projid as part of statx() (LU-12480).

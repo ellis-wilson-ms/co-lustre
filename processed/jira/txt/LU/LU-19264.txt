@@ -1,0 +1,566 @@
+Key:        LU-19264
+Summary:    LRU Inconsistency in Client-Server Distributed Lock Caching​
+Link:       https://jira.whamcloud.com/browse/LU-19264
+Type:       New Feature
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Qian Yingjin
+Reporter:   Qian Yingjin
+Created:    Fri, 15 Aug 2025 13:48:18 +0000
+Updated:    Sat, 28 Feb 2026 00:23:15 +0000
+Links:      Related: is related to  LU-6529; Related: is related to  LU-11509; Related: is related to LU-7266; Related: is related to LU-1128
+Attachments: Archived_test1.zip, Archived_test2.zip, LRU Inconsistency in Client-Server Distributed Lock Caching​.md
+
+--- Description ---
+When reclaiming locks on the server side, the Least Recently Used (LRU) algorithm is employed based on the locks' last used time. However, when a client finds a compatible cached lock in its local lock namespace, it can directly use it without intract to the lock server. In this case, only the client-side lock's last used time is updated, while the corresponding server-side lock's LRU timestamp remains unchanged.
+
+In large-scale Lustre systems with hundreds or thousands of clients, the server-side lock namespace must manage all locks granted to clients. And these locks are cached on server side memory. Due to limited server memory capacity, when lock reclaim is triggered, the server's LRU timestamps may not reflect recent used accurately.
+
+This can lead to premature reclaim of locks that are actually still in active use or may be reused repeatedly in the near future by clients, resulting in unnecessary lock communication overhead and degraded system performance.
+
+According to the analysis above, the core issue is that when clients use locally cached locks, they update their local LRU timestamp but don't propagate this to the server. The server's LRU list becomes stale and may incorrectly revoke actively used locks during memory pressure situations. This could cause significant performance issues in large-scale deployments with hundreds of clients.
+
+This is a deep technical issue in distributed systems where client-side caching causes server-side lock management inaccuracies.
+
+--- Comment (JIRAUSER19404, Fri, 27 Feb 2026 02:21:18 +0000) ---
+I was asked by Yingjin again that if "a very high performance system but with limited memory capacity for LDLM locks, i.e. the QPS maybe 100M, but the lock limit is just 100K in count" could be handled well by SLV ......
+
+I think the extreme scenario is useful to think through, but it may help to clarify the roles a bit.
+
+SLV mainly smooths lock usage under normal conditions. A lock storm, however, is more about abnormal admission rate from certain clients than smoothing itself. If incoming requests temporarily exceed what reclaim can process, oscillation may happen regardless of the smoothing mechanism.
+
+Regarding Notify — The pressure accounting introduced there is valuable. The main concern was the cross-node signaling complexity.
+
+Instead of pushing pressure information to clients, we might slightly adjust Notify's direction and reuse those pressure signals locally on the server side — for example, feeding lock usage and short-term allocation rate into TBF.
+
+Importantly, this does not have to be global throttling. If we already have per-client pressure visibility, TBF can selectively slow down clients whose request rate is abnormal under pressure, while keeping well-behaved clients unaffected.
+
+This would:
+
+	Keep the mechanism lightweight
+
+	Avoid protocol changes
+
+	Preserve the core idea behind Notify (pressure-aware control)
+
+	Handle storm at the admission layer rather than after allocation
+
+So rather than solely rely on SLV or reviving heavy Notify, we could align them:
+
+	SLV for smoothing
+
+	Pressure signals (from Notify logic) to guide selective TBF shaping
+
+	reclaim(reject new reqs)  as last protection
+
+That may give us more stable behavior in extreme cases without increasing overall system complexity.
+
+ 
+
+To qian_wc, weizhao.days  cc adilger, paf0186
+
+--- Comment (JIRAUSER19404, Mon, 16 Feb 2026 02:37:21 +0000) ---
+Thanks weizhao.days, Let me keep this brief.
+
+SLV functions as a system-level indicator, whereas CLV is a per-client, per-lock metric. In a large-scale cluster, the impact of a single client’s lock acquisition on the overall SLV should, in theory, be relatively minimal. And the antigravity on the client? It's a math problem by the formula: CLV = lock's-age * client's-total-unused-locks * weight-factor(1.0 by default). Should not dramatic in that situation as well.
+
+ 
+
+If the SLV/CLV mech can address the problem — even though it "requires additional effort and sufficient testing" — we should prioritize making it workable (server side undergo, and some effort needed on the client side). I'm concerned that adding extra logic like Notify would lead to unnecessary overhead (CPU/Network/Maintenance, etc). "Entities should not be multiplied beyond necessity."
+
+All in all, sync with adilger, paf0186, and qian_wc for your input on this.
+
+--- Comment (JIRAUSER20200, Sun, 15 Feb 2026 15:56:42 +0000) ---
+Thank you for your comments. Here are some of my humble opinions:
+
+In your experiment, the threshold is 634K, and QPS is 35K, which accounts to 35/634 ~= 5.5%, that's a huge volume compared to the the threshold. It's a bit of easy to bypass the limit. And you decrease the lru_max age, which would just severe the situation (it normally should be performed in a larger time extent). Assuming in production deployment, the lock threshold should be 30M locks (MDS with 64G mem), and there should be thousands of clients, some spike requests from a group of clients might just be absorbed by the total request pool. A 30M * 5.5% = 1.65M lock QPS to a single MDS should be rare.
+
+This is an interesting example. Indeed, a QPS is minuscule relative to the entire system. However, I think what we need to consider may be whether the magnitude of QPS should be relative to the client/workload or to the overall system limit. For instance, 35K is minuscule relative to the system's 30M, but if considered relative to the client/workload, this amount of lock reclamation might cause significant performance fluctuations for the client. For example, workloads that actually generate lock pressure (such as ls, find, or other workloads) often need to acquire locks within a short time (assuming one or multiple unit time quantities of QPS). Therefore, when there exists a certain value satisfying SLV, the client will often reclaim this batch of QPS locks (because their ages are similar, the final clv obtained is similar). This situation may be more pronounced when SLV changes rapidly, because more locks will satisfy `clv 30% is actually the percentage of total MEMORY ldlm_lock (as one of many resources like ldlm_resource, etc) could use. In the SLV-fix-revision, half of that, say 50% is the balance line, exceeds that number would lead server to start revoke locks from the client (we should not trigger revoke until the last second or it's too late). That's why it "reclaims locks prematurely (before reaching the limit)". Shall we readjust it to a larger number like 60%? Not sure yet, given it will compete with other resources. Besides, too late would intro relatively large amount of lock revocation in a short period of time which might worse the situation... I need some input here.
+
+Before discussing whether it should be 50% or 60%, I think we can first focus on whether the current SLV/CLV implementation can cache locks from 50% of the limit to the limit. I still doubt whether SLV/CLV can correctly set the limit, because I have previously also tested on an MDS server with 512G memory. Without modifying or limiting the limit, if I remember correctly (forgive me, I'm on vacation and cannot reproduce this now), SLV/CLV could only cache up to about 900,000 locks, which is obviously incorrect for a 512G server. Of course, once the cause is identified, this problem can be fixed simply and quickly. This is for your reference.
+
+The CLV/SLV mechanism will send a "ping" ("pool update") to each server even when idle to exchange state with the server, which avoids the issue you described about idle clients not canceling locks for a long period of time. That said, this "ping" of the DLM server may take a minute or two to complete for every OST in a large system, because we found that pinging the server too frequently (originally once per second for all OSTs) caused a high load on both the client and server, so now it only pings the namespace targets in round-robin order once per second per target.
+
+&
+
+In theory, a dedicated Notify mechanism excels at targeted reclamation, allowing the server to pressure "heavy hitters" while sparing low-usage, "innocent" clients. This also optimizes network overhead, as heavy owners can leverage batch-releasing far more efficiently than smaller peers. Lastly, Notify is latency sensitive, which does not rely on ping or active request.
+
+&
+
+And the latency part, we should not that latency sensitive?(or we might encounter RPC flood). So yes, it seems Notify is not a must need. A robustly/correctly implemented SLV/CLV framework should be sufficient here.
+
+I think what truly causes sudden changes in SLV is generally sudden large lock request workloads. We can consider active (with RPC) and inactive (requiring ping) clients. A ping wait time of one or two minutes is enough for active clients to do many things, which will result in a state of requesting locks - reclaiming locks - requesting locks..., which may have a performance impact on active clients, while clients waiting for ping occupy a share of locks without reclaiming locks, leading to delayed reclamation. In large-scale systems such as supercomputing, the proportion of inactive clients is often much higher than active ones. Of course, if we look at it from a long-term time perspective, they will tend toward normal, but if we consider short-term performance impact, or when latency creates unfairness, latency should be worth considering.
+
+However, we could achieve the same outcome by making the CLV calculation more "pressure-aware." By incorporating a "dramatic SLV shrink" factor into the CLV logic — alongside local metrics like lock utilization and batch thresholds — the clients would naturally self-regulate. Heavy hitters would sense the budget crunch and trigger massive batch releases, while light users remain below the threshold.
+
+I'm wondering whether this "dramatic SLV shrink" could be handled on the SLV side. For example, combined with Notify, I think it might be able to solve the latency issue mentioned in the previous comment? For instance, only when SLV changes significantly (which means sudden workloads may have generated a large number of lock demands in a short time), at this point SLV has changed by 20%, then handle a large number of client lock reclamations through a single Notify. In this case, Notify would only be generated when SLV changes significantly, while also mitigating the latency issue?
+
+• Otherwise, you are supposed to issue tens, hundreds, or even thousands of additional RPCs to the heavy clients (in what duration, 1 second? 5 seconds? in a severe situation, could you send them timely or not?) repeatedly. Note Andreas mentioned, even ping should be reduced more or less, I doubt the Notify RPC is acceptable or not. What's worse, in a huge cluster, that would introduce N times costs, each MDS/OSS would contribute.
+
+• SLV introduced self-contained per second calculation. On the other hand, Notify need to iterate all clients to pick the 'heavy' ones to send RPC, what's the frequency? would the pick/threshold/iteration algorithm complicated/fair or not (time cost)?... Details should not be discussed here, doubt if it might consume more CPU/memory or not.
+
+In reality, Notify does not issue tens, hundreds, or even thousands of additional RPCs to heavy clients each time, but rather stops after reaching a fixed number of locks. I believe that on average, a round of lock reclamation can be completed within dozens of RPCs, until the next reclamation. At most, the RPCs from each round of Notify are just a fraction among the thousands upon thousands of RPCs in the system... This is a simple and clear mechanism. Of course, it is obvious that in some extreme scenarios, it may indeed bring greater RPC overhead.
+
+Undeniably, the SLV/CLV lock reclamation mechanism is indeed an ingenious design, but in practice it still has issues. It still requires additional effort and sufficient testing to determine how to make it work perfectly.
+
+Thank you for your comments, and please correct me if I'm wrong.
+
+--- Comment (JIRAUSER19404, Fri, 13 Feb 2026 10:30:10 +0000) ---
+In theory, a dedicated Notify mechanism excels at targeted reclamation, allowing the server to pressure "heavy hitters" while sparing low-usage, "innocent" clients. This also optimizes network overhead, as heavy owners can leverage batch-releasing far more efficiently than smaller peers. Lastly, Notify is latency sensitive, which does not rely on ping or active request.
+
+However, we could achieve the same outcome by making the CLV calculation more "pressure-aware." By incorporating a "dramatic SLV shrink" factor into the CLV logic — alongside local metrics like lock utilization and batch thresholds — the clients would naturally self-regulate. Heavy hitters would sense the budget crunch and trigger massive batch releases, while light users remain below the threshold.
+
+And the latency part, we should not that latency sensitive?(or we might encounter RPC flood). So yes, it seems Notify is not a must need. A robustly/correctly implemented SLV/CLV framework should be sufficient here.
+
+--- Comment (adilger, Fri, 13 Feb 2026 08:55:18 +0000) ---
+Can SLV not be used as the notify mechanism by forcing the client to cancel more locks to meet its SLV budget in an increasingly dramatic manner until the client(s) release the locks as needed?
+
+--- Comment (JIRAUSER19404, Fri, 13 Feb 2026 06:40:36 +0000) ---
+To be clear, I’m not against using Notify. I just believe both SLV and Notify should be integrated into a unified framework to manage lock revocations, which would improve both consistency and code maintainability.
+
+While SLV is designed to smooth out the grant/revoke process without disrupting user workflows, Notify should act as the final safety net. It needs to be both conservative and aggressive: conservative in its activation—triggering only in severe cases (e.g., when SLV fails and lock usage exceeds 70%)—but aggressive in its execution, reclaiming a large batch of locks without hesitation once invoked.
+
+Furthermore, Notify could simply RPC a more stringent SLV value to specific users. This allows clients to use a single, unified approach(CLV vs SLV) for lock revocation rather than maintaining two separate logic paths.
+
+ 
+
+Just my raw ideas...
+
+--- Comment (JIRAUSER19404, Wed, 11 Feb 2026 09:30:39 +0000) ---
+3. The Fixed SLV/CLV patch calculates SLV based on the average across clients. Is this fair for clients with different load pressures? For example, with two clients - one requesting many locks but limited by the averaged SLV (possibly only able to obtain half the locks), while the other client is idle.
+
+Per SLV-fix-revision, lock grant mech is a bit generous if avaiable/total is more than 50%, client could ask for more locks than average - the larger this ratio, the more a cilent could be granted, hundreds of thousands are possible.
+
+However, once it reaches the 50% balance line, every client is treated equally, since server feels pressure in this case. And yes, as you mentioned, it's not fair here as idle clients are preventing busy clients from acquiring more locks. While if you look at this unfair in a longer term perspective, we have the safety net - the DEFAULT_LRU_MAX_AGE + Ping-Eviction, which helps to reduce locks belonging to the idle clients, and the returned locks will sooner or later be granted to busy clients, and in the last, it's again lock competition between active clients. (Correction: LRU_MAX_AGE could only force idle clients to return their locks timely while Ping-Eviction could only evict non-responsive clients(correct me if I'm wrong), none of above could really prevent idle-but-alive-clients from being accounted into SLV-averaging calculation. And we need to add weight factor in client side as the following paragraph).
+
+We could do some optimization on the client side (totally agree with Andreas that client business should be processed in the client side only) as well if 'short term' matters, like compose a weight factor - based on local CPU count, query latency, etc - to contribute to CLV.
+
+--- Comment (JIRAUSER19404, Wed, 11 Feb 2026 05:25:05 +0000) ---
+Hi Linzhao, thanks too. I'd like to defend SLV/CLV in this case 
+
+although the Fixed Patch aligned the lock_limit (30%), SLV/CLV does not cache locks up to the limit.
+
+30% is actually the percentage of total MEMORY ldlm_lock (as one of many resources like ldlm_resource, etc) could use. In the SLV-fix-revision, half of that, say 50% is the balance line, exceeds that number would lead server to start revoke locks from the client (we should not trigger revoke until the last second or it's too late). That's why it "reclaims locks prematurely (before reaching the limit)". Shall we readjust it to a larger number like 60%? Not sure yet, given it will compete with other resources. Besides, too late would intro relatively large amount of lock revocation in a short period of time which might worse the situation... I need some input here.
+
+From the image you provided, SLV-fix-revision do REVOKE locks, which it supposed to do in the initial version. New revision works.
+
+ 
+
+SLV/CLV (lru_resize=1) is unstable - it sometimes revokes a large number of locks at once
+
+In your experiment, the threshold is 634K, and QPS is 35K, which accounts to 35/634 ~= 5.5%, that's a huge volume compared to the the threshold. It's a bit of easy to bypass the limit. And you decrease the lru_max age, which would just severe the situation (it normally should be performed in a larger time extent). Assuming in production deployment, the lock threshold should be 30M locks (MDS with 64G mem), and there should be thousands of clients, some spike requests from a group of clients might just be absorbed by the total request pool. A 30M * 5.5% = 1.65M lock QPS to a single MDS should be rare.
+
+ 
+
+The last one, compare between SLV with Notify, let's return back to the goal of it: transfer server memory pressure info to client so clients could correspondingly return locks if necessary.
+
+	With SLV, all you need is piggybacked long long integer, no extra cost, that's all.
+
+	Otherwise, you are supposed to issue tens, hundreds, or even thousands of additional RPCs to the heavy clients (in what duration, 1 second? 5 seconds? in a severe situation, could you send them timely or not?) repeatedly. Note Andreas mentioned, even ping should be reduced more or less, I doubt the Notify RPC is acceptable or not. What's worse, in a huge cluster, that would introduce N times costs, each MDS/OSS would contribute.
+
+	SLV introduced self-contained per second calculation. On the other hand, Notify need to iterate all clients to pick the 'heavy' ones to send RPC, what's the frequency? would the pick/threshold/iteration algorithm complicated/fair or not (time cost)?... Details should not be discussed here, doubt if it might consume more CPU/memory or not.
+
+Thanks again for the experiment. Like to hear more inputs.
+
+--- Comment (adilger, Tue, 10 Feb 2026 04:05:21 +0000) ---
+Hi weizhao.days, thank you for your investigation into the LDLM performance. From the graphs you have provided, it appears that LFRU is generally better than LRU, and that bulk notification of pressure to shrink the client lock cache is more efficient than sending many individual callbacks to the client. 
+
+2. I wonder if this situation could occur: Since SLV/CLV is propagated via RPC, the server returns updated SLV in RPC replies so clients can combine it with CLV to determine whether to reclaim locks (please correct me if I misunderstand). In this case, inactive clients or clients without RPC requests (e.g., due to cache hits) hold stale SLV values, meaning lock reclaim only occurs on active clients, and inactive clients fail to revoke locks in time.
+
+The CLV/SLV mechanism will send a "ping" ("pool update")to each server even when idle to exchange state with the server, which avoids the issue you described about idle clients not canceling locks for a long period of time.  That said, this "ping" of the DLM server may take a minute or two to complete for every OST in a large system, because we found that pinging the server too frequently (originally once per second for all OSTs) caused a high load on both the client and server, so now it only pings the namespace targets in round-robin order once per second per target. 
+
+3. The Fixed SLV/CLV patch calculates SLV based on the average across clients. Is this fair for clients with different load pressures? For example, with two clients - one requesting many locks but limited by the averaged SLV (possibly only able to obtain half the locks), while the other client is idle.
+
+It would be reasonable to start with the mean average SLV across clients, but then use a decaying average for clients that do not use their locks, or similar mechanism to adjust SLV toward active clients and away from idle clients.  That is what the original LV mechanism was supposed to do, but didn't quite get it right. 
+
+It should be noted that DLM locking activity on the server is not a good indicator of how busy a client is. A very busy client may be re-using the same small set of DLM locks while processing a file, but a "find" operation will access many more DLM locks. That is why the business of the client should come from the client itself.
+
+--- Comment (JIRAUSER20200, Mon, 9 Feb 2026 14:01:55 +0000) ---
+Hi, This comment presents the test results for the newly submitted patch, combining the Fixed SLV/CLV and LFRU patches.
+
+Workload: Lock reclaim has minimal impact on files that are not accessed repeatedly. This test focuses on repeated access scenarios (such as shared library reads) to evaluate different lock reclaim policies under metadata pressure.
+
+The background metadata pressure consists of 1 million files, with 200,000 shared library files, totaling 1.2 million files. The metadata pressure continuously performs stat operations to keep the MDS under memory pressure. Each round of shared library access randomly selects a portion of files from the 200,000 shared library files for reading.
+
+The purpose of this test is to examine the aggressiveness and stability of different lock reclaim algorithms:
+
+1. The 200,000 shared libraries are distributed among 1.2 million files. Aggressive and unstable reclaim can negatively impact shared library access performance.
+
+2. Aggressive/unstable reclaim may revoke a large number of locks at once, causing premature release of shared library locks that may be accessed later.
+
+(1) Average Latency
+
+Compare the average time for each round of reads (cat) throughout the test. Results are shown in reads_20000.png (20,000 files per round) and reads_50000.png (50,000 files per round) (see Archived_test2.zip).
+
+For the Age reclaim policy, I modified the default age parameter (the default age was too slow after reaching the lock limit, exceeding my tolerance). Since the Age policy performs AST on each lock individually, increasing the batch size actually degrades performance. SLV/CLV (lru_resize=1) is unstable - it sometimes revokes a large number of locks at once and reclaims locks prematurely (before reaching the limit), resulting in poor performance under load. Notify is relatively more stable.
+
+(2) Per-Round Latency Variation
+
+Here we compare the per-round cat time variation between SLV/CLV and Notify (each bar represents the difference between the current round's cat time and the previous round's). Results are shown in round_lru_resize.png and round_notify.png (see Archived_test2.zip). The test results show that SLV/CLV is unstable, leading to large variations in cat time between rounds; Notify shows smaller variations between rounds.
+
+(3) Summary
+
+1. The reasons for the significant performance gap with SLV/CLV may include: unstable lock reclaim behavior, sometimes aggressively revoking large numbers of locks; premature lock reclaim - although the Fixed Patch aligned the lock_limit (30%), SLV/CLV does not cache locks up to the limit. This may be related to the definition of SLV/CLV, as it uses max_age in its calculation.
+
+2. I wonder if this situation could occur: Since SLV/CLV is propagated via RPC, the server returns updated SLV in RPC replies so clients can combine it with CLV to determine whether to reclaim locks (please correct me if I misunderstand). In this case, inactive clients or clients without RPC requests (e.g., due to cache hits) hold stale SLV values, meaning lock reclaim only occurs on active clients, and inactive clients fail to revoke locks in time.
+
+3. The Fixed SLV/CLV patch calculates SLV based on the average across clients. Is this fair for clients with different load pressures? For example, with two clients - one requesting many locks but limited by the averaged SLV (possibly only able to obtain half the locks), while the other client is idle.
+
+--- Comment (JIRAUSER19404, Fri, 28 Nov 2025 01:17:17 +0000) ---
+It would be prudent to test the SLV fixes in patch https://review.whamcloud.com/62497 ("LU-7266 ldlm: Fix LDLM pool Server Lock Volume")
+
+A separate test has been introduced to verify the fixed SLV/CLV https://review.whamcloud.com/62497, while I doubt if that's enough. Unfortunately, I lack the necessary compute resources (i.e., a cluster of multiple machines) for further verification at the moment, but I'm willing to facilitate for any further testing arrangement (Who would be the best person to consult regarding resource allocation or next steps in this situation?)
+
+We may gradually increase LRU_MAX_AGE in the furture once both SLV/CLV & ldlm_relaim works reliably.
+
+--- Comment (adilger, Tue, 25 Nov 2025 08:59:29 +0000) ---
+It would be prudent to test the SLV fixes in patch https://review.whamcloud.com/62497 ("LU-7266 ldlm: Fix LDLM pool Server Lock Volume") and also the LFRU patch patch: https://review.whamcloud.com/60162 ("LU-11509 ldlm: replace client lock LRU with LFRU") to see if this improves the DLM performance.
+
+--- Comment (JIRAUSER20200, Sat, 22 Nov 2025 14:43:31 +0000) ---
+Hi, I recently ran some simple tests to compare different lock reclaim mechanisms, and I’d like to share them here for discussion.
+
+As far as I understand, Lustre originally had two lock reclaim mechanisms:
+
+	LRU_RESIZE (SLV/CLV)
+
+	Aged-based revocation (the server reclaims the older locks)
+
+The ticket adds a third mechanism:
+
+Notify-based lock reclaim (the server notifies the client to choose which locks to reclaim).
+
+LRU_RESIZE is normally enabled by default.
+
+Below are the test results comparing these three mechanisms (single client, single MDS, mdtest -z 5 -b 5, stat on 1.8M+ directories).
+
+1. LRU_RESIZE enable
+
+In Figure 01-1 (with the zoomed-in view shown on the right), when LRU_RESIZE is enabled, the system is governed entirely by SLV/CLV, and it never reaches the reclaim_threshold to trigger the reclaim mechanism(Aged and Notify).
+
+However, SLV/CLV does not appear to cache locks up to the pool_limit as expected; instead, the values stay at a relatively low level, and pool_limit itself remains low and unchanged (compared to the default reclaim_threshold).
+
+This test is somewhat variable, and Figure 01-1,01-2, and 01-3 shows other scenarios, such as cases where the number of locks initially spikes well above pool_limit and later drops back down to around the pool_limit.
+
+The performance for four scenarios is shown in the figure(View the mdtest01.png in the Archived_test1.zip file).
+
+2. LRU_RESIZE disable
+
+Because LRU_RESIZE affects the reclaim tests, we have disabled lru_resize and set lru_size to be sufficiently large. We then tested the reclaim notify mechanism. The batch size is set to 512, 1%, 3%, 5%, 7%, 10%, and 15%(of the total lock count), corresponding to Figures 02–08, respectively.
+
+During this process, only a few hundred locks seem to be reclaimed per second. In theory, a single notify could reclaim up to total × 1% ≈ 6000 locks.
+
+Could this low rate be influenced by the client revocation policy (e.g., age Performance is then measured under different batch sizes and compared with the original LRU_RESIZE mechanism. The results indicate that changing the batch size has little impact on performance and may even be worse than LRU_RESIZE (SLV/CLV), as shown below:
+
+(View the mdtest_batch.png in the Archived_test1.zip file).
+
+The two worst-performing cases correspond to the original Age-based lock reclaim policy. By default, Age is set to 300 s, but when a workload rapidly acquires a large number of locks, the locks cannot decrease quickly. Once the lock_limit is reached, reclamation proceeds very slowly. Here, Age was set to 3s for testing, yet the performance remains poor.
+
+3. lru_max_age
+
+As mentioned earlier, the client-side notify currently uses the existing reclaim policy, which is related to lru_max_age. It is possible that lru_max_age limits the number of locks that can be reclaimed. To investigate this, batch = 5% is tested with lru_max_age set to 3900s -> 1s, 3s, 5s, and 10s.
+
+Because a very small lru_max_age causes locks to be reclaimed too early, the system never reaches the threshold to trigger notify. However, the trend shows that smaller lru_max_age exhibits changes and performance similar to SLV/CLV..., as illustrated in the figure below:
+
+(View the Figure_max_age.png in the Archived_test1.zip file).
+
+Final Summary and Questions
+
+i. Based on current testing, when LRU_RESIZE is enabled, SLV/CLV can sometimes keep client locks near the pool_limit, but in most cases it does not. Performance varies under different scenarios.
+
+ii. In the tests, SLV/CLV’s pool_limit consistently stays at a relatively low and fixed value (compared to the default reclaim_threshold). Additionally, the pool code states:
+
+	pl_limit - Number of allowed locks in pool. Applies to server and client
+
+	side (tunable);
+
+This suggests that the limit is a tunable parameter. However, setting it via lctl does not seem to take effect, possibly due to incorrect setting or recalculation?
+
+iii. The current notify mechanism does not appear to outperform LRU_RESIZE (SLV/CLV) in terms of performance, though it is better than the original age-based policy. SLV/CLV limits locks per namespace, while notify limits the total locks per node. Current tests involve a single client node with only a few namespaces. Would the comparison be different if more complex test scenarios were used?
+
+iv. Adjusting reclaim_batch in the notify mechanism has little impact on performance. Could this be influenced by the client-side lock reclaim policy? Is it possible to reclaim locks directly from the LRU tail, ignoring effects such as age?
+
+vi. Current notify tests require LRU_RESIZE to be disabled with a fixed lru_size. If LRU_RESIZE is disabled, does the client also need a corresponding RESIZE adjustment, since it can experience memory pressure?
+
+vii. Current test workloads are simple metadata operations involving only one namespace. Could more complex workloads or tests involving data I/O locks, or multiple clients, be considered?
+
+viii. Current performance evaluation is based on operations per second (ops). Could other metrics, such as RPC counts or lock enqueue, also be considered?
+
+...
+
+--- Comment (gerrit, Fri, 31 Oct 2025 11:43:40 +0000) ---
+"Weizhao Lin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/62146
+
+Subject: LU-19264 ldlm: improve server notify clients to reclaim locks
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 9fe5a01c2deb3f800c42c05a5bd9e11199e10147
+
+--- Comment (gerrit, Wed, 22 Oct 2025 09:25:36 +0000) ---
+"Qian Yingjin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/61956
+
+Subject: LU-19264 ldlm: server notify lock clients to reclaim LRU locks
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 261ceaff0d57903a2b42670c65e23110e0d8ebcf
+
+--- Comment (adilger, Mon, 25 Aug 2025 07:29:46 +0000) ---
+A heartbeat mechanism where clients periodically report lock usage to servers, allowing servers to maintain accurate LRU information.
+
+Clients periodically send heartbeat signals to the server when using locally cached locks, including timestamps for last access. This updates the server's LRU metadata without full lock revalidation.
+
+There is already a mechanism where the client sends the "lock volume" to the server to balance lock enqueue and lock cancellation (see ldlm.namespaces.*.pool.stats.  The intent is that the clients can notify the DLM server of how old their locks are, and the server will aggregate the lock volumes from all clients and balance this against server memory usage and can influence the clients to redunce their lock count without cancelling specific locks. However, I've long thought that the implementation of the DLM lock volume functionality is not working properly (since before LU-6529) because this should allow the server to manage lock memory usage better than it does today.
+
+This can be optimized by using batch heartbeats (e.g., every 5–10 seconds) to reduce network load.
+
+Sending specific updates for thousands of locks per client from thousands of clients every 5-10 seconds seems impractical.  The Lock Volume only conveys a single integer which is the sum of the ages of all the DLM locks on each client, which is low overhead, but provides a proxy for the age of the locks on the client.  I think the main problem is that the tuning/constants of the LV implementation do not cause the server to shrink locks early enough to avoid memory pressure.
+
+Attach short-term leases (e.g., 30 seconds) to locks during server authorization. Clients must renew leases before expiration to retain locks.
+
+This is not really much different than having lru_max_age=30s, which would cause even worse DLM locking storms than exist today, or huge amounts of DLM traffic to the servers to maintain the locks in cache.  I think this would make the lock cancellation problem on the clients worse rather than better.
+
+Memory usage approaches ldlm_reclaim_threshold_mb (e.g., >80%).
+
+We can increase ldlm_reclaim_threshold_mb, but 80% of RAM for DLM locks seems excessive since the servers need memory for other caches (inode, block, page).
+
+I think there are several things that can be done with minimal changes/impact but should help address this issue:
+
+	the LDLM LFRU implementation in patch https://review.whamcloud.com/60162 ("LU-11509 ldlm: replace client lock LRU with LFRU") could use a second reviewer to allow the patch to make progress and land.  This should better allow clients to have a shorter lru_max_age, but keep important locks in cache longer.
+
+	implement a new mechanism to report memory pressure from the server to the client(s).  One option that I've been thinking about is to. cancel lock on resource 0,0,0,0 and have the client select which lock to cancel.  Ideally this might include a count of locks to cancel so that the server does not need to send hundreds of cancel requests to a client.
+
+	understand and fix the LV implementation so that the server starts to shrink the client LV sooner to avoid OOM or aggressive cancellation of specific locks.  In theory this should be similar to the previous option to trigger the general cancellation of locks on the client, but re-use the existing mechanism
+
+--- Comment (qian_wc, Fri, 15 Aug 2025 13:54:20 +0000) ---
+LRU Inconsistency in Client-Server Distributed Lock Caching​
+Introduction
+
+Lustre uses a Distributed Lock Manager (DLM) to protect data and metadata consistency when the file system is accessed and modified by multiple clients. Lustre manages DLM locks in namespaces, where each Lustre Object Storage Target (OST) or Metadata Target (MDT) has a separate lock namespace to manage its local objects. Note that although clients send RPCs for lock requests to the Object Storage Server (OSS) or Metadata Server (MDS), the clients technically acquire them from the OSTs and MDTs. Henceforward, we will therefore only refer to the connection between
+
+the client and the OSTs and MDTs. In addition, clients use shadow namespaces to cache locks granted to them.
+
+When a client requests a lock on a resource, e.g., an MDT inode, it checks whether a matching lock already exists in the local shadow namespace. If a matching lock is found, it can be directly used. Otherwise, a lock request is sent to the lock server for that namespace. The cached locks of a client are usually not released immediately and are canceled asynchronously through a callback in case of a lock conflict, due to age, or when exceeding cache sizes.
+
+Lustre implements byte-granular extent locks for files and fine-grained metadata locking. Each MDT manages locks for opens, permissions, path names, extended attributes, and file layouts for its inodes and directories. Each OST has its own DLM for locks on file stripes stored thereon, which scales locking performance as the file system grows.
+
+Caching and Evicting Algorithm for client-side Locks
+
+The Lustre distributed lock manager (DLM) uses a client-side caching mechanism for granted locks to improve performance by reducing network traffic for frequently accessed resources protected by the locks. When the cache becomes full, an eviction algorithm determines which locks to remove.
+
+Lustre's Distributed Lock Manager (LDLM) uses an LRU (Least Recently Used) cache to manage locks, and the LRU reclaim process is crucial for maintaining lock availability and performance. When the lock cache is full, Lustre evicts less recently used locks to make room for new ones. This process is essential to prevent lock contention and ensure efficient file access. 
+
+	LRU Lock Caching:
+
+LDLM uses an LRU cache to store frequently used locks. This cache helps speed up lock acquisition by avoiding network communication with the lock server when a lock is already cached locally. 
+
+	LRU Lock Evicting:
+
+When the lock cache becomes full, Lustre needs to evict some locks to make space for new ones. The LRU algorithm is used for this eviction process. Locks that have not been used recently are more likely to be evicted, while frequently used locks are kept in the cache.
+
+Tunable Parameter Definition
+
+In Lustre, there are several key tunable paramaters for LRU lock caching on client side:
+
+{ldlm.namespaces.*.lru_size
+
+: Control the size of LRU cache for LDLM locks on clients.
+
+	Dynamic (default): Set ldlm.namespaces..lru_size=0 to enable dynamic sizing. The system automatically adjusts based on the memory pressure (about 50 locks per 1MB RAM). In this case, lru_size parameter (the output of "ldlm.namespaces..lru_size") shows the current number of unused locks in LRU cache. The dynamic LRU size adjustment mechanism is enabled by default.
+
+	Static: Specify a fixed value (e.g. lru_size=100000) to enforce a hard limit. Set the lru_size parameter to a non-zero value to specify the maximum number of unused locks in LRU cache. when exceeded, the LRU locks are evicted to free memory.
+
+The default dynamic LRU sizing is preferred and optimized for most workloads. And smaller LRUs speed up server recovery for lock replay but may increase lock reacquisition latency.
+
+The primary goal of this parameter is to control memory footprint by limiting unused cached locks.
+
+ldlm.namespaces.*.lru_max_age is a tunable parameter in Lustre's DLM that controls the maximum lifetime (in seconds) of unused locks in the client-side LRU cache.
+
+The default value is typically 600 seconds. It affects client-side (not server) lock caching behavior. It prevents unused locks from occupying resources indefinitely.
+
+It can be tunned by the following command:
+
+lctl set_param ldlm.namespaces.*.lru_max_age=$seconds
+
+This parameter defines how long unused locks remain cached on the client before becoming eligible for eviction. The key impacts on the overall performance includes the following aspects:
+
+Lock Cache Evicting Policy
+
+	If a lock is unused for lru_max_age seconds (limit lock cache duration), the client marks it for eviction and prioritizes its release when space is needed;
+
+	If resued before timeout, its LRU last used timestamp refreshes to avoid premature eviction.
+
+Memory-Performance Trade-off
+
+	Lower lru_max_age:
+	
+		More frequent lock reclaim -> It reduces client memory usage;
+
+		May increase lock reacquisition overhead (require server round-trip for lock request);
+
+	
+	
+
+	Higer lru_max_age:
+	
+		Longer cache retention -> It improves lock reuse, lowers latency;
+
+		Risks higher memory pressure (especially under high concurrency);
+
+	
+	
+
+Typical Use Cases
+
+(1) High-Concurrency, Short-Lived Locks (Lower Recommended)
+
+	Scenario: Frequent create/release of temporary files (e.g., compilation jobs, batch scripts).
+
+	Suggestion: Reduce lru_max_age (e.g., 100 seconds) to avoid caching transient locks.
+
+(2) Long-Term Access to Large Files or repeated used libraries (Higher Recommended)
+
+	Scenario: Sustained read/write operations on large files (e.g., HDF5/NetCDF datasets) or repeated access files such as shared libraries.
+
+	Suggestion: Increase lru_size to cache more locks and minimize frequent lock reacquisition; Pair with a moderate lru_max_age to avoid memory bloat from stale locks.
+
+(3) Memory-Constrained Environments
+
+	Scenario: Clients with limited memory require strict lock cache control.
+
+	Suggestion: Lower lru_max_age and pair with lru_size to cap total locks and aggressively free lock resources.
+
+(4) Default Tuning
+
+Lustre defaults to lru_size=0 (dynamic sizing) and lru_max_age=600. This balances adaptability and freshness.
+
+These two tunable parameters can be combined to optimimize memory and performance especailly for large scale deployments: It can enforce a hard limit on cached locks (quantity) via lru_size, while lru_max_age sets a soft limit (time); Then even if locks are within lru_max_age, they may be evicted if lru_size is exceeded.
+
+Tuning Principles
+
+The relationship between lru_size and lru_max_age in Lustre's Lock Management (LDLM) is complementary, as both parameters optimize lock caching and revocation efficiency, but target different aspects of lock lifecycle management.
+
+	lru_max_age ensures timely cleanup of unused cached locks, reducing server load during lock replay recovery or contention. It manages temporal efficiency (lock freshness vs. resource retention).
+
+	lru_size caps memory usage but may cause premature eviction if set too low, increasing lock reacquisition latency. it manages spatial efficiency (memory vs. lock availability).
+
+They are two critical parameters for optimizing Lustre client lock caching by balancing lock reuse efficiency and memory footprint.
+
+Default values work for most cases. This avoid unnecessary adjustments.
+
+Optimal tuning depends on workload patterns and system resources. ​​Optimal performance​​ requires balancing both based on workload patterns.
+
+If lock acquisition latency is high and the memory is sufficient, consider increasing lru_max_age and setting lru_size large enough; If the usage of the client memory is excessive, first reduce lru_size, then adjust lru_max_age.
+
+Reclaim Algorithm for server-side granted Locks
+To avoid ldlm lock exhausting server memory, two global parameters lock_reclaim_threshold_mb and lock_limit_mb are used for reclaiming granted locks to clients and rejecting incoming enqueue requests defensively from clients.
+
+	lock_reclaim_threshold_mb: When the amount of granted locks reaching this threshold, server start to revoke locks gradually.
+
+	lock_limit_mb: When the amount of granted locks reaching this threshold, server will return -EINPROGRESS to any incoming enqueue request until the lock count is shrunk below the threshold again.
+
+lock_reclaim_threshold_mb and lock_limit_mb is set to 20% & 30% of the total memory by default. It is tunable via proc entry, when it's set to 0, the feature (server-side lock reclaim) is disabled.
+
+When reclaiming locks on the server side, the Least Recently Used (LRU) algorithm is employed based on the locks' last used time. However, when a client finds a compatible cached lock in its local lock namespace, it can directly use it without intract to the lock server. In this case, only the client-side lock's last used time is updated, while the corresponding server-side lock's LRU timestamp remains unchanged.
+
+In large-scale Lustre systems with hundreds or thousands of clients, the server-side lock namespace must manage all locks granted to clients. And these locks are cached in server side memory. Due to limited server memory capacity, when lock reclaim is triggered, the server's LRU timestamps may not reflect recent used accurately.
+
+This can lead to premature reclaim of locks that are actually still in active use or may be reused repeatedly in the near future by clients, resulting in unnecessary lock communication overhead and degraded system performance.
+
+LRU inconsistency problem and solution in Lustre's distributed lock management
+According to the analysis above, the core issue is that when clients reuse locally cached locks, they update their local LRU timestamp but don't propagate this to the server. The server's LRU list becomes stale and may incorrectly revoke actively used locks during memory pressure situations. This could cause significant performance issues in large-scale deployments with hundreds of clients.
+
+This is a deep technical issue in distributed systems where client-side caching causes server-side lock management inaccuracies.
+
+To address the LRU inconsistency between client-side lock caching and server-side lock management in large-scale Lustre deployments, the following solutions can mitigate unnecessary lock revocations and communication overhead:
+
+(1) Client-Side Heartbeat Reporting
+A heartbeat mechanism where clients periodically report lock usage to servers, allowing servers to maintain accurate LRU information.
+
+Clients periodically send heartbeat signals to the server when using locally cached locks, including timestamps for last access. This updates the server's LRU metadata without full lock revalidation.
+
+This can be optimized by using batch heartbeats (e.g., every 5–10 seconds) to reduce network load.
+
+(2) Server-Side Lock Classification
+A server-side lock classification system similar to Linux's active/inactive lists, where locks transition between states based on client reports.
+
+	Active/Inactive Lists​​: Implement a dual-list LRU model (similar to Linux kernel page management):
+	
+		​​Active List​​: Locks with recent client heartbeats or direct server updates.
+
+		​​Inactive List​​: Locks without recent activity.
+
+	
+	
+
+Only locks in the ​​inactive list​​ are prioritized for revocation during memory pressure.
+
+	​​Transition Logic​​: Move locks from active→inactive after a threshold (e.g., 60 seconds of no updates).
+
+Moreover, for some frequent used shared libraries, their locks can be classified into higher prioirty and pinned in the both server and client lock namespaces, avoiding to be reclaimed as much as possible.
+
+(3) Hybrid Lease-Renewal Mechanism
+
+	​Lease Grants​​: Attach short-term leases (e.g., 30 seconds) to locks during server authorization. Clients must renew leases before expiration to retain locks.
+
+	​​Revocation Priority​​: Servers revoke expired leases first, ensuring actively used locks (with renewals) are preserved.
+
+	​​Integration​​: Combine with AWS FSx’s auto_import_policyto sync lease states across S3-linked systems [1].
+
+(4) Adaptive LRU Synchronization​​
+
+	​​Dynamic Sync Triggers​​: Servers request client LRU updates only when:
+	
+		Memory usage approaches ldlm_reclaim_threshold_mb (e.g., >80%).
+
+		Lock churn rate exceeds a safety margin.
+
+	
+	
+
+	​​Selective Querying​​: Clients respond with LRU timestamps for locks accessed since the last sync, minimizing data transfer.
+
+(5) Tuning and Monitoring​
+
+	​​Parameter Tuning​​:
+	
+		Reduce {{lru_max_age }} (e.g., to 120 seconds) to accelerate idle unused lock cleanup.
+
+		Increase ldlm_reclaim_threshold_mb to delay aggressive revocations.
+
+	
+	
+
+	​​Monitoring Tools​​:
+	
+		Use lctl get_param ldlm.namespaces.*.lock_count to track lock usage.
+
+		Develop interface and functionality to identify misrevoked locks and contended resources.
+
+		Deploy Prometheus to alert when client/server LRU gaps exceed thresholds.
+
+	
+	
+
+Key Recommendations for Large-Scale Deployments
+
+The solution needs to balance accuracy with the overhead of client-server communication.
+
+In large deployments, it would better to minimize synchronization frequency while still maintaining reasonable LRU accuracy. The dual-list approach seems particularly promising as it reduces immediate synchronization needs while protecting hot locks. Prioritize heartbeat combined with dual list is a solution reaching best balance of accuracy and overhead.
+
+It should never force continuous client-server LRU syncs as the scalability degrades with client count increasing.
+
+We can start with heartbeats and dual-list LRU, then fine-tune leases base on the lock revocation metrics. In the meanwhile, we should adopt adaptive tuning of LRU parameters based on system load and memory pressure and leveraging Lustre's existing debugging tools to monitor lock churn and identify misclassified locks.
+
+References
+
+[1] https://docs.aws.amazon.com/sdk-for-ruby/v3/api/Aws/FSx/Types/UpdateFileSystemLustreConfiguration.htmlhttps://docs.aws.amazon.com/sdk-for-ruby/v3/api/Aws/FSx/Types/UpdateFileSystemLustreConfiguration.html

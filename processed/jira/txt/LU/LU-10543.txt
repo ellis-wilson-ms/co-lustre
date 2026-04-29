@@ -1,0 +1,375 @@
+Key:        LU-10543
+Summary:    racer: /mnt/lustre2 is still busy, wait one second
+Link:       https://jira.whamcloud.com/browse/LU-10543
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Maloo
+Created:    Sun, 21 Jan 2018 15:54:44 +0000
+Updated:    Fri, 24 Jan 2025 06:02:18 +0000
+Links:      Related: is related to  LU-11219; Related: is related to  LU-15248; Related: is related to  LU-7073; Related: is related to LU-10904
+
+--- Description ---
+This issue was created by maloo for Bob Glossman 
+
+This issue relates to the following test suite run: https://testing.hpdd.intel.com/test_sets/9df61cce-fe48-11e7-bd00-52540065bddc
+
+This failure occurs after racer is complete, while test script is exiting.
+
+Can't see any evidence of panics or oops in logs.
+
+ConMan just disconnects from all the nodes and then all get rebooted.
+
+--- Comment (yujian, Tue, 19 Nov 2024 19:16:10 +0000) ---
+Lustre 2.15.6 RC1: https://testing.whamcloud.com/test_sets/e1ac0857-4011-44a6-ba7b-2023b3e0d77f
+
+--- Comment (yujian, Thu, 7 Nov 2024 20:02:34 +0000) ---
++1 on Lustre b2_15 branch: https://testing.whamcloud.com/test_sets/13d98025-0d8e-4d60-85d8-daa41bb6b664
+
+--- Comment (yujian, Mon, 7 Oct 2024 23:10:38 +0000) ---
+Test session details:
+
+clients: https://build.whamcloud.com/job/lustre-b2_15/94 - 4.18.0-553.5.1.el8_10.x86_64
+
+servers: https://build.whamcloud.com/job/lustre-master/4581 - 4.18.0-553.16.1.el8_lustre.x86_64
+
+https://testing.whamcloud.com/test_sets/f44a0321-dd81-4b78-8063-ba3a5e33c62d
+
+--- Comment (xinliang, Mon, 25 Sep 2023 02:04:05 +0000) ---
+Thanks for the explanation, Andreas. I'm trying to understand the problem. Will try patch 45605 later.
+
+Hmm, it looks like the problem is a little complicated. The racer test suite runs racing test scripts for a DURATION of time and then kills all the test scripts.
+
+It seems Lustre threads should be killed gracefully by a signal like SIGTERM, which doesn't yet, right?  Lustre should handle such a signal to exit properly.
+
+--- Comment (adilger, Fri, 15 Sep 2023 10:30:38 +0000) ---
+There is a second patch https://review.whamcloud.com/45605 "LU-15248 tests: improve racer cleanup" for that same ticket.  However, it isn't clear to me if that patch is just hiding the test failure or if it could potentially be close to a real fix for the problem? 
+
+It might be enough to add the hunks from that patch in obd_get_request_slot():
+
+	if (rc == -EINTR)
+		rc = -ERESTARTSYS;
+
+and then add a check in {{ptlrpc_interrupted_set()} to see if the request is a lock enqueue and don't interrupt it in this case.  Something like the following (which I haven't tested at all and is just a guess at might work):
+
+	list_for_each_entry(req, &set->set_requests, rq_set_chain) {
+		if (req->rq_intr)
+			continue;
+
+		if (req->rq_phase != RQ_PHASE_RPC &&
+		    req->rq_phase != RQ_PHASE_UNREG_RPC &&
+		    !req->rq_allow_intr)
+			continue;
+
+               if (req->rq_reqmsg && lustre_msg_get_opc(req->rq_reqmsg) == LDLM_ENQUEUE &&
+                   !__fatal_signal_pending(current))
+                        continue;
+
+This would have the drawback that LDLM_ENQUEUE RPCs could not normally be interrupted, but at least the threads wouldn't be stuck permanently...
+
+The alternative might be a check in ldlm_completion_ast() if the task can be interrupted?  It looks like this function is already using l_wait_event_abortable(), but there have been a number of changes in this area and it may be that the interrupt handling is not working properly (or it is interrupted but restarts immediately, the lustre client debug logs should show one way or the other.
+
+--- Comment (xinliang, Fri, 15 Sep 2023 08:07:27 +0000) ---
+Hi adilger, with patch 46384 it still gets stuck. These cp processes seem can't be killed by fuser cmd.
+
+stuck logs
+...
+/mnt/lustre2 is still busy, wait one second
+/mnt/lustre2 is still busy, wait one second
+/mnt/lustre2 is still busy, wait one second
+/mnt/lustre2 is still busy, wait one second
+/mnt/lustre2 is still busy, wait one second
+/mnt/lustre2 is still busy, wait one second
+/mnt/lustre2 is still busy, wait one second
+/mnt/lustre2 is still busy, wait one second
+...
+
+[root@lustre-pdbirbyf-02 ~]# ps -efH|grep "cp -p"
+root     3362672 3360694  0 08:01 pts/0    00:00:00           grep --color=auto cp -p
+root     2975599       1  0 05:54 ?        00:00:00   cp -p /bin/sleep /mnt/lustre/racer/1
+root     2982999       1  0 05:54 ?        00:00:00   cp -p /bin/sleep /mnt/lustre/racer/1
+root     1553902       1  0 06:37 ?        00:00:00   cp -p /bin/sleep /mnt/lustre2/racer3/11
+[root@lustre-pdbirbyf-02 ~]# fuser -k -m  /mnt/lustre2/racer3/
+[root@lustre-pdbirbyf-02 ~]# ps -efH|grep "cp -p"
+root     3362795 3360694  0 08:01 pts/0    00:00:00           grep --color=auto cp -p
+root     2975599       1  0 05:54 ?        00:00:00   cp -p /bin/sleep /mnt/lustre/racer/1
+root     2982999       1  0 05:54 ?        00:00:00   cp -p /bin/sleep /mnt/lustre/racer/1
+root     1553902       1  0 06:37 ?        00:00:00   cp -p /bin/sleep /mnt/lustre2/racer3/11 
+
+ 
+
+And some cp processes in D(disk sleep) state are unkillable:
+
+[root@lustre-pdbirbyf-02 ~]# kill -9 1553902                                                                                                                     
+[root@lustre-pdbirbyf-02 ~]# ps --ppid 1 -fH|grep cp                                                                                                             
+root     1553902       1  0 06:37 ?        00:00:00 cp -p /bin/sleep /mnt/lustre2/racer3/11                                                                      
+root     2982999       1  0 05:54 ?        00:00:00 cp -p /bin/sleep /mnt/lustre/racer/1                                                                         
+root     2975599       1  0 05:54 ?        00:00:00 cp -p /bin/sleep /mnt/lustre/racer/1  
+[root@lustre-pdbirbyf-02 ~]# killall -v cp                                                                                                                       
+Killed cp(1553902) with signal 15                                                                                                                                
+Killed cp(2975599) with signal 15                                                                                                                                
+Killed cp(2982999) with signal 15                                                                                                                                
+[root@lustre-pdbirbyf-02 ~]# ps --ppid 1 -fH|grep cp                                       
+root     1553902       1  0 06:37 ?        00:00:00 cp -p /bin/sleep /mnt/lustre2/racer3/11
+
+--- Comment (adilger, Fri, 15 Sep 2023 04:06:03 +0000) ---
+xinliang please try https://review.whamcloud.com/46384 "LU-15248 tests: kill all fs users at the end of racer" to see if this fixes the problem for you.
+
+--- Comment (xinliang, Thu, 14 Sep 2023 10:28:24 +0000) ---
+It seems that the problem is here:
+
+ cat lustre/tests/racer/racer.sh
+...
+ 15 RACER_PROGS=${RACER_PROGS:-"file_create dir_create file_rm file_rename \
+ 16 file_link file_symlink file_list file_concat file_exec file_chown \
+ 17 file_chmod file_mknod file_truncate file_delxattr file_getxattr \
+ 18 file_setxattr"}
+...
+ 37 racer_cleanup()
+ 38 {
+ 39         echo "racer cleanup"
+ 40         for P in $RACER_PROGS; do
+ 41                 killall -q $P.sh
+ 42         done 
+...
+
+It should also kill all the child processes of the sh scripts. Because if you force to kill all the file test sh scripts, you can't expect their child processes in a normal state, these child processes should be killed/cleaned up as well, because they could be in an abnormal state.
+
+--- Comment (xinliang, Thu, 14 Sep 2023 09:43:19 +0000) ---
+Can easily hit this issue on the Arm cluster by running the racer test suite several times.
+
+With similar cp stack:
+
+[jenkins@lustre-rec5k7yz-01 ~]$ ps -efH|grep lustre2/
+jenkins   873969  873837  0 09:36 pts/1    00:00:00           grep --color=auto lustre2/
+root      426463       1  0 Sep13 ?        00:00:00   cp -p /bin/sleep /mnt/lustre2/racer/4
+[jenkins@lustre-rec5k7yz-01 ~]$ sudo cat /proc/426463/stack 
+[] __switch_to+0x7c/0xbc
+[] ldlm_completion_ast+0x7a4/0xdbc [ptlrpc]
+[] ldlm_lock_match_with_skip+0x1c8/0x854 [ptlrpc]
+[] osc_enqueue_base+0x100/0x550 [osc]
+[] osc_lock_enqueue+0x434/0xc20 [osc]
+[] cl_lock_enqueue+0x98/0x1e0 [obdclass]
+[] lov_lock_enqueue+0x90/0x22c [lov]
+[] cl_lock_enqueue+0x98/0x1e0 [obdclass]
+[] cl_lock_request+0xa0/0x270 [obdclass]
+[] cl_lockset_lock+0x12c/0x240 [obdclass]
+[] cl_io_lock+0xd0/0x204 [obdclass]
+[] cl_io_loop+0xb8/0x280 [obdclass]
+[] cl_setattr_ost+0x290/0x364 [lustre]
+[] ll_setattr_raw+0x908/0x1160 [lustre]
+[] ll_setattr+0x8c/0x130 [lustre]
+[] notify_change+0x25c/0x43c
+[] do_truncate+0x84/0xe0
+[] handle_truncate+0xd4/0x124
+[] do_open+0xc4/0x30c
+[] path_openat+0x10c/0x1d0
+[] do_filp_open+0x84/0x134
+[] do_sys_openat2+0x208/0x2f0
+[] __arm64_sys_openat+0x6c/0xb4
+[] invoke_syscall+0x50/0x11c
+[] el0_svc_common.constprop.0+0x158/0x164
+[] do_el0_svc+0x2c/0x9c
+[] el0_svc+0x20/0x30
+[] el0_sync_handler+0xb0/0xb4
+[] el0_sync+0x160/0x180
+[jenkins@lustre-rec5k7yz-01 ~]$  
+
+And the related test script should be:
+
+lustre-release$ cat lustre/tests/racer/file_exec.sh 
+#!/bin/bash
+trap 'kill $(jobs -p)' EXIT
+
+org_LANG=$LANG
+export LANG=C
+
+DIR=$1
+MAX=$2
+PROG=/bin/sleep
+
+while /bin/true ; do
+        file=$((RANDOM % MAX))
+        cp -p $PROG $DIR/$file > /dev/null 2>&1
+        $DIR/$file 0.$((RANDOM % 5 + 1)) 2> /dev/null
+        sleep $((RANDOM % 3))
+done 2>&1 | egrep -v "Segmentation fault|Bus error"
+
+export LANG=$org_LANG
+
+--- Comment (adilger, Tue, 2 Feb 2021 08:43:24 +0000) ---
+A different test run also showed the same stack:
+
+https://testing.whamcloud.com/test_sets/eb16868e-613f-40fb-a820-18e0e627f694
+
+[ 4022.294274] cp              S ffff97d81fe99900     0 22278      1 0x00000080
+[ 4022.295585] Call Trace:
+[ 4022.296011]  [] schedule+0x29/0x70
+[ 4022.296868]  [] ldlm_completion_ast+0x1e5/0x9d0 [ptlrpc]
+[ 4022.299128]  [] ldlm_lock_match_with_skip+0x1ad/0x830 [ptlrpc]
+[ 4022.302394]  [] osc_enqueue_base+0x100/0x530 [osc]
+[ 4022.304799]  [] osc_lock_enqueue+0x359/0x830 [osc]
+[ 4022.305932]  [] cl_lock_enqueue+0x65/0x120 [obdclass]
+[ 4022.307161]  [] lov_lock_enqueue+0x95/0x150 [lov]
+[ 4022.308241]  [] cl_lock_enqueue+0x65/0x120 [obdclass]
+[ 4022.309428]  [] cl_lock_request+0x67/0x1f0 [obdclass]
+[ 4022.310562]  [] cl_io_lock+0xfb/0x280 [obdclass]
+[ 4022.311687]  [] cl_io_loop+0x8d/0x200 [obdclass]
+[ 4022.312868]  [] cl_setattr_ost+0x28f/0x3e0 [lustre]
+[ 4022.314033]  [] ll_setattr_raw+0x102a/0x1140 [lustre]
+[ 4022.315162]  [] ll_setattr+0x63/0xc0 [lustre]
+[ 4022.316231]  [] notify_change+0x30c/0x4d0
+[ 4022.317174]  [] do_truncate+0x75/0xc0
+[ 4022.318122]  [] do_last+0x627/0x1340
+[ 4022.320212]  [] path_openat+0xcd/0x5a0
+[ 4022.322229]  [] do_filp_open+0x4d/0xb0
+[ 4022.324109]  [] do_sys_open+0x124/0x220
+[ 4022.326209]  [] SyS_open+0x1e/0x20
+
+--- Comment (adilger, Tue, 2 Feb 2021 08:38:41 +0000) ---
+Looking at the stack traces from several recent racer timeouts (run with env=DURATION=3600) shows that there is a lingering "cp" process running on the stuck client:
+
+https://testing.whamcloud.com/test_sets/ad623a1d-dd28-4b4f-a323-f3893798c7d7
+
+[ 4688.804205] cp              S ffff9ca9258aa0e0     0  6454      1 0x00000080
+[ 4688.805787] Call Trace:
+[ 4688.806328]  [] schedule+0x29/0x70
+[ 4688.807351]  [] ? vvp_io_init+0x347/0x480 [lustre]
+[ 4688.808579]  [] ? cl_io_init0.isra.13+0x8b/0x160 [obdclass]
+[ 4688.809924]  [] ? cl_glimpse_lock+0x311/0x370 [lustre]
+[ 4688.811325]  [] ? cl_glimpse_size0+0x22d/0x260 [lustre]
+[ 4688.812576]  [] ? ll_getattr_dentry+0x53e/0x8e0 [lustre]
+[ 4688.813933]  [] ? user_path_at_empty+0x72/0xc0
+[ 4688.815083]  [] ? ll_getattr+0x1b/0x20 [lustre]
+[ 4688.816266]  [] ? vfs_getattr+0x49/0x80
+[ 4688.817200]  [] ? vfs_fstatat+0x75/0xc0
+[ 4688.818213]  [] ? SYSC_newstat+0x2e/0x60
+[ 4688.819180]  [] ? system_call_after_swapgs+0xa2/0x13a
+[ 4688.820398]  [] ? system_call_after_swapgs+0x96/0x13a
+[ 4688.821538]  [] ? system_call_after_swapgs+0xa2/0x13a
+[ 4688.822755]  [] ? system_call_after_swapgs+0x96/0x13a
+[ 4688.823886]  [] ? system_call_after_swapgs+0xa2/0x13a
+[ 4688.825089]  [] ? system_call_after_swapgs+0x96/0x13a
+[ 4688.826220]  [] ? system_call_after_swapgs+0xa2/0x13a
+[ 4688.827464]  [] ? system_call_after_swapgs+0x96/0x13a
+[ 4688.828684]  [] ? system_call_after_swapgs+0xa2/0x13a
+[ 4688.830021]  [] ? system_call_after_swapgs+0x96/0x13a
+[ 4688.831226]  [] ? system_call_after_swapgs+0xa2/0x13a
+[ 4688.832570]  [] ? SyS_newstat+0xe/0x10
+[ 4688.833591]  [] ? system_call_fastpath+0x25/0x2a
+[ 4688.834768]  [] ? system_call_after_swapgs+0xa2/0x13a
+:
+[ 4748.927655] Lustre: 6454:0:(client.c:2282:ptlrpc_expire_one_request()) @@@ Request sent has timed out for slow reply: [sent 1612251797/real 1612251797]  req@ffff9ca9157cd680 x1690564340618304/t0(0) o49->lustre-MDT0000-mdc-ffff9ca93876b800@10.9.6.224@tcp:12/10 lens 472/1040 e 0 to 1 dl 1612251804 ref 2 fl Rpc:XQr/0/ffffffff rc 0/-1 job:'cp.0'
+
+A second better-formed stack is on the other client:
+
+[ 4684.466221] cp              S ffffa0ea19d48000     0 16037      1 0x00000080
+[ 4684.467522] Call Trace:
+[ 4684.467975]  [] schedule+0x29/0x70
+[ 4684.468962]  [] ldlm_completion_ast+0x1e5/0x9d0 [ptlrpc]
+[ 4684.471257]  [] ldlm_lock_match_with_skip+0x1ad/0x830 [ptlrpc]
+[ 4684.474583]  [] osc_enqueue_base+0x100/0x530 [osc]
+[ 4684.477063]  [] osc_lock_enqueue+0x359/0x830 [osc]
+[ 4684.478339]  [] cl_lock_enqueue+0x65/0x120 [obdclass]
+[ 4684.479542]  [] lov_lock_enqueue+0x95/0x150 [lov]
+[ 4684.480727]  [] cl_lock_enqueue+0x65/0x120 [obdclass]
+[ 4684.481887]  [] cl_lock_request+0x67/0x1f0 [obdclass]
+[ 4684.483127]  [] cl_io_lock+0xfb/0x280 [obdclass]
+[ 4684.484222]  [] cl_io_loop+0x8d/0x200 [obdclass]
+[ 4684.485523]  [] cl_setattr_ost+0x28f/0x3e0 [lustre]
+[ 4684.486645]  [] ll_setattr_raw+0x102a/0x1140 [lustre]
+[ 4684.487880]  [] ll_setattr+0x63/0xc0 [lustre]
+[ 4684.488931]  [] notify_change+0x30c/0x4d0
+[ 4684.489978]  [] do_truncate+0x75/0xc0
+[ 4684.490898]  [] do_last+0x627/0x1340
+[ 4684.493054]  [] path_openat+0xcd/0x5a0
+[ 4684.496260]  [] do_filp_open+0x4d/0xb0
+[ 4684.498210]  [] do_sys_open+0x124/0x220
+
+--- Comment (jamesanunez, Mon, 13 Aug 2018 19:43:07 +0000) ---
+In some cases, we see that racer completes and it is marked as PASS, but the next test suite is not able to start and timeout due to mount2 busy. 
+
+See https://testing.whamcloud.com/test_sessions/91c9307e-4e4c-421f-a197-5e9827f00438; racer is marked as PASS, but replay-single hangs with, looking at the suite_log
+
+-----============= acceptance-small: replay-single ============----- Fri Aug 10 23:26:13 UTC 2018
+Running: bash /usr/lib64/lustre/tests/replay-single.sh
+== replay-single test complete, duration -o sec ====================================================== 23:26:13 (1533943573)
+excepting tests: 
+Stopping clients: trevis-6vm10,trevis-6vm9.trevis.whamcloud.com /mnt/lustre2 (opts:)
+CMD: trevis-6vm10,trevis-6vm9.trevis.whamcloud.com running=\$(grep -c /mnt/lustre2' ' /proc/mounts);
+if [ \$running -ne 0 ] ; then
+echo Stopping client \$(hostname) /mnt/lustre2 opts:;
+lsof /mnt/lustre2 || need_kill=no;
+if [ x != x -a x\$need_kill != xno ]; then
+    pids=\$(lsof -t /mnt/lustre2 | sort -u);
+    if [ -n \"\$pids\" ]; then
+             kill -9 \$pids;
+    fi
+fi;
+while umount  /mnt/lustre2 2>&1 | grep -q busy; do
+    echo /mnt/lustre2 is still busy, wait one second && sleep 1;
+done;
+fi
+Stopping client trevis-6vm9.trevis.whamcloud.com /mnt/lustre2 opts:
+Stopping client trevis-6vm10.trevis.whamcloud.com /mnt/lustre2 opts:
+/mnt/lustre2 is still busy, wait one second
+/mnt/lustre2 is still busy, wait one second
+/mnt/lustre2 is still busy, wait one second
+/mnt/lustre2 is still busy, wait one second
+...
+
+--- Comment (gerrit, Mon, 13 Aug 2018 15:03:42 +0000) ---
+James Nunez (jnunez@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/32986
+
+Subject: LU-10543 tests: determine racer hang
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: c6b7177dd126812f0f4a0535b65f6b42b282f797
+
+--- Comment (adilger, Thu, 9 Aug 2018 17:39:27 +0000) ---
+I checked the stack traces, and unmount does not appear. That is not surprising, given that the unmount command is returning an error instead of hanging during cleanup. This implies some kind of leak in the vfsmnt or inode refcount. That is likely due to some kind of change in the dcache or inode hanfling in llite.
+
+--- Comment (jamesanunez, Fri, 2 Feb 2018 00:00:10 +0000) ---
+Recent racer hangs:
+
+https://testing.whamcloud.com/test_sets/7f83ac30-9b18-11e8-b0aa-52540065bddc
+
+https://testing.whamcloud.com/test_sets/2ff5cab8-9ae6-11e8-8ee3-52540065bddc
+
+https://testing.whamcloud.com/test_sets/83e235b6-9a74-11e8-b0aa-52540065bddc
+
+racer test 1 looks like it completes successfully, but we aren't able to umount the second Lustre mount
+
+while umount  /mnt/lustre2 2>&1 | grep -q busy; do
+    echo /mnt/lustre2 is still busy, wait one second && sleep 1;
+done;
+fi
+Stopping client trevis-33vm6.trevis.whamcloud.com /mnt/lustre2 opts:
+Stopping client trevis-33vm7.trevis.whamcloud.com /mnt/lustre2 opts:
+/mnt/lustre2 is still busy, wait one second
+/mnt/lustre2 is still busy, wait one second
+/mnt/lustre2 is still busy, wait one second
+/mnt/lustre2 is still busy, wait one second
+/mnt/lustre2 is still busy, wait one second
+
+It looks like there are no client process still running
+
+there should be NO racer processes:
+USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+Filesystem             1K-blocks   Used Available Use% Mounted on
+10.9.4.180@tcp:/lustre  13532932 202516  12463840   2% /mnt/lustre
+We survived /usr/lib64/lustre/tests/racer/racer.sh for 900 seconds.
+there should be NO racer processes:
+USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+Filesystem             1K-blocks   Used Available Use% Mounted on
+10.9.4.180@tcp:/lustre  13532932 198284  12471324   2% /mnt/lustre
+We survived /usr/lib64/lustre/tests/racer/racer.sh for 900 seconds.
+pid=17959 rc=0
+pid=17960 rc=0

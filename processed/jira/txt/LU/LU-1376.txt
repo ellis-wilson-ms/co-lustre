@@ -1,0 +1,83 @@
+Key:        LU-1376
+Summary:    ldlm_poold noise on clients significantly reduces applification performance
+Link:       https://jira.whamcloud.com/browse/LU-1376
+Type:       Bug
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   Oleg Drokin
+Reporter:   Christopher Morrone
+Created:    Fri, 4 May 2012 17:25:20 +0000
+Updated:    Fri, 8 Nov 2019 02:53:28 +0000
+Labels:     jitter, llnl
+Links:      Related: is related to LU-2924
+Attachments: ldlm_poold_period.patch
+
+--- Environment ---
+https://github.com/chaos/lustre/commits/2.1.1-10chaos, 3000+ OSTs across 4 filesystems
+
+--- Description ---
+Our users found that their application was scaling very poorly on our "zin" cluster.  It is a sandy bridge cluster, 16 cores per node, roughly 3000 nodes.  At relatively low node counts (512 nodes), they found that their performance on zin now that it is one the secure network is 1/4 of what is was when zin was on the open network.
+
+One of the few differences is that zin now talks to 3000+ OSTs on the secure network, whereas it only talk to a few hundred OSTs while it was shaken down on the open network.  One of our engineers noted that the ldlm_poold was frequently using 0.3% of CPU time on zin.
+
+The application in question is HIGHLY sensitive to system daemons and other CPU noise on the compute nodes because it highly MPI coordinated.  I created the attached patch (ldlm_poold_period.patch) that allows me to change the sleep interval used by the ldlm_poold.  Sure enough, if I change the sleep time to 300 seconds, the application's performance immediate improves by 4X.
+
+The ldlm_poold walking a list of 3000+ namespaces every second and doing nothing most of the time (because client namespaces are only actually "recalculated" every 10s) is a very bad design.  The patch was just to determine if that was really the cause.
+
+I will now work on a real fix.
+
+I think instead of making the ldlm_poold's sleep time configurable, I will make both the  LDLM_POOL_SRV_DEF_RECALC_PERIOD and LDLM_POOL_CLI_DEF_RECALC_PERIOD tunables.  Then I will make the ldlm_poold will dynamically sleep based on the next period in the list of namespaces...although I probably don't want each name space to have its own starting time.
+
+I probably want to keep the server and client namespace periods in sync with the namespaces of the same type, and then perhaps order the list as well to avoid walking the entire list unnecessarily.
+
+No work needed by Whamcloud right now, except perhaps to comment on my approach if you think there is something that I should be doing differently (or if there is already work in this area that I haven't found).
+
+--- Comment (morrone, Fri, 11 May 2012 20:38:11 +0000) ---
+I took some time to look at the code fore this today.   The more I read, the worse things look.
+
+First of all, I think the use of these globals makes the code less readable that it could be:
+
+extern cfs_atomic_t ldlm_srv_namespace_nr;
+extern cfs_atomic_t ldlm_cli_namespace_nr;
+extern cfs_semaphore_t ldlm_srv_namespace_lock;
+extern cfs_list_t ldlm_srv_namespace_list;
+extern cfs_semaphore_t ldlm_cli_namespace_lock;
+extern cfs_list_t ldlm_cli_namespace_list;
+
+If we just made a struct with the three variables, and then had two global variables of that type, I think we could reduce the number of special accessor functions to one.
+
+Next, having a thread regularly poll all of the namespaces seems like a poor approach to handling SLV on the client side.  I would think that when a change SLV comes in over the network only then would we want to put the involved pool on a list of work, and send a signal to a sleeping thread to handle the work.
+
+Also, each pool tracks its own last recalculation time in pl_recalc_time, and has its own pl_recalc_period.  Why?  I see no reason at all for these.  If not for the time it takes to walk the namespace list, these recalc times would stay exactly in sync.  So why not just have a single value that can actually be adjusted?
+
+On the client side, we wake every second and shuffle the entire client list of namespaces.  9 times out of 10 there will be nothing to do because the pl_recalc_period is 10 seconds in each ns.  That is pretty silly.
+
+We could perhaps order the list based on time remaining to next recalc needed...but that doesn't seem to be worth while.
+
+I can perhaps see walking only a limited number of namespaces each time, as Andreas mentioned above.  This means that each namespace will only have its pool recalculated relatively rarely.  So then the question is whether it is better to have frequent small bits of noise, or rarer but larger amounts of noise.
+
+In either case though, we make SLV less effective as a tool to reduce server lock load.  Of course, SLV seems to currently be a pretty ineffective way of reducing lock usage when the server is under memory pressure (LU-1128), so maybe I just shouldn't worry about that for now.
+
+I think I will just make the ldlm_poold's polling interval configurable.  I will also probably synchronize the polling intervals with the wall clock, because it is much better for all of the nodes to see the noise at the same time.
+
+But I think we need to come up with a plan for overhauling this in a future version.
+
+--- Comment (pjones, Mon, 7 May 2012 09:27:17 +0000) ---
+Oleg
+
+Could you please comment?
+
+Thanks
+
+Peter
+
+--- Comment (morrone, Fri, 4 May 2012 19:38:00 +0000) ---
+Yes, I had compared the 2.1 code to 1.8 to see if this was a regression, and I agree that the changes do not look very significant.  Word from the users is that this bug has probably been around for quite some time, but folks finally had the time and inclination to begin investigating.
+
+I would love to see Fujitsu's patch.
+
+--- Comment (adilger, Fri, 4 May 2012 18:13:30 +0000) ---
+Fujitsu implmemented a patch similar to this for the K computer FEFS, which has 10000 OSTs in total.  AFAIK, they would walk only a fraction of the namespaces with each wakeup to reduce the amount of ongoing jitter introduced by the ldlm pool thread.
+
+It may be that Oleg has a version of their 1.8 patch that could be used as a starting point for your 2.x patch, since I don't think this code has changed dramatically.

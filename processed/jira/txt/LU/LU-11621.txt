@@ -1,0 +1,153 @@
+Key:        LU-11621
+Summary:    Add copy_file_range() API and use it for lfs migrate and mirror resync
+Link:       https://jira.whamcloud.com/browse/LU-11621
+Type:       Improvement
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   James A Simmons
+Reporter:   Andreas Dilger
+Created:    Mon, 5 Nov 2018 22:44:50 +0000
+Updated:    Thu, 18 Sep 2025 08:59:50 +0000
+Links:      Related: is related to  LU-6081; Related: is related to  LU-9961; Related: is related to  LU-6051; Related: is related to  LU-10278; Related: is related to  LU-10810; Related: is related to LU-17124; Related: is related to LU-13945; Related: is related to LU-14208
+
+--- Description ---
+The copy_file_range() API was added in kernel 4.4 and allows copying data between files without copying the data into userspace and then copying it back to the kernel again.  This should significantly speed up file copy operations, for applications which support this interface, and for Lustre tools such as lfs migrate and lfs mirror resync that may be copying a lot of file data.  While migrate and resync use O_DIRECT to avoid the data copy to/from userspace, this has other unfortunate effects such as causing sync read and write operations and has often been slower than doing the data copy with async writes (e.g. LU-10278).
+
+The copy_file_range() API in theory allows server-side offload of data copies between files in the same filesystem (and in the near future possibly between different filesystems), which is implemented for NFS and CIFS, and this could be tied into the HSM copytool via LU-6081 to avoid the need to copy the data to/from the client.  The copytool itself could also be modified to use copy_file_range() to avoid the data copy on the HSM agent node to improve efficiency once the basic API is available.
+
+This ticket should focus on implementing the basic API and its use with a few of the built-in tools, and separate tickets can be used to implement this in the lhsmtool-posix copytool and pushing the copy action over to HSM agent nodes.
+
+commit 29732938a6289a15e907da234d6692a2ead71855
+Author:     Zach Brown 
+AuthorDate: Tue Nov 10 16:53:30 2015 -0500
+
+    vfs: add copy_file_range syscall and vfs helper
+    
+    Add a copy_file_range() system call for offloading copies between
+    regular files.
+    
+    This gives an interface to underlying layers of the storage stack which
+    can copy without reading and writing all the data.  There are a few
+    candidates that should support copy offloading in the nearer term:
+    
+    - btrfs shares extent references with its clone ioctl
+    - NFS has patches to add a COPY command which copies on the server
+    - SCSI has a family of XCOPY commands which copy in the device
+    
+    This system call avoids the complexity of also accelerating the creation
+    of the destination file by operating on an existing destination file
+    descriptor, not a path.
+    
+    Currently the high level vfs entry point limits copy offloading to files
+    on the same mount and super (and not in the same file).  This can be
+    relaxed if we get implementations which can copy between file systems
+    safely.
+
+Later patches implement the ->copy_file_range method for various filesystems:
+
+3db11b2eecc0 btrfs: add .copy_file_range file operation
+2e72448b07dc NFS: Add COPY nfs operation
+9fe26045e98f xfs: add clone file and clone range vfs functions
+620d8745b35d cifs: Introduce cifs_copy_file_range()
+
+--- Comment (simmonsja, Tue, 15 Oct 2024 18:38:02 +0000) ---
+Also copy_file_range() offsets might not align with the start of a component. That makes this work more complicated.  As for doing it at the client verses between OSTs I don't know which would be better. For the client it is unlikely a file being read in will be with all locally cached data. For most data client nodes needs to transfer data from the OSS servers to the local node and then process it to send to another set of OSS servers for the write.  For OST to OST transfers its also complicated. Maybe we do both, use the client when the data is all locally cached? In any case this is why the work hasn't been completed since its  not a simple solution.
+
+--- Comment (adilger, Mon, 14 Oct 2024 01:23:41 +0000) ---
+sthiell the difficulty with direct OST->OST transfer is that there is not necessarily a 1:1 correspondence between objects of two files, so it is likely that there would need to be transfers between multiple OSS nodes, each one for fractions of a file due to PFL, etc. In the NFS case all of the files are on a single server. 
+
+With the AIO/DIO support for migrate in patch https://review.whamcloud.com/56016 that avoids the userspace copy (twice) and does not use client cache, I suspect this is nearly as fast as direct OSS copies.
+
+--- Comment (sthiell, Sun, 13 Oct 2024 20:29:03 +0000) ---
+On EL9.4 (5.14.0-427.31.1.el9_4.x86_64, actually Rocky Linux 9.4), I recently noticed that with OpenZFS (2.1.15) exported over nfsd, when copying a file within the same filesystem from the NFS client, copy_file_range() will perform the data copy on the server:
+
+strace of:
+
+cp -v iozone.DUMMY.3 copy2/      (64GiB)
+
+on the NFS client (EL9.4):
+
+openat(AT_FDCWD, "iozone.DUMMY.3", O_RDONLY) = 3
+fstat(3, {st_mode=S_IFREG|0640, st_size=68719476736, ...}) = 0
+openat(AT_FDCWD, "copy2/iozone.DUMMY.3", O_WRONLY|O_CREAT|O_EXCL, 0640) = 4
+fstat(4, {st_mode=S_IFREG|0640, st_size=0, ...}) = 0
+ioctl(4, BTRFS_IOC_CLONE or FICLONE, 3) = -1 EOPNOTSUPP (Operation not supported)
+fadvise64(3, 0, 0, POSIX_FADV_SEQUENTIAL) = 0
+copy_file_range(3, NULL, 4, NULL, 9223372035781033984, 0) = 68719476736
+copy_file_range(3, NULL, 4, NULL, 9223372035781033984, 0) = 0
+close(4)                                = 0
+close(3)                                = 0
+
+The copy was done at very high speed directly on the ZFS/NFS server (ZFS was quite busy) and copy_file_range() remained interruptible during that time on the client. Nothing significant was transferred over the network between the client and server during that time. I assume implementing the same with Lustre would be a rather radical change of behavior (to transfer data from OSTs to OSTs when copy_file_range() is used?), unless perhaps if reusing some FLR mechanisms to copy the components directly from OSTs to OSTs?
+
+--- Comment (gerrit, Thu, 5 Nov 2020 16:20:57 +0000) ---
+James Simmons (jsimmons@infradead.org) uploaded a new patch: https://review.whamcloud.com/40548
+
+Subject: LU-11621 utils: add special code to profile performance
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: ecef87f84b0e277d230db5b847357da84ca83e92
+
+--- Comment (gerrit, Fri, 10 Jul 2020 15:37:55 +0000) ---
+James Simmons (jsimmons@infradead.org) uploaded a new patch: https://review.whamcloud.com/39337
+
+Subject: LU-11621 utils: optimize lustre_rsync with copy_file_range()
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: f5aa44ebdd24a2e511eca6ced8a0e0da7738f842
+
+--- Comment (gerrit, Tue, 9 Jun 2020 15:57:22 +0000) ---
+James Simmons (jsimmons@infradead.org) uploaded a new patch: https://review.whamcloud.com/38883
+
+Subject: LU-11621 utils: optimize migrate_copy_data() with copy_file_range()
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: eb8f28a159a2e9ebd27416fd62030787d5729a9e
+
+--- Comment (gerrit, Wed, 27 May 2020 05:05:41 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/38651/
+
+Subject: LU-11621 utils: optimize lhsmtool_posix with copy_file_range()
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: ccac422cf9dd3b2390d1c70cd42eff06d2f53be3
+
+--- Comment (simmonsja, Fri, 22 May 2020 00:39:43 +0000) ---
+More work is coming
+
+--- Comment (gerrit, Mon, 18 May 2020 16:08:38 +0000) ---
+James Simmons (jsimmons@infradead.org) uploaded a new patch: https://review.whamcloud.com/38651
+
+Subject: LU-11621 utils: optimize lhsmtool_posix with copy_file_range()
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 04bd4a2da275a8c9878a5a2961f0c6ad64af9ee5
+
+--- Comment (simmonsja, Mon, 5 Nov 2018 23:01:34 +0000) ---
+Believe it no not I was planning on using this API to do my file presentation project. We can "create" new files out of various components of already existing files. I can take this up. The tricky part will be the non-aligned copies with components.

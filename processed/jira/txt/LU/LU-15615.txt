@@ -1,0 +1,141 @@
+Key:        LU-15615
+Summary:    memory leak on use_t10_grd path in tgt_checksum_niobuf_t10pi
+Link:       https://jira.whamcloud.com/browse/LU-15615
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Oleg Drokin
+Reporter:   Oleg Drokin
+Created:    Fri, 4 Mar 2022 06:40:47 +0000
+Updated:    Thu, 15 May 2025 12:26:06 +0000
+Resolved:   Mon, 1 May 2023 06:31:45 +0000
+Links:      Duplicate: is duplicated by LU-15500; Related: is related to  LU-15598
+
+--- Description ---
+It looks like tgt_checksum_niobuf_t10pi() can leak memory if we ever set rc to nonzero, some of the conditions appear to set it without any visible warnings:
+
+        req = cfs_crypto_hash_init(cfs_alg, NULL, 0);
+        if (IS_ERR(req)) {
+                CERROR("%s: unable to initialize checksum hash %s\n",
+                       tgt_name(tgt), cfs_crypto_hash_name(cfs_alg));
+                return PTR_ERR(req);
+        }
+...
+                if (use_t10_grd) {
+                        used = DIV_ROUND_UP(local_nb[i].lnb_len, sector_size);
+                        if (used > (guard_number - used_number)) {
+                                rc = -E2BIG;
+                                break;
+                        }
+...
+        if (rc)
+                GOTO(out, rc);
+...
+        rc = cfs_crypto_hash_final(req, (unsigned char *)&cksum, &bufsize);
+        if (rc == 0)
+                *check_sum = cksum;
+out:
+        __free_page(__page);
+        return rc;
+}
+
+This not only leads to leaking the req, but also the allocated page might be tied in the crypto hash calcs I imagine (passed in as sg buffer with a reference to be potentially freed in the final?)
+
+--- Comment (pjones, Mon, 1 May 2023 06:31:45 +0000) ---
+Landed for 2.16
+
+--- Comment (gerrit, Mon, 1 May 2023 04:11:01 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/50539/
+
+Subject: LU-15615 target: Free t10pi crypto state on error
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 6a88222bd6a1c0f5bd45fb40b88af226db8bd29a
+
+--- Comment (gerrit, Wed, 5 Apr 2023 03:46:14 +0000) ---
+"Li Dongyang " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/50539
+
+Subject: LU-15615 target: Free t10pi crypto state on error
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: db8a8c405ebd70d93410847f07ebe033a622df83
+
+--- Comment (adilger, Fri, 4 Mar 2022 21:31:52 +0000) ---
+I see that there is also a separate path were there could be a leak kmap(page), though this would at least print a CERROR(), and kmap() (AFAIK) cannot tolerate a large number of different pages being mapped at once:
+
+int obd_page_dif_generate_buffer(const char *obd_name, struct page *page,
+                                 __u32 offset, __u32 length,
+                                 __u16 *guard_start, int guard_number,
+                                 int *used_number, int sector_size,
+                                 obd_dif_csum_fn *fn)
+{
+        data_buf = kmap(page) + offset;
+        while (i if (used >= guard_number) {
+                        CERROR("%s: unexpected used guard number of DIF %u/%u, "
+                               "data length %u, sector size %u: rc = %d\n",
+                               obd_name, used, guard_number, length,
+                               sector_size, -E2BIG);
+                        return -E2BIG;
+                }
+                :
+        }
+        kunmap(page);
+        *used_number = used;
+
+        return 0;
+}
+
+I don't think this is a primary concern, but should also be fixed to instead always call kunmap(), like:
+
+                        GOTO(out_unmap, rc = -E2BIG);
+                }
+                :
+        }
+        *used_number = used;
+out_unmap:
+        kunmap(page);
+
+        return rc;
+
+--- Comment (adilger, Fri, 4 Mar 2022 21:27:08 +0000) ---
+It probably makes sense to add at least a CERROR() to this branch, similar to the one in obd_page_dif_generate_buffer(), since this is a "should never happen" code path:
+
+                CERROR("%s: unexpected used guard number of DIF %u/%u, data length %u, sector size %u: rc = %d\n",
+                               obd_name, used, guard_number, length,
+                               sector_size, rc);
+
+--- Comment (adilger, Fri, 4 Mar 2022 21:14:32 +0000) ---
+It looks like the "if (use_t10_grd)" condition is only true if there are T10-PI hardware checksums enabled on the underlying storage because of the lnb_guard_disk check:
+
+                use_t10_grd = t10_cksum_type && opc == OST_READ &&
+                              local_nb[i].lnb_len == PAGE_SIZE &&
+                              local_nb[i].lnb_guard_disk;
+
+and lnb_guard_disk should only be set if T10-PI is enabled in the hardware, but I could be wrong about the code flow.
+
+In either case, for a potential fix for the memory leak for both of the "if (rc) break;" conditions, something like the following should work:
+
+out:
+        bufsize = sizeof(cksum);  
+        rc2 = cfs_crypto_hash_final(req, (unsigned char *)&cksum, &bufsize);
+        if (rc2 && !rc)
+                rc = rc2;
+            
+        if (!rc)              
+                *check_sum = cksum; 
+        __free_page(__page);
+
+        return rc;
+
+However, that doesn't explain why this code path is being taken - it should never happen that there is not enough space for the GRD tag in the allocated buffer unless there is an error somewhere else in the code.

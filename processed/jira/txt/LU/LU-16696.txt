@@ -1,0 +1,252 @@
+Key:        LU-16696
+Summary:    Lustre memcg oom workaround for unpatched kernels
+Link:       https://jira.whamcloud.com/browse/LU-16696
+Type:       Improvement
+Priority:   Minor
+Status:     Resolved
+Resolution: Duplicate
+Assignee:   Shaun Tancheff
+Reporter:   Shaun Tancheff
+Created:    Sat, 1 Apr 2023 08:16:26 +0000
+Updated:    Tue, 23 May 2023 13:50:22 +0000
+Resolved:   Tue, 23 May 2023 13:50:22 +0000
+Links:      Duplicate: duplicates LU-16680; Related: is related to  LU-16713; Related: is related to LU-16697
+
+--- Description ---
+Lustre buffered I/O does not work well with restrictive memcg memory settings.
+
+This is partially to do unstable_page_accounting() not providing the expected counts and 
+
+balance_dirty_pages_ratelimited() not throttling.
+
+However the memcg also needs to be adjusted when min, low and high are left to the defaults (0, 0, and PAGE_COUNTER_MAX respectively). min and low at 0 disables too much of the memcg reclaim that also would provided the throttling needed.
+
+NOTE: This not a lustre specific issue.
+
+--- Comment (adilger, Tue, 23 May 2023 13:49:39 +0000) ---
+Reopen temporarily to link ticket and edit comment.
+
+Please use "Resolved" for tickets instead of "Closed", as this allows changing the ticket.
+
+--- Comment (stancheff, Tue, 23 May 2023 12:44:42 +0000) ---
+This is a better solution for Lustre: LU-16713
+
+--- Comment (stancheff, Tue, 11 Apr 2023 12:59:57 +0000) ---
+Final kernel patch submitted upstream:
+
+https://lore.kernel.org/lkml/20230406091450.167779-1-shaun.tancheff@gmail.com/T/
+
+--- Comment (qian_wc, Mon, 3 Apr 2023 04:01:40 +0000) ---
+Patrick,
+
+Thanks for your point about writeback and rate limiting in LU-3277. I will study to understand it.
+
+I thought doing sync IO like that forced a journal commit.  Doing direct I/O does.
+
+ofd_commitrw_write()
+if (th->th_sync == 0) {
+		for (i = 0; i if (!(lnb[i].lnb_flags & OBD_BRW_ASYNC)) {
+				th->th_sync = 1;
+				break;
+			}
+
+For direct I/O, the page will not marked with OBD_BRW_ASYNC, so it will commit the journal for each write.
+
+But for buffered I/O, it seems all cache pages are marked with OBD_BRW_ASYNC, and it will not trigger journal commit for write on OST..
+
+--- Comment (qian_wc, Mon, 3 Apr 2023 03:14:54 +0000) ---
+Ah, yes, you are right!
+
+For soft_sync, OST waits until has been several to trigger a async sync on the OST.
+
+atomic_inc_return(&fed->fed_soft_sync_count) ==
+		 ofd->ofd_soft_sync_limit)
+		dt_commit_async(env, ofd->ofd_osd);
+
+--- Comment (paf0186, Mon, 3 Apr 2023 03:09:42 +0000) ---
+So, the last time we tried to link Lustre to the kernel writeback infrastructure, we saw a very severe performance hit due to dirty page rate limiting.
+
+This is https://jira.whamcloud.com/browse/LU-3277
+
+That's an ~85% performance loss on buffered writes, so it's something we have to avoid.
+
+It looks like the issue is that the kernel didn't let us have enough pages in writeback for us to have good performance.
+
+But I can see some major problems with the old implementation that may have caused this.  The original solution did not really do writeback.  Lustre just sent a 'soft sync' RPC, which does not wait for the OST to sync, so the client does not reliably find out about the sync.  Also, the OST would wait for multiple soft sync requests.  This means a client could potentially sit for a long time doing nothing while low on memory.  Making the RPC force a sync and wait for a sync would probably help.
+
+But it's still possible dirty page rate limiting could severely damage performance.  So that is something to watch out for.
+
+--- Comment (paf0186, Mon, 3 Apr 2023 02:59:52 +0000) ---
+Yingjin,
+
+I will have to check, but I thought doing sync IO like that forced a journal commit.  Doing direct I/O does.
+
+I see your point about multiple cgroups, that's a good point.  If one user is constantly at their memory limit, it will slow I/O for everyone.
+
+So, here is my thought then: Currently in this situation, when we get memory pressure from cgroups, we usually just OOM and kill the application.  This means people consider Lustre to not have cgroup support.  I think my patch is a large improvement on the current situation, but your point about multiple cgroups is 100% correct.
+
+So I think your idea about hooking correctly in to the writeback infrastructure will be important for getting proper support for multiple cgroups.  It sounds like you're interested in trying to do that.  So I think for now, we should land the LU-16680 patch, and then we can remove/replace it once we have patches to connect to the writeback code properly.
+
+BTW, I don't think one soft sync RPC triggers a sync on the OST.  The OST waits until it has seen several, I think?  We could easily change it to be just one, though.
+
+--- Comment (qian_wc, Mon, 3 Apr 2023 02:08:10 +0000) ---
+Another wild thought is that maybe we can use cgroup manchanism to implementation IOPS rate control on a client, just like blkio subsystem does?
+
+--- Comment (qian_wc, Mon, 3 Apr 2023 02:02:36 +0000) ---
+Hi Partick,
+
+I have two concerns about your patch:
+
+First, it may break the resource and performance isolation among cgroups (dockers).
+
+For example, two cgroups have different memory limitations and two processes are writing two different files under cgroups' control.
+
+LU-16680 patch can not distinguish this situation and simply to make any I/O issuing to the target OST (with some uncommitted or unstable pages belonging to one cgroups) synchronously. If process A is under memory pressure within the cgroup A, but Process B still have lots of memory which can be used for subsequent I/Os. Then it may stall the I/O for Process B via making its writes synchronous wrongly?
+
+Second, the patch calls vvp_io_commit_sync to make I/O sync, but it seems that vvp_io_commit_sync just wait the I/O finishing in a synchronous way, it does not trigger any unstable I/O committing on OST, even will not trigger soft_sync if unstable pages is blew the overall limitation from my understanding?
+
+if we use a SOFT_SYNC RPC, we cannot guarantee anything happens.  So we could have a special force sync RPC, but it's not clear to me that's better than doing the next IO RPC as sync.  So maybe we could tie in to dirty page/writeback limits like you're suggesting, but instead of sending a soft sync, we could send the next IO RPC as sync, like my LU-16680 patch does?
+
+Good suggestion. We can do the next I/O RPC as sync for inodes under the precise cgroup control.
+
+SOFT_SYNC will trigger the fs_sync on the backend OST device, it will trigger the journal commit on the underlying FS (zfs or ldiskfs), but does not wait for it finished. 
+
+As each memory cgroup can have its own @bdi_writeback. Thus when writeback threads is woken up (for_backgroup and wb_over_bg_thresh checking returns true), we can write out some pages, and mark the inode under this cgroup control to indicate it to do sync I/O next time or for some period time (even in direct I/O mode if your patch switching BIO to DIO is finished). By this way, it will not stall or make I/O sync for processes under other cgroup control.
+
+Thanks,
+
+Qian
+
+--- Comment (adilger, Sun, 2 Apr 2023 19:36:06 +0000) ---
+Shaun, I read your post, but didn't realize that the URL was for a patch you sent to the list already. I think you could still try to move this forward if there is some evidence that memcg-v1 is still widely in use, and showing how the lack of min/low values set is causing this to break?  Alternately, a patch to expose default the 10%, 20%, 80% min, low, high thresholds (as a fraction of max) to userspace would blunt Michael's objection?
+
+That said, if you could test Patrick's patch, and that also passes in your test case, maybe the effort is not worthwhile.
+
+--- Comment (paf0186, Sun, 2 Apr 2023 17:54:39 +0000) ---
+Yingjin,
+
+This sounds good, but there's one significant problem.  A soft_sync RPC is basically advisory.  The OST will only do a sync if it receives several soft sync RPCs.  So a soft sync RPC does not guarantee anything will happen.  This is a big part of why I chose "send the next IO RPC as sync".  There is a possibility we could not have enough memory to send the next IO RPC, and in that case, a special dedicated 'sync request' RPC would help, but it seems in practice we can reliably get enough memory to send the next IO RPC.
+
+So, if we use a SOFT_SYNC RPC, we cannot guarantee anything happens.  So we could have a special force sync RPC, but it's not clear to me that's better than doing the next IO RPC as sync.  So maybe we could tie in to dirty page/writeback limits like you're suggesting, but instead of sending a soft sync, we could send the next IO RPC as sync, like my LU-16680 patch does?
+
+However, previously when we tried to do roughly what you're suggesting, we ran in to dirty pages rate limits, because Lustre needs many more uncommitted pages than the kernel wanted to allow.  Is that a problem we'll see here?  Or can we configure the dirty page limits to behave OK?  Are those dirty page/writeback limits a global limit or Lustre specific?  etc.
+
+I agree tying in to the dirty page/writeback limits is more correct, if we can make it performant.  (I also think we should get LU-16680 in and see if issues remain.  It may not be necessary to do more?)
+
+--- Comment (paf0186, Sun, 2 Apr 2023 17:45:47 +0000) ---
+Andreas,
+
+You missed it above - Shaun did almost exactly that.  It was nacked by Mickal Hocko, but he indicated he's curious to know more and try to help.  Here: https://lore.kernel.org/lkml/20230330202232.355471-1-shaun.tancheff@gmail.com/t/
+
+--- Comment (adilger, Sun, 2 Apr 2023 16:59:56 +0000) ---
+It sounds like it would be worthwhile to submit a patch upstream that sets the memcg-v1 min/low values when max is set would at least start a discussion, if not actually result in the patch being landed. I would mention only ext4 and XFS in the email (not Lustre), and include the test description to show that memcg-v1 is broken without this. The patch should also CC "stable" so that it has a better chance to be included in older kernels.
+
+--- Comment (qian_wc, Sun, 2 Apr 2023 16:05:14 +0000) ---
+I have studied the write back with cgroup in recent days.
+
+According to my understanding, Linux kernel already has matured solution for OOM with cgroup.
+
+The most related codes are in balance_dirty_pages:
+
+If the dirtied and uncommitted pages are over "background_thresh" for global memory limitation and memory cgroup limitation, the write back threads are woken to perform some whiteout.
+
+IMHO, the better solution should be (similar to NFS):
+
+In the completion of writeback for the dirtied pages (@brw_interpret), __mark_inode_dirty(), which will attach the @bdi_writeback (each memory cgroup can have its own bdi_writeback) to the inode.
+
+Once the writeback threads is woken up, and @for_background is set, it will check whether @wb_over_bg_thresh.  For background writeout, stop when we are below the background dirty threshold.
+
+So what we should do in Lustre client is:
+
+When writeback thread for background cals ll_writepages() to write out data, If the inode has dirtied pending pages, set it with soft_sync, and build I/O RPC to OST. If all pages has cleared dirtied flags, but still in unstable (uncommitted) state, we should send a dedicated soft_sync RPC to the OST and thus the uncommitted pages will be released finally.
+
+I will try to cook a patch later to see the effect.
+
+--- Comment (paf0186, Sun, 2 Apr 2023 15:06:56 +0000) ---
+Definitely test out the simple "sync on memory pressure" match in LU-16680, it makes very similar test cases pass without issue for me, and with decent performance.  Obviously we could do better in theory, but I think in practice it will work well.
+
+I'd be curious if there are configs of interest where it doesn't work - for me, it work well with as low as 64 MiB cgroup limit, which seems a reasonable minimum requirement.  (I could even do IO that was 64 MiB in block size (ie, individual read or write of 64 MiB), though that sometimes OOMed.  But frankly, io size == cgroups mem limit isn't something we should really expect to work.  Technically the user app is already using 100% of memory just for the IO source/destination in userspace.)
+
+Throwing this out:  I guess it seems to me if local file systems also can't do IO in a particular configuration, then it's not a bug we should be fixing?  I mean, if they can't do IO to local file systems, I think it's fair to say "this is an invalid configuration, see you can't even do IO locally".
+
+I don't 100% understand how this config comes up in practice or the interaction with low-medium-high, but can you see if the "immediate sync on mem pressure" patch makes it work?
+
+--- Comment (stancheff, Sun, 2 Apr 2023 04:56:42 +0000) ---
+Initial kenrel patch:
+
+https://lore.kernel.org/lkml/20230330202232.355471-1-shaun.tancheff@gmail.com/t/
+
+Yeah, we shouldn't force values, but... 
+
+When low == min == 0 memcg memory 'protection' is not enabled which the forces applications (and file systems) to find their own input throttling scheme and it simply isn't possible to do this with reasonable accuracy and without some 'tricks'.
+
+I tried a throttle that checked usage and then initiated writeback, a configurable delay, and eventually sync. This worked to a point (500M cgroup would work but any lower oom'd).
+
+The kernel patch for memcg-v1 worked and I tested 100M cgroup with out see oom.
+
+In all cases lower memory does mean lower bandwidth but the kernel patch scales much better than the my heuristic (I did not see or test Patricks earlier so I cannot comment on that yet).
+
+Yes, this is not the right thing. The primary intent here is to point to the problem and provide a workaround until either:
+
+	cgroups-v1 exposes the required parameters
+
+	cgroups in general enables a default level memory protection even when min/low are not set
+
+	cgroups-v1 sets some sane defaults for min/low
+
+The test case used to 
+
+MEMGROUP=ll-sync
+sudo mkdir /sys/fs/cgroup/memory/${MEMGROUP}
+echo 100M | sudo tee /sys/fs/cgroup/memory/${MEMGROUP}/memory.limit_in_bytes 
+echo $$ | sudo tee /sys/fs/cgroup/memory/${MEMGROUP}/tasks
+sudo rm -fr /mnt/lustre/*
+sudo mkdir /mnt/lustre/ior
+sudo lfs setstripe -c 4 -S 1M /mnt/lustre/ior
+sudo chown shaun /mnt/lustre/ior
+sync; sync; echo 3 | sudo tee /proc/sys/vm/drop_caches
+dd if=/dev/zero of=/mnt/lustre/ior/striped-v2.bin bs=10M status=progress
+
+memcg-v2:
+
+MEMGROUP=ll-sync
+sudo cgcreate -a $USER -t $USER -g memory:${MEMGROUP}
+echo 100M | sudo tee /sys/fs/cgroup/${MEMGROUP}/memory.max
+echo 40M | sudo tee /sys/fs/cgroup/${MEMGROUP}/memory.low
+echo 4M | sudo tee /sys/fs/cgroup/${MEMGROUP}/memory.min
+echo 80M | sudo tee /sys/fs/cgroup/${MEMGROUP}/memory.high
+sudo rm -fr /mnt/lustre/*
+sudo mkdir /mnt/lustre/ior
+sudo lfs setstripe -c 4 -S 1M /mnt/lustre/ior
+sudo chown shaun /mnt/lustre/ior
+sync; sync; echo 3 | sudo tee /proc/sys/vm/drop_caches
+cgclassify -g memory:${MEMGROUP} $$
+dd if=/dev/zero of=/mnt/lustre/ior/striped-v2.bin bs=10M status=progress
+
+The affect and fixable kernels are 4.18 to current.
+
+As far as sizing of memcg's my testing found that at 1.5 to 2G I/O was 'acceptable' and 4.5-5G normal (as if not memcg limit was set).
+
+As far as what to use for min / low I just pick what I guessed as reasonable (the actual values didn't seem to make a large impact but more testing would be good).
+
+And yes, this appears to be a problem for local filesystems as well. XFS, ext4 both failed the above dd test with 100M max memcg.
+
+I tested with 4.18 (alm8), 5.14 (alma9, openSUSE) and mainline (6.2.8).
+
+--- Comment (adilger, Sat, 1 Apr 2023 20:07:16 +0000) ---
+Coincidentally, Patrick is working on this same issue in LU-16680. It would be useful to compare the approaches here to see which performs better. Patrick's patch is adding IO throttling inside Lustre when kernel runs low of memory and starts reclaim vs. this patch which tries to hook Lustre more into the VM page handling. 
+
+I don't have a strong feeling in which one is better, but I've read for many years Dave Chinner posting emails on linux-fsdevel that XFS is doing all of its own IO scheduling because the kernel doesn't do a good job of it.
+
+--- Comment (gerrit, Sat, 1 Apr 2023 09:23:55 +0000) ---
+"Shaun Tancheff " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/50498
+
+Subject: LU-16696 llite: Detect and adjust memcg settings
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 12824893a6edcf496457570b2b1525ea5f3526ad

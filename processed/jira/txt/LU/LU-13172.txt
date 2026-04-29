@@ -1,0 +1,301 @@
+Key:        LU-13172
+Summary:    nodemap: a squashed primary GID allows user to successfully use chgrp to any unmapped group
+Link:       https://jira.whamcloud.com/browse/LU-13172
+Type:       Bug
+Priority:   Critical
+Status:     Open
+Resolution: Unresolved
+Assignee:   Sebastien Buisson
+Reporter:   Stephane Thiell
+Created:    Mon, 27 Jan 2020 00:52:42 +0000
+Updated:    Wed, 15 Dec 2021 02:36:36 +0000
+Links:      Related: is related to  LU-9145; Related: is related to  LU-3291; Related: is related to LU-8851
+
+--- Environment ---
+CentOS 7
+
+--- Description ---
+On a filesystem using nodemap with GID mapping, we have noticed that a user could change the GID of files to the squash_gid even though the user is not part of the squash_gid group. The behavior is described below and does affect at least Lustre 2.10 and Lustre 2.12.
+
+Reproducer
+
+1. configure two Lustre VMs and start lustre targets on one of them using llmount.sh, and mount the client on the other VM.
+
+For us, the server VM is 192.168.123.40@tcp0 and the mapped Lustre client VM is 192.168.123.41@tcp0
+
+2. Apply the following nodemap configuration on the server side:
+
++ lctl nodemap_add scg
++ lctl nodemap_modify --name scg --property map_mode --value gid_only
++ lctl nodemap_modify --name scg --property admin --value 0
++ lctl nodemap_modify --name scg --property deny_unknown --value 1
++ lctl nodemap_modify --name scg --property trusted --value 0
++ lctl nodemap_add_range --name scg --range 192.168.123.41@tcp0
++ lctl nodemap_add_idmap --name scg --idtype gid --idmap 59224:59224
++ lctl nodemap_activate 1
+
+3. On the client VM 192.168.123.41@tcp0, a user with a mapped primary GID (sthiell/59224) will work as expected: chgrp is not allowed to any group that the user is not part of (including nobody).
+
+$ id
+uid=59224(sthiell) gid=59224(sthiell) groups=59224(sthiell),98003(sw_vasp),98008(sw_schrodinger),98009(sw_matlab),98013(sw_stata),99001(sh_users),99010(sh_sysadm),99011(sh_swadm)
+$ touch foo
+$ ls -l foo
+-rw-rw-r-- 1 sthiell sthiell 0 Jan 25 09:07 foo
+$ chgrp 123456 foo
+chgrp: changing group of 'foo': Operation not permitted
+$ chgrp nobody foo
+chgrp: changing group of 'foo': Operation not permitted
+
+4. However, on the same client, if the user changes the primary GID, or has a primary GID by default that is NOT mapped by nodemap, chgrp is allowed to any unmapped group:
+
+$ newgrp sw_schrodinger    # not mapped
+$ id
+uid=59224(sthiell) gid=98008(sw_schrodinger) groups=98008(sw_schrodinger),59224(sthiell),98003(sw_vasp),98009(sw_matlab),98013(sw_stata),99001(sh_users),99010(sh_sysadm),99011(sh_swadm)
+$ ls -l foo
+-rw-rw-r-- 1 sthiell sthiell 0 Jan 25 09:07 foo
+$ chgrp 123456 foo
+$ ls -l foo
+-rw-rw-r-- 1 sthiell nobody 0 Jan 25 09:07 foo
+$ chgrp nobody foo
+$ ls -l foo
+-rw-rw-r-- 1 sthiell nobody 0 Jan 25 09:07 foo
+
+You see that chgrp is always successful in that case but, hopefully, the group ends up to be the squashed_gid, so I think that the security implications are somehow limited. It is very annoying for permissions and accounting though, that is why I set the severity of this ticket to 2.
+
+My current guess is that because the squashed_gid (nobody) is used as primary GID of the user, Lustre automatically thinks it is a valid group for the user, and chgrp then works for any unmapped GID (because squashed_gid will be used instead of any unmapped group).
+
+What need to be fixed is that we should always block a user from using chgrp to the squashed_gid, explicitly or implicitly (for unmapped groups).
+
+I tried to fix this problem myself today, with no luck so far. I added a condition to check for uc->uc_o_gid == nodemap->nm_squash_gid in old_init_ucred_common(), like in new_init_ucred() which seems to be handling the case for chgrp (CFS_SETGRP) – however I have not tested that specifically as we don’t use SSK nor Kerberos.
+
+This issue might also be related to LU-9145, see Kit Westneat’s comments in https://review.whamcloud.com/#/c/30812/
+
+--- Comment (sebastien, Mon, 3 Feb 2020 16:39:41 +0000) ---
+Hi Stephane,
+
+I appreciate your concerns, and agree migrating to project quotas would be a better fit for your needs.
+
+I am sorry it is not currently possible to address your needs with group quotas and well tuned nodemaps.
+
+Cheers,
+
+Sebastien.
+
+--- Comment (sthiell, Fri, 31 Jan 2020 20:40:53 +0000) ---
+Hi Sébastien,
+
+We've been thinking a lot internally these last few days. 
+
+On this system (Oak), we set a low-value quota limit on nobody (the group) to ensure that this squash_gid is indeed "forbidden", but quotas with low-values in Lustre are not always properly enforced (users are able to bypass them in some cases). Anyway, I agree with you that squashed uid/gid are more default uid/gid, so we have used a wrong approach here.
+
+However, we are not sure the patch should land as is, as supplementary groups are not checked. Probably if the user had only groups that are squashed_gid, it would make sense to block access completely. With the patch, even listing the directory is not allowed when the primary GID is switched to a squashed one, which we think might be too restrictive.
+
+Because this overall problem seems hard to resolve and your arguments make sense, we are currently thinking of migrating to project quotas instead of group quotas to enforce disk space, and allow squashed_gid to be actually used on the filesystem. It looks like this would be a better approach than trying to use the squashed_gid as the forbidden one.
+
+--- Comment (sebastien, Thu, 30 Jan 2020 16:40:12 +0000) ---
+Hi Stephane,
+
+Lustre is just setting the user's credentials the best it can, so that the syscall can be achieved depending on the access rights.
+
+In your use case, the user is the owner of file foo (sthiell), and the mv command wants to  chgrp to nobody. Because the user's group (sw_schrodinger) is mapped to nobody, this operation is legitimate from a Lustre perspective.
+
+Also, the squash_uid/gid cannot be considered a "forbidden" uid/gid. It is more about a default uid/gid. This is why I proposed an alternative approach that makes use of the deny_unknown property.
+
+Thanks,
+
+Sebastien.
+
+--- Comment (sthiell, Wed, 29 Jan 2020 16:12:41 +0000) ---
+With mv, the setgid bit on the parent directory is not actually ignored, mv attempts to do a lchown to restore the original group ownership after the copy. This is not fatal if that fails. If you do a cp (without -a nor -p), the group is inherited. The behavior of the setgid bit on directory with Lustre seems fine.
+
+However, if nodemap is in use and the user's primary GID is not mapped/squashed, such mv will proceed with a lchown that will succeed (for unmapped groups) and the group of the file will end up being squash_gid. We still think this is a bad behavior from nodemap that should be fixed (chgrp should not be allowed to a group the user is not part of, including squash_gid), but I'm not sure how...
+
+We cannot really squash all GIDs to the gid of our parent directory as there is one per project/group, and that's a lot of them (hundreds).
+
+--- Comment (sebastien, Wed, 29 Jan 2020 14:01:41 +0000) ---
+Hi Stephane,
+
+Your use case is interesting. I tried the same scenario locally by moving files from an xfs file system to an ext4 file system. I realize that in this case the setgid bit on the parent directory is ignored, as moved files get their original gid.
+
+# mkdir /ext4/user0
+# chown user0 /ext4/user0
+# chmod g+s /ext4/user0
+# ls -ld /ext4/user0
+drwxr-sr-x 2 user0 root  1024 Jan 29 21:36 /ext4/user0
+
+$ id
+uid=500(user0) gid=500(user0) groups=500(user0),5001(user0g1),5002(user0g2)
+$ touch /ext4/user0/myfile1
+$ ls -l /ext4/user0/myfile1
+-rw-rw-r-- 1 user0 root  0 Jan 29 21:38 /ext4/user0/myfile1
+
+$ touch /xfs/myfile2
+$ ls -l /xfs/myfile2
+-rw-rw-r-- 1 user0 user0 0 Jan 29 21:36 /xfs/myfile2
+$ mv /xfs/myfile2 /ext4/user0/
+$ ls -l /ext4/user0/myfile2
+-rw-rw-r-- 1 user0 user0 0 Jan 29 21:36 /ext4/user0/myfile2
+
+I cannot see how Lustre could behave differently than that.
+
+I think what you could do on Lustre is to squash all GIDs to the gid of your parent directory (the one with the setgid bit). This way, files moved from the outside would have the desired gid in all cases.
+
+Cheers,
+
+Sebastien.
+
+--- Comment (sthiell, Tue, 28 Jan 2020 19:12:49 +0000) ---
+Hi Sebastien,
+
+Thanks! Before opening this ticket, I also tried something similar but now this is too restrictive for our use case. We would like to block any attempt of chgrp to unmapped group but not deny users to create files when their primary GID is not mapped, as long as they own the target directory. Our pratical use case is that we have setgid directories (g+S) on Lustre (shared directories) and some users tend to use mv from another filesystem to these setgid directories using a unmapped primary GID. mv does a file copy + lchown(chgrp). We would like these users to be able to mv the files, but not chgrp to nobody afterwards. The new files will then just inherit the parent directory's group thanks to the setgid bit. I haven't been able to block only chgrp operations but still let users create files as of today.
+
+That said, I think your patch makes some sense because when deny_unknown is set, we may expect Lustre to deny file creation (perhaps unless the setgid bit is set on the directory?).
+
+Do you see any way to deny chgrp to nobody and still allow such users to create files?
+
+--- Comment (sebastien, Tue, 28 Jan 2020 17:17:46 +0000) ---
+With patch https://review.whamcloud.com/37351, Lustre behavior is now the following, when deny_unknown is set to 1:
+
+$ newgrp user0g1
+$ chgrp nobody foo
+chgrp: changing group of 'foo': Operation not permitted
+$ touch foo2
+touch: cannot touch 'foo2': Permission denied
+
+Could you please give a spin to this patch and see if it has any undesired side effect?
+
+Thanks.
+
+--- Comment (gerrit, Tue, 28 Jan 2020 17:16:59 +0000) ---
+Sebastien Buisson (sbuisson@ddn.com) uploaded a new patch: https://review.whamcloud.com/37351
+
+Subject: LU-13172 mdt: prevent access with squashed gid
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 42fbd815fc002072c3791192c6545af81c464b18
+
+--- Comment (sebastien, Tue, 28 Jan 2020 17:16:17 +0000) ---
+Now I think I understand what is going on. The fact that your call to chgrp succeeds while it should not, is due to the fact that you changed group with newgrp.
+
+Indeed, the call to chgrp fails if you do not do newgrp:
+
+# su - user0
+$ id
+uid=500(user0) gid=500(user0) groups=500(user0),5001(user0g1),5002(user0g2)
+$ cd /lustre/user0
+$ touch foo
+$ ls -l
+total 0
+-rw-rw-r-- 1 user0 user0 0 Jan 28 23:07 foo
+$ chgrp nobody foo
+chgrp: changing group of 'foo': Operation not permitted
+$ chgrp user00 foo
+chgrp: changing group of 'foo': Operation not permitted
+
+Basically, after newgrp, your user is still the owner of file foo (sthiell), and wants to do chgrp nobody foo. From a Lustre server perspective, it consists in changing the gid of file foo to its own GID, which turns out to be nobody because it is squashed. So from a file system standpoint, it appears to be completely legitimate.
+
+However, we could think of a possibility to address your need, by leveraging the deny_unknown property on nodemaps. When it is set, we could check if user's GID is squashed. And then we could prevent any access that would lead to set GID to the squashed value.
+
+--- Comment (sthiell, Tue, 28 Jan 2020 03:58:32 +0000) ---
+Hey Sebastien,
+
+Thanks for looking into this!
+
+	The permissions of the base directory, which is created at the very beginning, are:
+
+[root@lu1-centos74 tests]# chown sthiell /mnt/lustre/sthiell
+[root@lu1-centos74 tests]# ls -ld /mnt/lustre/sthiell
+drwxr-xr-x 2 sthiell root 4096 Jan 27 19:43 /mnt/lustre/sthiell
+
+	sw_schrodinger is not known on the MDS side, nor mapped using nodemap, but that's on purpose, we use the squashed_gid feature for unknown groups
+
+	I don't see how to do the tests without nodemap, I need to have unmapped GIDs for the reproducer to work 
+
+	Indeed, map_mode is set to gid_only so UIDs are NOT mapped and thus untouched indeed. However, I'm not sure to agree re: deny_unknown. In my understanding, it's used for blocking unknown UIDs and apparently not that much for unknown GIDs. We don't want to denied access to unmapped GIDs, we just want to use the squashed_gid for them.
+
+	I've tried with map_mode unset and I can easily reproduce the same problem:
+
+Server side (192.168.123.40@tcp0):
+
+[root@lu1-centos74 tests]# ./llmount.sh
+[root@lu1-centos74 tests]# mkdir /mnt/lustre/sthiell
+[root@lu1-centos74 tests]# chown sthiell /mnt/lustre/sthiell
+[root@lu1-centos74 tests]# ls -ld /mnt/lustre/sthiell
+drwxr-xr-x 2 sthiell root 4096 Jan 27 19:43 /mnt/lustre/sthiell
+[root@lu1-centos74 tests]# lctl nodemap_add scg
+[root@lu1-centos74 tests]# 
+[root@lu1-centos74 tests]# lctl nodemap_modify --name scg --property admin --value 0
+[root@lu1-centos74 tests]# lctl nodemap_modify --name scg --property deny_unknown --value 0
+[root@lu1-centos74 tests]# lctl nodemap_modify --name scg --property trusted --value 0
+[root@lu1-centos74 tests]# 
+[root@lu1-centos74 tests]# lctl nodemap_add_range --name scg --range '192.168.123.41@tcp0'
+[root@lu1-centos74 tests]# 
+[root@lu1-centos74 tests]# lctl nodemap_add_idmap --name scg --idtype uid --idmap 59224:59224
+[root@lu1-centos74 tests]# lctl nodemap_add_idmap --name scg --idtype gid --idmap 59224:59224
+[root@lu1-centos74 tests]# lctl nodemap_activate 1
+
+Client side (192.168.123.41@tcp0):
+
+[root@lu2-centos74 ~]# mount -t lustre -o user_xattr,flock 192.168.123.40@tcp0:/lustre /mnt/lustre
+[root@lu2-centos74 ~]# cd /mnt/lustre
+[root@lu2-centos74 lustre]# ls -l
+total 4
+drwxr-xr-x 2 sthiell nobody 4096 Jan 27 19:43 sthiell
+[root@lu2-centos74 lustre]# su - sthiell
+Last login: Sun Jan 26 13:03:08 PST 2020 on pts/1
+[sthiell@lu2-centos74 ~]$ cd /mnt/lustre/sthiell
+[sthiell@lu2-centos74 sthiell]$ touch foo
+[sthiell@lu2-centos74 sthiell]$ ls -l foo
+-rw-rw-r-- 1 sthiell sthiell 0 Jan 27 19:45 foo
+[sthiell@lu2-centos74 sthiell]$ id
+uid=59224(sthiell) gid=59224(sthiell) groups=59224(sthiell),98003(sw_vasp),98008(sw_schrodinger),98009(sw_matlab),98013(sw_stata),99001(sh_users),99010(sh_sysadm),99011(sh_swadm)
+[sthiell@lu2-centos74 sthiell]$ 
+[sthiell@lu2-centos74 sthiell]$ newgrp sw_schrodinger
+[sthiell@lu2-centos74 sthiell]$ id
+uid=59224(sthiell) gid=98008(sw_schrodinger) groups=98008(sw_schrodinger),59224(sthiell),98003(sw_vasp),98009(sw_matlab),98013(sw_stata),99001(sh_users),99010(sh_sysadm),99011(sh_swadm)
+[sthiell@lu2-centos74 sthiell]$ 
+[sthiell@lu2-centos74 sthiell]$ ls -l
+total 0
+-rw-rw-r-- 1 sthiell sthiell 0 Jan 27 19:45 foo
+[sthiell@lu2-centos74 sthiell]$ chgrp nobody foo
+[sthiell@lu2-centos74 sthiell]$ ls -l
+total 0
+-rw-rw-r-- 1 sthiell nobody 0 Jan 27 19:45 foo
+[sthiell@lu2-centos74 sthiell]$ 
+[sthiell@lu2-centos74 sthiell]$ chgrp 123456 foo
+[sthiell@lu2-centos74 sthiell]$ chgrp 101010 foo
+[sthiell@lu2-centos74 sthiell]$ ls -l foo
+-rw-rw-r-- 1 sthiell nobody 0 Jan 27 19:45 foo
+[sthiell@lu2-centos74 sthiell]$ 
+[sthiell@lu2-centos74 sthiell]$ chgrp sthiell foo
+[sthiell@lu2-centos74 sthiell]$ ls -l foo
+-rw-rw-r-- 1 sthiell sthiell 0 Jan 27 19:45 foo
+
+Users should be blocked from using chgrp to the squashed_gid, explicitly or implicitly (for unmapped groups). Otherwise, we really like the current nodemap behavior, please don't change it.
+
+--- Comment (sebastien, Mon, 27 Jan 2020 19:18:18 +0000) ---
+A few questions to begin with.
+
+What are the permissions on the directory in which you are carrying out the tests? And is sw_schrodinger known on MDS side? Also, have you tried the same tests but without nodemap?
+
+If I understand correctly, because map_mode is set to gid_only, UIDs should remain untouched. And because deny_unknown is set to 1, all GIDs that are not mapped explicitly should be denied access.
+
+Maybe there is an incorrect interaction between map_mode, deny_unknown and trusted properties. That would be very helpful if you could try again the same tests, but with map_mode unset (so that is uses normal mode), deny_unknown set to 0 and trusted set to 0. You would need to define an explicit mapping for the UID you are using for your test (and maybe adjust squash_uid and squash_gid to your needs).
+
+Thanks,
+
+Sebastien.
+
+--- Comment (pjones, Mon, 27 Jan 2020 18:24:21 +0000) ---
+Sebastien
+
+Could you please investigate?
+
+Thanks
+
+Peter

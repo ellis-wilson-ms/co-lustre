@@ -1,0 +1,780 @@
+Key:        LU-2240
+Summary:    implement index range lookup for osd-zfs.
+Link:       https://jira.whamcloud.com/browse/LU-2240
+Type:       Bug
+Priority:   Blocker
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Alex Zhuravlev
+Reporter:   Di Wang
+Created:    Sun, 28 Oct 2012 00:04:49 +0000
+Updated:    Tue, 23 Apr 2013 16:56:19 +0000
+Resolved:   Wed, 27 Mar 2013 21:10:22 +0000
+Labels:     HB, ptr, sequoia, topsequoia, zfs
+Links:      Duplicate: duplicates LU-838; Duplicate: is duplicated by LU-2773; Duplicate: is duplicated by LU-2754; Related: is related to LU-2691; Related: is related to LU-1187; Related: is related to LU-2236
+Attachments: LU-2240-stout-mds1.1363199014.lustre_log.gz, lustre-mds.llog, lustre-mdt1-pool_version_28.gz
+
+--- Description ---
+ZFS needs a index range lookup for DNE.
+
+--- Comment (morrone, Fri, 29 Mar 2013 18:42:06 +0000) ---
+I'd say post-2.4.0 would be a bit safer.  But yes, we don't need to keep it around too long.
+
+--- Comment (prakash, Fri, 29 Mar 2013 16:06:08 +0000) ---
+Well, we still need to upgrade our production side of things which needs the conversion code. But since it landed in a tag already (2.3.63), I'm personally OK with dropping it from master. We can upgrade using a 2.3.63-based tag which will fix the FIDs, and then later upgrade to a newer tag which wouldn't have the conversion code. I'd imagine that would work just fine, and then the conversion code won't be in the actual 2.4 release.
+
+morrone, how does that sound to you?
+
+--- Comment (bzzz, Fri, 29 Mar 2013 06:29:26 +0000) ---
+Prakash, do you think we need to keep this conversion code around for a while? my preference is to drop it as soon as possible.
+
+--- Comment (prakash, Wed, 27 Mar 2013 21:10:14 +0000) ---
+I reformatted out Grove-Test file system using our 2.3.62-4chaos tag. Our Grove-Production filesystem doesn't have any entries in oi.7/0x200000007* so we should be OK to simply upgrade that side of things without a reformat (as far as I can tell). So I'll go ahead and resolve this ticket.
+
+--- Comment (bzzz, Wed, 27 Mar 2013 06:12:03 +0000) ---
+I can make another patch to remove those objects, but frankly this isn't a nice way to go (we've made amount of changes to on-disk format from the beginning). so if this is possible, it'd be much much better to start from released version.
+
+to some extent we do check on-disk consistency, with ldiskfs though. the good thing is that attributes like nlink are manipulated the same way on zfs.
+
+--- Comment (prakash, Tue, 26 Mar 2013 21:21:18 +0000) ---
+After talking with Brian some more, I definitely think the issue is the improper handling of the "links" field. The first "rm" actually deleted the object from the dataset, and the subsequent removes got ENOENT because the object was already deleted. So I think the only path forward is to either hack the ZPL or Lustre to remove the entries we're interested in from the ZAPs, or reformat the filesystem. Assuming we wont have this problem on our production FS (which I need to verify, still), I'm going to pursue a reformat of our test FS to get around this.
+
+--- Comment (prakash, Tue, 26 Mar 2013 20:53:43 +0000) ---
+Sigh.. Well it let me remove files oi.7/0x200000007:0x3:0x0, oi.7/0x200000007:0x4:0x0, and oi.7/0x200000007:0x1:0x0 (inode numbers 414211, 414213, and 414209 respectively) but I'm getting ENOENT when removing the others. Using systemtap, I can see it failing in zfs_zget:
+
+# grove-mds2 /mnt/grove-mds2/mdt0 > stap /usr/share/doc/systemtap-1.6/examples/general/para-callgraph.stp 'module("zfs").function("*")' -c "rm ./oi.7/0x200000007:0x2:0x0/0x1010000"
+
+... [snip] ...
+
+   677 rm(94074):    ->dmu_buf_get_user db_fake=0xffff880d717f1e40
+   679 rm(94074):    sa_get_userdata hdl=0xffff880d52c28478
+   687 rm(94074):    sa_buf_rele db=0xffff880d717f1e40 tag=0x0
+   694 rm(94074):     ->dbuf_rele db=0xffff880d717f1e40 tag=0x0
+   696 rm(94074):      ->dbuf_rele_and_unlock db=0xffff880d717f1e40 tag=0x0
+   698 rm(94074):      zfs_dirent_unlock dl=0xffff880f521949c0
+   710 rm(94074):   rrw_exit rrl=0xffff880d5a100290 tag=0xffffffffa0505727
+   716 rm(94074):  
+
+I tried removing the files in the order that they were listed in the "find" command in my previous comment. So the first "rm" for each distinct inode number succeeded, but the following calls for files referencing the same inode number failed. Perhaps due to incorrect accounting of the number of links for a given inode?
+
+In case it's useful, the zdb info regarding these objects is below (AFAIK the inode number correspond to its dmu object number):
+
+# grove-mds2 /mnt/grove-mds2/mdt0 > zdb grove-mds2/mdt0 414209 414211 414213
+Dataset grove-mds2/mdt0 [ZPL], ID 45, cr_txg 110, 4.05G, 2088710 objects
+
+    Object  lvl   iblk   dblk  dsize  lsize   %full  type
+    414209    1    16K   128K   128K   128K  100.00  ZFS plain file
+    414211    2     4K     4K     4K     8K  100.00  ZFS directory
+    414213    2     4K     4K     4K     8K  100.00  ZFS directory
+
+I'm beginning to think a reformat is our best option moving forward...
+
+--- Comment (bzzz, Tue, 26 Mar 2013 18:45:00 +0000) ---
+yes, I'd suggest to remove them .. and I'd suggest to take a snapshot just before that  unfortunately I'm unable to reproduce the case locally:
+
+I can't generate such an image (can't even find the code in gerrit using 0x200000007 for quota).
+
+--- Comment (prakash, Tue, 26 Mar 2013 18:28:16 +0000) ---
+Here's what I see on the MDS:
+
+# grove-mds2 /tmp/zfs > ls -li oi.3/0x200000003* oi.5/0x200000005* oi.6/0x200000006* oi.7/0x200000007* seq* quota*
+   176 -rw-r--r-- 1 root root  8 Dec 31  1969 oi.3/0x200000003:0x1:0x0
+   180 -rw-r--r-- 1 root root  0 Dec 31  1969 oi.3/0x200000003:0x3:0x0
+414212 -rw-r--r-- 1 root root  2 Dec 31  1969 oi.5/0x200000005:0x1:0x0
+414214 -rw-r--r-- 1 root root  2 Dec 31  1969 oi.5/0x200000005:0x2:0x0
+417923 -rw-r--r-- 1 root root  2 Dec 31  1969 oi.6/0x200000006:0x10000:0x0
+417924 -rw-r--r-- 1 root root  2 Dec 31  1969 oi.6/0x200000006:0x1010000:0x0
+417927 -rw-r--r-- 1 root root  2 Dec 31  1969 oi.6/0x200000006:0x1020000:0x0
+417926 -rw-r--r-- 1 root root  2 Dec 31  1969 oi.6/0x200000006:0x20000:0x0
+414209 -rw-r--r-- 1 root root  8 Dec 31  1969 oi.7/0x200000007:0x1:0x0
+414211 -rw-r--r-- 1 root root  2 Dec 31  1969 oi.7/0x200000007:0x3:0x0
+414213 -rw-r--r-- 1 root root  2 Dec 31  1969 oi.7/0x200000007:0x4:0x0
+414209 -rw-r--r-- 1 root root  8 Dec 31  1969 seq-200000007-lastid
+   173 -rw-rw-rw- 1 root root 24 Dec 31  1969 seq_ctl
+   174 -rw-rw-rw- 1 root root 24 Dec 31  1969 seq_srv
+
+oi.3/0x200000003:0x2:0x0:
+total 0
+
+oi.3/0x200000003:0x4:0x0:
+total 9
+417925 drwxr-xr-x 2 root root 2 Dec 31  1969 dt-0x0
+417922 drwxr-xr-x 2 root root 2 Dec 31  1969 md-0x0
+
+oi.3/0x200000003:0x5:0x0:
+total 9
+417923 -rw-r--r-- 1 root root 2 Dec 31  1969 0x10000
+417924 -rw-r--r-- 1 root root 2 Dec 31  1969 0x1010000
+
+oi.3/0x200000003:0x6:0x0:
+total 9
+417927 -rw-r--r-- 1 root root 2 Dec 31  1969 0x1020000
+417926 -rw-r--r-- 1 root root 2 Dec 31  1969 0x20000
+
+oi.7/0x200000007:0x2:0x0:
+total 18
+414211 -rw-r--r-- 1 root root 2 Dec 31  1969 0x10000
+414212 -rw-r--r-- 1 root root 2 Dec 31  1969 0x10000-MDT0000
+414213 -rw-r--r-- 1 root root 2 Dec 31  1969 0x1010000
+414214 -rw-r--r-- 1 root root 2 Dec 31  1969 0x1010000-MDT0000
+
+quota_master:
+total 9
+417925 drwxr-xr-x 2 root root 2 Dec 31  1969 dt-0x0
+417922 drwxr-xr-x 2 root root 2 Dec 31  1969 md-0x0
+
+quota_slave:
+total 18
+414211 -rw-r--r-- 1 root root 2 Dec 31  1969 0x10000
+414212 -rw-r--r-- 1 root root 2 Dec 31  1969 0x10000-MDT0000
+414213 -rw-r--r-- 1 root root 2 Dec 31  1969 0x1010000
+414214 -rw-r--r-- 1 root root 2 Dec 31  1969 0x1010000-MDT0000
+
+I'm somewhat guessing as to what the on disk format is supposed to look like, but it does appear to be using the new quota sequence numbers (0x200000005ULL and 0x200000006ULL).
+
+So, does this mean I can go ahead and remove these files:
+
+# grove-mds2 /tmp/zfs > find . -inum 414209 -o -inum 414211 -o -inum 414213
+./oi.7/0x200000007:0x3:0x0
+./oi.7/0x200000007:0x4:0x0
+./oi.7/0x200000007:0x2:0x0/0x1010000
+./oi.7/0x200000007:0x2:0x0/0x10000
+./oi.7/0x200000007:0x1:0x0
+./seq-200000007-lastid
+./quota_slave/0x1010000
+./quota_slave/0x10000
+
+?
+
+--- Comment (bzzz, Tue, 26 Mar 2013 10:24:02 +0000) ---
+could you check whether your filesystem has been using new quota files now? they're supposed to be in the following sequences:
+
+	FID_SEQ_QUOTA		= 0x200000005ULL,
+
+	FID_SEQ_QUOTA_GLB	= 0x200000006ULL,
+
+if so, then it should be OK to just remove old quota files in 0x200000007 sequence.
+
+--- Comment (bzzz, Tue, 26 Mar 2013 10:00:58 +0000) ---
+seq--lastid stores the last used ID in sequence
+
+--- Comment (adilger, Fri, 22 Mar 2013 03:28:23 +0000) ---
+Sigh, this is the difficulty with following the development branch - you are picking up all of the dirty laundry that is normally put away before the release is made.  Typically, we don't want anyone to use development releases for long-lived filesystems for exactly this reason.
+
+Hopefully Mike or Alex configure out something to resolve this easily.
+
+--- Comment (nedbass, Thu, 21 Mar 2013 23:30:55 +0000) ---
+Right, I confirmed in a VM that deleting oi.7/0x200000007:0x1:0x0 avoids the crash, and lets it successfully add the new root fid:
+
+$ ls -lid ./oi.7/0x200000007:0x1:0x0 ROOT
+177 drwxr-xr-x 158 root root 2 Dec  6 12:55 ./oi.7/0x200000007:0x1:0x0/
+177 drwxr-xr-x 158 root root 2 Dec  6 12:55 ROOT/
+
+I'm not sure what the seq-200000007-lastid is for, or if it's safe to remove its OI entry.  The MDT for the production filesystem has a similar file, but in a non-colliding sequence:
+
+# grove-mds1 /mnt/mdtsnap > ls -lid seq-200000003-lastid  oi.3/0x200000003:0x1:0x0
+207172557 -rw-r--r-- 1 root root 8 Dec 31  1969 oi.3/0x200000003:0x1:0x0
+207172557 -rw-r--r-- 1 root root 8 Dec 31  1969 seq-200000003-lastid
+
+So hopefully we won't run into a problem there.
+
+It would be nice if the conversion code handled these collisions. But since there should be very few affected filesystems in the wild, we could probably live with a manual workaround.
+
+--- Comment (prakash, Thu, 21 Mar 2013 23:26:23 +0000) ---
+I'm curious if this is the commit that is biting us:
+
+commit 5b64ac7f7cf2767acb75b872eaffcf6d255d0501
+Author: Mikhail Pershin 
+Date:   Thu Oct 4 14:24:43 2012 +0400
+
+    LU-1943 class: FID_SEQ_LOCAL_NAME set to the Orion value
+    
+    Keep the same numbers for Orion and master for compatibility
+    
+    Signed-off-by: Mikhail Pershin 
+    Change-Id: I318eba9860be7849ee4a8d828cf27e5fb91164e9
+    Reviewed-on: http://review.whamcloud.com/4179
+    Reviewed-by: Andreas Dilger 
+    Tested-by: Hudson
+    Tested-by: Maloo 
+    Reviewed-by: Alex Zhuravlev 
+
+diff --git a/lustre/include/lustre/lustre_idl.h b/lustre/include/lustre/lustre_idl.h
+index 4705c1d..bae42d0 100644
+--- a/lustre/include/lustre/lustre_idl.h
++++ b/lustre/include/lustre/lustre_idl.h
+@@ -421,13 +421,12 @@ enum fid_seq {
+        /* sequence for local pre-defined FIDs listed in local_oid */
+         FID_SEQ_LOCAL_FILE = 0x200000001ULL,
+         FID_SEQ_DOT_LUSTRE = 0x200000002ULL,
+-        /* XXX 0x200000003ULL is reserved for FID_SEQ_LLOG_OBJ */
+        /* sequence is used for local named objects FIDs generated
+         * by local_object_storage library */
++       FID_SEQ_LOCAL_NAME = 0x200000003ULL,
+         FID_SEQ_SPECIAL    = 0x200000004ULL,
+         FID_SEQ_QUOTA      = 0x200000005ULL,
+         FID_SEQ_QUOTA_GLB  = 0x200000006ULL,
+-       FID_SEQ_LOCAL_NAME = 0x200000007ULL,
+         FID_SEQ_NORMAL     = 0x200000400ULL,
+         FID_SEQ_LOV_DEFAULT= 0xffffffffffffffffULL
+ };
+
+--- Comment (prakash, Thu, 21 Mar 2013 23:09:32 +0000) ---
+I think we're getting the -EEXISTS (i.e. -17) error back from zap_add when we try inserting the new root fid (0x200000007:0x1:0x0) into the OI since it already exists.
+
+--- Comment (nedbass, Thu, 21 Mar 2013 23:01:34 +0000) ---
+Mounting a snapshot of the MDT through the POSIX layer, I found that objects in the quota_slave directory and the file seq-200000007-lastid are using FID_SEQ_ROOT. Note the matching inode numbers:
+
+$ ls -li oi.7/0x200000007* seq-200000007-lastid quota_slave/
+414209 -rw-r--r-- 1 root root 8 Dec 31  1969 oi.7/0x200000007:0x1:0x0
+414211 -rw-r--r-- 1 root root 2 Dec 31  1969 oi.7/0x200000007:0x3:0x0
+414213 -rw-r--r-- 1 root root 2 Dec 31  1969 oi.7/0x200000007:0x4:0x0
+414209 -rw-r--r-- 1 root root 8 Dec 31  1969 seq-200000007-lastid
+
+oi.7/0x200000007:0x2:0x0:
+total 22K
+414211 -rw-r--r-- 1 root root 2 Dec 31  1969 0x10000
+414212 -rw-r--r-- 1 root root 2 Dec 31  1969 0x10000-MDT0000
+414213 -rw-r--r-- 1 root root 2 Dec 31  1969 0x1010000
+414214 -rw-r--r-- 1 root root 2 Dec 31  1969 0x1010000-MDT0000
+
+quota_slave/:
+total 22K
+414211 -rw-r--r-- 1 root root 2 Dec 31  1969 0x10000
+414212 -rw-r--r-- 1 root root 2 Dec 31  1969 0x10000-MDT0000
+414213 -rw-r--r-- 1 root root 2 Dec 31  1969 0x1010000
+414214 -rw-r--r-- 1 root root 2 Dec 31  1969 0x1010000-MDT0000
+
+--- Comment (prakash, Wed, 20 Mar 2013 21:39:05 +0000) ---
+And enabling D_OTHER I gather this message:
+
+2013-03-20 14:37:14 Lustre: 58602:0:(osd_oi.c:720:osd_convert_root_to_new_seq()) lstest-MDT0000: /ROOT -> [0x200000001:0x6:0x0] -> 177
+
+--- Comment (prakash, Wed, 20 Mar 2013 18:29:46 +0000) ---
+I'm reopening this issue. I tried upgrading our Grove-Test filesystem to 2.3.62-4chaos but hit the following crash:
+
+Lustre: Lustre: Build Version: 2.3.62-4chaos-4chaos--PRISTINE-2.6.32-220.23.1.2chaos.ch5.x86_64
+LustreError: 58463:0:(osd_oi.c:784:osd_convert_root_to_new_seq()) lstest-MDT0000: can't convert to new fid: rc = -17
+BUG: unable to handle kernel NULL pointer dereference at 0000000000000018
+
+crash> bt
+PID: 58463  TASK: ffff88200c0fc040  CPU: 9   COMMAND: "mount.lustre"
+ #0 [ffff881ff51e1520] machine_kexec at ffffffff8103216b
+ #1 [ffff881ff51e1580] crash_kexec at ffffffff810b8d12
+ #2 [ffff881ff51e1650] oops_end at ffffffff814f2c00
+ #3 [ffff881ff51e1680] no_context at ffffffff810423fb
+ #4 [ffff881ff51e16d0] __bad_area_nosemaphore at ffffffff81042685
+ #5 [ffff881ff51e1720] bad_area at ffffffff810427ae
+ #6 [ffff881ff51e1750] __do_page_fault at ffffffff81042eb3
+ #7 [ffff881ff51e1870] do_page_fault at ffffffff814f4bde
+ #8 [ffff881ff51e18a0] page_fault at ffffffff814f1f95
+    [exception RIP: list_del+12]
+    RIP: ffffffff8127d75c  RSP: ffff881ff51e1958  RFLAGS: 00010292
+    RAX: ffff881ff51e0000  RBX: 0000000000000010  RCX: ffff882017ff7400
+    RDX: 0000000000000000  RSI: 0000000000000030  RDI: 0000000000000010
+    RBP: ffff881ff51e1968   R8: ffff882018246500   R9: ffff88200f263c00
+    R10: ffff8820178263a0  R11: 0000000000000000  R12: ffff881ff51e19f8
+    R13: 00000000ffffffef  R14: ffff88200b877340  R15: ffff881ff51e19f8
+    ORIG_RAX: ffffffffffffffff  CS: 0010  SS: 0018
+ #9 [ffff881ff51e1970] arc_remove_prune_callback at ffffffffa042413c [zfs]
+#10 [ffff881ff51e1990] osd_device_fini at ffffffffa0d315a7 [osd_zfs]
+#11 [ffff881ff51e19b0] osd_device_alloc at ffffffffa0d31c90 [osd_zfs]
+#12 [ffff881ff51e19e0] obd_setup at ffffffffa0736a67 [obdclass]
+#13 [ffff881ff51e1aa0] class_setup at ffffffffa0736d78 [obdclass]
+#14 [ffff881ff51e1af0] class_process_config at ffffffffa073e28c [obdclass]
+#15 [ffff881ff51e1b80] do_lcfg at ffffffffa0746249 [obdclass]
+#16 [ffff881ff51e1c60] lustre_start_simple at ffffffffa0746614 [obdclass]
+#17 [ffff881ff51e1cc0] lustre_fill_super at ffffffffa0756883 [obdclass]
+#18 [ffff881ff51e1da0] get_sb_nodev at ffffffff8117ab1f
+#19 [ffff881ff51e1de0] lustre_get_sb at ffffffffa0741315 [obdclass]
+#20 [ffff881ff51e1e00] vfs_kern_mount at ffffffff8117a77b
+#21 [ffff881ff51e1e50] do_kern_mount at ffffffff8117a922
+#22 [ffff881ff51e1ea0] do_mount at ffffffff81198fa2
+#23 [ffff881ff51e1f20] sys_mount at ffffffff81199630
+#24 [ffff881ff51e1f80] system_call_fastpath at ffffffff8100b0f2
+    RIP: 00007ffff771345a  RSP: 00007fffffff99d8  RFLAGS: 00010206
+    RAX: 00000000000000a5  RBX: ffffffff8100b0f2  RCX: 0000000001000000
+    RDX: 0000000000408087  RSI: 00007fffffffca48  RDI: 0000000000618480
+    RBP: 0000000000000000   R8: 0000000000618670   R9: 0000000000000000
+    R10: 0000000001000000  R11: 0000000000000206  R12: 000000000060bbd8
+    R13: 000000000060bbd0  R14: 0000000000618670  R15: 0000000000000000
+    ORIG_RAX: 00000000000000a5  CS: 0033  SS: 002b
+
+--- Comment (pjones, Mon, 18 Mar 2013 21:10:26 +0000) ---
+As per LLNL, ok to mark this as resolved. LLNL will open a new ticket if any problems are found with the patch that has been landed
+
+--- Comment (nedbass, Fri, 15 Mar 2013 18:15:57 +0000) ---
+We haven't tested it yet on Sequoia's filesystem, which is the most important consideration for us.  But we can always reopen the ticket if we find a problem.
+
+--- Comment (pjones, Fri, 15 Mar 2013 17:32:32 +0000) ---
+That patch has landed to master. Do you feel confident enough that this is fixed for us to consider this ticket resolved?
+
+--- Comment (nedbass, Fri, 15 Mar 2013 15:35:13 +0000) ---
+My tests on a real filesystem (LLNL's stout cluster) with patch set 11 did not find any problems.
+
+--- Comment (prakash, Fri, 15 Mar 2013 14:56:35 +0000) ---
+Testing patch-set 11 using VMs, I was able to mount the MDT, and mount the 2.3.62 FS with a 2.1.2 client.
+
+--- Comment (nedbass, Thu, 14 Mar 2013 16:35:35 +0000) ---
+I was able to mount the image with patch set 11.  Next I'll try it out on a real filesystem and will let you know how it goes.
+
+--- Comment (di.wang, Thu, 14 Mar 2013 15:28:05 +0000) ---
+Ned, I just updated the patch, I can mount this image with the patch. Could you please try this patch. Thanks.
+
+--- Comment (di.wang, Thu, 14 Mar 2013 15:12:00 +0000) ---
+Ned, Thanks. the img works this time. I will try it here. Thanks
+
+--- Comment (nedbass, Thu, 14 Mar 2013 14:53:46 +0000) ---
+Di, please try lustre-mdt1-pool_version_28.gz.  I deleted the first image because the pool version is not supported by the ZFS release you are running.
+
+My initial test of http://review.whamcloud.com/#change,5249 patch set 10 did not succeed.  My VM locked up hard when I ran mount.lustre.  I haven't gotten any debug data yet.
+
+--- Comment (nedbass, Thu, 14 Mar 2013 14:47:19 +0000) ---
+Attach mdt image from lustre 2.3.58, formatted with ZFS pool version 28.  The previously attached image used pool version 5000 which could not be imported on earlier ZFS releases.
+
+--- Comment (nedbass, Thu, 14 Mar 2013 12:13:11 +0000) ---
+Did you try the -f switch for zpool import?  I'll give the patch a try.  Thanks
+
+--- Comment (di.wang, Thu, 14 Mar 2013 02:14:53 +0000) ---
+I tried this image, but got this, I probably do sth wrong 
+
+[root@testnode tests]# zpool import -d /work/
+   pool: lustre-mdt1
+     id: 14706860377619313238
+  state: UNAVAIL
+ status: The pool was last accessed by another system.
+ action: The pool cannot be imported due to damaged devices or data.
+   see: http://zfsonlinux.org/msg/ZFS-8000-EY
+ config:
+
+	lustre-mdt1          UNAVAIL  newer version
+	  /work/lustre-mdt1  ONLINE
+
+But I updated the patch, could you please tried it? Thanks.
+
+--- Comment (di.wang, Wed, 13 Mar 2013 19:05:28 +0000) ---
+Thanks, this would be really helpful. I am cooking the patch now, and will try this locally. Thanks.
+
+--- Comment (nedbass, Wed, 13 Mar 2013 17:45:33 +0000) ---
+If you want to reproduce the mount failure in your test environment, the attached mdt image should do it.  I created it with a 2.3.58 lustre build, created some files in the lustre namespace, then exported the pool.
+
+zcat lustre-mdt1.gz > /tmp/lustre-mdt1
+zpool import -f -d /tmp lustre-mdt1
+mkdir /mnt/mds1
+mount.lustre lustre-mdt1/mdt1 /mnt/mds1 # should fail
+
+--- Comment (nedbass, Wed, 13 Mar 2013 15:48:02 +0000) ---
+Maybe you grabbed the wrong attachment?  It is LU-2240-stout-mds1.1363199014.lustre_log.gz
+
+--- Comment (nedbass, Wed, 13 Mar 2013 15:44:49 +0000) ---
+Di, what is it you aren't finding in the log? debug_mb was already 641 MB and I basically did
+
+lctl dk /dev/null
+echo -1 > /proc/sys/lnet/debug
+/etc/init.d/lustre start ; lctl dk /tmp/lustre_log
+
+so that should have captured it.  Also I have in the log:
+
+00000020:01000004:1.0:1363198964.957209:0:19745:0:(obd_mount.c:2978:lustre_fill_super()) Mounting server from stout-mds1/mdt0
+00000020:00000001:1.0:1363198964.957210:0:19745:0:(obd_mount.c:2358:server_fill_super()) Process entered
+...
+00000020:02000400:1.0:1363198967.290841:0:19745:0:(obd_mount.c:2403:server_fill_super()) lsrzb-MDT0000: Unable to start target: -5
+00000020:00000001:1.0:1363198967.295914:0:19745:0:(obd_mount.c:2404:server_fill_super()) Process leaving via out_mnt (rc=18446744073709551611 : -5 : 0xfffffffffffffffb)
+
+which looks like it contains the whole mount attempt.
+
+--- Comment (di.wang, Wed, 13 Mar 2013 15:18:28 +0000) ---
+Sigh, indeed, we even bypass index insert for FLDB on ZFS
+
+int fld_index_create(struct lu_server_fld *fld,
+                     const struct lu_env *env,
+                     const struct lu_seq_range *range,
+                     struct thandle *th)
+{
+        int rc;
+
+        ENTRY;
+  
+        if (fld->lsf_no_range_lookup) {
+                /* Stub for underlying FS which can't lookup ranges */
+                if (range->lsr_index != 0) {
+                        CERROR("%s: FLD backend does not support range"
+                               "lookups, so DNE and FIDs-on-OST are not"
+                               "supported in this configuration\n",
+                               fld->lsf_name);
+                        return -EINVAL;
+                }
+        }
+
+        LASSERT(range_is_sane(range));
+      
+        rc = dt_insert(env, fld->lsf_obj, fld_rec(env, range),
+                       fld_key(env, range->lsr_start), th, BYPASS_CAPA, 1);
+        CDEBUG(D_INFO, "%s: insert given range : "DRANGE" rc = %d\n",
+               fld->lsf_name, PRANGE(range), rc);
+        RETURN(rc);
+}
+
+--- Comment (di.wang, Wed, 13 Mar 2013 15:04:08 +0000) ---
+Hmm, this debug log does not include failure information I need. Could you please set larger debug_size and collecting the log just after the mount failure.
+
+--- Comment (nedbass, Wed, 13 Mar 2013 14:26:16 +0000) ---
+-1 debug log for failed MDS mount
+
+--- Comment (bzzz, Wed, 13 Mar 2013 14:22:04 +0000) ---
+my understanding was this is an existing filesystem formatted in Orion era and FLDB was not maintained at that time.
+
+--- Comment (di.wang, Wed, 13 Mar 2013 14:15:37 +0000) ---
+Sigh, proc fldb entry is removed after mount failure. Could you please post debug log(with -1 level) of MDT mount process? Somehow, the fld entries is not inserted into the memory somehow during the fld_index_init.
+
+--- Comment (nedbass, Wed, 13 Mar 2013 10:56:41 +0000) ---
+# stout-mds1 /root > lctl get_param fld.srv-lsrzb-MDT0000.fldb
+error: get_param: /proc/{fs,sys}/{lnet,lustre}/fld/srv-lsrzb-MDT0000/fldb: Found no match
+
+Note, the MDT will not mount.
+
+--- Comment (di.wang, Wed, 13 Mar 2013 00:27:47 +0000) ---
+Ned, Could you please post the result 
+
+lctl get_param fld.srv-lsrzb-MDT0000.fldb
+
+--- Comment (di.wang, Wed, 13 Mar 2013 00:19:40 +0000) ---
+Hmm, 0x200000bd2 should be in the first group of sequence [0x0000000200000400-0x0000000240000400), and all of the fld lookup should happen inside memory on the server side. Ah, we should insert the current sequence inside the FLDB as well, since we do not really have fldb for ZFS, do we?
+
+No, we have to let zfs work with FLDB right now because of FID on OST and DNE.
+
+--- Comment (bzzz, Wed, 13 Mar 2013 00:01:35 +0000) ---
+hmm, this doesn't seem directly related to the patch.. the sequence 0x200000bd2 was not found in FLDB preventing access the the corresponded object.
+
+Di, any idea ? ohh... I remember we enforced FLDB to return 0 and do not store records as osd-zfs didn't range lookups.
+
+--- Comment (nedbass, Tue, 12 Mar 2013 18:57:51 +0000) ---
+Correction: we have patch set 8 of Change 5249.
+
+--- Comment (nedbass, Tue, 12 Mar 2013 18:43:18 +0000) ---
+I tried tag 2.3.62-3chaos which has patch set 1 of Change 5249.  The test system had an existing filesystem.  I get the following errors mounting the MDS:
+
+2013-03-12 15:13:33 LustreError: 11-0: lsrzb-OST0008-osc-MDT0000: Communicating with 172.21.1.108@o2ib200, operation ost_connect failed with -19.
+2013-03-12 15:13:33 LustreError: Skipped 4 previous similar messages
+2013-03-12 15:13:33 LustreError: 11-0: lsrzb-MDT0000-lwp-MDT0000: Communicating with 0@lo, operation mds_connect failed with -11.
+2013-03-12 15:13:34 Lustre: lsrzb-MDD0000: FID of /ROOT has been changed. Please remount the clients.
+2013-03-12 15:13:34 LustreError: 16301:0:(fld_handler.c:170:fld_server_lookup()) srv-lsrzb-MDT0000: Can not found the seq 0x200000bd2
+2013-03-12 15:13:34 LustreError: 16301:0:(lod_dev.c:86:lod_fld_lookup()) lsrzb-MDT0000-mdtlov: Can't find tgt by seq 0x200000bd2, rc -5
+2013-03-12 15:13:34 LustreError: 16301:0:(mdd_compat.c:144:mdd_convert_object()) lsrzb-MDD0000: can't access the object: rc = -5
+2013-03-12 15:13:34 LustreError: 16301:0:(mdd_compat.c:252:mdd_fix_children()) lsrzb-MDD0000: can't convert [0x200000bd2:0x601:0x0]: rc = -5
+2013-03-12 15:13:34 Lustre: lsrzb-MDT0000: Unable to start target: -5
+2013-03-12 15:13:34 Lustre: Failing over lsrzb-MDT0000
+2013-03-12 15:13:35 LustreError: 14932:0:(client.c:1048:ptlrpc_import_delay_req()) @@@ IMP_CLOSED   req@ffff8807bf057c00 x1429339966014252/t0(0) o13->lsrzb-OST0001-osc-MDT0000@172.21.1.101@o2ib200:7/4 lens 224/368 e 0 to 0 dl 0 ref 1 fl Rpc:/0/ffffffff rc 0/-1
+2013-03-12 15:13:35 LustreError: 14932:0:(client.c:1048:ptlrpc_import_delay_req()) Skipped 15 previous similar messages
+2013-03-12 15:13:36 Lustre: server umount lsrzb-MDT0000 complete
+2013-03-12 15:13:36 LustreError: 16301:0:(obd_mount.c:2992:lustre_fill_super()) Unable to mount  (-5)
+
+--- Comment (bzzz, Fri, 15 Feb 2013 07:52:17 +0000) ---
+http://review.whamcloud.com/#change,5249
+
+--- Comment (di.wang, Wed, 6 Feb 2013 14:09:24 +0000) ---
+Re-assign this ticket to Alex, since he is working on the patch to change the ROOT FID to the new sequence for ZFS.
+
+--- Comment (di.wang, Mon, 4 Feb 2013 14:22:43 +0000) ---
+I made a new patch http://review.whamcloud.com/#change,5257, but zfs part change is missing. Per discussion with Alex, except 5249, we still need change the root fid in .. and linkea of all inodes in FS, otherwise mv would not work. Alex is working on that.
+
+--- Comment (di.wang, Fri, 1 Feb 2013 15:08:01 +0000) ---
+Hello, Alex made this patch on zfs part, http://review.whamcloud.com/#change,5249, and I will add it to 5134 and test it locally first. I will let you know the result soon.
+
+--- Comment (bzzz, Wed, 30 Jan 2013 04:51:48 +0000) ---
+we just discussed this topic with Di. to enable DNE we need another sequence for /ROOT and do not mix it with really local objects (like last_rcvd).
+
+I'd suggest to convert this once upon start and do not introduce more cases to OI code.
+
+the conversion should be trivial to do with existing primitives within OSD:
+
+1) remove FID_SEQ_LOCAL_FILE:MDD_ROOT_INDEX_OID from OI
+
+2) lookup inode/dnode of /ROOT
+
+3) insert FID_SEQ_ROOT:1 into OI
+
+in a single transaction.
+
+then fid of /ROOT becomes a normal one and nothing special is required to handle that.
+
+--- Comment (di.wang, Fri, 25 Jan 2013 00:27:47 +0000) ---
+Thanks for testing and debug log. I just update the patch 5134 again. But I would like Alex check the patch before further testing. Since I am not so confident about ZFS changes.
+
+--- Comment (prakash, Thu, 24 Jan 2013 20:49:19 +0000) ---
+I see the same behavior with revision 4 on the VM cluster I set up, as I did with revision 3. I'll post the lustre debug log from the MDS with "-1" set, but I still think the error is coming from mdt_body_unpack as I mentioned in a comment above. I also tested with ldiskfs, and that does work, so the error is specific to the ZFS OSD.
+
+--- Comment (morrone, Thu, 24 Jan 2013 19:39:46 +0000) ---
+Does not appear to work.  Both 2.3.59-based ppc64 clients and 2.1.2 x86_64 clients fail to mount.  Error on 2.1.2 x86_64 client is:
+
+Lustre: Server MGS version (2.3.59.0) is much newer than client version. Consider upgrading client (2.1.2)
+Lustre: Skipped 768 previous similar messages
+LustreError: 9002:0:(mgc_request.c:247:do_config_log_add()) failed processing sptlrpc log: -2
+LustreError: 9002:0:(llite_lib.c:498:client_common_fill_super()) md_getattr failed for root: rc = -2
+Lustre: Unmounted lsfull-client
+LustreError: 9002:0:(obd_mount.c:2198:lustre_fill_super()) Unable to mount  (-2)
+
+and 2.3.59 ppc64 clients say:
+
+Lustre: Lustre: Build Version: 2.3.59-1chaos4morrone-1chaos4morrone--PRISTINE-2.6.32-220.23.3.bgq.18llnl.V1R1M2.bgq62_16.ppc64
+LNet: Added LNI 172.20.12.1@o2ib500 [8/256/0/180]
+Lustre: Layout lock feature supported.
+LustreError: 3469:0:(llite_lib.c:508:client_common_fill_super()) lsfull-clilmv-c0000003c6081c00: md_getattr failed for root: rc = -2
+LustreError: 3309:0:(lov_obd.c:473:lov_notify()) event(2) of lsfull-OST0209_UUID failed: -22
+LustreError: 3309:0:(lov_obd.c:473:lov_notify()) event(2) of lsfull-OST0210_UUID failed: -22
+LustreError: 3309:0:(lov_obd.c:473:lov_notify()) Skipped 4 previous similar messages
+Lustre: Unmounted lsfull-client
+LustreError: 3469:0:(obd_mount.c:2991:lustre_fill_super()) Unable to mount  (-2)
+
+--- Comment (morrone, Thu, 24 Jan 2013 17:16:53 +0000) ---
+We will test it.
+
+--- Comment (di.wang, Thu, 24 Jan 2013 16:55:13 +0000) ---
+I just tried this patch http://review.whamcloud.com/#change,5134  with 2.1 client and ZFS server. It works for me now
+
+Client 2.1.4
+
+[root@client1 tests]# cat /proc/fs/lustre/version 
+lustre: 2.1.4
+kernel: patchless_client
+build:  2.1.4--PRISTINE-2.6.32
+[root@client1 tests]# mount | grep lustre
+/work/lustre-release.0118/lustre/utils/mount.lustre on /sbin/mount.lustre type none (rw,bind)
+mds:/lustre on /mnt/lustre type lustre (rw)
+
+Server: 2.3.59 + patch 5134
+
+[root@mds tests]# mount | grep lustre
+/work/lustre-release/lustre/utils/mount.lustre on /sbin/mount.lustre type none (rw,bind)
+lustre-mdt1/mdt1 on /mnt/mds1 type lustre (rw)
+lustre-ost1/ost1 on /mnt/ost1 type lustre (rw)
+lustre-ost2/ost2 on /mnt/ost2 type lustre (rw)
+[root@mds tests]# ../utils/lctl get_param version
+version=
+lustre: 2.3.59
+kernel: patchless_client
+build:  2.3.59-gf86e9d4-CHANGED-2.6.32
+[root@mds tests]#
+
+--- Comment (di.wang, Thu, 24 Jan 2013 16:01:52 +0000) ---
+I just checked ZFS code carefully, I think the problem is here. 
+
+diff --git a/lustre/osd-zfs/osd_oi.c b/lustre/osd-zfs/osd_oi.c
+index e629821..79f4511 100644
+--- a/lustre/osd-zfs/osd_oi.c
++++ b/lustre/osd-zfs/osd_oi.c
+@@ -178,7 +178,8 @@ uint64_t osd_get_name_n_idx(const struct lu_env *env, struct osd_device *osd,
+                zapid = osd_get_idx_for_ost_obj(env, osd, fid, buf);
+        } else if (fid_is_last_id(fid)) {
+                zapid = osd->od_ost_compat_grp0;
+-       } else if (unlikely(fid_seq(fid) == FID_SEQ_LOCAL_FILE)) {
++       } else if (unlikely(fid_seq(fid) == FID_SEQ_LOCAL_FILE) ||
++                  fid_is_root(fid)) {
+                /* special objects with fixed known fids get their name */
+                char *name = oid2name(fid_oid(fid));
+
+I missed one case check inside zfs code.  Sure I will test this with 2.1 client + ZFS server.
+
+--- Comment (morrone, Thu, 24 Jan 2013 15:01:36 +0000) ---
+Please test from an unpatched 2.1 client too, and zfs on the server.  Otherwise, I don't think you are testing the right things.
+
+--- Comment (di.wang, Thu, 24 Jan 2013 14:38:14 +0000) ---
+I used 2.3.59 on all of nodes, but I revert those FLDB changes on the client side. And use 2.1 ldiskfs format disk here, (since my ZFS environment has some problem here). Initially I met the same problem as you described, but with the patch, the problem can be fixed here.
+
+--- Comment (prakash, Thu, 24 Jan 2013 12:56:51 +0000) ---
+What versions are you using for the client, MDS, and OSS? I still see the same error with revision 3 of that patch.
+
+--- Comment (di.wang, Wed, 23 Jan 2013 18:07:22 +0000) ---
+I just updated the patchz9 http://review.whamcloud.com/#change,5134), and it works for me locally. Could you please try this. If it still failed, could you please provide -1 debug log on the MDS side?
+
+--- Comment (prakash, Wed, 23 Jan 2013 17:44:00 +0000) ---
+Change FID_SEQ_SPECIAL to FID_SEQ_ROOT
+
+I tried this as well, and see the same error.
+
+For example:
+
+ static inline void lu_root_fid(struct lu_fid *fid)
+ {
+-       fid->f_seq = FID_SEQ_SPECIAL;
+-       fid->f_oid = 0;
++       fid->f_seq = FID_SEQ_ROOT;
++       fid->f_oid = 1;
+        fid->f_ver = 0;
+ }
+
+As far as I can tell, it's coming from the inlined mdt_body_unpack function:
+
+client
+
+$ sudo stap /usr/share/doc/systemtap-client-1.7/examples/general/para-callgraph.stp 'module("mdc").function("*")' 'module("lustre").function("ll_fill_super")' -c "mount /p/lustre"
+...
+     0 mount.lustre(30320):->mdc_getattr exp=0xffff8800259e6400 op_data=0xffff8800258b7e00 request=0xffff88003c297c00
+    18 mount.lustre(30320): ->mdc_pack_body req=0xffff880005c33800 fid=0xffff8800258b7e00 oc=0x0 valid=0x28001016fff ea_size=0x0 suppgid=0xffffffff flags=0x0
+    24 mount.lustre(30320):  ->__mdc_pack_body b=0xffff88003dda82e8 suppgid=0xffffffff
+    28 mount.lustre(30320):  mdc_pack_capa req=0xffff880005c33800 field=0xffffffffa09ee2c0 oc=0x0
+    41 mount.lustre(30320):  mdc_getattr_common exp=0xffff8800259e6400 req=0xffff880005c33800
+   870 mount.lustre(30320): 
+
+MDS
+
+$ sudo /usr/share/doc/systemtap-client-1.7/examples/general/para-callgraph.stp 'module("mdt").function("*")' 'module("mdt").function("mdt_handle_common")'
+...
+     0 mdt00_002(25607):->mdt_unpack_req_pack_rep info=0xffff88007bbe8000 flags=0x1
+     7 mdt00_002(25607): ->mdt_object_find env=0xffff88007b6ca380 d=0xffff880073b78000 f=0xffffc900049b40e8
+    17 mdt00_002(25607):  ->mdt_obj o=0xffff88000ee621c8
+    22 mdt00_002(25607):  mdt_object_put env=0xffff88007b6ca380 o=0xffff88000ee62170
+    33 mdt00_002(25607): 
+
+mdt_body_unpack
+
+2691                 if ((flags & HABEO_CORPUS) &&                                   
+2692                     !mdt_object_exists(obj)) {                                  
+2693                         mdt_object_put(env, obj);                               
+2694                         /* for capability renew ENOENT will be handled in       
+2695                          * mdt_renew_capa */                                    
+2696                         if (body->valid & OBD_MD_FLOSSCAPA)                     
+2697                                 rc = 0;                                         
+2698                         else                                                    
+2699                                 rc = -ENOENT;
+
+--- Comment (di.wang, Wed, 23 Jan 2013 17:12:21 +0000) ---
+Hmm, there is another defect pointed by Andreas, you probably should change that too.
+
+static inline void lu_root_fid(struct lu_fid *fid)
+{
+	      fid->f_seq = FID_SEQ_SPECIAL;
+Andreas Dilger	(defect?) Hmm, shouldn't this be FID_SEQ_ROOT?
+517	»       fid->f_oid = 0;
+Andreas Dilger	Would it be better for f_oid != 0 to avoid the need for special casing
+518	»       fid->f_ver = 0;
+}
+
+Change FID_SEQ_SPECIAL to FID_SEQ_ROOT.  I will update the patch soon. Thanks
+
+--- Comment (prakash, Wed, 23 Jan 2013 15:43:02 +0000) ---
+I applied this patch to the MDS in my VM filesystem:
+
+diff --git i/lustre/include/lustre/lustre_idl.h w/lustre/include/lustre/lustre_idl.h
+index 96b9a3f..9033ca3 100644
+--- i/lustre/include/lustre/lustre_idl.h
++++ w/lustre/include/lustre/lustre_idl.h
+@@ -514,7 +514,7 @@ static inline int fid_is_root(const struct lu_fid *fid)
+ static inline void lu_root_fid(struct lu_fid *fid)
+ {
+        fid->f_seq = FID_SEQ_SPECIAL;
+-       fid->f_oid = 0;
++       fid->f_oid = 1;
+        fid->f_ver = 0;
+ }
+
+And now the client running a 2.3.54 based tag is failing here:
+
+LustreError: 27063:0:(llite_lib.c:504:client_common_fill_super()) md_getattr failed for root: rc = -2
+
+Prior to the patch the client would fail the same way as the 2.1 client:
+
+LustreError: 15266:0:(llite_lib.c:472:client_common_fill_super()) Invalid root fid during mount
+
+--- Comment (di.wang, Wed, 23 Jan 2013 15:22:57 +0000) ---
+Ah, I did not realize fid_oid(fid) != 0 check in 2.1. I will update the patch to not use 0_oid root fid. Thanks.
+
+--- Comment (prakash, Tue, 22 Jan 2013 20:32:54 +0000) ---
+As Andreas pointed out, I think the issue is that fid_oid(fid) returns 0 for the root fid. fid_is_sane in 2.1:
+
+ 742 static inline int fid_is_sane(const struct lu_fid *fid)                         
+ 743 {                                                                               
+ 744         return                                                                  
+ 745                 fid != NULL &&                                                  
+ 746                 ((fid_seq(fid) >= FID_SEQ_START && fid_oid(fid) != 0            
+ 747                                                 && fid_ver(fid) == 0) ||        
+ 748                 fid_is_igif(fid));                                              
+ 749 }  
+
+If fid_oid(fid) was non zero, I'd imagine the function would return true.
+
+--- Comment (di.wang, Tue, 22 Jan 2013 20:08:15 +0000) ---
+Hmm, sorry, I was wrong here "((fid_seq(fid) >= FID_SEQ_START && fid_ver(fid) == 0)" should be able to validate the new special root fid. Maybe fid_ver is contaminated somewhere for ZFS, I will check.
+
+--- Comment (di.wang, Tue, 22 Jan 2013 19:23:07 +0000) ---
+Ah, I see where is the problem. old client still use the old fid_is_sane to validate the root_fid in client_common_fill_super, which does not include special sequence FID. So the old client would consider the new root fid to be invalid (see fid_is_sane).
+
+(code snippet to fix this for new client)
+
+         return (seq >= FID_SEQ_NORMAL);
+@@ -792,7 +825,8 @@ static inline int fid_is_sane(const struct lu_fid *fid)
+        return fid != NULL &&
+               ((fid_seq(fid) >= FID_SEQ_START && fid_ver(fid) == 0) ||
+               fid_is_igif(fid) || fid_is_idif(fid) ||
+-              fid_seq_is_rsvd(fid_seq(fid)));
++              fid_seq_is_rsvd(fid_seq(fid)) ||
++              fid_seq_is_special(fid_seq(fid)));
+ }
+
+I need think how to fix this for the old client.
+
+--- Comment (di.wang, Tue, 22 Jan 2013 19:01:44 +0000) ---
+Any error console msg from MDS side?
+
+--- Comment (morrone, Tue, 22 Jan 2013 18:45:15 +0000) ---
+"mv" is still broken as well.  Client is running 2.3.58-5chaos, server running 2.3.59 + rev2 of your patch.  So no visible improvement from the patch.
+
+--- Comment (morrone, Tue, 22 Jan 2013 18:15:29 +0000) ---
+Before your patch, a 2.1.2-4chaos client would say this on trying to mount 2.3.58-whatever:
+
+2013-01-17 17:05:01 LustreError: 10409:0:(obd_mount.c:2198:lustre_fill_super()) Unable to mount  (-5)
+2013-01-17 17:05:11 LustreError: 11577:0:(mgc_request.c:247:do_config_log_add()) failed processing sptlrpc log: -2
+2013-01-17 17:05:11 LustreError: 11577:0:(lmv_fld.c:75:lmv_fld_lookup()) Error while looking for mds number. Seq 0x200000001, err = -5
+2013-01-17 17:05:11 LustreError: 11577:0:(llite_lib.c:498:client_common_fill_super()) md_getattr failed for root: rc = -5
+2013-01-17 17:05:12 Lustre: Unmounted ls1-client
+
+Now, 2.1.2-4chaos trying to mount 2.0.39 plus patch set 2 of your patch 5134 says:
+
+2013-01-22 14:49:06 Lustre: Server MGS version (2.3.59.0) is much newer than client version. Consider upgrading client (2.1.2)
+2013-01-22 14:49:06 LustreError: 2636:0:(mgc_request.c:247:do_config_log_add()) failed processing sptlrpc log: -2
+2013-01-22 14:49:06 Lustre: Server lsfull-MDT0000_UUID version (2.3.59.0) is much newer than client version. Consider upgrading client (2.1.2)
+2013-01-22 14:49:06 LustreError: 2636:0:(llite_lib.c:466:client_common_fill_super()) Invalid root fid during mount
+2013-01-22 14:49:07 Lustre: Unmounted lsfull-client
+
+Since your patch talks about changing the root fid and the error is about an invalid root fid, I'm guessing there is a connection.
+
+--- Comment (di.wang, Sun, 20 Jan 2013 16:18:06 +0000) ---
+Prakash: Here is the fix http://review.whamcloud.com/#change,5134 , Could you please try it? Thanks
+
+--- Comment (prakash, Fri, 18 Jan 2013 13:46:08 +0000) ---
+I'm reopening this ticket because I think we're hitting an issue due to the changes made in 4396.
+
+We've updated our MDS on Grove to a 2.3.58 based tag, and now we're having issue mounting the FS on our clients, and the clients which survived the upgrade can't mv files around.
+
+# oslic1 /root > mount /p/sequoia_fs1
+mount.lustre: mount grove-mds1-lnet0@o2ib500:/ls1 at /p/sequoia_fs1 failed: Input/output error
+
+seqlac2@root:ls -l
+-rw-rw-rw-   1 root   root       0 Jan 18 10:44 new
+drwx------   2 root   root    5632 Jan 18 10:44 test
+
+seqlac2@root:mv new test
+mv: cannot move `new' to `test/new': Input/output error
+
+I used systemtap to track the issue down to this -EIO returned in fld_server_lookup:
+
+# grove-mds1 /root > stap /usr/share/doc/systemtap-1.6/examples/general/para-callgraph.stp 'module("fld").function("*")' 'module("fld").function("fld_query")'                                                                                                                                                                                                                                                                           
+     0 mdt_fld_0001(27300):->fld_server_lookup env=0xffff882fdebf1f80 fld=0xffff882ff14b00c0 seq=0x200000001 range=0xffff8813753613e8
+    10 mdt_fld_0001(27300): ->fld_cache_lookup cache=0xffff882ffd74a0c0 seq=0x200000001 range=0xffff882fb88f1268
+    17 mdt_fld_0001(27300): 
+
+fld_server_lookup
+
+164         if (fld->lsf_obj) {                                                     
+165                 /* On server side, all entries should be in cache.              
+166                  * If we can not find it in cache, just return error */         
+167                 CERROR("%s: Can not found the seq "LPX64"\n",                   
+168                         fld->lsf_name, seq);                                    
+169                 RETURN(-EIO);                                                   
+170         } else {
+
+--- Comment (adilger, Wed, 9 Jan 2013 13:33:31 +0000) ---
+Patch to move range lookups to FLD has been landed.
+
+--- Comment (di.wang, Fri, 21 Dec 2012 13:48:15 +0000) ---
+http://review.whamcloud.com/#change,4396

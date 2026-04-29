@@ -1,0 +1,138 @@
+Key:        LU-14519
+Summary:    Cascading evictions due to lock timeouts when some of the servers are unhealthy
+Link:       https://jira.whamcloud.com/browse/LU-14519
+Type:       New Feature
+Priority:   Critical
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Oleg Drokin
+Created:    Sat, 13 Mar 2021 01:21:36 +0000
+Updated:    Tue, 25 Apr 2023 10:38:46 +0000
+Links:      Related: is related to  LU-16770
+
+--- Description ---
+This is to capture my discussion with vitaly_fertman and perhaps let other interested parties to chime in.
+
+We have a bit of a problem that some operations require multiple locks held from multiple targets (e.g. writes under O_APPEND opened files, truncate, striped dir operations, ...) when one or more of the targets goes down. Partially acquired locks are then subject to conflicts, but could not be released by the clients that hold them due to being stuck trying to acquire the other locks or trying to flush some state to other servers and the like.
+
+Now while it's possible to proclaim "let's get rid of such dependencies", it seems to be mostly a pipe dream, esp. considering potential second and third order inter-dependencies (see LU-13131 as an example).
+
+Some might advocate that "let's just increase ldlm lock cancel timeout universally" and while that would help some, it would also not help entirely in situations when servers take extremely long time to come back up or if there are genuine client side problems with deadlocks or other logic flaws.
+
+Here's my rough idea of how this could be solved that most likely needs additional fleshing out:
+
+disable evicting clients for lock cancel timeouts as long as there are "unhealthy" targets in the system (either down or in recovery).
+
+MGS would be tasked with determining this state and distributing it to servers.
+
+There are multiple approaches to how it could get this information, from mundane HA monitoring already universally in place to detect dead servers and trigger failover (but not telling other Lustre parts about it) to advanced "health network" implementations of the future.
+
+Additionally it's possible to implement more rapid ping evictor mechanism between MGS and servers if desired.
+
+An extra change would be needed to notify MGS when servers voluntarily go down (esp. if for failover).
+
+Notably this is only half the problem. The other half is if we allow locks to be indefinitely stuck while servers are in failover - that would quickly lead to all available server threads stuck waiting for such locks.
+
+To address this second I propose we'll need to mark resources that encountered such "stuck" locks in a special way. any attempts at getting server side locks in there would return with some error similar to EAGAIN that would then be always leading to abort of current operation processing and result in returning the EAGAIN or similar state backto the client to be retried at some later time.
+
+It is ok to allow normal (non intent) client lock requests  on such resources since this does not plug a server thread and instead returns ungranted lock to the client without plugging a server thread (granted there re timeout implications here too so it might also be possible to universally turn away any lock requests to such resources)
+
+And lastly there's a potential AT consideration where we might want to exclude elevated processing time for requests while the cluster is unhealthy though considering AT self corrects withing 600 seconds, it might not be ass important.
+
+--- Comment (vitaly_fertman, Tue, 3 Aug 2021 21:42:16 +0000) ---
+after giving it more thoughts I have a couple more ideas:
+
+first of all, once more why lock callback timeout is needed:
+
+1. deadlock on ldlm locks
+
+2. client error - client side deadlock or not going to send proper RPCs to servers
+
+3. unhealthy target 
+
+why already not needed:
+
+4. dead client - leaving it for pinger to resolve
+
+and in contrast:
+
+5. everything is very slow (resends) or a lot of work (wide striping)
+
+== idea #1.
+
+this is what was discussed above. leaving lock callback timeout (LCT) relatively small and introduce prolong RPCs to extend it while a slow IO (5) is in progress. such prolong is sent only if a new step is completed by an IO job. e.g. if a client gets stuck on a mutex - no progress, no prolong. 
+
+== idea #2.
+
+It is pity that in a case of unhealthy targets (3) the client keep trying to connect and gets evicted finally (no new steps completed, no progress, no prolong) - it was not this client fault. therefore, prolong RPC only is not enough. Oleg already suggested to inform servers about an unhealthy one through MGS and disable LCT, but it leads to locks stuck in cluster. I have another idea:
+
+Client could control how connect is going, and in case of connect timeouts/errors, it does not repeat endlessly but have a global timeout for establishing a connection or connection counter. once expired:
+
+	for expired enqueue RPC, we can interrupt, exit with ERESTARTSYS and restart the IO;
+
+	for expired trunc or append DIO, interrupt the IO and exit with an error;
+
+	for expired appeand BIO, IO is finished and locks are unpinned - not a problem.
+
+it let to avoid evictions at all in case of unhealthy target,
+
+also no even errors on enqueue phase (which takes most of the time)
+
+== idea #3.
+
+While waiting for an RPC (enqueue, trunc, connect) timeout, despite the fact there is no progress, the prolong mechanism must guarantee we have it prolonged until RPC completion or timeout, and then a decision if the prolongation is to be disabled is made.
+
+== idea #4
+
+An interesting case here is a lock completion. in contrast to RPC reply, it may take much longer time to come, especially with this prolong mechanism. If not to prolong, the client will be evicted while the other conflicting client is slowly progressing. if to prolong, deadlock until LCT hard limit expires.  An idea here is to introduce a client side timeout similar to the idea #2, which would be of the same order of magnitude as the current server-side LCT. And once expired, interrupted and restarted as above. while not expired, keep prolong going.
+
+this way we can avoid evictions.
+
+and ldlm deadlock will be resolved too. 
+
+== idea #5.
+
+Due to #3 and #4, another idea appears.
+
+instead of introducing a cross osc lock chain, we may tell ldlm at the beginning of IO (cl_io_lock) - do prolong for this IO locks until said opposite. and cancel this instruction at the end (cl_io_unlock). the implementation looks more simple.
+
+a possible downside is an error in the code (2), eviction will occur on LCT hard limit in this case, as prolong will keep going. as this is an error case it might be considered as OK. the potential problem Oleg pointed to here is inability to get logs for this whole very long period of time.
+
+thoughts ?
+
+--- Comment (vitaly_fertman, Thu, 15 Jul 2021 15:56:21 +0000) ---
+another problem here happens on a healthy cluster, having 256 stripes it is enough to have 1-2 resends for enqueues while trying to get all these locks ordered to get lock cb timeout on the first lock.
+
+--- Comment (vitaly_fertman, Mon, 15 Mar 2021 21:00:21 +0000) ---
+the problem concerns not only lock enqueue but an operation under the taken locks. what means we cannot simply return ERESTATRTSYS and re-try as we need to remember the used xid's and re-use them, otherwise who knows if the operation has been already applied to the server the the retry will be just a new one.
+
+the approach Oleg suggests looks problematic because it requires some time to detect a node failure, report it to MGS, report it server wide. the AT which may be even gathered somewhere is unknown to the current node which is waiting for a lock cancel, thus it is 3 obd_timeout (ok, considering just 1 delivery failure at a time - 1 obd_timeout) - by this time the client will be already evicted.
+
+having this in mind, I also suggested Oleg what Andreas described above - the problem client has the AT of communication with all the servers are can report to the involved OSTs about an appeared failure in the system.
+
+at the same time, looking for a more simple solution, my original question was - why large enough lock callback timeout is so bad? how a small timeout may be useful? e.g.:
+
+1. dead client detection: in fact this mechanism is not about it, we have pinger.
+
+2. a limit how fast a client must resolve its problems and release a lock and if it fails, it must be evicted to let others to proceed: in fact, if the client is alive and we know it is doing something useful, we want to give it more time;
+
+3. deadlock: this seems to be the only problem this mechanism controls, but this is a program bug, once appeared - supposed to be fixed and not going to be a problem.
+
+if so, probably the only question is what if a large timeout will be not large enough to avoid evictions during failover? a simple answer could be - a tunable parameter for a dedicated system to survive just 1 server failover? or the hard failover limit ?
+
+--- Comment (green, Sat, 13 Mar 2021 05:23:20 +0000) ---
+We actually discussed ERESTARTSYS and it seems to be very nontrivial.
+
+Depending on external frameworks is not great, but we already do it so why not get some extra direct benefits and make it provide direct Lustre feedback too? Think of evict by nid that was used to preemptively evicting dead clients for example, the idea is similar and everything works even in absence of this 3rd party input. Like I said we could have internal mechanism of more frequent pings (for ping evictor to work faster for mgs) + proactive notifications by targets when they go down.
+
+--- Comment (adilger, Sat, 13 Mar 2021 01:36:22 +0000) ---
+I think there are a few options here:
+
+	have clients respond to the blocking callbacks with a state that indicates those locks are blocked because of a lock on another server. However, that is tricky in the current code since it needs the client be able to determine which thread is blocked on another server, and which locks it is currently holding.
+
+	to implement the above, it would be possible for clients to keep a list of locks that they are currently holding in their lu_env, and if they are blocked on another lock for a long time they can at least send an update for those locks to the server
+
+	added to the above, if the thread is blocked on a server while holding any locks on other servers, they fail the call with -ERESTARTSYS and drop all of the locks and restart the syscall. This is more complex, but there are very few places that a client is holding multiple locks and they should be "well known" in any case.
+
+Depending on an external framework for correctness is not great, IMHO.

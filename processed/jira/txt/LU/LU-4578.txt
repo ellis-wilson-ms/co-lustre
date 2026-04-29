@@ -1,0 +1,167 @@
+Key:        LU-4578
+Summary:    Early replies do not honor at_max
+Link:       https://jira.whamcloud.com/browse/LU-4578
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Cliff White
+Reporter:   Chris Horn
+Created:    Mon, 3 Feb 2014 21:16:23 +0000
+Updated:    Fri, 17 Oct 2014 18:41:13 +0000
+Resolved:   Thu, 8 May 2014 14:52:44 +0000
+Labels:     mn4, patch
+Links:      Related: is related to LU-5077; Related: is related to LU-5079
+
+--- Description ---
+There seems to be a flaw in the logic which extends the request deadline when sending early reply. This bit of code is supposed to check whether we're able to extend the deadline:
+
+                /* Fake our processing time into the future to ask the clients
+                 * for some extra amount of time */
+                at_measured(&svcpt->scp_at_estimate, at_extra +
+                            cfs_time_current_sec() -
+                            req->rq_arrival_time.tv_sec);
+
+                /* Check to see if we've actually increased the deadline -
+                 * we may be past adaptive_max */
+                if (req->rq_deadline >= req->rq_arrival_time.tv_sec +
+                    at_get(&svcpt->scp_at_estimate)) {
+                        DEBUG_REQ(D_WARNING, req, "Couldn't add any time "
+                                  "(%ld/%ld), not sending early reply\n",
+                                  olddl, req->rq_arrival_time.tv_sec +
+                                  at_get(&svcpt->scp_at_estimate) -
+                                  cfs_time_current_sec());
+                        RETURN(-ETIMEDOUT);
+                }
+
+This logic looks sound to me. The service estimate is bounded by at_max, so arrival time + service estimate is guaranteed to be less than or equal to at_max seconds after arrival time. If the current deadline is equal or greater than that, we cannot extend the deadline. The problem is with calculating the new deadline when the current deadline is less than the arrival time + service estimate sum:
+
+        newdl = cfs_time_current_sec() + at_get(&svcpt->scp_at_estimate);
+
+Here we offset the current time rather than the arrival time. This is not only inconsistent with the above logic, but it can also result in a situation where we extend the deadline well past at_max seconds from the arrival time. In one instance we noticed timeouts on servers of 1076 seconds, and associated timeouts on clients of over 1300 seconds.
+
+Similarly, on the client side, when an early reply is received we currently extend the deadline thusly:
+
+        req->rq_deadline = cfs_time_current_sec() + req->rq_timeout +
+                           ptlrpc_at_get_net_latency(req);
+
+There are two things I think are potentially wrong with this. The first is that we again are offsetting the current time rather than, say, rq_sent or rq_arrival, which would make more sense to me. Secondly, and more importantly, the sum of req->rq_timeout and net latency can exceed at_max seconds. If my reading of the code is correct, both rq_timeout and net latency are bounded by at_max, so in worst case the sum could be 2*at_max.
+
+I plan to push a patch to fix the server side issue.
+
+-	newdl = cfs_time_current_sec() + at_get(&svcpt->scp_at_estimate);
++	newdl = req->rq_arrival_time.tv_sec + at_get(&svcpt->scp_at_estimate);
+
+One concern I have with this change is how it might affect things during recovery. I'm not as familiar with the recovery mode, so there may be some assumptions in there that this patch violates. Hopefully Maloo will let me know if this is the case 
+
+I have similar patch for the client side
+
+-	req->rq_deadline = cfs_time_current_sec() + req->rq_timeout +
+-			   ptlrpc_at_get_net_latency(req);
++	req->rq_deadline = req->rq_sent + min_t(int, at_max, req->rq_timeout +
++						ptlrpc_at_get_net_latency(req));
+
+Same sort of concern w.r.t recovery mode. For now, I'm just planning on pushing the server side change. Thanks in advance for any feedback.
+
+--- Comment (simmonsja, Mon, 19 May 2014 16:34:32 +0000) ---
+Landed for b2_5 as well.
+
+--- Comment (cliffw, Fri, 9 May 2014 16:40:52 +0000) ---
+The patch has been landed in master, b2_5 version still waiting for reviewers.
+
+--- Comment (pjones, Thu, 8 May 2014 14:52:44 +0000) ---
+Landed for 2.6. Will consider separately for b2_4 and b2_5 branches
+
+--- Comment (simmonsja, Tue, 6 May 2014 14:10:53 +0000) ---
+Cherry picked for b2_5 - http://review.whamcloud.com/#/c/10230
+
+--- Comment (simmonsja, Wed, 30 Apr 2014 15:05:05 +0000) ---
+More results from testing last night. I found this patch doesn't completely eliminate the client evictions but it does greatly reduce their occurrence.This is a still a great patch to land to master as well as b2_5.
+
+--- Comment (simmonsja, Tue, 29 Apr 2014 22:16:52 +0000) ---
+First I created a directory of stripe count 56 i.e test_ior and run the below command.
+
+aprun -n 288 /lustre/sultan/scratch/jsimmons/IOR -a POSIX -i 5 -C -v -g -w -r -e -b 1024m -t 4m -o /lustre/sultan/scratch/jsimmons/test_ior/testfile.out
+
+Without this patch the job would fail and the compute nodes would be evicted.
+
+Ticket LU-4963 has a similar reproducer.
+
+--- Comment (spitzcor, Tue, 29 Apr 2014 22:03:55 +0000) ---
+James, what was your test case with single shared files?
+
+--- Comment (simmonsja, Tue, 29 Apr 2014 21:54:30 +0000) ---
+http://review.whamcloud.com/#/c/9100
+
+Tried this patch and the client evictions I was experiencing went way.
+
+--- Comment (tappro, Wed, 16 Apr 2014 05:30:15 +0000) ---
+Yes, I tend to agree, at_measured() sets new at_current with honoring the at_max, so new deadline will be extended up to that value.
+
+--- Comment (hornc, Mon, 14 Apr 2014 17:21:32 +0000) ---
+Mikhail, thanks for taking a look at this.
+
+if you change its logic to be always arrival_time + at_get then it is just stay unchanged after early reply.
+
+arrival_time + at_get is not constant. The service estimate is increased each time we send an early reply:
+
+                /* Fake our processing time into the future to ask the clients
+                 * for some extra amount of time */
+                at_measured(&svcpt->scp_at_estimate, at_extra +
+                            cfs_time_current_sec() -
+                            req->rq_arrival_time.tv_sec);
+
+Meanwhile I don't see how that dishonor at_max? The rq_deadline is checked against arrival time and cannot exceed at_max, at least on server.
+
+As I said in the original ticket description, the problem is not in checking the current rq_deadline. The problem is when we calculate the new deadline. Here's an example from a customer system:
+
+Jan 17 11:35:56 snx11061n059 kernel: [240061.551119] Lustre: 12824:0:(service.c:1138:ptlrpc_at_send_early_reply()) @@@ Couldn't add any time (5/-471), not sending early reply
+
+In this instance we can see:
+
+ olddl = req->rq_deadline - cfs_curr_time() = 5
+
+and
+
+ req->rq_arrival_time.tv_sec + at_get(&svcpt->scp_at_estimate) - cfs_curr_time() = -471
+
+We can simplify things by using an arrival time of 0, and service estimate of max value 600 seconds. In this case we have:
+
+req->rq_arrival_time.tv_sec + at_get(&svcpt->scp_at_estimate) - cfs_curr_time() =
+0 + 600 - cfs_curr_time() = -471
+cfs_curr_time = 471 + 600 = 1071
+and
+req->rq_deadline = 5 + cfs_curr_time() = 5 + 1071 = 1076
+
+So, our deadline is 1076 seconds after the arrival time. Indeed, this was the case for several rpcs on the server. For example,
+
+Jan 17 11:35:56 snx11061n059 kernel: [240061.551119] Lustre: 12824:0:(service.c:1138:ptlrpc_at_send_early_reply()) @@@ Couldn't add any time (5/-471), not sending early reply
+Jan 17 11:35:56 snx11061n059 kernel: [240061.551122]   req@ffff88058bcd0800 x1457392512529764/t0(0) o3->b7ded670-aa13-1196-967c-72a7a3cb5c3d@3627@gni:0/0 lens 488/400 e 3 to 0 dl 1389958561 ref 2 fl Interpret:/0/0 rc 0/0
+Jan 17 11:35:56 snx11061n059 kernel: [240061.579690] Lustre: 12824:0:(service.c:1138:ptlrpc_at_send_early_reply()) Skipped 57 previous similar messages
+Jan 17 11:36:01 snx11061n059 kernel: [240066.648048] LustreError: 11673:0:(ldlm_lib.c:2821:target_bulk_io()) @@@ timeout on bulk PUT after 1076+0s  req@ffff88058bcd0800 x1457392512529764/t0(0) o3->b7ded670-aa13-1196-967c-72a7a3cb5c3d@3627@gni:0/0 lens 488/400 e 3 to 0 dl 1389958561 ref 1 fl Interpret:/0/0 rc 0/0
+
+Okay, so we know that the request deadline was postponed several times until it was well over at_max seconds, and we can see why it stopped at 1076. The remaining question is how it got the 1076 value in the first place.
+
+We can see from the earlier discussion that as long as the current deadline is less than arrival + service estimate seconds, then the server will send the early reply and extend the deadline. If the service estimate is maxed out at at_max seconds (600), then a deadline anywhere between 0 and 599 seconds after arrival time will be extended, and in this case it will be extended by 600 seconds
+
+         newdl = cfs_time_current_sec() + at_get(&svcpt->scp_at_estimate);
+
+So, if we happen to enter ptlrpc_at_send_early_reply() 476 seconds after the request arrived, and our service estimate is currently 600 seconds, then our new deadline will be 1076 seconds.
+
+--- Comment (tappro, Sat, 12 Apr 2014 20:35:38 +0000) ---
+Chris, as I understand the deadline is supposed to be increased upon sending early reply, if you change its logic to be always arrival_time + at_get then it is just stay unchanged after early reply. That is why there is current_sec() is used - just to extend deadline, the client is notified about that as well and keeps the same logic.
+
+Meanwhile I don't see how that dishonor at_max? The rq_deadline is checked against arrival time and cannot exceed at_max, at least on server. Could you specify how exactly at_max can be exceeded? I tend to think right now that it is not about rq_deadline, but we need to check at_max is not exceeded explicitly in the place where that may happens.
+
+--- Comment (hornc, Tue, 18 Feb 2014 18:12:35 +0000) ---
+I pushed a revised version of my client side patch to gerrit: http://review.whamcloud.com/#/c/9298/
+
+I dropped the capping of rq_timeout + net_latency, but changed from offsetting current time to offsetting the rq_sent time. The thought is that this is more in line with rq_arrival time which the server is offsetting.
+
+--- Comment (hornc, Tue, 18 Feb 2014 17:02:05 +0000) ---
+Has anyone had a chance to look at this?
+
+--- Comment (hornc, Mon, 3 Feb 2014 21:26:26 +0000) ---
+For your consideration:
+
+http://review.whamcloud.com/9100

@@ -1,0 +1,204 @@
+Key:        LU-15934
+Summary:    client refused mount with -EAGAIN because of missing MDT-MDT llog connection
+Link:       https://jira.whamcloud.com/browse/LU-15934
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Yang Sheng
+Reporter:   Andreas Dilger
+Created:    Sun, 12 Jun 2022 01:12:44 +0000
+Updated:    Tue, 23 Apr 2024 02:33:25 +0000
+Resolved:   Wed, 28 Jun 2023 22:40:00 +0000
+Links:      Related: is related to LU-15938; Related: is related to LU-16159; Related: is related to LU-17365
+
+--- Description ---
+New clients were unable to establish a connection to the MDT, even after recovery had been aborted due to an llog context not being set up properly.  The clients were permanently getting -11 = -EAGAIN errors from the server:
+
+(service.c:2298:ptlrpc_server_handle_request()) Handling RPC req@ffff8cdd37ad0d80 pname:cluuid+ref:pid:xid:nid:opc:job mdt09_0
+01:0+-99:4093:x1719493089340032:12345-10.16.172.159@tcp:38:
+(service.c:2303:ptlrpc_server_handle_request()) got req 1719493089340032
+(tgt_handler.c:736:tgt_request_handle()) Process entered
+(ldlm_lib.c:1100:target_handle_connect()) Process entered
+(ldlm_lib.c:1360:target_handle_connect()) lfs02-MDT0003: connection from 16778a5c-5128-4231-8b45-426adc7e94b6@10.16.172.159@tcp t55835524055 exp           (null) cur 51537 last 0
+(obd_class.h:831:obd_connect()) Process entered
+(mdt_handler.c:6671:mdt_obd_connect()) Process entered
+(lod_dev.c:2136:lod_obd_get_info()) lfs02-MDT0003-mdtlov: lfs02-MDT0001-osp-MDT0003 is not ready.
+(lod_dev.c:2145:lod_obd_get_info()) Process leaving (rc=18446744073709551605 : -11 : fffffffffffffff5)
+(ldlm_lib.c:1446:target_handle_connect()) Process leaving via out (rc=18446744073709551605 : -11 : 0xfffffffffffffff5)
+(service.c:2347:ptlrpc_server_handle_request()) Handled RPC req@ffff8cdd37ad0d80 pname:cluuid+ref:pid:xid:nid:opc:job mdt09_001:0+-99:4093:x1719493089340032:12345-10.16.172.159@tcp:38: Request processed in 86us (124us total) trans 0 rc -11/-11
+
+This corresponds to the following block of code in lod_obd_get_info(), where it is the second "is not ready" message being printed from the missing ctxt->loc_handle:
+
+                lod_foreach_mdt(d, tgt) {
+                        struct llog_ctxt *ctxt;
+        
+                        if (!tgt->ltd_active)
+                                continue;
+               
+                        ctxt = llog_get_context(tgt->ltd_tgt->dd_lu_dev.ld_obd,
+                                                LLOG_UPDATELOG_ORIG_CTXT);
+                        if (!ctxt) {
+                                CDEBUG(D_INFO, "%s: %s is not ready.\n",
+                                       obd->obd_name,
+                                      tgt->ltd_tgt->dd_lu_dev.ld_obd->obd_name);
+                                rc = -EAGAIN;
+                                break;
+                        }
+                        if (!ctxt->loc_handle) {
+                                CDEBUG(D_INFO, "%s: %s is not ready.\n",
+                                       obd->obd_name,
+                                      tgt->ltd_tgt->dd_lu_dev.ld_obd->obd_name);
+                                rc = -EAGAIN;
+                                llog_ctxt_put(ctxt);
+                                break;
+                        }
+                        llog_ctxt_put(ctxt);
+                }
+
+It would be useful to distinguish those two messages more clearly, e.g. "ctxt is not ready" and "handle is not ready", as minor differences in line numbers would make it difficult to distinguish them in the logs.
+
+The root problem is that the MDT0003-MDT0001 connection wasn't completely set up due to abort_recovery_mdt (due to a different recovery error, LU-15761), and the MDS never retries to establish this connection, leaving the filesystem permanently unusable.  Running "lctl --device NN recover" reconnected the import, but did not actually re-establish the llog context. Mounting with "-o abort_recov_mdt" resulted in the problem moving to MDT0000 (only the first bad llog context is printed before breaking out of the loop).
+
+I think there are two issues to be addressed here:
+
+1) the MDS should try to reconnect and rebuild the llog connection in this case, at least on recover if not automatically.  there didn't appear to be any permanent reason why these llog connections were not working, just fallout from abort_recovery_mdt.  
+
+2) is it strictly necessary to block client mounting if not all MDT-MDT connections are established?  Or is no different than any other case where the MDT loses a connection after it is mounted?  The MDT recovery had already been aborted, so allowing new clients to connect shouldn't cause any issues.  Maybe this issue would be moot if (1) was fixed, but it seems otherwise counter productive.  The filesystem was apparently fully functional for clients that had previously mounted before the MDT recovery (both MDT0003/MDT0001 and MDT0001/MDT0003 remote directory creation worked fine).
+
+--- Comment (adilger, Thu, 19 Oct 2023 00:52:47 +0000) ---
+YS, can you see why mds0 was not finished recovery?  If it was making progress, then waiting longer would be OK (VM testing can be very unpredictable).  However, if it is stuck for some other reason then waiting will not help and the blocker to finish recovery needs to be fixed.
+
+--- Comment (ys, Mon, 16 Oct 2023 18:49:10 +0000) ---
+Hi, Andreas,
+
+Looks like the mds0 was still waiting for recovery. But mds1 was not blocked on lod part rather than communication. Do we need prolong the waiting time?
+
+Thanks,
+
+YangSheng
+
+--- Comment (pjones, Wed, 28 Jun 2023 22:40:00 +0000) ---
+Landed for 2.16
+
+--- Comment (gerrit, Wed, 28 Jun 2023 21:46:46 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/51208/
+
+Subject: LU-15934 tests: add a test case for update llog
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 54301fe4f598eef5aebdbdb0c7f3dddea9541c4e
+
+--- Comment (JIRAUSER17900, Sun, 25 Jun 2023 02:12:30 +0000) ---
+2023-06-25: The second patch (#49528) landed to master, the third patch(#51208) adding test case is ready to land(on master-next branch)
+
+--- Comment (gerrit, Tue, 20 Jun 2023 03:36:04 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/49528/
+
+Subject: LU-15934 lod: clear up the message
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 9882d4e933fd8cdbc4a9bc8bf6b29655009f7e03
+
+--- Comment (JIRAUSER17900, Sun, 11 Jun 2023 11:27:17 +0000) ---
+2023-06-17: The second patch (#49528) is ready to land(on master-next branch), the third patch adding test case is being reviewed
+
+--- Comment (gerrit, Sat, 3 Jun 2023 18:50:35 +0000) ---
+"Yang Sheng " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/51208
+
+Subject: LU-15934 tests: add a test case for update llog
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 48ec3ead32ff44f33997051752601009903684e9
+
+--- Comment (JIRAUSER17900, Sat, 20 May 2023 02:26:42 +0000) ---
+2023-05-20: The improving patch(#49569) landed to master, another patch(#49528) is being discussed.
+
+--- Comment (gerrit, Fri, 19 May 2023 07:00:30 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/49569/
+
+Subject: LU-15934 lod: renew the update llog
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 814691bcffab0a19240121740fb85a1912886a3c
+
+--- Comment (JIRAUSER17900, Sat, 6 May 2023 14:02:13 +0000) ---
+2023-05-13: The improving patch(#49569) is ready to land(on master-next branch).
+
+--- Comment (JIRAUSER17900, Fri, 28 Apr 2023 12:07:26 +0000) ---
+2023-04-28: The fix patch(#49569) is being improved per review feedback.
+
+--- Comment (JIRAUSER17900, Thu, 6 Apr 2023 11:51:50 +0000) ---
+2023-04-06: The fix patch(#49569) is being reviewed, may needs to be updated.
+
+--- Comment (JIRAUSER17900, Sat, 7 Jan 2023 13:08:33 +0000) ---
+2023-01-07: The fix patch(#49569) is being worked on.
+
+--- Comment (adilger, Fri, 6 Jan 2023 17:14:07 +0000) ---
+"Yang Sheng " uploaded a new patch: https://review.whamcloud.com/49569
+
+Subject: LU-15934 lod: renew the update llog
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 480a3babda9ef1eba31097031ae7c429cbc54bdc
+
+--- Comment (gerrit, Thu, 29 Dec 2022 17:52:10 +0000) ---
+"Yang Sheng " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/49528
+
+Subject: LU-15934 lod: print more detail info in fail path
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 46e9c8f1095c5c352829908453a7bd5fc223dd7a
+
+--- Comment (adilger, Wed, 14 Dec 2022 01:24:10 +0000) ---
+Hit the same issue on another system.
+
+[OI Scrub running in a loop because FID is missing]
+:
+1670963811.447855:0:28018:0:(client.c:1498:after_reply()) @@@ resending request on EINPROGRESS  req@ffff8ec49336cc80 x1752076841808640/t0(0) o1000->fs01-MDT0001-osp-MDT0000@172.16.1.10@o2ib:24/4 lens 304/4320 e 0 to 0 dl 1670963849 ref 2 fl Rpc:RQU/2/0 rc 0/-115 job:''
+:
+[OI Scrub is killed]
+:
+1670963903.447724:0:28018:0:(osp_object.c:596:osp_attr_get()) fs01-MDT0001-osp-MDT0000:osp_attr_get update error [0x900000404:0x1:0x0]: rc = -78
+1670963903.447734:0:28018:0:(lod_dev.c:425:lod_sub_recovery_thread()) fs01-MDT0001-osp-MDT0000 get update log failed: rc = -78
+1670966282.324977:0:26880:0:(lod_dev.c:2136:lod_obd_get_info()) fs01-MDT0000-mdtlov: fs01-MDT0001-osp-MDT0000 is not ready.
+
+Later when a client tries to mount the filesystem it fails due to the bad llog state causing the MDT to refuse all new connections:
+
+1670966308.517999:0:29630:0:(service.c:2298:ptlrpc_server_handle_request()) Handling RPC req@ffff8ec6734bf500 pname:cluuid+ref:pid:xid:nid:opc:job mdt02_003:0+-99:13925:x1752076850908352:12345-0@lo:38:
+1670966308.518019:0:29630:0:(ldlm_lib.c:1360:target_handle_connect()) fs01-MDT0000: connection from 5c5c267c-0fa0-4acb-b884-d5ce8cae08c2@0@lo t0 exp           (null) cur 55901 last 0
+1670966308.518036:0:29630:0:(lod_dev.c:2136:lod_obd_get_info()) fs01-MDT0000-mdtlov: fs01-MDT0001-osp-MDT0000 is not ready.
+1670966308.518038:0:29630:0:(lod_dev.c:2145:lod_obd_get_info()) Process leaving (rc=18446744073709551605 : -11 : fffffffffffffff5)
+1670966308.518040:0:29630:0:(mdd_device.c:1615:mdd_obd_get_info()) Process leaving (rc=18446744073709551605 : -11 : fffffffffffffff5)
+1670966308.518042:0:29630:0:(mdt_handler.c:6693:mdt_obd_connect()) Process leaving (rc=18446744073709551605 : -11 : fffffffffffffff5)
+1670966308.518044:0:29630:0:(ldlm_lib.c:1446:target_handle_connect()) Process leaving via out (rc=18446744073709551605 : -11 : 0xfffffffffffffff5)

@@ -1,0 +1,694 @@
+Title:        PFL2 High Level Design
+URL:          https://wiki.lustre.org/PFL2_High_Level_Design
+Page ID:      1019
+Last Updated: 2025-09-25T19:24:19Z
+Last Editor:  Adilger
+Edit Comment: fix intel URL
+
+--- Content ---
+Introduction
+The Progressive File Layout Phase 2 (PFL2) High Level Design describes details of how the PFL feature may be implemented, including the user interfaces for both the command-line as well as Lustre-aware applications, how PFL files will interact with the client-IO (CLIO) layer in the Lustre kernel VFS driver, as well as the RPC formats between the client and servers, and the interface to the underlying storage. This document further builds upon the reference documents below.
+
+This design is intended to be comprehensive for both the current PFL Phase 2 implementation, as well as a future PFL Phase 3 implementation, so some use cases describe functionality that will not be implemented as part of the PFL Phase 2 implementation, but are included here so that the overall PFL design is complete, and to ensure that functionality implemented in PFL Phase 2 is considering the longer-term implementation goals and does not need to be reworked once PFL Phase 3 implementation is started.  Design aspects that are not intended to be implemented in PFL Phase 2 are marked as such in this document or the PFL2 Scope Statement.
+
+References
+Layout Enhancement High Level Design
+
+Progressive File Layouts
+
+PFL Prototype Scope Statement
+
+PFL Prototype Solution Architecture
+
+PFL Prototype High Level Design
+
+PFL2 Scope Statement
+
+PFL2 Solution Architecture
+
+Design Overview
+There are three main components to the PFL design:
+
+-     the user-space interfaces for Lustre-specific command-line tools and user library application programming interfaces (APIs)
+-     changes to the client IO (CLIO) layer IO engine and RPC interfaces to the MDS for accessing and manipulating composite file layouts
+-     changes to the MDS server to create, modify, and delete composite files
+
+The design is structured in a top-down manner, starting with the command-line interfaces that users are going to interact with the most, then the user library APIs, the client-side kernel changes for reading, writing, and accessing PFL files, RPCs for creating and modifying composite files, and finally server-side changes.  There is also a discussion of protocol and disk format compatibility issues.
+
+Client Side Design
+User Space Interfaces
+lfs Command-line Interface
+The lfs(1) command-line interface will be extended to understand and manipulate PFL files and their component layouts.  lfs is the primary interface for end users to create new files with a specific layout, show the layout of existing files, as well as setting default layout templates on directories that will be inherited by all new files and subdirectories created therein.
+
+The lfs setstripe(1), lfs migrate(1), lfs getstripe(1), and lfs find(1) sub-commands will be extended to set and display the composite layout of a file, and to search for files with specific composite layout parameters or for components that match specific parameters. The added command-line arguments along with descriptions and examples for each of these commands is given on a dedicated man page for each sub-command linked to the name of the command, so only the synopsis and brief description of each command is shown here.
+
+lfs getstripe
+The lfs getstripe command prints some or all of the parameters of a file's layout.  This is intended for regular users and administrators to query a particular file's layout, or the individual components of a composite file to examine the layout used to create the file.
+
+ lfs getstripe [--stripe-count|-c ] [--stripe-index|-i (--directory|-d])
+     [--mdt-index|-m (--layout|-L]) [--ost|-O ] [--recursive|-r (--pool|-p]) [--stripe-size|-S (--raw|-R]) [start (--component-start)]
+     [end (--component-end|-E)] [flag (--component-flag|-F)] [id (--component-id|-I)]
+     [--quiet|-q (--component-count]) {dirname|filename} ...
+
+Without any of the option flags, this will display all the layout components, as shown below.  To limit the display to specific values of the layout, the options are largely the same as the current lfs getstripe, with new parameters for extracting attributes of composite files, such as the start and end extent of the last instantiated component, the unique component identifier, and the component attribute flags.  By default, when requesting specific values of the layout, this will print the parameters of the last instantiated component of the layout, since this is the one that affects the current IO behaviour, and if a single parameter needs to be selected that best represents the file it should come from the layout that the file needed at its current size. It is also possible to select a specific file component by its offset within the file or attribute flags to print specific values from the specified component of the layout.  If multiple component options are specified, such as --component-end=64M and --component-flag=uninit, then lfs getstripe will return the attributes of the component that matches all specified options.  If no component matches all specified component options, then nothing will be printed.
+
+Since the output format needs to be changed for composite files, the output is YAML formatted for both ease of parsing and still be human readable.  This is still reasonably similar to the original output format, with the exception of the OST object ID information, which is now more structured for ease of use.
+ # An output example of a file with 3 components
+ $ lfs getstripe -v /mnt/lustre/file
+ "/mnt/lustre/file":
+  fid: "[0x200000400:0x2c3:0x0 (--verbose|-v])"
+  composite_header:
+    composite_magic: 0x0BDC0BD0
+    composite_size:  536
+    composite_gen:   4
+    composite_flags: 0
+    component_count: 3
+  components:
+    - component_id:     1
+      component_flags:  0
+      component_start:  0
+      component_end:    2097152
+      component_offset: 152
+      component_size:   56
+      sub_layout:
+        lmm_magic:        0x0BD10BD0
+        lmm_pattern:      1
+        lmm_stripe_size:  1048576
+        lmm_stripe_count: 1
+        lmm_stripe_index: 7
+        lmm_pool:         flash
+        lmm_layout_gen:   0
+        lmm_obj:
+          - 0: { lmm_ost: 7, lmm_fid: "}
+    - component_id:     2
+      component_flags:  0
+      component_start:  2097152
+      component_end:    16777216
+      component_offset: 208
+      component_size:   128
+      sub_layout:
+        lmm_magic:        0x0BD10BD0
+        lmm_pattern:      1
+        lmm_stripe_size:  1048576
+        lmm_stripe_count: 4
+        lmm_stripe_index: 0
+        lmm_layout_gen:   0
+        lmm_obj:
+          - 0: { lmm_ost: 0, lmm_fid: "[0x100000000:0x2:0x0 (0x100070000:0x2:0x0]")" }
+          - 1: { lmm_ost: 1, lmm_fid: "}
+          - 2: { lmm_ost: 2, lmm_fid: "[0x100020000:0x4:0x0 (0x100010000:0x3:0x0]")" }
+          - 3: { lmm_ost: 3, lmm_fid: "}
+    - component_id:     4
+      component_flags:  0
+      component_start:  16777216
+      component_end:    18446744073709551615
+      component_offset: 336
+      component_size:   176
+      sub_layout:
+        lmm_magic:        0x0BD10BD0
+        lmm_pattern:      1
+        lmm_stripe_size:  4194304
+        lmm_stripe_count: 6
+        lmm_stripe_index: 5
+        lmm_pool:         archive
+        lmm_layout_gen:   0
+        lmm_obj:
+          - 0: { lmm_ost: 5, lmm_fid: "[0x100050000:0x2:0x0 (0x100030000:0x4:0x0]")" }
+          - 1: { lmm_ost: 6, lmm_fid: "}
+          - 2: { lmm_ost: 7, lmm_fid: "[0x100070000:0x3:0x0 (0x100060000:0x2:0x0]")" }
+          - 3: { lmm_ost: 0, lmm_fid: "}
+          - 4: { lmm_ost: 1, lmm_fid: "[0x100010000:0x4:0x0 (0x100000000:0x3:0x0]")" }
+          - 5: { lmm_ost: 2, lmm_fid: "}
+
+lfs setstripe
+The lfs setstripe command creates a new file with the specified layout parameters, or sets the specified layout parameters as the default layout template on a parent directory.
+
+ lfs setstripe {--component-end|-E end1} [component1_OPTIONS (0x100020000:0x5:0x0]") end2} [component2_OPTIONS ({--component-end|-E) ...] {directory|filename}
+ lfs setstripe --component-del comp_id (--component-id|-I) flags (--component-flags|-F) filename
+ lfs setstripe --component-set comp_id (--component-id|-I) {--component-flags|-F flags} filename
+
+Since this is the primary command-line interface for users creating new files with Lustre-specific layouts, there are a significant number of existing options that can be used.  Adding in composite-file specific options to lfs setstripe allows the same code to create both files with plain layouts and composite layouts, without duplicating a large number of options.  The command-line arguments of lfs setstripe are described in detail in the lfs-setstripe(1) man page.  The significant changes to these arguments is the addition of the --component-end argument for specifying which component is being modified during file creation, and allowing multiple components to be specified on the same command-line so that the file does not need to be created piecemeal.
+
+An example from the man page illustrates the flexibility of the file creation interface:
+ $ lfs setstripe -E 4M -c 1 --pool flash -E 64M -c 4 -S 4M -E -1 -c -1 -S 16M --pool archive /mnt/lustre/file1
+
+This creates a file with composite layout in a single operation, rather than building it up one component at a time. The first component has a single stripe that covers 4MiB) and is allocated from an OST in the flash pool. The second component has four stripes that cover [4MiB, 64MiB) and has a stripe size of 4MiB. The last component covers [64MiB, EOF), has a stripe size of 16MiB, and uses all available OSTs in the archive pool.
+
+Please notice that the setstripe options in the command line are inheritable, which means the options indicated in previous component will be used by the following components unless they are changed. For example, if -c option appears in the command line as following:
+ $ lfs setstripe -E 4M -c 1 -E 8M -E 32M -c 4 -E eof
+
+It will create the components [0, 4M) and [4M, 8M) with 1 stripe and [8M, 32M) and [32M, EOF) with 4 stripes. This attribute applies to all setstripe options.
+
+There is a work in progress to use an explicit option --parent so that it can reset the previous setstripe options and use system default stripe options thereafter.
+
+lfs migrate
+The lfs migrate command moves the a file's data from one (set of) OST(s) to another (set of) OST(s).  This is done by copying the file data from the existing source file layout to a new target file layout as specified by the user.  Most of the options to lfs migrate are the same as those of lfs setstripe, since lfs migrate is also creating a new file layout for the file data to be copied.
+
+ lfs migrate [--component-id|-I comp_id (0,) filename
+
+With the addition of composite files in this project, it needs to be possible to migrate a composite file, or a sub-component of that file, to new OST object(s) using the specified parameters.  If a component ID is specified, then only that component should be migrated, and the new component should use the same start and end offsets as the source component so that the source component can be replaced without violating the PFL layout rules.
+
+lfs find
+The lfs find command is a Lustre-optimized and enhanced version of the find(1) command.  It adds several extended options for matching Lustre specific parameters for the file layout.  It is also optimizing file access to avoid fetching OST object attributes for each file checked, if the decision can be made based only on the information initially retrieved from the MDT inode.
+
+ lfs find {directory|filename} ... [[! (OPTIONS])  --atime|-A  [[! (-+]days]) --mtime|-M [[! (-+]days]) --ctime|-C [--maxdepth|-D depth (+-]days]) --mdt|-m  {mdt_uuid|mdt_index,...} (!)
+      pattern (--name|-n) --ost|-O {ost_uuid|ost_index,...} (!) [--print0|-P (--print|-p])
+      --size|-s [-+ (!)bytes[[! (kMGTPE]]) --stripe-count|-c [[! (+-]stripes]) --stripe-index|-i {ost_index,...}] --stripe-size|-S [+- (!)bytes[[! (kMG]]) --layout|-L {raid0,released,composite}] |-t {bcdflps} (--type)
+      --gid|-g|--group|-G {group_name|gid} (!) --uid|-u|--user|-U {user_name|uid} (!)
+      --pool pool (!) start (--component-start) end (--component-end|-E)
+      --component-count [+- (!])count flags (--component-flags|-F)
+
+The existing command is enhanced with the --component-start, --component-end, --component-count and --component-flags commands to allow limiting the search criterion to specific extents or components of the file.
+
+llapi_layout_comp_* Library API
+The llapi_layout_* interfaces provide an interface for userspace applications, including lfs, to specify plain and composite file layouts in an abstract manner, and then convert those abstract layouts into actual file layouts depending on the final attributes of the layout.  The main data structure for llapi_layout_* functions is struct llapi_layout, which is opaque to userspace, but internally stores all of the attributes of a single plain layout or a single component's sub-layout.  For composite file layouts, the API  will be extended to handle layouts with multiple components and other composite file specific attributes, for use in Lustre-specific tools such as lfs setstripe, lfs getstripe, and lfs find, as well as by end-user applications or libraries that want to create files with specific composite layouts to optimize file IO patterns, such as HDF5.
+
+A composite layout can be composed by several layout components, and each component's sub-layout will be described by the opaque data in struct llapi_layout, therefore, few more fields should be added to the structure:
+ struct llapi_layout {
+     uint32_t                    llot_magic;
+     uint64_t                    llot_pattern;
+     uint64_t                    llot_stripe_size;
+     uint64_t                    llot_stripe_count;
+     uint64_t                    llot_stripe_offset;
+     /** Indicates if llot_objects array has been initialized. */
+     bool                        llot_objects_are_valid;
+     /* Add 1 so user always gets back a null terminated string. */
+     char                        llot_pool_name+ 1 (LOV_MAXPOOLNAME);
+     /* fields for composite layouts */
+ +   struct lu_extent            llot_extent;    /* end) of component */
+ +   uint32_t                    llot_id;        /* unique ID of component */
+ +   uint32_t                    llot_flags;     /* LCME_FL_* flags */
+ +   struct list_head            llot_list;      /* linked list of llapi_layout components */
+     struct lov_user_ost_data_v1 llot_objects[0 (start,);
+ };
+
+-  llot_extent: The file extent covered by current component; initially assigned by the caller when defining a layout component.
+-  llot_id: The numeric ID of current component; this may be assigned internally by the llapi_layout_*() interfaces for identification purposes, but the final component ID assignment is the responsibility of the MDS.
+-  llot_flags: The flags of current component;
+-  llot_list: List of all the components of the same composite layout;
+
+A new pair of interfaces will be introduced to set/get the extent of a layout component.  The llapi_layout_comp_extent_get(3) function will fetch the start and end offset of the current layout component, and  function will set the layout extent of a layout currently being constructed, within acceptable parameters for that component.
+ int llapi_layout_comp_extent_set(struct llapi_layout *layout, uint64_t start, uint64_t end);
+ int llapi_layout_comp_extent_get(const struct llapi_layout *layout, uint64_t *start, uint64_t *end);
+
+A new set of interfaces will be introduced to get, set, and clear the attribute flags of a layout component.  The llapi_layout_comp_flags_get(3) function gets the attribute flags of the current component.  The llapi_layout_comp_flags_set(3) command sets the specified flags of the current component leaving other flags as-is, while llapi_layout_comp_flags_clear(3) clears the flags specified in the flags word leaving other flags as-is.
+ int llapi_layout_comp_flags_get(const struct llapi_layout *layout, uint32_t *flags);
+ int llapi_layout_comp_flags_set(struct llapi_layout *layout, uint32_t flags);
+ int llapi_layout_comp_flags_clear(const struct llapi_layout *layout, uint32_t flags);
+
+The new llapi_layout_comp_id_get(3) interface fetches the file-unique component ID of the current layout component. 
+ int llapi_layout_comp_id_get(const struct llapi_layout *layout, uint32_t *id);
+
+A new pair of interface to add/delete a component to/from the composite layout.  The llapi_layout_comp_add(3) command adds the passed layout component comp to the existing composite file layout layout, to allow creating compound composite layouts at one time.  The llapi_layout_comp_del(3) deletes the specified layout component comp  from the composite layout layout.
+ int llapi_layout_comp_add(struct llapi_layout *layout, struct llapi_layout *comp);
+ int llapi_layout_comp_del(struct llapi_layout *layout, struct llapi_layout *comp);
+
+A new interface llapi_layout_comp_get_by_id(3) to fetch component(s) by ID if the user or application already knows the ID:
+ struct llapi_layout *llapi_layout_comp_get_by_id(const struct llapi_layout *layout, uint32_t id);
+
+A new interface llapi_layout_comp_next(3) to iterate all components of a composite layout, by selecting each component in turn internally, and then allowing different llapi_layout_comp_*() operations on that component layout:
+ struct llapi_layout *llapi_layout_comp_next(const struct llapi_layout *layout);
+
+The existing llapi_layout_to_lum() and llapi_layout_from_lum() interfaces should be extended to handle the composite layout, the new user md for composite layout is defined in Layout Enhancement High Level Design.
+ /* data structure representing each layout component, defined in "Layout Enhancement HLD" */
+ struct lov_comp_md_entry_v1 {
+         __u32 lcme_id;                  /* unique identifier of component */
+         __u32 lcme_flags;               /* LCME_FL_XXX */
+         struct lu_extent lcme_extent;   /* file extent for component */
+         __u32 lcme_offset;              /* offset of component blob in layout */
+         __u32 lcme_size;                /* size of component blob data */
+         __u64 lcme_padding};
+  
+ /* On-disk/wire structure of the composite layout, defined in "Layout Enhancement HLD" */
+ struct lov_comp_md_v1 {
+         __u32 lcm_magic;        /* LOV_MAGIC_COMP_V1 */
+         __u32 lcm_size;         /* overall size of layout including this structure */
+         __u32 lcm_layout_gen;
+         __u16 lcm_flags;
+         __u16 lcm_entry_count;
+         __u64 lcm_padding1;
+         __u64 lcm_padding2;
+         struct lov_comp_md_entry_v1 lcm_entries[0 (2];);
+ };
+  
+ #define lov_user_comp_md    lov_comp_md_v1;
+
+A new interface llapi_layout_file_comp_add(3) to add layout components to an existing file, it converts the passed in layout into lov_user_comp_md, then issue setxattr with the special xattr name defined in "Changes on MDS":
+ int llapi_layout_file_comp_add(const char *path, const struct llapi_layout *layout);
+
+A new interface llapi_layout_file_comp_del(3) to delete component(s) by the specified component id (accepting LCME_ID_* wildcards also) from an existing file:
+ int llapi_layout_file_comp_del(const char *path, uint32_t id);
+
+A new interface llapi_layout_file_comp_set(3) to change flags or other parameters of the component(s) by component ID of an existing file. The component to be modified is specified by the comp->lcme_id value, which may be either a specific component number or an LCME_ID_* wildcard value. The new attributes are passed in by comp and valid is used to specify which attributes in the component are going to be changed. This allows the  interface to be extended to set any attributes in the future.
+int llapi_layout_file_comp_set(const char *path, const struct llapi_layout *comp, uint32_t valid);
+
+User Space API Use Cases
+Several uses of the llapi_layout_* interfaces are shown as examples, to understand how this new API can be used by user tools.
+
+Use case 1: Create a file with full layout components
+ /* Allocate opaque layout structure for the first component */
+ layout1 = llapi_layout_alloc();
+  
+ /* Set 2M) extent to the first component */
+ rc = llapi_layout_comp_extent_set(layout1, 0, 2M);
+  
+ /* Set stripe size of the first component */
+ rc = llapi_layout_stripe_size_set(layout1, 1M);
+  
+ /* Set stripe count of the first component */
+ rc = llapi_layout_stripe_count_set(layout1, 1);
+  
+ /* Allocate opaque layout structure for the second component */
+ layout2 = llapi_layout_alloc();
+ 
+ /* Add layout2 into layout1, and layout2 will inherit the stripe size of layout1 */
+ rc = llapi_layout_comp_add(layout1, layout2);
+  
+ /* Set [2M, 256M) extent to the second component */
+ rc = llapi_layout_comp_extent_set(layout2, 2M, 256M);
+  
+ /* Set stripe count of the second component */
+ rc = llapi_layout_stripe_count_set(layout2, 4);
+  
+ /* Repeat above steps to create a layout3 with [256M, EOF) */
+ ...
+  
+ /* Create file with the composite layout */
+ rc = llapi_layout_file_create(path, open_flags, open_mode, layout1);
+
+Use case 2: Create a file with initial component, and add components later
+ /* Allocate opaque layout structure for the first component */
+ layout1 = llapi_layout_alloc();
+ 
+ /* Set [0, 2M) extent to the first component */
+ rc = llapi_layout_comp_extent_set(layout1, 0, 2M);
+ 
+ /* Set stripe size of the first component */
+ rc = llapi_layout_stripe_size_set(layout1, 1M);
+ 
+ /* Set stripe count of the first component */
+ rc = llapi_layout_stripe_count_set(layout1, 1);
+ 
+ /* Create file with the specified initial component */
+ rc = llapi_layout_file_create(path, open_flags, open_mode, layout1);
+ 
+ /* Allocate opaque layout structure for the second component */
+ layout2 = llapi_layout_alloc();
+  
+ /* Set [2M, 256M) extent to the second component */
+ rc = llapi_layout_comp_extent_set(layout2, 2M, 256M);
+ 
+ /* Set stripe count of the second component */
+ rc = llapi_layout_stripe_count_set(layout2, 4);
+ 
+ /* Add the component layout2 into the file */ 
+ rc = llapi_layout_file_comp_add(path, layout2);
+
+Use case 3: Traverse all components of a composite layout.  This is useful for something like lfs getstripe to be able to iterate over all components of an object without knowing in advance how many components each file has. During processing, the process using iterator can decide which components are of interest and print them, or use the component's file-unique component ID to print, modify or delete each component in turn.
+ /* Get composite layout from existing file */
+ layout = llapi_layout_get_by_path(path, flags);
+  
+ /* Traverse the layout */
+ comp = layout;
+ do {
+     /* Get & print stripe count */
+     rc = llapi_layout_stripe_count_get(comp, &count);
+     printf("stripe_count: %llu\n", count);
+  
+     /* Get & print stripe size */
+     rc = llapi_layout_stripe_size_get(comp, &size);
+     printf("stripe_size: %llu\n", size);
+   
+     /* Get & print layout pattern */
+     rc = llapi_layout_pattern_get(comp, &pattern);
+     printf("stripe_pattern: %llx\n", pattern);
+   
+     comp = llapi_layout_comp_next(comp);
+ } while (comp != layout);
+
+Client-IO Interface
+This design is based on the PFL Prototype High Level Design, which demonstrated the feasibility of the PFL concept. In this design, we will add further details to the design and address a few problems discovered during the prototype phase so that it can be used better in production.
+
+In the PFL prototype design, it addressed the problems of object mapping, in-memory cl_objects setup by layout components and a framework to support fundamental I/O operations. Operations like read, write, setattr, and glimpse are working properly. Two additional problems have to be solved for better use of PFL. The first problem is to create layout components on demand; and the second one is an optimization in terms of performance. This is a part of design of full PFL implementation, and the work in this part design will not be implemented in the project of PFL Phase 2.
+
+For the PFL Phase 2 implementation, the Client IO layer will be able to interpret existing composite file layouts, but will return an -ENODATA error to the application until the Phase 3 handling of ll_layout_intent() to dynamically fetch and instantiate layout components from the MDS is implemented.
+
+Create Layout Component on Demand
+The prototype phase doesn’t have the functionality to create layout component on demand. If applications are writing a file extent without layout component defined, clients will simply return an error to applications. This implies that the user has to know the layout components in advance, and has to understand the application’s access pattern really well so that each layout component can be created before it’s written.
+
+To support creating layout component on demand, the administrator can associate a PFL file with a layout template, which describes the number of stripes to be created for each range of file extents, along with other parameters such as stripe size, OST pool, etc. If the corresponding file extent is being written without layout component defined, the client will send a dedicated RPC, named layout intent RPC (A13 in PFL Phase 2 Solution Architecture), to the MDT, then the MDT can use the information within layout template to allocate corresponding OST objects to form a layout component, then the layout component will be appended to the file’s layout. After this is done, the client should be able to fetch new layout and proceed the I/O. No error should be seen by applications under normal circumstances, though it is possible to see errors at this point due to environmental factors such as -ENOSPC, -EIO, -ENOMEM or others that may occur when the MDS creates new OST objects and modifies the file layout on disk.
+
+The following diagram describes the process of creating layout component on demand:
+Flow chart for PFL write
+
+In the above diagram, 'File Update' can be any operations that will modify file contents, such as file write, mkwrite, and truncate. Read only operation won't necessarily trigger layout component allocation. Reading file extents with undefined layout components will simply return zero filled buffer.
+
+As it's shown in the diagram, the LOV layer, which is the only module in CLIO who can understand layout, will check if the intended writing region has a layout defined. If there is no layout defined, it will abort and invoke ll_layout_intent() that will send layout intent RPC to the MDT. As what we mentioned in the design of PFL prototype phase, CLIO will split by the boundary of layout component, therefore if only part of the I/O region doesn't have layout defined, it will finish the I/O with layout defined first, and then request for new layout.
+
+In cl_io data structure, a new bit is going to be defined to mark that the I/O failure was due to missing layout component:
+ struct cl_io {
+     ...
+     /* true if this io failed due to missing layout */
+     unsigned int ci_no_layout:1;
+     ...
+ }
+
+If LOV detects that the update I/O can't be finished due to missing layout, it will set ci_no_layout and abort the I/O with error code -ENODATA. In vvp_io_fini(), it should check ci_no_layout and then compose a layout intent RPC and send it to the MDT. Layout intent RPC is an LDLM enqueue RPC with an intent operation, the payload of the intent operation is as follows:
+ struct layout_intent {
+         __u32 li_opc; /* intent operation for enqueue, read, write etc */
+         __u32 li_flags;
+         __u64 li_start;
+         __u64 li_end;
+ };
+
+In order to request new component, the li_opc will be assigned to LAYOUT_INTENT_WRITE, and li_start and li_end are set to the full range of intended I/O. MDT may decide to create multiple layout components within this range at its discretion. Later, CLIO will fetch the new layout and continue I/O from where it stops.
+Flushing Cached Page Wisely under Layout Change
+
+Client side page cache may needs flushing whenever the file layout is changed. This works well for HSM and file migration because no pages would remain valid after those operations change the file layout. However, for PFL files the cached pages should be still valid after a layout change because layout components are only appended to the existing layout, and do not affect the existing components or their data. It could hurt application performance significantly if all pages are evicted from the client cache and then read back again for each new component that is added to the file.
+
+PFL uses layered generations to identify layout generations of each file and each component. One is layout generation at the whole file level, this generation will be changed after appending a layout component. Another one is the per layout component generation, which will remain unchanged when appending new file components.
+
+This feature will be used to facilitate client page cache management. When clients detect a layout change at the LOV layer, the LOV will further check the generations on layout components, and it will only flush pages for the newly added or modified layout components, which is an empty operation for PFL because layout components won’t be altered once created.
+
+One tricky case worth mentioning is that layout component generations are comparable only if the file's layout generation matches. Even it's known that the file's layout generation increased due to layout component addition, they are still conceptually unrelated layouts. Therefore, clients must compare not only component generations but also OST indices and objects to decide if components are unchanged to avoid unnecessary page eviction. 
+
+In order to accomplish this, a pair of range parameters will be added into cl_object_prune() to indicate that only a subset of pages are being evicted. A callback may be provided by LOV later to check if an individual page should be evicted due to layout change.
+
+Dynamic Layout Request
+In the PFL Prototype, layout components must have been defined and instantiated before I/O starts. Otherwise, applications that are trying to access an uninstantiated or undefined component will receive an ENODATA error. With dynamic layout request supported, clients are able to instantiate layout components on demand. Layout intent RPC will be used to request an instantiated layout component from the MDT.
+
+The RPC format of layout intent:
+ static const struct req_msg_field *ldlm_intent_layout_client[ (0,) = {
+         &RMF_PTLRPC_BODY,
+         &RMF_DLM_REQ,
+         &RMF_LDLM_INTENT,
+         &RMF_LAYOUT_INTENT,
+         &RMF_EADATA /* for new layout to be set up */
+ };
+   
+ struct req_msg_field RMF_LAYOUT_INTENT =
+         DEFINE_MSGF("layout_intent", 0,
+                     sizeof(struct layout_intent), lustre_swab_layout_intent,
+                     NULL);
+ EXPORT_SYMBOL(RMF_LAYOUT_INTENT);
+   
+ /* enqueue layout lock with intent */
+ struct layout_intent {
+         __u32 li_opc; /* intent operation for enqueue, read, write etc */
+         __u32 li_flags;
+         __u64 li_start;
+         __u64 li_end;
+ };
+
+Layout intent RPC is essentially an LDLM intent RPC. In the layout intent RPC, struct layout_intent will carry the necessary layout information to the MDT, for example, what is the range of required component, and which operation it expects the MDT to execute. With the information of preset layout template, the MDT should be able to create the corresponding component. The MDT should instantiate all components within the range of li_end). If the MDT successfully instantiates a component, it will increment the file's layout generation number by 1.
+
+When to send layout intent in CLIO stack
+In CLIO stack, the LOV layer is the only place where layout can be understood and interpreted. When I/O is instantiated, the LOV layer will split file level I/O range to sub I/Os by components information, and make sure that one sub I/O won’t cross component boundary. The lov_io_iter_init() function is where it checks if a component is instantiated or not.
+
+If a component is not instantiated, and if this I/O is a write operation, LOV will set a flag in cl_io data and return to the llite layer with error -ENODATA. The llite layer will realize that new components are required to complete this I/O so that it will invoke ll_layout_request() to send layout intent RPC. If everything goes okay, ll_layout_request() will fetch and apply new layout to CLIO stack. Finally the llite layer should restart the I/O and it should be able to move forward.  Since the components are instantiated only once, and are added only to the end of the file, any layout changes for PFL files cannot affect in-flight IO operations.
+
+So far, the operations would trigger layout intent request are VFS write() family of calls, truncate(), and page ->mkwrite().  In the future, other interfaces such as fallocate() would also need to handle uninstantiated components in a similar manner.
+
+Server-side RPC Interface and IO code paths
+MDS should provide an interface that can handle the client's requests to populate a new layout and modify an existing layout. We can consider a few different options to go through the various layers in the metadata stack from the client to the underlying storage on the MDT that holds the layout itself:
+
+- a new DT method or set of methods
+  -  will be used only by the Logical Object Device (LOD) on the MDS
+  -  unit testing (talking directly to LOD) would need additional infrastructure
+-  use setxattr() with special xattr names
+  -  lustre.lov.add = { components to add to the composite layout }
+  -  lustre.lov.del = { delete the component ID in the value }
+  -  lustre.lov.set = { set component flags }
+  -  lustre.lov.clear = { clear component flags }
+  -  no need in an extra infrastructure to implement unit testing
+  -  no new special methods
+-  extend ->dbo_punch() method
+  -  a flag to populate range: assign new objects
+  -  a flag to depopulate: release the objects
+  -  probably not enough to change flags (out-of-sync stripe?)
+-  totally crazy idea - layout as an index
+  -  this is what it is in essence
+  -  range/offset as a key
+  -  object+status as a value
+
+Several aspects of the xattr interface (#2) are of interest, which lead to selecting the xattr method for the PFL implementation.
+
+The first and foremost reason for selecting the xattr interface is that it allows adding the ability to modify existing layout xattrs without a significant change in the number of RPC types, without adding new dedicated server APIs that will only be used for composite files, and without introducing new userspace APIs that may have portability issues.  This simplifies the understanding of the code and keeps the complexity growth in check for the future, and doesn't sacrifice flexibility.
+
+A secondary reason for selecting the xattr interface for managing the layouts on the client is that with IO forwarders such as IBM's CIOD it is difficult to pass ioctl() commands from the compute nodes where applications run to the IO nodes where the Lustre client runs.  This needs a special handler for every ioctl() command and quickly becomes a maintenance headache.  However, the getxattr() and setxattr() interfaces already exist in such environments and provide generic key=value methods that can work with arbitrary key names and values between the llapi_layout(7) library commands and the Lustre client, over the network to the MDS, and from the MDS down to the underlying MDT storage. It is not expected that applications or users will interact directly with the file components using getxattr() and setxattr(), but only via the llapi_layout interfaces.
+
+Use Cases for getxattr() and setxattr() interfaces
+In order to manipulate the layout of the lustre.lov xattr holding the file layout, getxattr() and setxattr() (or fgetxattr() and fsetxattr() for operations on already-open file descriptors) will manipulate virtual xattrs with names such as lustre.lov.add, lustre.lov.del, lustre.lov.set, and lustre.lov.clear.  These can interface transparently from userspace on the client with the kernel on the client, or with the MDS as needed.  Below we look at the use cases from the PFL 2 Solution Architecture to verify that these xattr interfaces can meet the requirements set out in that document.
+
+U01. User creates new file with fixed-size layout component
+ setxattr("lustre.lov", <binary composite file description>);
+The LOD on the MDS parses the layout, which should contain a component that has an extent start of zero, and adds the component as described and populates it with OST objects.  The MDS will always allocate the first component's objects, to avoid the immediate overhead of another RPC and layout lock cancellation for the normal pattern of file create followed by file write.
+
+U02. User adds component(s) with fixed-size extent(s) to an existing composite file
+ setxattr("lustre.lov.add", <binary component description>);
+The LOD on the MDS parses the layout, sanity checks the components against the existing layout (S03, S04) and against each other, adds the component(s) as described to the file, essentially the same as U01.  The binary component description is largely self-describing, so it may contain one or more components that are added to the existing file layout, if any.  The LOD will assign file-unique component IDs as necessary, which may be different than those the client generated while creating the layout in memory.  If the client does not have the OBD_CONNECT_PFL_DYNAMIC flag set at connection time (a PFL 2 client, see Client-MDS Protocol below), then it is not capable of dynamically requesting the layout components need to be instantiated, in which case the MDS will allocate objects for all components.
+
+U03. User adds final component to existing composite file
+ setxattr("lustre.lov.add", <binary component description>);
+LOD parses the layout, adds the component as supplied, and populates it with OST objects (for PFL2 clients only if no OBD_CONNECT_PFL_DYNAMIC flag set at connection time, see Client-MDS Protocol below).  This is also the same as U01 and U02, with the only difference being that the supplied component has an extent that ends at 264-1 bytes.
+
+U04. User requests the layout for an existing file
+ getxattr("lustre.lov");
+If the client is fetching the full layout xattr, then it can use the same getxattr interface as is used today by existing tools with no additional processing of the xattr or layout.  This ensures that utilities such as tar(1) and others that already save and restore Lustre file layouts continue to work properly with composite files.
+ getxattr("lustre.lov.extent.");
+The LOD on the MDS and/or the LOV on the client parses the layout and returns the component(s) covering range [start,end).  Since the components themselves are self-describing, containing the component_id, component_start, and component_end, they can be returned directly to the caller and handled directly.
+ 
+U05. User gets layout parameters to existing component by ID
+ getxattr("lustre.lov.id.<component_id>");
+The LOD on the MDS and/or the LOV on the client parses the layout, finds component with id=<component id> and returns it to the caller.
+ 
+U06. User accesses or modifies components in an existing file
+ setxattr("lustre.lov.set.<valid>", <binary component description>);
+LOD iterates over the components in the file, applies changes to the individual components passed in as the binary component value, and sets the fields in the component as specified by valid.
+ 
+U07. User deletes composite file
+The LOD iterates over the components on the MDS, destroying the individual OST objects using the existing RPC and recovery methods before deleting the MDT inode.
+ 
+U08. User creates a new composite file describing multiple components
+ setxattr("lustre.lov", <binary composite file description>);
+This is essentially the same as U01 but the composite file description contains multiple components.
+
+U09. User migrates composite file
+ fsetxattr(source_fd, "lustre.lov.swap.<component_id>", <volatile_fid>);
+The existing mechanism to swap while file layouts should be usable without modification, as it is simply copying the layout xattrs and doesn't actually look into the layouts.  This allows existing tools that may use the llapi_[f (li_start,)swap_layouts() interface, such as HSM copytools, to continue to be able to manage whole-file layout changes.  If the user is migrating a single component from a composite file, then the data copy step is largely the same, except it will only copy data covered by the source extent into the target file before swapping the layout from the source component to the temporary target file.  The design of composite file layouts ensures that the logical file offsets of the source file and the target files are the same, so no special support is needed in userspace to do the data copy.  The volatile_fid is accessible on the MDS while the migration tool keeps the volatile file open, though the MDS needs to verify that the file matching <volatile_fid> has been opened by the client for write, to ensure the client has file write permission on the file, since it is not possible to pass two open file descriptors to the fsetxattr() syscall.
+
+U10. User searches for composite files
+ getxattr("lustre.lov.header");
+This will return the composite file layout header containing layout type, number of components, etc.  This can reduce amount of information going over the network and up to userspace, so that the caller can allocate a sufficiently large buffer to hold the full layout.
+ 
+U11. User specifies default composite file template for directory (Phase 3)
+ setxattr("lustre.lov", <binary composite file template>);
+The setxattr() operation would be done on the parent directory, in a similar manner that it is done today, only with different xattr contents.  The composite layout template is stored on the parent directory as is done today for plain layout templates, storing only struct lov_mds_md_v1 with the required fields set, and not storing any of the file stripes in lmm_objects. 
+U12. Administrator specifies filesystem-wide composite file template for root directory (Phase 3)
+Same as U11, except the operation takes place on the root directory and affects all new files.
+U13. User deletes uninstantiated stripe component from file by ID (Phase 3)
+ setxattr("lustre.lov.del", <component id>);
+LOD parses the layout, finds the component with ID=<component id> and if it is uninstantiated (has no object assigned), then delete it.
+ 
+U14. User deletes uninstantiated stripe components from file by flags (Phase 3)
+ setxattr("lustre.lov.del", <component id>);
+To delete all uninstantiated components from the file it is possible to use the enum lcme_id wildcard LCME_ID_UNINIT to delete all uninstantiated components.
+For more complex operations, it is more practical to fetch the entire layout to the client, iterate over the components in userspace, and then perform the pattern matching in an arbitrarily complex manner to determine which component IDs to remove or modify.  While there is some extra overhead in deleting or modifying components individually, it is impractical to have a complex query and update interface embedded in the MDS for this.  Otherwise, there may be an explosion of different matching criteria that need to be added (e.g. components within these extents, have specific flags set, that have specific layout generations, stripe sizes, etc). 
+
+Server-side Composite Layout Handling
+Composite File Layout Handling
+The server needs to interpret and handle the virtual xattr values that are sent from the client.  In order to avoid namespace collisions and potential abuse by users, the virtual xattr keywords such as .add, .del, .swap, etc. are only interpreted for specific Lustre xattrs such as lustre.lov, and potentially lustre.lmv in the future. The lustre.lov xattr is already handled specially on the client, since it cannot be set if the file already has a layout, so this will not add significant complexity on the client or server.  Because xattrs are read and written as a single unit, any modification to the xattr needs to load the existing layout xattr into memory, modify it as requested by the client, and then store it back to the MDT inode object.  This will be handled by the LOD layer of the MDS, since it is the software module that interprets the file layout, and also has access to the MDT OSD to load and store the xattr contents.
+
+The LOD must verify incoming lustre.lov layout xattrs, whether a whole composite layout is being sent, or an incremental update is being made to a layout component.  Until other composite layout features such as File-Level Replication, partial HSM restore, the layout checks done by the MDS will be PFL-specific.  These include verifying that components have adjacent extents, so that there are no holes in the layout (S03), that the layouts do not overlap (S03, S04) or if they do that they describe identical components (S09.1), and that they do not specify attribute flags that are controlled by the server.  Fields such as lcme_offset and lcme_id that are server managed will be ignored and overwritten by the server.
+
+The composite layout header contains a generation value, lcm_layout_gen , that is updated by the MDS when the composite layout is changed.  In order to ensure that component IDs within a file are unique, the lcme_id assigned to a new component added to the layout will be the lcm_layout_gen of the composite file.  An lcme_id of 0 is reserved, and indicates that the ID is unassigned for this component or no specific component is requested, and will not be used by the MDS for any components in a file.
+
+As these checks of the incoming layout and the update of the lustre.lov xattr on disk need to be serialized, these operations will be serialized by the layout lock (MDS_INODELOCK_LAYOUT) on the inode.
+
+Layout Intent Lock Handling
+For PFL, there are two kinds of request that could cause layout change. One is from the command line that appends or changes components manually; another one is from CLIO stack after dynamic layout intent is supported. Both kinds of request will end up with invocation of setxattr() on the MD stack. The MDT has to hold LCK_EX mode of the MDS_INODELOCK_LAYOUT lock when it calls setxattr() to do actual changes to the layout. Not only does the holding of the layout lock on the MDT inode object serialize updates between multiple threads on the MDS, it also serves to revoke the layout lock from all clients that have been granted this lock.  This revocation will invalidate the cached file layout from the clients, and cause them to refresh the layout on their next IO operation.
+
+Feature Compatibility and Interoperability
+File Layout Compatibility
+The PFL composite layout is incompatible with the existing Lustre file layout, though the individual layout components will re-use the existing lov_mds_md_v1 and lov_mds_md_v3 RAID-0 layouts. Non-PFL clients will receive an EIO error when accessing a composite file. Accessing plain (non-composite) files in the same filesystem will continue to work for both PFL and non-PFL clients.  It is not possible to translate the PFL file layouts into a layout that the older clients will understand. Older servers will refuse to try and create a file with a PFL layout, due to the new magic value stored at the start of each layout.
+
+MDT On-Disk Format
+The PFL composite layout stored on disk will continue to use the trusted.lov xattr name and will be stored directly in the MDT inode, if space permits, to maximize performance. The existing maximum limits on xattr sizes will not be changed as part of this project.  For both ZFS and ldiskfs backing filesystems the on-disk xattr size is not the limiting factor for determining the maximum stripe count of a file, but rather the RPC size limits.
+
+The MDS itself needs to understand the new struct lov_comp_md_v1 layout format described in Layout Enhancement HLD Composite Layouts, in order to unlink the OST objects within that file when it is deleted, or change the ownership of a file's OST objects when the file ownership changes.
+
+The [https://wiki.hpdd.intel.com/display/opensfs/LFSCK2+High+Level+Design Lustre File System Check (LFSCK) (start,end)) tool also needs to understand struct lov_comp_md_v1 in order to accurately determine the relationship between an MDT inode and all the OST objects where it stores its data. This can leverage the same composite file layout iteration that the MDS is using for file unlink, setattr, and other operations that affect all of the OST objects on a file.
+
+MDT Default File Layout Templates
+The file layout template is an uninstantiated file layout that is initially stored on a parent directory, or on the filesystem root directory, and provides the default layout for new files that do not otherwise have a specific layout assigned at file creation time.  When a new file file or directory is first created, it inherits the layout template from the parent directory in which it was created, or if the parent directory has no template then it is inherited from the filesystem root directory.  Once assigned to the new file, the layout is stored with the MDT inode on disk and is instantiated as needed for that file.
+
+The layout template itself for a plain file is simply struct lov_mds_md_v1, or struct lov_mds_md_v3 if an OST pool is in use, without any of the OST objects allocated for it (i.e. the lmm_objectsarray is unused).  The plan for composite file templates will be similar - a layout template for a 3-component file would consist of the composite header template struct lov_comp_md_v1 along with three separate pairs of component entries and uninstantiated sub-layout templates, namely struct lov_comp_md_entry_v1 and the accompanying struct lov_mds_md_v1 without any OST objects allocated.
+ struct lu_extent {
+        __u64 e_start;
+        __u64 e_end;
+ };
+
+ struct lov_comp_md_entry_v1 {
+         __u32 lcme_id;                  /* unique identifier of component */
+         __u32 lcme_flags;               /* LCME_FL_XXX */
+         struct lu_extent lcme_extent;   /* file extent for component */
+         __u32 lcme_offset;              /* offset of component blob in layout */
+         __u32 lcme_size;                /* size of component blob data */
+         __u64 lcme_padding[2 (]);
+ };
+
+ struct lov_comp_md_v1 {
+         __u32 lcm_magic;        /* LOV_MAGIC_COMP_V1 */
+         __u32 lcm_size;         /* overall size of layout including this structure */
+         __u32 lcm_layout_gen;
+         __u16 lcm_flags;
+         __u16 lcm_entry_count;
+         __u64 lcm_padding1;
+         __u64 lcm_padding2;
+         struct lov_comp_md_entry_v1 lcm_entries};
+
+ struct lov_ost_data_v1 {          /* per-stripe data structure (little-endian)*/
+         struct ost_id l_ost_oi;   /* OST object ID */
+         __u32 l_ost_gen;          /* generation of this l_ost_idx */
+         __u32 l_ost_idx;          /* OST index in LOV (lov_tgt_desc->tgts) */
+ };
+
+ struct lov_mds_md_v1 {            /* LOV EA mds/wire data (little-endian) */
+         __u32 lmm_magic;          /* magic number = LOV_MAGIC_V1 */
+         __u32 lmm_pattern;        /* LOV_PATTERN_RAID0, LOV_PATTERN_RAID1 */
+         struct ost_id   lmm_oi;   /* LOV object ID */
+         __u32 lmm_stripe_size;    /* size of stripe in bytes */
+         /* lmm_stripe_count used to be __u32 */
+         __u16 lmm_stripe_count;   /* num stripes in use for this object */
+         __u16 lmm_layout_gen;     /* layout generation number */
+         struct lov_ost_data_v1 lmm_objects[0 (0];); /* per-stripe data */
+ };
+
+Unfortunately, the size of a 3-component layout template, even without any OST objects allocated, is larger than can fit into the currently 512-byte ldiskfs inodes' free space, as can be seen in the diagram below.  There are approximately 180 bytes of free space in the 512-byte inode (depends on the length of the filename and if there are multiple hard links to a file), but a 3-component template layout is 268 bytes in size.  Even with aggressive reduction of the size of the lov_comp_md_v1, lov_comp_md_entry_v1, and lov_mds_md to remove all fields that are not strictly necessary, the 3-component template would still be too large to fit into the directory inode, let alone on an actual file using this template with at least one allocated OST object.   If the xattr is too large for the in-inode space, for example a plain RAID-0 file with more than 5 stripes, then the layout xattr is stored in an separate data block. Storing the layout xattr outside the inode may incur significant performance penalties, due to an extra seek for every inode access in order to fetch the layout xattr into memory, so this is undesirable for normal usage.
+
+One option to avoid the overflow of the in-inode xattr space would be to store only a single-component layout on the file, which would fit within the available 180-byte space, and inherit the rest of the components from the parent directory as the file size grows to need these components.  This would be desirable from the point of view of minimizing the overhead for small files, which can make up a large fraction of all files in HPC filesystems.  However, this also adds complexity to the PFL code and usage, since the inode is not guaranteed to have the same parent directory, and hence a different layout template, when the time comes to extend the file beyond the first component. This may lead to inconsistent or sub-optimal layout components if the file is renamed, or the default layout of a directory or the filesystem is modified, and the new directory layout template is incompatible with the existing component(s) on the file due to overlapping layout extents.
+
+Even if a single-component file layout could fit in the inode xattr space, the composite layout template still couldn't fit into the parent directory's inode.  However, since there are normally far fewer directories than files, and directory leaf blocks are themselves likely to be allocated only one block at a time, the external xattr block would not be as high an overhead, and the one xattr read overhead would normally be amortized over the creation of many files within that directory that use the same layout template.
+
+Another option is to format the MDT with larger 1024-byte inodes by default, to ensure there is enough space for not only the composite layout or template, but also for other xattrs such as SELinux labels, ACLs, etc. This has the drawback that the MDT will need to be reformatted for 1024-byte inodes to maximize PFL performance, and each inode will take twice as much space on disk and in memory, which may also impact metadata performance.  This can possibly be mitigated on existing 512-byte inodes that use SSD or NVM storage for the MDT to avoid the overhead of seeking to read the external xattr block for each cache-cold MDT inode access.
+
+Due to the implementation complexity and risk of inconsistent or sub-optimal file layouts being created by the incremental inheritance of layouts from the parent layout template, the PFL 2 project will implement whole-layout inheritance at file creation time.
+
+Image:pfl2_default_layout_template.png
+
+MDS Layout Verification
+In addition to PFL layout verification performed by userspace in the llapi_layout_* functions, the MDS should also do verification of the layout components to ensure that they are valid for the PFL feature.  This includes the following checks:
+
+-  verify the start of each component matches the end of the previous component (if any), to prevent overlapping or disjoint extents.
+-  verify the layout stripe_size and the layout extent_end are properly aligned to prevent fractional pages or RPCs that span multiple components.  This restriction may be relaxed over time, but for the initial implementation it will avoid complexity to ensure that full-stripe reads and writes are done within a single component.
+-  verify object_maxbytes * stripe_count >= extent_end for each component except the last one, to ensure that file data can be written over the full range of the component.  For ldiskfs OSTs the object_maxbytes is 16 TiB, so for a component with few stripes and a very large extent_end it is possible that the client would get -EFBIG while writing to the middle of the file.  For ZFS OSTs the object_maxbytes value is 263-1 bytes, so this is not an issue.  This may be difficult to implement 100% consistently, since the MDS will not necessarily know which specific OSTs will be selected when setting a uninstantiated layout template, which would only be a concern if there are different OST types within the same filesystem.  In this unlikely case, it would be easiest to select the minimum maxbytes limit at OST connect time.
+
+As other features are added that use composite layouts, such as File Level Replication, these restrictions can be relaxed.
+
+Client-MDS Protocol
+By using extensions to the xattr protocol to instantiate and modify composite layouts there are no RPC protocol changes needed between the client and MDS.  The Phase 2 PFL client will send the new OBD_CONNECT_COMPOSITE connection flag to indicate that it understands the composite layout feature, and the MDS replies with the same feature flag set to inform the client that this feature is supported, otherwise the client would get an error when storing the composite layout on the MDS. The existing MDS_SETXATTR and MDS_GETXATTR RPC opcodes can be used to create, modify, and remove individual components of a file, as well as whole composite files.  Since the connection flag exchange is done on every client and MDS restart, there should never be a case where the MDS does not recognize the incoming file layout magic or the enhanced RPC opcodes.
+
+The existing RPC size limit will not be changed as part of this project, allowing a single file to have maximum stripe count of 2000 OSTs for a plain RAID-0 file.  Since the PFL composite file and component layout containers themselves take up space, the maximum number of OSTs that a single file can use depends on the exact layout being used.  For a single-component file, the maximum stripe count will only be 2-3 stripes below the 2000-OST limit.  For a file with many single-stripe components, the maximum number of components will be approximately 500.
+
+If the PFL Phase 2 Static Layout implementation is deployed separately from the proposed PFL Phase 3 Dynamic Layout, then some additional changes are needed in the RPC protocol between clients and the MDS.  For clients using the PFL2 code that understands composite layouts but not dynamic layout initialization, as detected by the lack of OBD_CONNECT_PFL_DYNAMIC flag at connection time, any file creation requests will result in the MDS allocating all of the OST objects for a file with a layout template. The PFL Phase 3 clients can notify the MDS at connect time, by passing a new OBD_CONNECT_PFL_DYNAMIC feature flag, that they handle on-the-fly layout initialization of files, so it is safe to store only the layout template to disk.
+
+Client-OSS Protocol
+During normal IO operations between the client and OSS, the client sends information to the OSS about each object that is being accessed, to avoid the overhead of extra communication between the MDS and OSS for every object created and accessed in the filesystem.  This information includes sending the MDT inode File Identifier (FID) to the OSS in order to indicate which file each OST object belongs to, as well as the stripe index of that object within the file.  This information is stored on the OST object the first time the object is ever modified. The MDT inode FID passed from the client is sanity checked against the one stored on the OST object for later IO operations in order to avoid accidentally accessing or modifying OST objects due to software bugs, as well as by the Lustre File System Check (https://wiki.hpdd.intel.com/display/opensfs/LFSCK2+High+Level+Design) (LFSCK) tool to verify consistency between the file layout on the MDT and the objects on the OST(s) and to rebuild the MDT inode file layout if it becomes corrupted.  By storing the component ID with each OST object, along with the stripe index and stripe size, the LFSCK tool can re-assemble the file layout for each MDT inode FID, even if the layout is lost or corrupted on the MDT.
+
+The RPC from the client to the OSS currently only passes a single integer for the object's stripe index, since this is all that was needed to uniquely identify the object in a RAID-0 file layout. In order to accommodate the presence of multiple component layouts within a single composite file, the RPC from the client needs to be modified slightly in order to send more information for above purposes, including the stripe size and the stripe count, and if the target is for PFL component, the component ID and related extent range will be sent also. If all these information are sent from the client to the OSS via current obdo structure, then only the obdo.o_padding_{4/5/6} are not enough, we have to reuse some other fields to avoid enlarge the obdo structure. Currently the obdo.o_lcookie is only used by OSP for recording async RPC llog cookie. In fact, such cookie is only used locally. So the obdo.o_lcookie can be used for other on wire purpose. Fortunately, it is large enough (32 bytes) to hold all above information for LFSCK. To be clear, we will define new structure ost_layout for that.
+ struct llog_cookie {
+         struct llog_logid       lgc_lgl;
+         __u32                   lgc_subsys;
+         __u32                   lgc_index;
+         __u32                   lgc_padding;
+ } __attribute__((packed));
+ 
+ +struct ost_layout {
+ +        __u64   ol_pfl_start;
+ +        __u64   ol_pfl_end;
+ +        __u32   ol_pfl_id;
+ +        __u32   ol_stripe_size;
+ +        __u32   ol_stripe_count;
+ +        __u32   ol_padding_0;
+ +};
+  
+ struct obdo {
+     __u64                   o_valid;        /* hot fields in this obdo */
+     struct ost_id           o_oi;
+     __u64                   o_parent_seq;
+     __u64                   o_size;         /* o_size-o_blocks == ost_lvb */
+     __s64                   o_mtime;
+     __s64                   o_atime;
+     __s64                   o_ctime;
+     __u64                   o_blocks;       /* brw: cli sent cached bytes */
+     __u64                   o_grant;
+     /* 32-bit fields start here: keep an even number of them via padding */
+     __u32                   o_blksize;      /* optimal IO blocksize */
+     __u32                   o_mode;         /* brw: cli sent cache remain */
+     __u32                   o_uid;
+     __u32                   o_gid;
+     __u32                   o_flags;
+     __u32                   o_nlink;        /* brw: checksum */
+     __u32                   o_parent_oid;
+     __u32                   o_misc;         /* brw: o_dropped */
+     __u64                   o_ioepoch;      /* epoch in ost writes */
+     __u32                   o_stripe_idx;   /* layout stripe idx */
+     __u32                   o_parent_ver;
+     struct lustre_handle    o_handle;       /* brw: lock handle to prolong
+                                              * locks */
+ -       struct llog_cookie      o_lcookie;      /* destroy: unlink cookie from
+ -                                                * MDS, obsolete in 2.8, reused
+ -                                                * in OSP */
+ +       /* Originally, the field is llog_cookie for destroy with unlink cookie
+ +        * from MDS, it is obsolete in 2.8. Then reuse it by client to transfer
+ +        * layout and PFL information in IO, setattr RPCs. Since llog_cookie is
+ +        * not used on wire any longer, remove it from the obdo, then it can be
+ +        * enlarged freely in the further without affect related RPCs.
+ +        *
+ +        * Here, we have verified sizeof(ost_layout) == sizeof(llog_cookie). */
+ +       union {
+ +               /* struct llog_cookie o_lcookie; */
+ +               struct ost_layout o_layout;
+ +       };
+     __u32                   o_uid_h;
+     __u32                   o_gid_h;
+     __u64                   o_data_version; /* getattr: sum of iversion for
+                                              * each stripe.
+                                              * brw: grant space consumed on
+                                              * the client for the write */
+     __u64                   o_padding_4;
+     __u64                   o_padding_5;
+     __u64                   o_padding_6;
+ };
+
+Implementing the support for LFSCK and the OSTs to handle composite files belongs to PFL Phase 3a, that is beyond the scope of the PFL Phase 2 implementation.
+
+OST On-Disk Format
+As discussed in the Client-OSS Protocol section, the OST stores a fragment of the MDT layout with each object in order to do sanity checks on incoming client RPCs and recovery in case of MDT corruption. The OST needs to be able to store an additional 32 bytes of data with struct filter_fid to store additional information for the composite layout so that the OST object knows its place within the component and within the composite file:
+ struct filter_fid {
+     struct lu_fid   ff_parent;          /* ff_parent.f_ver == file stripe number */
+ +   __u32           ff_stripe_size;
+ +   __u32           ff_stripe_count;
+ +   __u64           ff_pfl_start;
+ +   __u64           ff_pfl_end;
+ +   __u32           ff_pfl_id;
+ };
+
+The osd-ldiskfs on-disk inode along with the Lustre-specific xattrs ("lma" and "fid") are very nearly out of free space in the OST's 256-byte inode, there is not enough room to store these 28 additional bytes in the "fid" xattr. As explained above, storing the "fid" xattr in a separated block will cause serious performance trouble, we have to consider other solution. One possible way is the merge the "lma" and "fid" into the "lma" EA body (or value) to save the space occupied by the "fid" matter entry (20 bytes). It is some hack way, and is hidden inside the osd-ldiskfs. From the up layer users' view, the "fid" xattr is still independent, they do not know and should not care about how the "fid" xattr is stored on the disk.
+
+Image:pfl2_inode_size.png
+
+For the osd-zfs on-disk dnode (inode), the added information will be stored in the System Attributes, which currently already do not fit into the dnode proper, but must already allocate a separate spill block to hold the SAs for the dnode.  Once the large dnode patch is landed to the ZFS-on-Linux repository it will allow the SAs to always be stored within the dnode for maximum performance.
+
+MDS-OSS Protocol
+The MDS-OSS protocol is largely unaffected by composite layouts, since the OSTs themselves never use the file layout directly.  The LFSCK utility does fetch the struct filter_fid xattr from the OST in order to verify its consistency against its locally stored file layout. The actual network protocol remains unchanged, besides the extra two fields added to this structure.  The LFSCK utility will need to verify the ff_stripe_size and ff_component_id fields against their respective values in the file layout to verify that the object is part of the correct component.
+
+Known Issues
+-  Append write. Append write has to instantiate all components to fulfill the posix semtantics;
+-  Group lock. The current semantics of group lock would be hard to comply, work in progress to come up with a solution.
+
+Please see more known issues at https://jira.whamcloud.com/browse/LU-9349
+
+Category:Architecture
+Category:PFL
+Category:Layout

@@ -1,0 +1,114 @@
+Key:        LU-14062
+Summary:    Setting project ID inheritance on directories can break hardlinking
+Link:       https://jira.whamcloud.com/browse/LU-14062
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Won't Fix
+Assignee:   Core Lustre Triage
+Reporter:   Jeff Niles
+Created:    Wed, 21 Oct 2020 19:38:57 +0000
+Updated:    Thu, 27 Feb 2025 15:13:25 +0000
+Resolved:   Thu, 27 Feb 2025 15:13:25 +0000
+Labels:     medium, quota
+Links:      Related: is related to  LU-11872
+
+--- Description ---
+A colleague of mine mentioned that LU-11872 and how it relates to hardlinks was brought up on the Robinhood mailing list, so we tested some various cases and debugged as much as we could. We were interested in the reported problems, as we were looking to enable project quotas on one of our file systems within the month, but the users of said file system rely fairly heavily on hardlinks. Here's what we came up with.
+
+There are two main issues:
+
+Issue 1: All hardlink project IDs get set to the most recent update to the inode. This is somewhat expected behavior.
+
+Issue 2: You cannot create hardlinks across multiple existing project directories when inheritance is set.
+
+Examples:
+
+Issue 1:
+
+# mkdir hardlink_dir1
+# mkdir hardlink_dir2
+# touch hardlink_dir1/foo
+# cd hardlink_dir2
+# ln ../hardlink_dir1/foo ./hardlink_to_fo
+# cd ..
+# lfs project -srp 1111 hardlink_dir1
+# lfs project -d ./hardlink_dir1/foo
+ 1111 P ./hardlink_dir1/foo
+# lfs project -srp 2222 hardlink_dir2
+# lfs project -d ./hardlink_dir1/foo
+ 2222 P ./hardlink_dir1/foo
+#
+
+Issue 2:
+
+# mkdir hardlink_dir1
+# mkdir hardlink_dir2
+# lfs project -srp 1111 hardlink_dir1
+# lfs project -srp 2222 hardlink_dir2
+# touch hardlink_dir/foo
+touch: cannot touch 'hardlink_dir/foo': No such file or directory
+# touch hardlink_dir1/foo
+# cd hardlink_dir2
+# ln ../hardlink_dir1/foo ./hardlink_to_foo
+ln: failed to create hard link './hardlink_to_foo' => '../hardlink_dir1/foo': Invalid cross-device link
+
+# cd ..
+# lfs project -C -k hardlink_dir2
+# lfs project -d hardlink_dir2
+ 2222 - hardlink_dir2
+# cd hardlink_dir2
+# ln ../hardlink_dir1/foo ./hardlink_to_foo
+# ls -l
+total 1
+-rw-r--r-- 2 root root 0 Oct 21 14:49 hardlink_to_foo
+#
+
+Looking at `lfs_project.c`, it seems that `project_get_xattr()` is using `sys/stat.h`'s `st_mode` to determine if a file meets the `S_ISREG` or `S_ISDIR` test. If it does, it's then processed. This works for symlinks, but the issue is that hardlinks match the `S_ISREG` condition. We thought over some possible ways to resolve this and you could theoretically use something like `st_nlink > 1` to determine if the file is a hardlink, but that seemingly leads to a ton of edge cases. For one, a project ID could be set on the original file, and then if a hardlink were created, you'd no longer be able to update or change the existing project ID. If you decided to programmatically clear the project ID once a hardlink was identified, you'd end up not accounting for any of the data represented by the various hardlinks.
+
+I'm not sure there's a great permanent solution to this, but as of right now if you enable project quotas, hardlinks break in certain circumstances.
+
+--- Comment (adilger, Tue, 24 Nov 2020 18:29:26 +0000) ---
+The first thing I would ask is whether the workflow can change from using hard links to using symlinks?  That would allow the "shared_input_data" directory to hold the quota for those files, and not require the ability to create hard links across project IDs (which is also the disallowed for ext4 and XFS, and AFAIK ZFS).  
+
+IMHO, it doesn't make sense to "charge" the users of the hard links for the use of space in shared_input_data, so if this is allowed (as a non-default tunable paramter on the MDS) it should be that the second hardlink would not change the projid of the inode, and running "lfs project" on a directory to repair the projid should not affect files with multiple links.  I think that would give the correct, and reasonably sane, semantics for this kind of usage.
+
+--- Comment (wshilong, Tue, 24 Nov 2020 01:24:47 +0000) ---
+Firstly, this is expected behavior with project quota, allowing hardlinks across different projid could be tricky. So what should be new projectID with newly
+
+created hardlink? hardlink did not create new inode, so its projectID points to target inode projectID, is that fine? or we should re-setting project ID with source parent's project ID, and as sthiell mentioned for directory quota, denying. the behavior looks sane.
+
+We might introduce extra interface from MDS, eg allow hardlink from different project ID, but that should be only used for specific usage and need define 
+
+behavior explictly, what do you think Andreas? adilger
+
+--- Comment (pjones, Thu, 22 Oct 2020 14:34:40 +0000) ---
+Shilong
+
+Could you please advise
+
+Thanks
+
+Peter
+
+--- Comment (nilesj, Wed, 21 Oct 2020 21:09:33 +0000) ---
+Stephane,
+
+While I think most people associate projects (and thus project IDs) with specific directories, in the current implementation it's much more arbitrary. I can have a directory and half of its files associated with one project ID, while the other half of the files within the directory are associated with another project ID. Generally not how people use it, but as an example.
+
+We are intending to use project ID mostly as an accounting feature and not an enforcement feature. I don't necessarily think that project ID should be used to gate access to files. If I have permissions on a given file, I think I should be able to link to it from anywhere else that I have permissions. The example breakdown in our users' use case would be:
+
+/lustre/example_fs/shared_input_data - project ID: 999 - input directory for large input files that are used across various projects
+/lustre/example_fs/project1 - project ID: 1 - working area for users of the "project 1" project
+/lustre/example_fs/project2 - project ID: 2 - working area for users of the "project 2" project
+
+In the layout above, project ID 999 would be used to account for the space consumed by "shared" input files for all of the various projects. Users would hardlink (which for the record, I don't like, but user workflows...) data from the "shared_input_data" area into the "project 1" working area to use in their workflow. "project 2" would do the same, as would "project 3", etc. In the above scenario, it doesn't make sense to attribute the data to any one of the projects for accounting or quota enforcement, but we'd still like to give it a project ID so that we can account for it in quota reports. I'm not sure if this use case is considered odd, but it seems like an intended use of the feature as it exists now. Maybe I'm off base?
+
+	Jeff
+
+--- Comment (sthiell, Wed, 21 Oct 2020 20:47:30 +0000) ---
+Hi Jeff,
+
+We migrated to project quotas a while back on our scratch and we think 'Issue 2' is the expected behavior (and we like it). Users should NOT be able to create hardlinks between different projects. This is the same on Isilon when you use directory quotas, so our users understand it (they got "Invalid cross-device link" when using ln between projects).
+
+Of course, if you have many hardlinks already on your filesystem and want to migrate to project quotas, that can be a real problem indeed...

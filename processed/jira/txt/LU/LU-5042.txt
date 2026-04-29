@@ -1,0 +1,214 @@
+Key:        LU-5042
+Summary:    Recovery Lock Replay
+Link:       https://jira.whamcloud.com/browse/LU-5042
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Bruno Faccini
+Reporter:   Brian Behlendorf
+Created:    Fri, 9 May 2014 23:40:23 +0000
+Updated:    Thu, 14 Jun 2018 21:41:37 +0000
+Resolved:   Thu, 28 Aug 2014 14:32:54 +0000
+Labels:     llnl
+
+--- Description ---
+While performing load testing on one of our filesystems this week we power cycled the OSSs to test recovery.  To my surprise it ended up taking the OSS several hours to complete recovery and the vast majority of that time was spent in the lock replay stage.
+
+What I know for certain is that the OST has roughly 500,000 locks outstanding before it was power cycled.  When it came up all the clients did properly reconnect to it and seems to have decided to replay all their locks, used and unused.  I thought we fixed this years ago, so I verified that the tunables were set such that we shouldn't replay unused locks.  They appeared to be set properly but those 500,000 locks were resent to the OST.
+
+After the recovery timed dropped to zero and I didn't quickly see recovery complete message I dumped some stacks from the OST.  They showed that the tgt_recov thread was in stage two sequentially replaying all of those 500,000 locks.  Because this was being done sequentially from a single thread the disk was hardly working and the system looked idle.
+
+This exact behavior has been reported on our production machines and I can easily understand why an administrator might think the system was hung/deadlocked and give up on it.  Basically the recovery timer drops to zero and then recovery doesn't actually complete for several hours.
+
+You should be able to fairly easily reproduce this on any test system.  Just ensure your server has a large number of locks enqueued and then power cycle it.
+
+--- Comment (pjones, Mon, 15 Sep 2014 11:42:33 +0000) ---
+b2_4 version: http://review.whamcloud.com/#/c/11920/
+
+--- Comment (bfaccini, Fri, 12 Sep 2014 17:42:16 +0000) ---
+b2_5 back-port is at http://review.whamcloud.com/11895/.
+
+--- Comment (morrone, Tue, 9 Sep 2014 22:50:33 +0000) ---
+Version for 2.4/2.5?
+
+--- Comment (pjones, Thu, 28 Aug 2014 14:32:54 +0000) ---
+Landed for 2.7
+
+--- Comment (bfaccini, Wed, 16 Jul 2014 15:08:39 +0000) ---
+More testing of my patch found a flaw when a delayed LVB needs to be allocated+filled+sent back to a new Client as part of new/non-replayed and/but not immediately granted lock ...
+
+So, patch-set #4/#5 now also handle the case of new/not-replayed lock requests that can't be granted immediately but where LVB has to be sent to Client. I wonder why LVB is sent back for non-granted locks ? Will this not be better/optimized to only send LVB for granted locks or upon completion-AST ?
+
+--- Comment (bfaccini, Thu, 26 Jun 2014 09:53:48 +0000) ---
+1st patch attempt, as testonly, is at http://review.whamcloud.com/10845.
+
+My local testing is ok, but as indicated in commit-msg of patch, it is still unclear for me if cases where a request that requires LVB update is received by Server between end of recovery/replays and before LVB is re-filled upon lock granting to a new Client ...
+
+--- Comment (bfaccini, Mon, 9 Jun 2014 19:04:07 +0000) ---
+Jinshan, thanks for your comments and help, I was already hesitating to block lvb setup/fetch between lvbo_init() or lvbo_fill() calls, so ... Let's give i a try now!
+
+--- Comment (jay, Mon, 9 Jun 2014 17:51:01 +0000) ---
+_ no longer fetch/fill/send lvb for/to Client for already granted and successfully replayed locks on Server side. Seems this has to occur mainly in ldlm_handle_enqueue0().
+
+I think we need to revise ldlm_resource_get() to delay lvbo_init() call for new resource. Instead, we can call lvbo_init() at the time when LVB is really necessary.
+
+_ not sure already on which flags/fields I will use to implement this and also if I need to only focus on Client/OST replays.
+
+Clients pack a flag into replay request to indicate if the lock is granted or blocked. See the code snippet from ldlm_lock_enqueue() below:
+
+        } else if (*flags & LDLM_FL_REPLAY) {
+                if (*flags & LDLM_FL_BLOCK_CONV) {
+                        ldlm_resource_add_lock(res, &res->lr_converting, lock);
+                        GOTO(out, rc = ELDLM_OK);
+                } else if (*flags & LDLM_FL_BLOCK_WAIT) {
+                        ldlm_resource_add_lock(res, &res->lr_waiting, lock);
+                        GOTO(out, rc = ELDLM_OK);
+                } else if (*flags & LDLM_FL_BLOCK_GRANTED) {
+                        ldlm_grant_lock(lock, NULL);
+                        GOTO(out, rc = ELDLM_OK);
+                }
+                /* If no flags, fall through to normal enqueue path. */
+        }
+
+For replay locks, it can skip the enqueue process and we can easily skip LVB packing in ldlm_lock_enqueue0().
+
+--- Comment (bfaccini, Fri, 6 Jun 2014 08:04:14 +0000) ---
+Sorry I am a bit late on this.
+
+Based on earlier discussion/comments and after looking into related source files, and since I am not fully aware of the whole replay mechanism, here is what I am planning to implement :
+
+           _ no longer fetch/fill/send lvb for/to Client for already granted and successfully replayed locks on Server side. Seems this has to occur mainly in ldlm_handle_enqueue0().
+
+           _ on Client, upon already granted+relayed lock successful reply from Server, keep going with what we already got.  Seems this has to occur mainly in ldlm_cli_enqueue_fini(). But other places, like ldlm_handle_cp_callback()/replay_one_lock()/... may also need to be investigated.
+
+           _ not sure already on which flags/fields I will use to implement this and also if I need to only focus on Client/OST replays.
+
+           _ also, what is still unclear for me is how the Server is able to detect the replayed lock was already granted to Client (mainly during recovery after a Server crash/reboot), and also how the Server will handle the situation where lvb content had not been fetched during replay and really needs to be at some point of time later.
+
+Jinshan, Brian, any comments/add-ons/no-go on this ?
+
+--- Comment (bfaccini, Tue, 27 May 2014 09:26:51 +0000) ---
+Ok, I currently try to implement Jinshan's idea. Will try to push a patch soon.
+
+--- Comment (pjones, Fri, 23 May 2014 23:18:49 +0000) ---
+Bruno
+
+Could you please create a patch to implement this approach?
+
+Thanks
+
+Peter
+
+--- Comment (behlendorf, Fri, 23 May 2014 18:34:13 +0000) ---
+If this IO can be avoided entirely that would be ideal.  Can you propose a patch because at the moment failover is exceptionally painful where there are a significant number of locks to replay.
+
+--- Comment (jay, Thu, 22 May 2014 17:06:52 +0000) ---
+My guess is that the target is reading inode for LVB and pack it back to client side when replaying a lock. This can be avoided if this is really the case.
+
+--- Comment (behlendorf, Wed, 21 May 2014 19:51:18 +0000) ---
+I was able to grab an inspect a set of client logs for this problems.  For all the logs I looked at the client seems to have done the right thing and only replayed the locks it considered 'used'.  Given our test workload and those log results I'm inclined to believe there really were 500,000 'used' locks spread over all of the clients that needed to be replayed.  And upon further reflection this really isn't a particularly large number considering that's only 500 locks per-client  if you have 1000 clients.
+
+So I'm thinking the issue here is simply that the servers must be able to handle lock replay significantly faster.  Particularly because none of this time is accounted for in the recovery timer which is downright confusing.  It shows up as the recovery timer dropping to zero and then it taking minutes or hours for you FS to actually be available.
+
+From what I've seen on our ZFS based OSTs it's largely because lock replay seems to require reading data from the disk and this is all done sequentially.  The fact that you have a cold cache certainly doesn't help things.  Speeding that up somehow would improve things considerably.  I've suggesting prefetching as a fairly easy way to speed this up but I'm all for better ideas.
+
+--- Comment (jay, Tue, 13 May 2014 00:24:58 +0000) ---
+I think it would be enough to get some log on the client side. There is no proc interface to dump all lock from a namespace. So please apply the follow settings on the client node:
+
+  lctl set_param debug=-1
+
+  lctl set_param debug=-trace
+
+  lctl set_param debug_mb=200
+
+should be enough. Please dump the log some time during the recovery and after recovery so that we can get all of them.
+
+Thanks in advance.
+
+--- Comment (behlendorf, Tue, 13 May 2014 00:00:37 +0000) ---
+Sure, it's easy enough to run the stress tests.  Can you tell me what logs you want.  Are the proc files on the client/servers, what log level on the server wouldn't be completely overwhelming.
+
+--- Comment (jay, Mon, 12 May 2014 23:57:20 +0000) ---
+Are the test cases running while on recovery?
+
+One other troublesome thing I noticed was that once recovery was complete and all the locks were enqueued virtually all of them were canceled. The lock count on the server drops quickly from roughly 500,000 to 5,000.
+
+This is weird, the only thing I can think of is that those locks are write locks and there were lots of glimpse requests which accelerates the cancelation of them.
+
+We really need to make clear what type of locks they are. Is it possible to run the test cases again and get some log?
+
+--- Comment (behlendorf, Mon, 12 May 2014 18:18:44 +0000) ---
+One other troublesome thing I noticed was that once recovery was complete and all the locks were enqueued virtually all of them were canceled.  The lock count on the server drops quickly from roughly 500,000 to 5,000.
+
+--- Comment (prakash, Mon, 12 May 2014 18:14:14 +0000) ---
+I think getting the filesystem back online should be the priority here. Yes, we want to try and preserve "useful" locks, but we don't want to do that at the cost of many minutes or hours of filesystem uptime.
+
+--- Comment (behlendorf, Mon, 12 May 2014 17:58:20 +0000) ---
+Jinshan, I'm not sure what the mix of locks being replayed is.  We've been running our SWL stress tests which loads up the filesystem with a random assortment of concurrent IOR, simul, fdtree, mdtest, and various application codes.  Each client appears to be replaying roughly 15,000 locks which I have a hard time believing are all covering dirty data which needs to be replayed.
+
+Replaying the enqueue also appears to be much slower than you're expecting.  We're seeing a rate of roughly 100 enqueues per second on ZFS because all the FID lookups are being done sequentially.  Each FID lookup on ZFS is likely going to require a synchronous IO because the OIs on won't be cached yet after the reboot.  And it appears this is all done sequentially from the target_recov thread in 2.4.  Here's a target_recov stack from an OST showing the issue.  During this replay 'iostat -x' reports that our disks are only roughly 10% utilized which makes sense due to the single threaded read workload.
+
+Doing this sequentially wouldn't be so bad if there was an interface which could use to do a prefetch on the FID lookup as described in LU-5041.
+
+cat /proc/5512/stack 
+[] cv_wait_common+0x8c/0x100 [spl]
+[] __cv_wait_io+0x18/0x20 [spl]
+[] zio_wait+0xfb/0x1b0 [zfs]
+[] dbuf_read+0x3fd/0x740 [zfs]
+[] __dbuf_hold_impl+0x189/0x480 [zfs]
+[] dbuf_hold_impl+0x86/0xc0 [zfs]
+[] dbuf_hold+0x20/0x30 [zfs]
+[] dmu_buf_hold+0x97/0x1d0 [zfs]
+[] zap_get_leaf_byblk+0x4f/0x2a0 [zfs]
+[] zap_deref_leaf+0x6a/0x80 [zfs]
+[] fzap_lookup+0x60/0x120 [zfs]
+[] zap_lookup_norm+0xe1/0x190 [zfs]
+[] zap_lookup+0x33/0x40 [zfs]
+[] osd_fid_lookup+0xb0/0x2e0 [osd_zfs]
+[] osd_object_init+0x1a1/0x6d0 [osd_zfs]
+[] lu_object_alloc+0xcd/0x300 [obdclass]
+[] lu_object_find_at+0x211/0x370 [obdclass]
+[] lu_object_find+0x16/0x20 [obdclass]
+[] ofd_object_find+0x35/0xf0 [ofd]
+[] ofd_lvbo_init+0x32d/0x950 [ofd]
+[] ldlm_resource_get+0x374/0x820 [ptlrpc]
+[] ldlm_lock_create+0x59/0xcc0 [ptlrpc]
+[] ldlm_handle_enqueue0+0x156/0x10a0 [ptlrpc]
+[] ldlm_handle_enqueue+0x66/0x70 [ptlrpc]
+[] ost_handle+0x1db8/0x48e0 [ost]
+[] handle_recovery_req+0x181/0x2e0 [ptlrpc]
+[] target_recovery_thread+0x912/0x1980 [ptlrpc]
+
+--- Comment (jay, Mon, 12 May 2014 17:34:07 +0000) ---
+It totally depends on the work load - if the locks are for many clients, the res lock contention on the server side would be high, but it's worth trying.
+
+--- Comment (bzzz, Mon, 12 May 2014 17:09:42 +0000) ---
+like said before - doing one lock a time can't be very fast. many lock replays in flight could make it few times faster which could be enough. iirc, we are able to process ~100K getattr/sec, which is more expensive than just locks (especially when you don't need to check for conflicts).
+
+--- Comment (jay, Mon, 12 May 2014 17:01:45 +0000) ---
+indeed, I agree what you said.
+
+This is a trade-off to make the system operable sooner by shortening the recovery time. Otherwise, it would take a lot of time to replay all locks and the system is unusable during that time.
+
+--- Comment (bzzz, Mon, 12 May 2014 16:42:57 +0000) ---
+"no readers" doesn't mean a lock is useless - there might be data cached and protected by the lock. now if you cancel that you lose data. for example, that could be an executable running on the cluster with 1000x nodes. and after OST failover all those would have to re-read the data back.
+
+--- Comment (jay, Mon, 12 May 2014 16:38:31 +0000) ---
+ah right now in the implementation of 2.4, our policy is that if there is no readers for a LCK_PR, we think it's safe to cancel the lock. Of course we do trick to check the case if a page is being covered by multiple locks.
+
+In the latest implementation in master, we also do check for write lock as well - if canceling a write lock won't cause write back, it's also good to cancel it on the local side during recovery.
+
+--- Comment (bzzz, Mon, 12 May 2014 15:59:22 +0000) ---
+from the lock itself it might be hard to decide whether the lock is "useful" (i.e. has some data behind).
+
+--- Comment (jay, Mon, 12 May 2014 15:56:32 +0000) ---
+That would be a good direction to improve. However, I think there might be a BUG on the client side to replay unnecessary locks.
+
+--- Comment (bzzz, Mon, 12 May 2014 06:14:25 +0000) ---
+shouldn't we try to replay locks concurrently? given the locks do not conflict we could also skip regular processing on the server. we easily do 10K file creations a second from many client. with non-conflicting locks I'd expect something like 100K enqueues/second.
+
+--- Comment (jay, Sat, 10 May 2014 00:53:40 +0000) ---
+Do you have a rough idea what type the locks are? Right now in 2.4 implementation, only read locks w/o covering any read ahead pages will be canceled during recovery.
+
+We have a better implementation for cancel for recovery in master, but I want to clarify the situation before initiating a backport.

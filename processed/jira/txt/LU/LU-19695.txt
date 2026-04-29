@@ -1,0 +1,154 @@
+Key:        LU-19695
+Summary:    sanity test 160s is flaky
+Link:       https://jira.whamcloud.com/browse/LU-19695
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Thomas Bertschinger
+Reporter:   Thomas Bertschinger
+Created:    Thu, 11 Dec 2025 16:01:55 +0000
+Updated:    Tue, 20 Jan 2026 19:24:24 +0000
+Resolved:   Tue, 20 Jan 2026 19:24:24 +0000
+
+--- Description ---
+On my local system, sanity test 160s frequently fails. I haven't seen it fail when I run it on its own, but it commonly fails if I run it together with other changelog tests:
+
+ 
+
+$ for i in {0..20}; do MDSCOUNT=2 ./lustre/tests/auster -s sanity --only 160p,160s 2>/dev/null | if grep -q "sanity returned 1" ; then echo "fail" ; else echo "pass";  fi ; done | sort | uniq -c
+     11 fail
+     10 pass 
+
+ 
+
+I believe the explanation for the failure is that the garbage collection thread that 160s tries to launch does not get launched (when expected) – in fact, it does get launched, but too soon.
+
+It would appear that the first metadata operation that the test performs:
+
+test_mkdir -c $MDSCOUNT -H all_char $DIR/$tdir 
+
+sometimes results in the garbage collection thread being launched.
+
+This results in mc_gc_time being set to "now" in mdd_changelog_store():
+
+int mdd_changelog_store(const struct lu_env *env, struct mdd_device *mdd,
+                        struct llog_changelog_rec *rec, struct thandle *th)
+{
+        ...
+        spin_lock(&mdd->mdd_cl.mc_lock);
+        if (likely(mdd->mdd_changelog_gc &&
+                     mdd->mdd_cl.mc_gc_task == MDD_CHLG_GC_NONE &&
+                     ktime_get_real_seconds() - mdd->mdd_cl.mc_gc_time >
+                        mdd->mdd_changelog_min_gc_interval)) {
+                ...
+                /* next check in mdd_changelog_min_gc_interval anyway */
+                mdd->mdd_cl.mc_gc_time = ktime_get_real_seconds();
+}
+
+Then, when the metadata operations that are intended to trigger the GC thread occur:
+
+        # Generate one more changelog to trigger GC
+        for ((i = 0; i do
+                $LFS mkdir -i $i $DIR/$tdir/d$i.3 $DIR/$tdir/d$i.4 ||
+                        error "create $DIR/$tdir/d$i.3 failed"
+        done 
+
+... the thread is NOT launched, because the comparison mdd->mdd_changelog_min_gc_interval >= ktime_get_real_seconds() - mdd->mdd_cl.mc_gc_time fails:
+
+int mdd_changelog_store(const struct lu_env *env, struct mdd_device *mdd,
+                        struct llog_changelog_rec *rec, struct thandle *th)
+{
+        ...
+        /* time to recover some space ?? */
+        if (likely(!mdd->mdd_changelog_gc ||
+                   mdd->mdd_cl.mc_gc_task != MDD_CHLG_GC_NONE ||
+                   mdd->mdd_changelog_min_gc_interval >=
+                        ktime_get_real_seconds() - mdd->mdd_cl.mc_gc_time))
+                /* save a spin_lock trip */
+                goto out_put;
+
+        if (CFS_FAIL_PRECHECK(OBD_FAIL_MDS_CHANGELOG_IDX_PUMP)) {
+                spin_lock(&mdd->mdd_cl.mc_lock);
+                mdd->mdd_cl.mc_index += cfs_fail_val;
+                spin_unlock(&mdd->mdd_cl.mc_lock);
+        }
+        ...
+}
+ 
+
+and the function exits before hitting the fault injection and attempting to launch a GC thread.
+
+I'm not sure why the GC thread sometimes gets triggered too soon, and sometimes not. But it would seem that the simplest solution here is to make the test sleep for an extra second, so that even if the GC thread is triggered at the beginning of the test, enough time will still elapse for it to trigger again 2 seconds later:
+
+$ git diff
+diff --git a/lustre/tests/sanity.sh b/lustre/tests/sanity.sh
+index 4f825ce824..beae714095 100755
+--- a/lustre/tests/sanity.sh
++++ b/lustre/tests/sanity.sh
+@@ -20947,7 +20947,7 @@ test_160s() {
+        do_nodes $mdts $LCTL set_param fail_loc=0x16d fail_val=500000000        # ensure we are past the previous changelog_min_gc_interval set above
+-       local sleep2=$((start + 2 - SECONDS))
++       local sleep2=$((start + 3 - SECONDS))
+        (( sleep2 > 0 )) && echo "sleep $sleep2 for interval" && sleep $sleep2        # Generate one more changelog to trigger GC 
+
+With that change in place, the test reliably passes for me locally:
+
+$ for i in {0..20}; do MDSCOUNT=2 ./lustre/tests/auster -s sanity --only 160p,160s 2>/dev/null | if grep -q "sanity returned 1" ; then echo "fail" ; else echo "pass";  fi ; done | sort | uniq -c
+     21 pass
+
+--- Comment (pjo, Tue, 20 Jan 2026 19:24:24 +0000) ---
+Merged for 2.18
+
+--- Comment (gerrit, Wed, 7 Jan 2026 07:59:05 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/63024/
+
+Subject: LU-19695 tests: fix flaky test 160s
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: aa6cc72f7c7ad4aad8015f5a2089b2a8b957fe83
+
+--- Comment (gerrit, Thu, 11 Dec 2025 19:33:42 +0000) ---
+"Thomas Bertschinger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/63024
+
+Subject: LU-19695 tests: fix flaky test 160s
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 3d8d42ddd463943c33ddf6a99874502042fc5c60
+
+--- Comment (JIRAUSER18444, Thu, 11 Dec 2025 16:20:33 +0000) ---
+Rather than update the test to sleep for an extra second, an alternative could be to update the timestamp comparisons like this:
+
+$ git diff
+diff --git a/lustre/mdd/mdd_dir.c b/lustre/mdd/mdd_dir.c
+index 52b7e2cbc0..5da7be47aa 100644
+--- a/lustre/mdd/mdd_dir.c
++++ b/lustre/mdd/mdd_dir.c
+@@ -1030,7 +1030,7 @@ int mdd_changelog_store(const struct lu_env *env, struct mdd_device *mdd,
+        /* time to recover some space ?? */
+        if (likely(!mdd->mdd_changelog_gc ||
+                   mdd->mdd_cl.mc_gc_task != MDD_CHLG_GC_NONE ||
+-                  mdd->mdd_changelog_min_gc_interval >=
++                  mdd->mdd_changelog_min_gc_interval >
+                        ktime_get_real_seconds() - mdd->mdd_cl.mc_gc_time))
+                /* save a spin_lock trip */
+                goto out_put;
+@@ -1045,7 +1045,7 @@ int mdd_changelog_store(const struct lu_env *env, struct mdd_device *mdd,
+        spin_lock(&mdd->mdd_cl.mc_lock);
+        if (likely(mdd->mdd_changelog_gc &&
+                     mdd->mdd_cl.mc_gc_task == MDD_CHLG_GC_NONE &&
+-                    ktime_get_real_seconds() - mdd->mdd_cl.mc_gc_time >
++                    ktime_get_real_seconds() - mdd->mdd_cl.mc_gc_time >=
+                        mdd->mdd_changelog_min_gc_interval)) {
+                if (unlikely(need_gc)) {
+                        CWARN("%s: %s starting changelog garbage collection\n",

@@ -1,0 +1,191 @@
+Key:        LU-12946
+Summary:    Multipath path flapping issue
+Link:       https://jira.whamcloud.com/browse/LU-12946
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Wang Shilong
+Reporter:   Wang Shilong
+Created:    Thu, 7 Nov 2019 02:31:58 +0000
+Updated:    Wed, 17 Feb 2021 22:14:19 +0000
+Resolved:   Fri, 22 Nov 2019 20:01:51 +0000
+
+--- Description ---
+The symptoms of this issue are high I/O latency seen on an external server from the multipath devices without associated latency on the underlying physical disks. The following messages are also associated with this issue:
+
+Oct 28 15:12:23 nvme1 kernel: device-mapper: multipath: Reinstating path 8:160.
+
+Oct 28 15:12:23 nvme1 multipathd: 8:160: reinstated
+
+Oct 28 15:12:23 nvme1 multipathd: 360001ff0b05e90000000002e8964000a: remaining active paths: 5
+
+Oct 28 15:12:25 nvme1 multipathd: 360001ff0b05e90000000002e8964000a: switch to path group #1
+
+Oct 28 15:12:25 nvme1 kernel: device-mapper: multipath: Failing path 8:160.
+
+Oct 28 15:12:26 nvme1 multipathd: sdk: mark as failed
+
+Oct 28 15:12:26 nvme1 multipathd: 360001ff0b05e90000000002e8964000a: remaining active paths: 4
+
+Oct 28 15:12:27 nvme1 multipathd: 360001ff0b05e90000000002e8964000a: sdi - tur checker reports path is up
+
+Oct 28 15:12:27 nvme1 multipathd: 8:128: reinstated
+
+Oct 28 15:12:27 nvme1 multipathd: 360001ff0b05e90000000002e8964000a: remaining active paths: 5
+
+Oct 28 15:12:27 nvme1 kernel: device-mapper: multipath: Reinstating path 8:128.
+
+Oct 28 15:12:28 nvme1 multipathd: 360001ff0b05e90000000002e8964000a: sdk - tur checker reports path is up
+
+Oct 28 15:12:28 nvme1 kernel: device-mapper: multipath: Reinstating path 8:160.
+
+Specifically, paths being failed by the device-mapper module itself (e.g. this message) without any other associated error:
+
+Oct 28 15:12:25 nvme1 kernel: device-mapper: multipath: Failing path 8:160.
+
+Oct 28 15:12:26 nvme1 multipathd: sdk: mark as failed
+
+and then being reinstated shortly thereafter by the tur checker:
+
+Oct 28 15:12:28 nvme1 multipathd: 360001ff0b05e90000000002e8964000a: sdk - tur checker reports path is up
+
+Oct 28 15:12:28 nvme1 kernel: device-mapper: multipath: Reinstating path 8:160.
+
+For a more definitive diagnosis one can run the attached systemtap script and the output should look like this (the key is the return/error fields set to 3 and the tail of the backtrace being fail_path called by multipath_end_io):
+
+blk_insert_cloned_request() return=3
+
+dm_multipath:multipath_end_io() error=3
+
+0xffffffffc03a46f0 : fail_path+0x0/0xe0 [dm_multipath]
+
+0xffffffffc03a646a : multipath_end_io+0x4a/0x1a0 [dm_multipath]
+
+0xffffffffc0019403 : dm_softirq_done+0xc3/0x2d0 [dm_mod]
+
+0xffffffffb154fe5f : __blk_mq_complete_request+0xdf/0x1e0 [kernel]
+
+0xffffffffb154ff87 : blk_mq_complete_request+0x27/0x30 [kernel]
+
+0xffffffffc0018614 : dm_complete_request+0x34/0x60 [dm_mod]
+
+0xffffffffc0018d40 : map_request+0x170/0x2a0 [dm_mod]
+
+0xffffffffc001928e : dm_mq_queue_rq+0x8e/0x140 [dm_mod]
+
+0xffffffffb1550d18 : blk_mq_dispatch_rq_list+0x268/0x620 [kernel]
+
+0xffffffffb1555dee : blk_mq_do_dispatch_sched+0x7e/0x130 [kernel]
+
+0xffffffffb15567ae : blk_mq_sched_dispatch_requests+0x11e/0x1c0 [kernel]
+
+0xffffffffb154ec10 : __blk_mq_run_hw_queue+0x50/0xc0 [kernel]
+
+0xffffffffb154ed38 : __blk_mq_delay_run_hw_queue+0xb8/0x110 [kernel]
+
+0xffffffffb154ee57 : blk_mq_run_hw_queue+0x57/0x110 [kernel]
+
+0xffffffffb1556c6e : blk_mq_sched_insert_requests+0x6e/0xc0 [kernel]
+
+0xffffffffb1551d1c : blk_mq_flush_plug_list+0x19c/0x200 [kernel]
+
+0xffffffffb154703e : blk_flush_plug_list+0xce/0x230 [kernel]
+
+0xffffffffb15475b4 : blk_finish_plug+0x14/0x40 [kernel]
+
+0xffffffffc0a15f3b [mmfslinux]
+
+0xffffffffc0e5b174 [mmfs26]
+
+The cause is a borked RedHat backport of this upstream patch (https://github.com/torvalds/linux/commit/86ff7c2a80cd357f6156a53b354f6a0b357dc0c9). Here's what I believe to be the fix which prevents the BLK_MQ_RQ_QUEUE_DEV_BUSY state from causing the request to be prematurely completed in an error state:
+
+— kernel-3.10.0-957.21.3.el7/linux-3.10.0-957.21.3.el7.x86_64/drivers/md/dm-rq.c 2019-06-14 06:29:35.000000000 +0000
++++ kernel-3.10.0-957.21.3.el7.patched/linux-3.10.0-957.21.3.el7.x86_64/drivers/md/dm-rq.c 2019-10-28 00:16:55.949220284 +0000
+@@ -477,7 +477,7 @@
+
+clone->start_time = jiffies;
+r = blk_insert_cloned_request(clone->q, clone);
+
+if (r != BLK_MQ_RQ_QUEUE_OK && r != BLK_MQ_RQ_QUEUE_BUSY)
++ if (r != BLK_MQ_RQ_QUEUE_OK && r != BLK_MQ_RQ_QUEUE_BUSY && r != BLK_MQ_RQ_QUEUE_DEV_BUSY )
+/* must complete clone in terms of original request */
+dm_complete_request(rq, r);
+return r;
+@@ -661,7 +661,7 @@
+trace_block_rq_remap(clone->q, clone, disk_devt(dm_disk(md)),
+blk_rq_pos(rq));
+ret = dm_dispatch_clone_request(clone, rq);
+if (ret == BLK_MQ_RQ_QUEUE_BUSY) {
++ if (ret == BLK_MQ_RQ_QUEUE_BUSY || ret == BLK_MQ_RQ_QUEUE_DEV_BUSY) {
+blk_rq_unprep_clone(clone);
+tio->ti->type->release_clone_rq(clone);
+tio->clone = NULL;
+
+--- Comment (gerrit, Thu, 12 Dec 2019 23:06:27 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/36868/
+
+Subject: LU-12946 kernel: fix to handle BLK_MQ_RQ_QUEUE_DEV_BUSY event
+
+Project: fs/lustre-release
+
+Branch: b2_12
+
+Current Patch Set: 
+
+Commit: 849e1a5cbcd7025a19611277b14c5605c0dffefa
+
+--- Comment (gerrit, Tue, 26 Nov 2019 15:15:50 +0000) ---
+Minh Diep (mdiep@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/36868
+
+Subject: LU-12946 kernel: fix to handle BLK_MQ_RQ_QUEUE_DEV_BUSY event
+
+Project: fs/lustre-release
+
+Branch: b2_12
+
+Current Patch Set: 1
+
+Commit: b0d536927e7c882dae1d59d7b01c8b7242a243aa
+
+--- Comment (pjones, Fri, 22 Nov 2019 22:08:11 +0000) ---
+Yes
+
+--- Comment (ofaaland, Fri, 22 Nov 2019 20:12:34 +0000) ---
+Should this be backported to b2_12?
+
+--- Comment (gerrit, Fri, 22 Nov 2019 19:59:51 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/36699/
+
+Subject: LU-12946 kernel: fix to handle BLK_MQ_RQ_QUEUE_DEV_BUSY event
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 5c8b1e87a97bbe7b05f0b8325e98c16a0de1ff4c
+
+--- Comment (chunteraa, Thu, 21 Nov 2019 18:53:33 +0000) ---
+There is a private BZ:
+
+The patch has been identified and our Quality team is currently testing this patch. This fix will go in Rhel 7.8
+
+--- Comment (ruth.klundt@gmail.com, Wed, 20 Nov 2019 22:44:36 +0000) ---
+We see this with RHEL 7.7 and lustre 2.10+. We confirmed the patch fixes the issue.
+
+Is there a RHEL bugzilla associated with this? Thanks.
+
+--- Comment (gerrit, Thu, 7 Nov 2019 02:32:51 +0000) ---
+Wang Shilong (wshilong@ddn.com) uploaded a new patch: https://review.whamcloud.com/36699
+
+Subject: LU-12946 kernel: fix to handle BLK_MQ_RQ_QUEUE_DEV_BUSY event
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 709749d9af355a67dde4ef7d6ca12a09e873ae86

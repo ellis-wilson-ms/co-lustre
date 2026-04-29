@@ -1,0 +1,174 @@
+Key:        LU-18449
+Summary:    Handling kernel mmap read-ahead triggering by advise(MADV_HUGEPAGE)
+Link:       https://jira.whamcloud.com/browse/LU-18449
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Qian Yingjin
+Reporter:   Qian Yingjin
+Created:    Fri, 15 Nov 2024 09:00:34 +0000
+Updated:    Fri, 30 Jan 2026 04:46:39 +0000
+Resolved:   Fri, 5 Dec 2025 07:31:45 +0000
+Links:      Related: is related to LU-19009
+
+--- Description ---
+kernel:LustreError: 126979:0:(rw.c:2162:ll_readpage()) ASSERTION( !ra_assert ) failed: 
+
+Found a possible bug in kernel to trigger readahead in Linux kernel:
+
+static struct file *do_sync_mmap_readahead(struct vm_fault *vmf)
+{
+	struct file *file = vmf->vma->vm_file;
+	struct file_ra_state *ra = &file->f_ra;
+	struct address_space *mapping = file->f_mapping;
+	DEFINE_READAHEAD(ractl, file, ra, mapping, vmf->pgoff);
+	struct file *fpin = NULL;
+	unsigned long vm_flags = vmf->vma->vm_flags;
+	unsigned int mmap_miss;
+
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+	/* Use the readahead code, even if readahead is disabled */
+	if (vm_flags & VM_HUGEPAGE) {
+		fpin = maybe_unlock_mmap_for_io(vmf, fpin);
+		ractl._index &= ~((unsigned long)HPAGE_PMD_NR - 1);
+		ra->size = HPAGE_PMD_NR;
+		/*
+		 * Fetch two PMD folios, so we get the chance to actually
+		 * readahead, unless we've been told not to.
+		 */
+		if (!(vm_flags & VM_RAND_READ))
+			ra->size *= 2;
+		ra->async_size = HPAGE_PMD_NR;
+		page_cache_ra_order(&ractl, ra, HPAGE_PMD_ORDER);
+		return fpin;
+	}
+#endif
+
+	/* If we don't want any read-ahead, don't bother */
+	if (vm_flags & VM_RAND_READ)
+		return fpin;
+	if (!ra->ra_pages)
+		return fpin;
+        ...
+}
+
+Usually the kernel readahead will disabled by setting ra_pages with 0.
+
+However,
+
+when CONFIG_TRANSPARENT_HUGEPAGE is enabled and vm flagged with VM_HUGEPAGE, it will trigger the kernel readahead.
+
+When the kernel is configed with CONFIG_TRANSPARENT_HUGEPAGE and the application is set VM_HUGEPAGE via MADV_HUGEPAGE via madvise() system call, it is possible to trigger these kind of read-ahead from Linux kernel and out the control of Lustre.
+
+--- Comment (pjo, Fri, 5 Dec 2025 07:31:38 +0000) ---
+The follow-on patch was duplicating changes already merged so everything is complete.
+
+--- Comment (pjo, Tue, 2 Dec 2025 09:04:46 +0000) ---
+Still a follow-on patch being tracked under this ticket
+
+--- Comment (yujian, Tue, 2 Dec 2025 07:18:44 +0000) ---
+Merged for 2.17.
+
+--- Comment (gerrit, Fri, 14 Nov 2025 02:14:54 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/57038/
+
+Subject: LU-18449 llite: handle kernel readahead for VM_HUGEPAGE vma
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 4a9951dd7ea895930f5d5e264435e03f7b0f1930
+
+--- Comment (gerrit, Sat, 1 Nov 2025 04:22:40 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/62159
+
+Subject: LU-18449 llite: fix wrong VM_HUGEPAGE readahead check
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 55d072001cad7a0700869d872af1e814f95041ee
+
+--- Comment (JIRAUSER19464, Wed, 6 Aug 2025 17:29:28 +0000) ---
+I tried this patch on my environment, and it can fix the issue. Thanks! Qian
+
+--- Comment (JIRAUSER19464, Wed, 6 Aug 2025 04:17:30 +0000) ---
+> Has the application used MADV_HUGEPAGE via madvise()?
+
+I am not sure, the application suppose to use mmap to fetch the fetch the data.  
+
+def load_safetensors_file(tensor_name, worker_id):
+  # input dimension from vllm/model_executor/layers/linear.py:60 is 1
+  #### way #1 where we load tensor, then narrow it
+  loaded_weight = f.get_tensor(tensor_name).          this is from tensorflow, which I am not familar with.
+  if len(loaded_weight.shape) > 1:
+    shard_size = loaded_weight.shape[1] // args.worker_count
+    start_idx = worker_id * shard_size
+    loaded_weight_narrowed = loaded_weight.narrow(1, start_idx, shard_size)
+    param = torch.empty_like(loaded_weight_narrowed, device='cpu')
+    param_data = param.data
+    param_data.copy_(loaded_weight_narrowed)
+ 
+
+Though I can reproduce the issue, do you have the patch based on 2.14?
+
+--- Comment (qian_wc, Wed, 6 Aug 2025 01:27:29 +0000) ---
+Has the application used MADV_HUGEPAGE via madvise()?
+
+--- Comment (JIRAUSER19464, Tue, 5 Aug 2025 20:51:24 +0000) ---
+I saw this in my testing.
+
+[202727.315627] LustreError: 376530:0:(rw.c:2148:ll_readpage()) sbi ra pages 0, file ra pages 4096
+[202727.315636] LustreError: 376530:0:(rw.c:2156:ll_readpage()) bdi io_pages 0
+[202727.315640] LustreError: 376530:0:(rw.c:2162:ll_readpage()) ASSERTION( !ra_assert ) failed: 
+[202727.315642] LustreError: 376530:0:(rw.c:2162:ll_readpage()) LBUG
+[202727.315652] CPU: 18 PID: 376530 Comm: python3 Kdump: loaded Tainted: G           OE     -------  ---  5.14.0-427.31.1_lustre.el9.x86_64 #1
+[202727.315655] Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS Google 07/12/2025
+[202727.315659] Call Trace:
+[202727.315662]  
+[202727.315665]  dump_stack_lvl+0x34/0x48
+[202727.315673]  lbug_with_loc.cold+0x5/0x43 [libcfs]
+[202727.315717]  ll_readpage+0xc62/0xc90 [lustre]
+[202727.315807]  ? __pfx_ll_read_folio+0x10/0x10 [lustre]
+[202727.315871]  filemap_read_folio+0x40/0x2c0
+[202727.315876]  ? xas_load+0x9/0xa0
+[202727.315879]  ? __filemap_get_folio+0x106/0x330
+[202727.315882]  filemap_fault+0x656/0x700
+[202727.315886]  ll_filemap_fault+0x2e/0x50 [lustre]
+[202727.315957]  vvp_io_kernel_fault+0x1b/0x310 [lustre]
+[202727.316026]  vvp_io_fault_start+0x393/0xcd0 [lustre]
+[202727.316093]  ? cl_lock_enqueue+0x56/0x110 [obdclass]
+[202727.316213]  ? cl_lock_request+0x66/0x1d0 [obdclass]
+
+--- Comment (qian_wc, Thu, 8 May 2025 03:59:10 +0000) ---
+I tested on rock9.4 with fio as follows:
+
+ $TRUNCATE $file $((10 * 1024 * 1024 * 1024)) ||
+                error "failed to truncate $file"
+fio --name=read_test --ioengine=mmap --filename=$file --rw=read \
+                --bs=1m --thp=1 || error "failed to run fio on $file"
+cat /proc/meminfo | grep HugePage
+
+It can not reproduce the panic...
+
+The option "--thp=1" will inform the fio to run with MADV_HUGEPAGE madvise, I am just curious how the panic happened without the option "--thp=1"....
+
+--- Comment (gerrit, Fri, 15 Nov 2024 09:33:41 +0000) ---
+"Qian Yingjin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/57038
+
+Subject: LU-18449 llite: handle kernel readahead for VM_HUGEPAGE vma
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: e56566635285c787c54363606c76452e37b31494

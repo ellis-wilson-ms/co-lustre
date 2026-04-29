@@ -1,0 +1,92 @@
+Key:        LU-16047
+Summary:    cache contention in ".lustre/fid/
+Link:       https://jira.whamcloud.com/browse/LU-16047
+Type:       Improvement
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Etienne Aujames
+Reporter:   Etienne Aujames
+Created:    Mon, 25 Jul 2022 19:23:52 +0000
+Updated:    Wed, 27 Jul 2022 10:44:34 +0000
+Labels:     performance, robinhood
+Attachments: perf_fid_cont.svg
+
+--- Environment ---
+VMs + 2.12.8 + 3.10.0-1160.59.1
+
+robinhood v3 + 2.12.8 + 3.10.0-1062
+
+--- Description ---
+This issue was observed with robinhood clients:
+
+	robinhood become slower to sync the fs with changelog with the time
+
+	robinhood become slower if the reader is late (more negative entries generated).
+
+"strace" on reader threads reveal that the FID stats could take several seconds.
+
+drop_cache 2 or 3 fixes temporary the issue.
+
+Reproducer
+
+I was able to reproduce the issue with a "dumb" executable that generate a lot of "negative entries" with parallel stats on "/.lustre/fid/".
+
+The  perf_fid_cont.svg is a flamegraph on the threads of the test process (fid_rand).
+
+Most of the threads of fid_rand wait for the mutex of "./lustre/fid" inode in:
+
+static int lookup_slow(struct nameidata *nd, struct path *path)
+{                                                              
+        struct dentry *dentry, *parent;                        
+        int err;                                               
+                                                               
+        parent = nd->path.dentry;                              
+        BUG_ON(nd->inode != parent->d_inode);                  
+                                                               
+        mutex_lock(&parent->d_inode->i_mutex);                            last, parent, nd->flags);  
+        mutex_unlock(&parent->d_inode->i_mutex); 
+
+workarround
+
+	crontab with "echo 2 > /proc/sys/vm/drop_caches"
+
+	set the "/proc/sys/fs/negative-dentry-limit" on 3.10.0-1160 kernel
+
+--- Comment (eaujames, Tue, 26 Jul 2022 07:56:42 +0000) ---
+The robinhood node have the 3.10.0-1062, negative-dentry-limit parameter does not exist for this kernel. So we use "echo 2 > /proc/sys/vm/drop_caches" every minute to keep the number of changelog dequeued by robinhood up to 10k.
+
+robinhood already have a de-duplicate mechanism on changelog to limit the number of "stat" on the filesystem, so it does not require negative dentry cache.
+
+For now, I was not able to reproduce this with a lustre 2.15 (on the same scale, dentries are freed regularly), so maybe the https://review.whamcloud.com/39685/ (LU-13909 llite: prune invalid dentries) could help.
+
+The CEA will try to upgrade the robinhood nodes with RHEL8 kernel to benefit from the cache improvements.
+
+--- Comment (adilger, Mon, 25 Jul 2022 21:41:52 +0000) ---
+Do you have any stats on how many negative dentries need to accumulate in the .lustre/fid directory for this to become a problem, and how long it takes for that many negative dentries to accumulate?  That would allow setting negative-dentry-limit to a reasonable default value (e.g. via /usr/lib/sysctl.d/lustre.conf) at startup.
+
+One possible fix is to not cache negative dentries for the .lustre/fid directory at all, but this might increase loading on the MDS due to repeated negative FID lookup RPCs being sent to the MDS. That depends heavily on how often the same non-existent FID is being looked up multiple times, and unfortunately I have no idea whether that is common or not. It likely also depends heavily on whether the Changelog reader itself will discard repeated records for the same FID (essentially implementing its own negative FID cache in userspace).
+
+Alternately, having some kind of periodic purging of old negative dentries on this directory would be possible. Something like dropping negative dentries after 30s (tunable?) of inactivity seems like a reasonable starting point. I couldn't find the /proc/sys/fs/negative-dentry-limit tunable on my RHEL8 server, but it appears that the newer kernel handles negative dentries better and does not need this tunable.
+
+However, if the negative-dentry-limit parameter is working reasonably well for el7.9 kernels, and el8.x kernels don't have a problem, then maybe there isn't a need for a Lustre-specific patch?  I do recall a number of patches being sent to linux-fsdevel related to limiting the negative dentry count, but I don't know if any of those patches landed.  It seems highly unlikely that they were landed upstream in time for the el8.x kernel, but maybe one of those patches was backported to el8.x while they were still making up their minds about the upstream solution.
+
+--- Comment (eaujames, Mon, 25 Jul 2022 20:33:29 +0000) ---
+With:
+
+[root@client ~]# cat /proc/sys/fs/dentry-state
+8499096 8483804 45      0       8470127 0     
+
+And 100 threads doing state on non-existent fid and 20 threads doing stat on existent fid, I have the following latencies:
+
+[root@client ~]#  for i in {1..10}; do  time stat /media/lustrefs/client/.lustre/fid/[0x200000402:0x66:0x0] ; done |& grep real
+real    0m0.333s
+real    0m0.352s
+real    0m0.370s
+real    0m0.003s
+real    0m0.311s
+real    0m0.296s
+real    0m0.172s
+real    0m0.345s
+real    0m0.383s
+real    0m0.330s

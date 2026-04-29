@@ -1,0 +1,199 @@
+Key:        LU-8562
+Summary:    osp_precreate_cleanup_orphans/osp_precreate_reserve race may cause data loss
+Link:       https://jira.whamcloud.com/browse/LU-8562
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Alex Zhuravlev
+Reporter:   Sergey Cheremencev
+Created:    Mon, 29 Aug 2016 13:01:30 +0000
+Updated:    Tue, 16 Jul 2019 17:18:11 +0000
+Resolved:   Thu, 16 Feb 2017 21:44:05 +0000
+Links:      Duplicate: duplicates LU-8967; Related: is related to LU-8972; Related: is related to LU-11196
+
+--- Description ---
+osp_statfs_interpret can clear error in opd_pre_status despite of the
+
+fact that osp_precreate_cleanup_orphans got error and doesn't know
+
+exactly OST object last_id. Example: 
+
+	mdt sends req "create objects x..y"
+
+	objects created. mdt gets OK
+
+	MDT->OST reconnection
+
+	MDT sends cleanup_orphans last_used_fid=x
+
+	OST removes x..y and sends reply OK and last_id=x
+
+	MDT->OST connection aborted. cleanup_orphans exits with EIO
+
+	osp_statfs_interpret changes opd_pre_status from EIO to 0
+
+	osp_precreate_reserve reserves object and changes last_used_id from x to x+1
+
+	connection restored. MDT sends cleanup_orphans last_id=x+1
+
+In fine OST has a gap - object x was removed by cleanup_orphans.
+
+Below is reproducer that works only on singe node setup:
+
+diff --git a/lustre/tests/conf-sanity.sh b/lustre/tests/conf-sanity.sh
+index c64ebab..f5026dc 100755
+--- a/lustre/tests/conf-sanity.sh
++++ b/lustre/tests/conf-sanity.sh
+@@ -6796,6 +6796,32 @@ test_97() {
+ }
+ run_test 97 "ldev returns correct ouput when querying based on role"
+ 
++test_98() {
++       local_mode || { skip "Need single node setup"; return; }
++       local cmp=0
++       local dev=$FSNAME-OST0000-osc-MDT0000
++       setupall
++
++       createmany -o $DIR1/$tfile-%d 50000&
++       cmp=$!
++       # MDT->OST reconnection causes MDTOST last_id synchornisation
++       # via osp_precreate_cleanup_orphans.
++       for i in $(seq 0 100); do
++               for k in $(seq 0 10); do
++                       $LCTL --device $dev deactivate
++                       $LCTL --device $dev activate
++               done
++               ls -asl $MOUNT | grep '???' && \
++                       (kill -9 $cmp &>/dev/null; \
++                       error "File hasn't object on OST")
++               ps -A -o pid | grep $cmp 1>/dev/null || break
++       done
++       wait $cmp
++       stopall
++}
++run_test 98 "Race MDT->OST reconnection with create"
++
++
+
+--- Comment (mdiep, Thu, 16 Feb 2017 21:44:05 +0000) ---
+Landed in Lustre 2.10
+
+--- Comment (gerrit, Tue, 24 Jan 2017 05:21:48 +0000) ---
+Oleg Drokin (oleg.drokin@intel.com) merged in patch https://review.whamcloud.com/24758/
+
+Subject: LU-8562 osp: osp_precreate_thread gets stuck after disconnect
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: fb64c701791e591f4fd1a849e4be774ff85145fc
+
+--- Comment (gerrit, Sat, 7 Jan 2017 01:46:27 +0000) ---
+Ned Bass (bass6@llnl.gov) uploaded a new patch: https://review.whamcloud.com/24758
+
+Subject: LU-8562 osp: osp_precreate_thread gets stuck after disconnect
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: b0eae5b52842c32c63ed6ba3e8981a84cede7c94
+
+--- Comment (nedbass, Fri, 30 Dec 2016 03:22:36 +0000) ---
+I was testing out patch 22211 and (if my understanding is correct) may have found a defect.
+
+It seems osp_precreate_thread() can get stuck because d->opd_got_disconnected never gets reset. When opd_got_disconnected is set, osp_precreate_cleanup_orphans() returns early with EAGAIN and can't clear d->opd_pre_recovering. And because d->opd_pre_recovering can't be cleared we always hit the break statement below and don't clear d->opd_got_disconnected. So osp_precreate_cleanup_orphans() is stuck always failing.
+
+ 
+
+        while (osp_precreate_running(d)) {
+                /*
+                 * need to be connected to OST
+                 */
+                while (osp_precreate_running(d)) {
++                       if (d->opd_pre_recovering &&
++                           d->opd_imp_connected)
++                               break;
+                        l_wait_event(d->opd_pre_waitq,
+                                     !osp_precreate_running(d) ||
+                                     d->opd_new_connection,
+                                     &lwi);
+ 
+                        if (!d->opd_new_connection)
+                                continue;
+ 
+                        d->opd_new_connection = 0;
+                        d->opd_got_disconnected = 0;
+                        break;
+                }
+ 
+                if (!osp_precreate_running(d))
+                        break;
+ 
+                LASSERT(d->opd_obd->u.cli.cl_seq != NULL);
+                /* Sigh, fid client is not ready yet */
+                if (d->opd_obd->u.cli.cl_seq->lcs_exp == NULL)
+                        continue;
+ 
+                /* Init fid for osp_precreate if necessary */
+                rc = osp_init_pre_fid(d);
+                if (rc != 0) {
+                        class_export_put(d->opd_exp);
+                        d->opd_obd->u.cli.cl_seq->lcs_exp = NULL;
+                        CERROR("%s: init pre fid error: rc = %d\n",
+                               d->opd_obd->obd_name, rc);
+                        continue;
+                }
+ 
+                osp_statfs_update(d);
+ 
+                /*
+                 * Clean up orphans or recreate missing objects.
+                 */
+                rc = osp_precreate_cleanup_orphans(&env, d);
+-               if (rc != 0)
++               if (rc != 0) {
++                       schedule_timeout_interruptible(cfs_time_seconds(1));
+                        continue;
++               }
+                /*
+                 * connected, can handle precreates now
+                 */
+
+--- Comment (nedbass, Wed, 28 Dec 2016 00:40:27 +0000) ---
+Why was this not a blocker for 2.9?
+
+--- Comment (tappro, Sat, 24 Dec 2016 21:32:24 +0000) ---
+reopen due to LU-8972
+
+--- Comment (pjones, Fri, 23 Dec 2016 13:38:19 +0000) ---
+Landed for 2.10
+
+--- Comment (gerrit, Fri, 23 Dec 2016 05:04:50 +0000) ---
+Oleg Drokin (oleg.drokin@intel.com) merged in patch https://review.whamcloud.com/22211/
+
+Subject: LU-8562 osp: fix precreate_cleanup_orphans/precreate_reserve race
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: d295847d946276ab7ebae7811498fbdb1289e6e7
+
+--- Comment (sergey, Tue, 11 Oct 2016 11:28:16 +0000) ---
+We observed that patch needs to be changed.
+
+New version is under review in seagate now.
+
+When review will be completed I'll update the patch and will add a test with reproducer.
+
+--- Comment (sergey, Wed, 31 Aug 2016 18:16:24 +0000) ---
+http://review.whamcloud.com/#/c/22211/

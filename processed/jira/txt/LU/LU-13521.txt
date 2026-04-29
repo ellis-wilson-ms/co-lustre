@@ -1,0 +1,108 @@
+Key:        LU-13521
+Summary:    WBC: special readdir() handling for root WBC directory
+Link:       https://jira.whamcloud.com/browse/LU-13521
+Type:       Technical task
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Qian Yingjin
+Reporter:   Qian Yingjin
+Created:    Wed, 6 May 2020 10:04:27 +0000
+Updated:    Mon, 10 Jan 2022 01:17:57 +0000
+Links:      Related: is related to  LU-5703
+
+--- Description ---
+For a file or directory flagged with Protect(P) state under the protection of EX WBC lock, the open() system call does not need to communicate with MDS, can also be executed locally in MemFS of Lustre WBC.
+
+ Complete(C): the directory is 1) cached in MemFS; 2) under the protection of subtree EX lock; 3) contains the complete direct subdirs. In this state, results of readdir() and lookup() operations under the directory can directly be obtained from client-side MemFS. All file operations can be performed on the MemFS without communication with the server.
+
+However, Lustre is a stateful filesystem. Each open keeps a state on the MDS. We must keep transparency for applications once the EX WBC lock is cancelled. To achieve this goal, each local open will be recorded in the inode’s open list (or maintain pre dentry?); When the EX WBC lock is cancelling, it must reopen the files in the open list from MDS.
+
+For WBC directories, it must be handled carefully for the ->readdir() call.
+
+ Currently the mechanism adopted by MemFS (tmpfs) is to simply scan the in-memory sub dentries of the directory in dcache linearly to fill the content returned to readdir call: ->dcache_readdir().
+
+ While Lustre new readdir implementation is much complex. It does readdir in hash order and uses hash of a file name as a telldir/seekdir cookie stored in the file handle.
+
+Thus, we must find a method to bridge two implementation firstly.
+
+The proposal solution is to transform readdir() by using hash order same as current Lustre as follows:
+
+ 1. At the connection time, decide the hash function used both on the OSD backend on MDSes and MemFS on the client (supposed that all MDT servers are isomorphic, all formated as ldiskfs or zfs and use the same name hash function).
+
+ 2. Use rbtree (or in-memory Htree used by ext4/ldiskfs) to manage children dentries under a directory. It sorts according to the hash value of the file name.
+
+ 2. When create a new file under a directory, add the corresponding dentry into the sorting tree.
+
+ 3. when unlink a file under a directory, remove the corresponding dentry from the sorting tree.
+
+ 4. For readdir(), do same as what current Lustre does, fill the dentry in the hash order.
+
+ 5. The memory used for rbtree and its nodes should be accounted. When reaching the limits of the memory usage for WBC, decomplete the directory. 
+
+ 6. When decomplete a directory, all metadata operations under this directory must go to the server synchronously. At this time, destroy the sorting tree for children dentries under the directory.
+
+ 
+
+Besides the proposal above that building a memory resident sorting tree during the whole life of a directory, we can build the hashed index rbtree during readdir() call in runtime, return the dentries in hash order. Upon closing the file, destroy the hashed index rbtree.
+
+The proposal solution has shortcoming:
+
+	For an isomerism MDT environment, the hash function used by backend may be different, cause stack layer volatile.
+
+	implementing and managing sorting tree according the hash of file name maybe complex.
+
+	Even all MDTs are formatted as ldiskfs, each ldiskfs filesystem on MDT may have different hash seeds, it must reach an agreement on hash seeds that all MDTs not use hash seed or use the same hash seed.
+
+Any comments and suggestion are welcome!
+
+--- Comment (gerrit, Tue, 12 May 2020 09:04:46 +0000) ---
+Yingjin Qian (qian@ddn.com) uploaded a new patch: https://review.whamcloud.com/38578
+
+Subject: LU-13521 wbc: readdir() handling for a directory under WBC
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 9b6e27eea1de3557a6bd0c3109a603dad4ac5407
+
+--- Comment (adilger, Sat, 9 May 2020 12:32:29 +0000) ---
+Sorry, I meant "simplified interoperability" LU-5703 needed the cleanup of open handle replays.
+
+--- Comment (adilger, Sat, 9 May 2020 12:28:17 +0000) ---
+One comment about tracking local opens per inode - this would also be useful for the "imperative recovery" mechanism, to clean up/remove the complex saved RPC replay mechanism that exists for opens. This should be done as a separate patch from WBC.
+
+--- Comment (qian_wc, Fri, 8 May 2020 14:05:41 +0000) ---
+After discussed with Siyao, we thought we can read all entires in one blow for small directories.
+
+The reason is as follows:
+
+To block any normal operations under a root WBC directory when the root EX WBC is revoking, it hold a write readwrite semaphore during the whole processing: flush all children files to MDT and get back the root EX WBC locks on these children files, reopen the files...
+
+While for the normal operations such as open/close/read/write/readdir/seek/setattr/getattr, it just hold a read semaphore. 
+
+Thus, we can account the sum of size of all children dentries when create/delete a file under a directory flagged with Complete(C). If the prepared buffer size is larger enough to fill all dentires, we can read all these entries in one blow.
+
+Fortunately, the default buffer size allocated for getdents system call in the tool coreutils/ls is 32768 (32K). Usually, it is larger enough to fill 100~1000 entries.
+
+ 
+
+When the directory is too larger, can not fill all dentires in a blow, we could decomplete the directory first, and then read the dentries from MDT.
+
+--- Comment (qian_wc, Wed, 6 May 2020 13:55:56 +0000) ---
+Of course, we can limit the number of children dentries created under a directory. If reach the limits, we can decomplete the directory, which means that flush all children dentries to MDT and unmask Complete(C) flag from the directory.
+
+--- Comment (qian_wc, Wed, 6 May 2020 13:52:32 +0000) ---
+Siyao, Thanks for your comment.
+
+Please note that the root EX WBC lock on the root WBC directory would be revoked at any time during reading directory entries after open the directory.
+
+After root WBC EX lock was revoked, all the sub dentries are flushed to MDT. After that, the dentry reading are in HASH order not the previous linear order via dcache_readdir().
+
+This may cause that we read the repeated or wrong dentries...
+
+--- Comment (laisiyao, Wed, 6 May 2020 13:29:26 +0000) ---
+For small directories (whose sub dir entries can fit into one page), we can call dcache_readdir() to read all entries in one blow, while for large directories, I'd suggest readdir via ll_readdir() directly, though it may force flush of cached data.

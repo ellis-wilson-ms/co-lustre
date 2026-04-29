@@ -1,0 +1,107 @@
+Key:        LU-4079
+Summary:    ll_revalidate_it() may access request after releasing intent
+Link:       https://jira.whamcloud.com/browse/LU-4079
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Duplicate
+Assignee:   Dmitry Eremin
+Reporter:   John Hammond
+Created:    Wed, 9 Oct 2013 15:56:25 +0000
+Updated:    Fri, 21 Feb 2014 13:06:02 +0000
+Resolved:   Fri, 21 Feb 2014 13:06:02 +0000
+Labels:     dcache, llite
+
+--- Description ---
+An error path in ll_revalidate_it() will access the request and the intent after calling ll_intent_release(). This will happen if ll_revalidate_it_finish() returns an error other than -ESTALE or -ENOENT:
+
+revalidate_finish:
+        rc = ll_revalidate_it_finish(req, it, de);
+        if (rc != 0) {
+                if (rc != -ESTALE && rc != -ENOENT)
+                        ll_intent_release(it);
+                GOTO(out, rc = 0);
+        }
+
+	if ((it->it_op & IT_OPEN) && de->d_inode &&
+            !S_ISREG(de->d_inode->i_mode) &&
+            !S_ISDIR(de->d_inode->i_mode)) {
+                ll_release_openhandle(de, it);
+        }
+        rc = 1;
+
+out:
+    	/* We do not free request as it may be reused during following lookup
+         * (see comment in mdc/mdc_locks.c::mdc_intent_lock()), request will
+         * be freed in ll_lookup_it or in ll_intent_release. But if
+         * request was not completed, we need to free it. (bug 5154, 9903)
+        */
+        if (req != NULL && !it_disposition(it, DISP_ENQ_COMPLETE))
+                ptlrpc_req_finished(req);
+
+Since ll_intent_release() clears it_disposition this logic is invalid. To trigger this inject a memory allocation failure in ll_prep_inode() or do as I did and simulate an unrecognized lov magic.
+
+diff --git a/lustre/lov/lov_pack.c b/lustre/lov/lov_pack.c
+index bc1e489..ca5f078 100644
+--- a/lustre/lov/lov_pack.c
++++ b/lustre/lov/lov_pack.c
+@@ -282,6 +282,9 @@ static int lov_verify_lmm(void *lmm, int lmm_bytes, __u16 *stripe_count)
+ {
+         int rc;
+
++       if (OBD_FAIL_CHECK(0x2001))
++               RETURN(-EINVAL);
++
+         if (lsm_op_find(le32_to_cpu(*(__u32 *)lmm)) == NULL) {
+                 char *buffer;
+                 int sz;
+
+llmount.sh
+# cd ~/lustre-release
+# sh ./lustre/tests/racer.sh
+...
+# lctl set_param fail_loc=0x2001
+
+== racer test 1: racer on clients: t DURATION=3600 == 09:47:11 (1381330031)
+racers pids: 7474 7475
+
+Message from syslogd@t at Oct  9 09:47:18 ...
+ kernel:LustreError: 7517:0:(client.c:2231:__ptlrpc_free_req()) ASSERTION( !request->rq_replay ) failed: req ffff880178aedc00
+
+Message from syslogd@t at Oct  9 09:47:18 ...
+ kernel:LustreError: 7517:0:(client.c:2231:__ptlrpc_free_req()) LBUG
+
+PID: 7517   TASK: ffff8801b8701500  CPU: 0   COMMAND: "dir_create.sh"
+ #0 [ffff8801b12fda40] machine_kexec at ffffffff81035d6b
+ #1 [ffff8801b12fdaa0] crash_kexec at ffffffff810c0e22
+ #2 [ffff8801b12fdb70] panic at ffffffff8150f01f
+ #3 [ffff8801b12fdbf0] lbug_with_loc at ffffffffa02c6eeb [libcfs]
+ #4 [ffff8801b12fdc10] __ptlrpc_req_finished at ffffffffa059ff93 [ptlrpc]
+ #5 [ffff8801b12fdc30] ptlrpc_req_finished at ffffffffa05a0630 [ptlrpc]
+ #6 [ffff8801b12fdc40] ll_revalidate_it at ffffffffa0cbd533 [lustre]
+ #7 [ffff8801b12fdd30] ll_revalidate_nd at ffffffffa0cbe613 [lustre]
+ #8 [ffff8801b12fdd60] __lookup_hash at ffffffff8118fa45
+ #9 [ffff8801b12fddb0] lookup_hash at ffffffff8119016a
+#10 [ffff8801b12fddd0] do_filp_open at ffffffff8119446f
+#11 [ffff8801b12fdf20] do_sys_open at ffffffff8117f849
+#12 [ffff8801b12fdf70] sys_open at ffffffff8117f960
+#13 [ffff8801b12fdf80] system_call_fastpath at ffffffff8100b072
+    RIP: 0000003d046db400  RSP: 00007fff7425ed40  RFLAGS: 00010202
+    RAX: 0000000000000002  RBX: ffffffff8100b072  RCX: 0000000000000000
+    RDX: 00000000000001b6  RSI: 0000000000000241  RDI: 000000000257f650
+    RBP: 00007fff7425ede0   R8: 0000000000000020   R9: 000000000000002a
+    R10: 0000000000000076  R11: 0000000000000246  R12: ffffffff8117f960
+    R13: ffff8801b12fdf78  R14: 0000000000000000  R15: 0000000000000001
+    ORIG_RAX: 0000000000000002  CS: 0033  SS: 002b
+
+On entry to ll_intent_release() then intent had type OPEN | CREATE and disposition
+
+DISP_IT_EXECD | DISP_LOOKUP_EXECD | DISP_LOOKUP_POS | DISP_OPEN_OPEN | DISP_ENQ_COMPLETE | DISP_ENQ_OPEN_REF. The request had refcount 3.
+
+ll_revalidate_it() and the other functions around md_intent_lock() all suffer from this confusing and dangerous practice of having/putting the request in it_data and keeping it on stack/returning it through the **reqp parameter. We have two pointers to request and it's not clear which one owns request. The above bug is a good example of this. As an aside, mdc_enqueue has the same issue with the lock handle. We store it in the intent and we return it through a pointer parameter. It's not clear whether they're always the same or which one owns the lock.
+
+--- Comment (pjones, Fri, 21 Feb 2014 13:06:02 +0000) ---
+duplicate of lu-3544
+
+--- Comment (dmiter, Wed, 20 Nov 2013 15:34:36 +0000) ---
+This issue was fixed by http://review.whamcloud.com/7475

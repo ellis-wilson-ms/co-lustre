@@ -1,0 +1,86 @@
+Key:        LU-11962
+Summary:    File LSOM updates to store proper size via FLR for regular stat() usage
+Link:       https://jira.whamcloud.com/browse/LU-11962
+Type:       Improvement
+Priority:   Major
+Status:     Reopened
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Patrick Farrell
+Created:    Tue, 12 Feb 2019 19:06:56 +0000
+Updated:    Fri, 19 Dec 2025 23:58:32 +0000
+Labels:     hard, patch, performance, som
+Links:      Duplicate: is duplicated by LU-13248; Duplicate: is duplicated by LU-14461; Duplicate: is duplicated by LU-18529; Related: is related to LU-12649; Related: is related to LU-12337; Related: is related to LU-11994; Related: is related to LU-11554
+
+--- Description ---
+The layout manipulations required to bring an FLR file in to sync (READONLY in FLR parlance) also give SOM while the file is in sync.  This is true SOM, with no caveats, able to be used for any purpose (as distinct from lazy SOM which can only be used by tools which are aware of it).
+
+In essence, there is no reason the SOM portion has to be associated with a replica.  Exactly the same functionality can be used just for SOM.
+
+Because the layout state transitions for FLR require synchronous writes to the MDS each time, and because a write to the file destroys the SOM state, this is too expensive to try to use all the time. Instead, the proposal is to set it on all files a certain amount of time after they have been modified (e.g. 24h).  If there are no writes to a file for a time, and the client is returning identical size+blocks in the LSOM state at close time, we take it through the layout transitions to mark it LCM_FL_RDONLY (does not make it not writeable, just indicates the attributes are not being modified), and then it has SOM.
+
+This would be a fairly low effort way to allow all files except those being actively modified to have true SOM and improve performance for normal stat() and similar calls.
+
+--- Comment (adilger, Fri, 23 May 2025 03:38:50 +0000) ---
+I think you are referring to the transition from SOM READONLY state when the file is being written.
+
+My comment was about the (IMHO more important) transition from an existing file to SOM READONLY state.  This would potentially happen in batches when pre-existing files are accessed after this feature is deployed.  We can't have read-only file access suddenly triggering a mass of sync MDT writes.
+
+The percentage of files being written after being idle for over 24h old is vanishingly small, so I think it is a statistics game - rare chance of more overhead (sync MDT write to clear READONLY flag) vs. common case of stat() avoiding 1 or 20 extra OST RPCs to fetch size, blocks, and timestamps.
+
+--- Comment (paf0186, Wed, 11 Dec 2024 04:56:44 +0000) ---
+The issue isn't atomicity, it's the state protection required, it's basically the same as for FLR - For SOM to be reliably accurate in the face of MDS evicted clients, we have to prevent writes that the MDS doesn't know about.  If an MDS evicted client were able to do a write, now SOM is wrong.  So we'll do the same stuff as regular FLR.
+
+So the SOM files are going to go through the same state transitions of RDONLY, WRITE_PENDING, and SYNC_PENDING, and have to update the OSTs with a new generation so writes are rejected.
+
+--- Comment (adilger, Wed, 11 Dec 2024 04:47:11 +0000) ---
+I was thinking that the MDS sync write is only needed for FLR mirrored files, since the SOM xattr update is itself atomic regardless of when it is written to the storage, and it doesn't matter if the MDS crashes and the update is lost (ie. it would just be like the current non-SOM state).  All of the tracking for the state machine is in memory on the MDS anyway. 
+
+The main reason to make the SOM update sync for FLR is that this ensures clients will go through the dance to mark one of the mirrors stale if they open the file for write, but we don't care about that if there is no mirror on a file.
+
+--- Comment (paf0186, Tue, 10 Dec 2024 23:17:03 +0000) ---
+Patrick Farrell (pfarrell@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/57357
+
+Subject: LU-18529 mdt: lazy as strict som
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 2
+
+Commit: dbd79127647cfa310312803f701d3eadb58f845b
+
+--- Comment (paf0186, Tue, 10 Dec 2024 23:14:03 +0000) ---
+I've made a significant revision to my thinking on this.
+
+Doing an FLR state transition has a few costs:
+
+	MDT activity - synchronous write for layout transition (I believe, Andreas indicated he thinks otherwise, need to check code)
+
+	OST writes to update layout generation
+
+	Cache flushing on the client
+
+The MDT sync/flush is serious if present, but may not exist.  However, the client side cache flushing is quite bad - In this case, it would prevent a workflow like
+
+write(), close(), read()
+
+from hitting cache, which is unacceptable.
+
+However, this complete cache flush is unnecessary - It's required so we can't read stale data, but the possibility of reading stale data only comes up on some layout transitions.
+
+In particular, it happens when a replica goes from READ_ONLY/IN_SYNC to out of sync/stale - for this transition, it's critical that cached data be flushed since it might be from a replica which could become stale.
+
+But this is the only case where this is required.  It is not required if we are not staling a replica, so it's never required for the transition to "SYNC_PENDING", or "READ_ONLY", and is not required if the only thing we're making stale is the SOM.  That has no risk of stale data.
+
+However, we must still update the layout everywhere as part of these transitions.  This means we need something like "blocking callback with layout payload".  If the layout is included, that would let us do a special type of lock conversion where we update the layout.
+
+Having that feature would let us update the layout everywhere, doing a convert instead of cancel.  The conflict to cause the cancellation would be implemented as something like the server requesting a PR lock (or whatever the appropriate non-exclusive mode is), and considering all locks with older layout versions as conflicting.  This conflict would be resolved by the conversion and we'd have to update the layout version for those locks on the server as well.
+
+This is useful, but a slightly tricky proposition which would take real work, so we want to verify this is worth the trouble.  I've got a patch here to test lazy-as-strict SOM, to see the best case improvement:
+
+https://review.whamcloud.com/c/fs/lustre-release/+/57357
+
+--- Comment (adilger, Wed, 13 Mar 2024 16:57:57 +0000) ---
+This kind of LSOM upgrade would be a general performance improvement for datasets that are read-mostly and referenced frequently. This can happen with workloads like OpenFoam that is doing stat() on millions of files over and over, so having the strict SOM attributes saved on the MDS can avoid lots of unnecessary OST RPCs.

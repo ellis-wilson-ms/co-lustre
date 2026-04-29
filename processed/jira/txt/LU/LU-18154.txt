@@ -1,0 +1,90 @@
+Key:        LU-18154
+Summary:    Client can permanently hang in lustre recovery on race condition in replay_locks
+Link:       https://jira.whamcloud.com/browse/LU-18154
+Type:       Bug
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   Mark Roper
+Reporter:   Mark Roper
+Created:    Mon, 19 Aug 2024 14:06:25 +0000
+Updated:    Fri, 20 Sep 2024 12:37:32 +0000
+Labels:     recovery
+Links:      Related: is related to  LU-14027
+
+--- Environment ---
+Amazon Linux 2 4.14 or 5.10 kernel for server and client, but the problem is not linux version specific, it impacts all versions.
+
+--- Description ---
+LU-14027 resolved some cases where Lustre recovery (on a client) can fail to progress due to race conditions that prevent replay lock RPC requests from being processed when the server import state changes during recovery on a client. However, a race condition remains where the following sequence of events still hangs recovery:
+
+T1: A lock recovery RPC is added added to the set_new_requests to be processed while the import state is in REPLAY_LOCKS, and increments the counter for replay requests in flight imp->imp_replay_inflight.
+
+T2: An unrelated in-flight request fails (ptlrpc_replay_interpret) and calls ptlrpc_connect_import, setting import state to CONNECTING to reinitiate the reconnect process with the server.
+
+T3: A thread processing the RPCs in set_new_requests to send them to the server (in ptlrpc_check_set) evaluates the request from T1 and evaluates that the request state of REPLAY_LOCKS is not the same as the server import state of CONNECTING, and so moves the RPC to a delay list for RPCs to be sent later (imp->imp_delayed_list).
+
+T4: The state machine for moving a server import through the stages of recovery (CONNECTING->REPLAY->REPLAY_LOCKS->...>FULL) cannot move the import into REPLAY_LOCKS state because a check to imp>imp_replay_inflight > 0 prevents this due to T1. The RPC from T1 can never be sent and recovery process can never progress.
+
+Debug from client impacted, demonstrating the timeline above
+
+grep "lock replay thread kp64dbev-OST0002-osc-ffff91e61d14d800" lustre_debug.txt A 100000 -B 100 | grep "3261117|kp64dbev-OST0002_UUID: changing import|REPLAY_LOCKS != CONNECTING) req@00000000c2780d3d x1804541258909120/t0(0) o101>kp64dbev-OST0002"
+
+00000100:00080000:19.0:1721359050.645983:0:9860:0:(import.c:83:import_set_state_nolock()) 00000000f6a15738 kp64dbev-OST0002_UUID: changing import state from CONNECTING to REPLAY
+
+00000100:00080000:19.0:1721359050.645985:0:9860:0:(import.c:83:import_set_state_nolock()) 00000000f6a15738 kp64dbev-OST0002_UUID: changing import state from REPLAY to REPLAY_LOCKS
+
+00010000:00080000:76.0:1721359050.646033:0:3261117:0:(ldlm_request.c:2438:ldlm_lock_replay_thread()) lock replay thread kp64dbev-OST0002-osc-ffff91e61d14d800 to kp64dbev-OST0002_UUID@10.200.159.15@tcp
+
+00010000:00080000:76.0:1721359050.699193:0:3261117:0:(ldlm_request.c:2380:lock_can_replay()) check lock replay limit, inflights = 1(8)
+
+00010000:00080000:76.0:1721359050.699197:0:3261117:0:(ldlm_request.c:2380:lock_can_replay()) check lock replay limit, inflights = 2(8)
+
+00010000:00080000:76.0:1721359050.699199:0:3261117:0:(ldlm_request.c:2380:lock_can_replay()) check lock replay limit, inflights = 3(8)
+
+00010000:00080000:76.0:1721359050.699201:0:3261117:0:(ldlm_request.c:2380:lock_can_replay()) check lock replay limit, inflights = 4(8)
+
+00010000:00080000:76.0:1721359050.699203:0:3261117:0:(ldlm_request.c:2380:lock_can_replay()) check lock replay limit, inflights = 5(8)
+
+00010000:00080000:76.0:1721359050.699204:0:3261117:0:(ldlm_request.c:2380:lock_can_replay()) check lock replay limit, inflights = 6(8)
+
+00010000:00080000:76.0:1721359050.699206:0:3261117:0:(ldlm_request.c:2380:lock_can_replay()) check lock replay limit, inflights = 7(8)
+
+00010000:00080000:76.0:1721359050.699207:0:3261117:0:(ldlm_request.c:2380:lock_can_replay()) check lock replay limit, inflights = 8(8)
+
+00010000:00080000:76.0:1721359050.699208:0:3261117:0:(ldlm_request.c:2380:lock_can_replay()) check lock replay limit, inflights = 8(8)
+
+00010000:00080000:76.0:1721359348.930423:0:3261117:0:(ldlm_request.c:2380:lock_can_replay()) check lock replay limit, inflights = 7(8)
+
+00010000:00080000:76.0:1721359348.930432:0:3261117:0:(ldlm_request.c:2380:lock_can_replay()) check lock replay limit, inflights = 8(8)
+
+00010000:00080000:76.0:1721359348.930432:0:3261117:0:(ldlm_request.c:2380:lock_can_replay()) check lock replay limit, inflights = 8(8)
+
+00000100:00080000:89.0:1721359348.948236:0:9860:0:(import.c:83:import_set_state_nolock()) 00000000f6a15738 kp64dbev-OST0002_UUID: changing import state from REPLAY_LOCKS to CONNECTING
+
+00000100:00080000:89.0:1721359348.948317:0:9860:0:(client.c:1610:ptlrpc_send_new_req()) @@@ req waiting for recovery: (REPLAY_LOCKS != CONNECTING) req@00000000c2780d3d x1804541258909120/t0(0) o101->kp64dbev-OST0002-osc-ffff91e61d14d800@10.200.159.15@tcp:28/4 lens 328/400 e 0 to 0 dl 0 ref 1 fl Rpc:W/40/ffffffff rc 0/-1
+
+00010000:00080000:77.0:1721359348.948487:0:3261117:0:(ldlm_request.c:2380:lock_can_replay()) check lock replay limit, inflights = 7(8)
+
+00000100:00080000:89.0:1721359348.961445:0:9860:0:(import.c:83:import_set_state_nolock()) 00000000f6a15738 kp64dbev-OST0002_UUID: changing import state from CONNECTING to REPLAY
+
+I will propose a patch that modifies T3 to cancel any replay lock request, rather than to delay it, if the server import is in any state other than REPLAY_LOCKS. This decrements imp->imp_replay_inflight and allows the import recovery to restart from the beginning and proceed through all the states needed for recovery to succeed.
+
+--- Comment (ropermar, Sun, 25 Aug 2024 17:18:42 +0000) ---
+Ah, good eye @adilger, I hadn't seen that test! Yes, I agree the sequence described on this issue could cause this failure and the fact that it is intermittent is completely consistent with the raciness. I expect the fix here would stop the intermittent failure of that test.
+
+--- Comment (adilger, Fri, 23 Aug 2024 17:12:33 +0000) ---
+ropermar  thanks for your patch. Could you please take a look at LU-17792 to see if that issue is related (and potentially addressed) by your patch)?
+
+--- Comment (ropermar, Wed, 21 Aug 2024 18:38:46 +0000) ---
+"Mark Roper " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/56112
+
+Subject: LU-18154 ptlrpc: Fail replay lock RPC if import fails
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 4fc67b136230319d03989715d92783fc47115312

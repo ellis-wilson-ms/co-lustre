@@ -1,0 +1,246 @@
+Key:        LU-7085
+Summary:    Toward smaller memory allocations on wide-stripe file systems
+Link:       https://jira.whamcloud.com/browse/LU-7085
+Type:       Improvement
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Yang Sheng
+Reporter:   Matt Ezell
+Created:    Tue, 1 Sep 2015 21:20:23 +0000
+Updated:    Fri, 1 Jul 2016 18:46:38 +0000
+Resolved:   Thu, 7 Jan 2016 17:56:54 +0000
+
+--- Environment ---
+Test nodes with 2.7.57-gea38322
+
+--- Description ---
+I'm testing on a fairly recent master build that includes the patch from LU-6587 (refactor OBD_ALLOC_LARGE to always do kmalloc first).  That band-aid has been great a improving performance on our wide-stripe file systems, but in the face of memory pressure/fragmentation, it will still rely on vmalloc to satisfy memory requests.  Since users tend to use RAM, I'd like to see if there are any opportunities to reduce allocation sizes.
+
+Anywhere we need to allocate sizeof(something) * num_stripes, we should check to see if there's any way to avoid per-stripe information or at least reduce sizeof(something).
+
+--- Comment (jgmitter, Thu, 7 Jan 2016 17:56:54 +0000) ---
+Landed for 2.8.0
+
+--- Comment (gerrit, Thu, 7 Jan 2016 01:48:21 +0000) ---
+Oleg Drokin (oleg.drokin@intel.com) merged in patch http://review.whamcloud.com/17476/
+
+Subject: LU-7085 lov: trying smaller memory allocations
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: e1e56300cac30fe8d9db296107905f5936648c3c
+
+--- Comment (gerrit, Fri, 4 Dec 2015 06:35:08 +0000) ---
+Yang Sheng (yang.sheng@intel.com) uploaded a new patch: http://review.whamcloud.com/17476
+
+Subject: LU-7085 lov: trying smaller memory allocations
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 8c7f009755ef03080c599347cf0452a9bd7cf5f9
+
+--- Comment (ys, Mon, 9 Nov 2015 16:55:52 +0000) ---
+I'll trying second way and then would doing it in first way if we still not satisfy the effect. 
+
+Thanks,
+
+YangSheng
+
+--- Comment (yujian, Fri, 6 Nov 2015 00:57:24 +0000) ---
+Thank you, Yang Sheng. Which way would you prefer to implement?
+
+--- Comment (ys, Mon, 2 Nov 2015 10:43:41 +0000) ---
+After a few test and discuss with clio expert. Looks like lis_subs buffer allocation is not avoid entirely. One way is allocate every osc separately. So we can skip some osc needn't sync data. But it really bring some complexity. Other way just trying to reduce the struct size. 
+
+Thanks,
+
+YangSheng
+
+--- Comment (yujian, Thu, 22 Oct 2015 00:57:00 +0000) ---
+I think we can skip invoke cl_sync_file_range while unlink file.
+
+Hi Yang Sheng, are you going to create a patch for this?
+
+--- Comment (ys, Wed, 14 Oct 2015 14:16:43 +0000) ---
+The 'lio->lis_subs'big buffer allocated  from cl_io_init invoked by cl_sync_file_range. The code path as below:
+
+iput=> iput_final => drop_inode => ll_delete_inode => cl_sync_file_range 
+
+I think we can skip invoke cl_sync_file_range while unlink file.
+
+--- Comment (yujian, Thu, 1 Oct 2015 21:21:46 +0000) ---
+There should not be a large buffer allocation for unlinks, that would be a bug I think. 
+
+Hi Yang Sheng,
+
+Could you please look into the above issue? Thank you.
+
+--- Comment (adilger, Fri, 25 Sep 2015 06:26:16 +0000) ---
+There should not be a large buffer allocation for unlinks, that would be a bug I think. 
+
+As for the max reply size decay, that was something I proposed during patch review but was never implemented. I agree that if access to wide striped files is rare that it may make sense to reduce the allocations again, but the hard part is to figure out what "rarely" means do that there are not continual resends.
+
+--- Comment (ezell, Thu, 24 Sep 2015 16:00:20 +0000) ---
+Oleg, thanks for the explanations.  I had forgotten that kmalloc was order-based, and I agree that once you have to vmalloc it doesn't make much difference if you have rounded up or not.
+
+The node I tested on had previously done wide-striping, but I don't know how recently.  I don't see any time-based decay, so I guess "recently" just means "ever".  So once anyone uses a wide-striped file, all replies to opens will be large?
+
+Do you think the changes to mdc_intent_getxattr_pack() are worthwhile, assuming we add a safety net like LU-4847?
+
+I'm still curious about why unlink needs to allocate a large reply buffer since object deletion is handled by the MDT now.  What is returned in an unlink reply?
+
+--- Comment (green, Thu, 10 Sep 2015 16:24:09 +0000) ---
+Also, to address your other concern of non-wide file reads doing large allocations - did you do an access to a wide-striped file from this client recently? Because the client caches a "largest striping I saw from the server lately" value and allocates bigger buffers for some time to avoid performance hit on resends if you do access wide striped file and allocated too small of a buffer. This was fixed by http://review.whamcloud.com/11614 and was broken before causing allocations to always be too small.
+
+This pessimistic allocation only happens on opens (see in mdc_intent_open_pack how obddev->u.cli.cl_max_mds_easize is used).
+
+I guess the usage there is incorrect, though and should have been cl_default_mds_easize instead like everywhere else and consistent with other users of this, but need to be careful of LU-4847, I guess.
+
+--- Comment (green, Thu, 10 Sep 2015 16:08:45 +0000) ---
+The requests are rounded up to the next power of two in terms of size. Kernel does it anyway internally, so it was decided it's best if we do it ourselves and use all available buffer space rather than losing some of it.
+
+The code is
+
+static
+int null_alloc_repbuf(struct ptlrpc_sec *sec,
+                      struct ptlrpc_request *req,
+                      int msgsize)
+{
+        /* add space for early replied */
+        msgsize += lustre_msg_early_size();
+
+        msgsize = size_roundup_power2(msgsize);
+
+        OBD_ALLOC_LARGE(req->rq_repbuf, msgsize);
+
+Now, it changed a little bit once ALLOC_LARGE started to do vmalloc for all requests beyond 16K, because vmalloc can round up to the next page boundary, but that was considered unimportant.
+
+Now that we always are doing kmalloc first again (before falling back to vmalloc on error) - this code is again correct in the sense that if you try to alloc 16k+1 bytes, 17k bytes or 31k bytes - internally kernel would still do a 32k allocation. 32k+1 would result in 64k allocation and so on.
+
+If your desire is to reduce vmalloc allocation once kmalloc has failed - that's a bit tricky since right now it is all hidden in OBD_ALLOC_LARGE that has no idea of a possible reduced allocation size if kmalloc fails.
+
+We probably can unwind it just in reply buffer allocation and do a smaller one if we use vmalloc, but it sounds like a lot of trouble for very little gain in a heavily fragmented system corner case. If you are in that corder case, your allocations are already slow due to vmalloc.
+
+--- Comment (ezell, Thu, 3 Sep 2015 20:50:28 +0000) ---
+Wide striped file access would still need big allocations because we need all striping information
+
+Sure, until we have a more compact wide-stripe layout, I understand that after about 670 OSTs the layout will be over 4 pages (on x86).  On our 1008-OST systems, that's about 24K (6 pages) for the largest layout.  Any request over that is assuming more than just the layout.  I demonstrated requests at 32K and 64K.
+
+And it's not just wide stripe file access causing large allocations.
+
+nonwideread.sh
+
+#!/bin/bash
+lfs setstripe -c 4 nonwidefile
+echo 3 > /proc/sys/vm/drop_caches
+lctl set_param ldlm.namespaces.*.lru_size=clear > /dev/null
+echo +malloc > /proc/sys/lnet/debug
+lctl dk > /dev/null
+cat nonwidefile > /dev/null
+lctl dk | awk '/malloc/  && $4 > 16384 {print}'
+echo -malloc > /proc/sys/lnet/debug
+
+# ./nonwideread.sh 
+02000000:00000010:1.0:1441312631.657483:0:85809:0:(sec_null.c:215:null_alloc_repbuf()) kmalloced 'req->rq_repbuf': 32768 at ffff8806b3480000.
+
+--- Comment (green, Wed, 2 Sep 2015 18:22:27 +0000) ---
+Wide striped file access would still need big allocations because we need all striping information
+
+--- Comment (yujian, Tue, 1 Sep 2015 21:33:02 +0000) ---
+Hi Yang Sheng,
+
+Could you please look into this ticket and advise? Thank you.
+
+--- Comment (ezell, Tue, 1 Sep 2015 21:25:56 +0000) ---
+# grep build /proc/fs/lustre/version 
+build:  2.7.57-gea38322-CHANGED-2.6.32-431.17.1.el6.wc.x86_64
+
+Removing a wide stripe file system causes several large (64K) allocations
+
+widerm.sh
+
+#!/bin/bash
+lfs setstripe -c 1008 widefile
+echo +malloc > /proc/sys/lnet/debug
+lctl dk > /dev/null
+rm widefile
+lctl dk | awk '/malloc/  && $4 > 16384 {print}'
+echo -malloc > /proc/sys/lnet/debug
+
+# ./widerm.sh 
+02000000:00000010:5.0:1441136659.771448:0:44491:0:(sec_null.c:215:null_alloc_repbuf()) kmalloced 'req->rq_repbuf': 32768 at ffff8802fcea8000.
+02000000:00000010:5.0:1441136659.773314:0:44491:0:(sec_null.c:215:null_alloc_repbuf()) kmalloced 'req->rq_repbuf': 32768 at ffff8802fcea8000.
+00020000:00000010:5.0:1441136659.775340:0:44491:0:(lov_io.c:306:lov_io_subio_init()) kmalloced 'lio->lis_subs': 64512 at ffff8807a3b80000.
+00020000:00000010:5.0:1441136659.775381:0:44491:0:(lov_lock.c:159:lov_lock_sub_init()) kmalloced 'lovlck': 64560 at ffff8807a35a0000.
+02000000:00000010:5.0:1441136659.811536:0:44491:0:(sec_null.c:215:null_alloc_repbuf()) kmalloced 'req->rq_repbuf': 32768 at ffff8802fcea8000.
+
+Here lov_io_subio_init is allocating 64 bytes per stripe for a struct lov_io_sub.  Ideally we could find a way to skip these allocations all together, but I'm not sure if sub_refcheck2 is even used (I'm not seeing it anywhere) and sub_io_initialized and sub_borrowed appear to be boolean values that could possibly be packed into a bitfield, although that adds a lot of complexity.  Every int we can remove from the structure saves us 2 pages of allocation for a 1008-stripe file.
+
+Changing the rm to unlink still results in the 64K allocation:
+
+# ./wideunlink.sh 
+02000000:00000010:5.0:1441139513.846527:0:47037:0:(sec_null.c:215:null_alloc_repbuf()) kmalloced 'req->rq_repbuf': 32768 at ffff88047f408000.
+00020000:00000010:5.0:1441139513.862811:0:47037:0:(lov_io.c:306:lov_io_subio_init()) kmalloced 'lio->lis_subs': 64512 at ffff880830f40000.
+
+Since the MDS is handling the OST object removal, what is the client using all of that space for?
+
+Running setstripe causes 32K allocations for reply buffers, which I would like to see lowered
+
+# ./widesetstripe.sh 
+02000000:00000010:5.0:1441138007.306360:0:46049:0:(sec_null.c:215:null_alloc_repbuf()) kmalloced 'req->rq_repbuf': 32768 at ffff880466c70000.
+02000000:00000010:5.0:1441138007.306700:0:46049:0:(sec_null.c:215:null_alloc_repbuf()) kmalloced 'req->rq_repbuf': 32768 at ffff88047f408000.
+02000000:00000010:5.0:1441138007.339016:0:46049:0:(sec_null.c:260:null_enlarge_reqbuf()) kmalloced 'newbuf': 32768 at ffff880409e00000.
+02000000:00000010:5.0:1441138007.342874:0:46049:0:(sec_null.c:215:null_alloc_repbuf()) kmalloced 'req->rq_repbuf': 32768 at ffff88045e410000.
+00000002:00000010:5.0:1441138007.343228:0:46049:0:(mdc_locks.c:720:mdc_finish_enqueue()) kmalloced 'lmm': 24224 at ffff880409a10000.
+00020000:00000010:5.0:1441138007.344499:0:46049:0:(lov_pack.c:365:lov_getstripe()) kmalloced 'lmmk': 24224 at ffff88045e410000.
+
+And getstripe is just as setstripe
+
+# ./widegetstripe.sh 
+02000000:00000010:5.0:1441138826.018174:0:46625:0:(sec_null.c:215:null_alloc_repbuf()) kmalloced 'req->rq_repbuf': 32768 at ffff880409ac0000.
+02000000:00000010:5.0:1441138826.018588:0:46625:0:(sec_null.c:260:null_enlarge_reqbuf()) kmalloced 'newbuf': 32768 at ffff880483e78000.
+00000002:00000010:5.0:1441138826.018596:0:46625:0:(mdc_locks.c:720:mdc_finish_enqueue()) kmalloced 'lmm': 24224 at ffff8804500a0000.
+02000000:00000010:5.0:1441138826.021218:0:46625:0:(sec_null.c:215:null_alloc_repbuf()) kmalloced 'req->rq_repbuf': 32768 at ffff880483e78000.
+02000000:00000010:5.0:1441138826.021927:0:46625:0:(sec_null.c:215:null_alloc_repbuf()) kmalloced 'req->rq_repbuf': 32768 at ffff880483e78000.
+
+A touch allocates 32K and the same 64K as above
+
+# ./widetouch.sh 
+02000000:00000010:5.0:1441138290.229050:0:46266:0:(sec_null.c:215:null_alloc_repbuf()) kmalloced 'req->rq_repbuf': 32768 at ffff88045e410000.
+02000000:00000010:5.0:1441138290.229484:0:46266:0:(sec_null.c:260:null_enlarge_reqbuf()) kmalloced 'newbuf': 32768 at ffff88047f408000.
+00000002:00000010:5.0:1441138290.229492:0:46266:0:(mdc_locks.c:720:mdc_finish_enqueue()) kmalloced 'lmm': 24224 at ffff8804864e0000.
+00020000:00000010:5.0:1441138290.232015:0:46266:0:(lov_io.c:306:lov_io_subio_init()) kmalloced 'lio->lis_subs': 64512 at ffff88042cf00000.
+
+Clearing locks is particularly bad:
+
+# /tmp/widelockcancel.sh | head -2
+00020000:00000010:10.0F:1441141987.299475:0:13812:0:(lov_io.c:306:lov_io_subio_init()) kmalloced 'lio->lis_subs': 64512 at ffff880cbf1c0000.
+00020000:00000010:0.0:1441141987.299775:0:13973:0:(lov_io.c:306:lov_io_subio_init()) kmalloced 'lio->lis_subs': 64512 at ffff8808268e0000.
+[root@atlas-spare04 tmp]# /tmp/widelockcancel.sh | wc -l
+1008
+
+We get a 64K allocation PER OST (this is for a single file)
+
+widelockcancel.sh
+
+#!/bin/bash
+cd /tmp
+echo 3 > /proc/sys/vm/drop_caches
+lctl set_param ldlm.namespaces.*.lru_size=clear > /dev/null
+lfs setstripe -c 1008 /lustre/atlas2/stf002/scratch/ezy/md_test/widefile
+echo +malloc > /proc/sys/lnet/debug
+lctl dk > /dev/null
+lctl set_param ldlm.namespaces.*.lru_size=clear > /dev/null
+lctl dk | awk '/malloc/  && $4 > 16384 {print}'
+echo -malloc > /proc/sys/lnet/debug
+
+I suspect there's also some badness in mdc_intent_getxattr_pack() related to using the max_easize, but I haven't dug into it that closely yet.

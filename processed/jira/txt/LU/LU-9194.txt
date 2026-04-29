@@ -1,0 +1,119 @@
+Key:        LU-9194
+Summary:    single stream read performance with ZFS OSTs
+Link:       https://jira.whamcloud.com/browse/LU-9194
+Type:       Improvement
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Joseph Gmitter
+Reporter:   Erich Focht
+Created:    Tue, 7 Mar 2017 23:47:30 +0000
+Updated:    Fri, 6 Jul 2018 14:29:39 +0000
+Resolved:   Fri, 6 Jul 2018 14:29:39 +0000
+Labels:     patch, performance, zfs
+
+--- Environment ---
+ZFS based OSTs
+
+Lustre 2.9.0 or newer, EL 3.0, EL 3.1
+
+--- Description ---
+With ZFS OSTs the single stream read performance for files with 1 OST has dropped and is depending very strongly on some tunables. I use OSTs which are capable of reading a file directly from ZFS with 1.8GB/s and more due to good performance of the zfetch prefetcher. With Lustre read performance is often in the range of 300-500MB/s, which is pretty low compared to solid 1GB/s which we can see with ldiskfs on a hardware RAID controller storage unit.
+
+The explanation for the performance problem is that the RPCs in flight (up to 256) that do read-ahead for the Lustre client are scheduled on the server in more or less random order on the OSS side (as ll_ost_io* kernel threads) and break the zfetch pattern. The best performance is with low max_rpcs_in_flight and large max_read_ahead_per_file_mb values. Unfortunately these values are bad for loads with many streams per client.
+
+The effort in LU-8964 actually makes read performance with ZFS OSTs worse, because the additional parallel tasks are again scheduled in random order.
+
+Measurements are with "dd bs=1MB count=100000 ...", between the measurements the caches were dropped on both OSS and client.
+
+single stream dd bs=1M read bandwidth
+-----------------------------------------
+rpcs        ZFS prefetch enabled
+in         max_read_ahead_per_file_mb                            
+flight     1     16    32    64   256                              
+-----------------------------------------
+1         335   597   800   817   910    
+2         379   500   657   705   690    
+4         335   444   516   558   615    
+8         339   396   439   471   546    
+16        378   359   385   404   507    
+32        333   360   378   379   429    
+64        332   346   377   377   398    
+128       375   359   379   381   402    
+256       339   351   380   378   409    
+
+ 
+
+Disabling the ZFS prefetcher completely helps when max_read_ahead_per_file_mb is huge and max_rpcs_in_flight are large because the many (random) streams lead to some sort of prefetching effect. Unfortunately the multiple stream workloads are very bad, so no prefetch is not really a solution.
+
+single stream dd bs=1M read bandwidth
+-----------------------------------------
+rpcs        ZFS prefetch disabled
+in         max_read_ahead_per_file_mb                   
+flight     1     16    32    64   256
+-------------------------- --------------
+1         155   247   286   288   283    
+2         157   292   360   360   358    
+4         157   346   461   465   450    
+8         155   389   580   602   604    
+16        158   384   614   782   791    
+32        152   386   600   878   972    
+64        158   386   597   858  1100    
+128       155   390   603   863   948    
+256       160   382   602   859   934    
+
+ 
+
+There are probably two approaches to the problem:
+
+	make ZFS zfetch smarter, such that it can cope with the pseudo-randomly ordered read requests from Lustre.
+
+	change the Lustre client such that it has only one RPC in flight to a particular OST object. This would present an acceptable pattern to zfetch and lead to ~1GB/s for the single stream read.
+
+This ticket is about implementing option 2. I prepared patches for tracking the number of read requests per osc_object but have difficulties to limit/enforce them in osc_cache.c. I hope for some hints...
+
+--- Comment (jgmitter, Fri, 6 Jul 2018 14:29:39 +0000) ---
+Closing the ticket as we have moved well beyond these versions in performance testing and production usage.
+
+--- Comment (efocht, Thu, 9 Mar 2017 22:29:31 +0000) ---
+Errr, my measurements were with an OSS running IEEL 3.1 and zfs 0.6.5.7. Turns out that zfs 0.7.0rc3 has a significantly different dmu_prefetch(), which behaves totally different and much better! I measured with lustre-2.9.0 on top of zfs-0.7.0rc3 on the OSS side and get:
+
+                  single OST stream dd read bs=1M
+          OSS, Client: lustre-2.9.0;   OSS: zfs-0.7.0rc3;
+ rpcs  |----------------------------------------------------
+  in   |         llite.*.max_read_ahead_per_file_mb
+flight |    1       4        8       16       64      256
+-------|----------------------------------------------------
+  1    |   394     665      806      724     1300     1200
+  2    |   319     735     1000     1100     1800     1700
+  4    |   330     700      797      933     1200     1500
+  8    |   333     690      628      817     1100     1400          
+ 16    |   382     749      657      638     1100     1300          
+ 32    |   323     703      618      601     1100     1300          
+ 64    |   371     682      625      606     1100     1300          
+128    |   320     719      609      603     1100     1200          
+256    |   364     671      643      617     1000     1200          
+
+ 
+
+ 
+
+It is still possible to do smart things to improve performance, given that there is a peak at 2 rpcs in flight. Right now I'd say that limiting the number of worker threads per object that pull from the ORR binheap after the NRS "sorting" could give us an optimum independent of the value of the max_rpcs_in_flight tunable.
+
+--- Comment (jay, Thu, 9 Mar 2017 07:21:57 +0000) ---
+NRS ORR with ZFS prefetch should be the right way to go.
+
+The difficulty is that ZFS doesn't expose the disk offset information to upper levels, so the best that ORR can do on osd-zfs is to submit the reads in file offset order, not in disk offset order when using osd-ldiskfs.
+
+Even though it'll be difficult to sort the requests by disk offset, the requests can still be sorted by file offset and then dmu_prefetch() can be enabled, and then we can catch the read speed of native zfs.
+
+--- Comment (efocht, Wed, 8 Mar 2017 22:46:29 +0000) ---
+Hi Andreas, thanks for commenting, I'll forget about the one rpc in flight. The more I look at NRS/ORR, the more appropriate it seems, though the parallelism is still spoiling the order of read requests. Many/several ll_ost_io* kthreads pick up nicely sorted requests (even when only one rpc is in flight) which probably get issued in slightly different order than they are picked up. Performance with ORR is not different to what I was seeing before. I'd like to try to serialize the requests for one object, to see if the performance with ZFS OSTs actually changes.
+
+--- Comment (adilger, Wed, 8 Mar 2017 18:49:03 +0000) ---
+Erich, it will not be a good long term solution to limit the RPCs in flight to 1 for a single client, since this will mean no pipelining is happening to cover the network RPC latency (e.g. WAN links with high latency). 
+
+The NRS ORR policy is indeed the right way to handle this case. That allows the OSS to order the RPCs based on offset to optimize disk ordering. This also allows the OSS to reorder RPCs submitted from different cllients. The difficulty is that ZFS doesn't expose the disk offset information to upper levels, so the best that ORR can do on osd-zfs is to submit the reads in file offset order, not in disk offset order when using osd-ldiskfs.
+
+--- Comment (efocht, Wed, 8 Mar 2017 00:41:04 +0000) ---
+Another (simple) way of getting read requests for a particular ost object issued in order would be to schedule requests from a particular client for a particular object to the same ll_ost_io* thread. I wonder if that's not actually something the NRS is designed to do. The ORR policy sounds a bit like that.

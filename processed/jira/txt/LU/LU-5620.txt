@@ -1,0 +1,205 @@
+Key:        LU-5620
+Summary:    nrs tbf policy based on opcode
+Link:       https://jira.whamcloud.com/browse/LU-5620
+Type:       New Feature
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   wu libin
+Reporter:   wu libin
+Created:    Mon, 15 Sep 2014 02:45:41 +0000
+Updated:    Thu, 20 Apr 2017 19:22:23 +0000
+Resolved:   Fri, 10 Feb 2017 04:59:54 +0000
+Labels:     patch
+Links:      Related: is related to  LU-3558; Related: is related to LU-6668; Related: is related to LU-3558; Related: is related to LU-8006
+
+--- Description ---
+Some times it need to limit the read or write operation, it can limit the performance of one operation and improve for the other.So, we want to limit the performance for the operation.
+
+--- Comment (pjones, Fri, 10 Feb 2017 04:59:54 +0000) ---
+Landed for 2.10
+
+--- Comment (gerrit, Fri, 10 Feb 2017 03:51:09 +0000) ---
+Oleg Drokin (oleg.drokin@intel.com) merged in patch https://review.whamcloud.com/11918/
+
+Subject: LU-5620 ptlrpc: Add QoS for opcode in NRS-TBF
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: d2c403363f65337166dc745b58d0a4529a534b84
+
+--- Comment (qian, Wed, 11 Jan 2017 02:27:43 +0000) ---
+I think the main reason that kernel CFQ hurts IO performance is: It make the disk idling to wait for next request on certain cfq queue. The coresponding tunning parameter is slice_idle, which is a non-zero value by default. 
+
+See the following reference in kernel/Documentation/block/cfq-iosched for details:
+
+slice_idle
+
+----------
+
+This specifies how long CFQ should idle for next request on certain cfq queues (for sequential workloads) and service trees (for random workloads) before queue is expired and CFQ selects next queue to dispatch from.
+
+By default slice_idle is a non-zero value. That means by default we idle on queues/service trees. This can be very helpful on highly seeky media like single spindle SATA/SAS disks where we can cut down on overall number of seeks and see improved throughput.
+
+Setting slice_idle to 0 will remove all the idling on queues/service tree level and one should see an overall improved throughput on faster storage
+
+devices like multiple SATA/SAS disks in hardware RAID configuration. The down side is that isolation provided from WRITES also goes down and notion of
+
+IO priority becomes weaker.
+
+So depending on storage and workload, it might be useful to set slice_idle=0. In general I think for SATA/SAS disks and software RAID of SATA/SAS disks
+
+keeping slice_idle enabled should be useful. For any configurations where there are multiple spindles behind single LUN (Host based hardware RAID controller or for storage arrays), setting slice_idle=0 might end up in better throughput and acceptable latencies.
+
+--- Comment (adilger, Tue, 10 Jan 2017 00:31:04 +0000) ---
+It should be noted that the kernel CFQ IO scheduler hurts IO performance significantly, so it should not necessarily be used as the basis for NRS.  Otherwise, this proposal sounds interesting.
+
+I think there definitely should be some (optional) RPC reordering (like ORR) within a class to improve disk I/O ordering and increase the size of disk IO.  Ideally, NRS would be able to merge multiple small read or write RPCs from different clients into a single disk IO so that the RAID device sees a single large IO submission.
+
+--- Comment (qian, Mon, 19 Dec 2016 08:57:42 +0000) ---
+1. 
+
+Conceptually, In traditional TBF, tokens are inserted into the bucket every 1/r seconds, where r is the token rate set by administrator. However, considering that there may be lots of buckets in the system with different rate settings, this method is not very effecient.In some implementations (i.e. paper:" IOFlow: A Software-Defined Storage Architecture"), tokens are replenished to the buckets using a interval (T, i.e. T=10ms) timer with the vaule of T*r. But this method is not applied for all cases. For exmaple, when r Our TBF is not a strict TBF algorithm. In our actual implementation, we do not actually need to insert tokens every 1/r seconds, which is rather inefficient. Instead, tokens in a bucket are only updated according to the elapsed time and token rate when the class queue is actually able to dequeue an RPC request. Our policy uses a global timer always with expiration time setting to the latest deadline of classes (bucket) and all classes are sorted according to their deadlines. When the timer expired, The class with smallest deadline will be selected. Then the first RPC request in this class queue will be dequeued and handled by an idle service thread.
+
+In current implementation:
+
+ class.deadline = class.last_check_time + 1/r;
+
+Our TBF assigns deadline spaced by increments of 1/r to successive requests, If all requests are scheduled in order of their deadline values, the application will receive service in proportion to r. But in meanwhile it can not make sure all sequential requests are scheduled batchly or it even destroys the sequentiality of I/O requests, resulting performance regression.
+
+So I am considered a new way to set deadline of class which can configure the batch number of requests in time space:
+
+ start RuleName jobid={dd.0} batch_num=32 rate=320
+
+ class.deadline = class.last_check_time + batch_num * 1/r
+
+Druing dequeuing requests, we can make sure TBF policy always selects the class since last served and with available tokens. By this way, the batch_num requests belongs to a class can be handled batchly in a round and meanwhile kept the rate control.
+
+2. 
+
+During TBF evaluation, we found that:
+
+When the sum of I/O bandwidth requirements for all classes exceed the system capacity, all class get less bandwidth than preconfigured evenly. Under heavy load on a congested server, it will result in some missed deadlines for some classes. At this time we can set the class properties. i.e. The flag "rt" means that it insure requests belong to centain class with high realtime requirement be handled as much as possible.
+
+ batch_num = 1
+
+ class.token = (now - class.last_check_time) * r
+
+In current implementation, when deqeueu a request, if calcuated tokens is larger than 1, we just simple reset class.last_check_time to current time, reset the deadline of the class, and resort the order of the class in the class sorter (binheap), consume one token and then handle the request. But I think we can keep the class.deadline unchanged, just consume the token and keep the class is at the front of the class sorter. It make the next idle I/O thread will also select this class to serve until exhaust all available token. (simliar to the TBF batchly scheduling)
+
+3.
+
+How to implement min. bandwidth guarantee.
+
+Rule format:
+
+ start RuleName jobid={dd.0} reserve=100 rate=300
+
+where the reserve is the min. bandwidth guarantee for classes match the rule.
+
+As mentioned above, when the total bandwidth requirement of all classes exceeds the system capacity, the missed deadline will happen, resulting the obtained rate value is less than configured. The key/value pair "reserve=100" of the above rule defines the min. bandwidth guarantee of the class.
+
+The principle is simple. We maintain the bandwidth requirement with reserve parameter as much as possible. There is a fallback class with very low bandwith limition (i.e. 5% of system capacity). The class statictics itself bandwith every second, if the measured IOPS is less than reserve value for a centain time period, it will set 'congested' flag. The requests belong to the classes without reserve flags will begin to shifted into the fallback class gradually to make sure min. bandwidth guartee. when all classes with reserve flag recover the noramal speed above the reserved values, clear the 'congested' flag, the requests belong to the class without reserve flag will handle as normal.
+
+4. 
+
+The TBF policy is a nonwork-conserving scheduler. I am not figuring out how to avoids wasting resources on the server. 
+
+But we can implement a new classful work-conserving scheduler similar to linux CFQ with much more features, which can reuse lots of code of TBF policy.
+
+It can support:
+
+Different I/O priorities: RT, BE, IDLE.
+
+ RT:It is used for the realtime I/O, This scheduling evle is given higher priority than any other in the system.
+
+ BE: This is the best-effort scheduling type, which is the default scheduling level for all classes that have not set a specific IO priority.
+
+ IDLE: This is the idle scheduling level, a class seting with this level only gets I/O service when no one else needs the disk.
+
+Different scheduler types of a class: FIFO, ORR (necessary?)
+
+Different quantum setting policy: 
+
+ a. timeslice (i.e. batchly serve requests belong to a class: 20ms)
+
+ b. I/O size (i.e. batchly serve requests belong to a class until use out totoal I/O size quantum: 32MB)
+
+ c. RPC number (i.e. batchly serve requests belong to a class until use out total rpc number quantum: 32 RPCs)
+
+I/O service is preemptable. class with high priority can prempt the serving class with lowing priority.
+
+The command format:
+
+lctl set_param ost.OSS.ost_io.nrs_policies="CFQ quantum=time"
+
+start ruleName jobid={dd.0} time=20ms type=rt
+
+Or
+
+lctl set_param ost.OSS.ost_io.nrs_policies="CFQ quantum=size"
+
+start ruleName jobid={dd.0} size=32M type=idle
+
+Or
+
+lctl set_param ost.OSS.ost_io.nrs_policies="CFQ quantum=rpcs"
+
+start ruleName jobid={dd.0} rpcs=32 type=be
+
+This scheduler can implement proportional fair scheduling under heavy congested server (RPC queue depth reaches thousands or tens of thousands), but it is not very suitalbe for a light loaded server.
+
+Any suggestion?
+
+--- Comment (adilger, Fri, 16 Dec 2016 04:14:15 +0000) ---
+Rather than specifying actual RPC rate limits for TBF rules, would it be possible to have the specified rates be relative to the actual performance of the device?  This would make the TBF rules work better in cases where the actual performance doesn't match the total number of RPCs specified for the different TBF rules. 
+
+For example, if there is an OST with 20000 read IOPS but only 12000 write IOPS it isn't very easy for users/admins to set up rules that spread the IOPS evenly between jobs/nodes/opcodes. This gets even more complex if e.g. a write takes much more time than a setattr, and a read takes more time than a getattr. 
+
+What I'm thinking is that the number of RPCs handled by each bucket is proportional to the weight of the rules that match, and if all RPCs matching the buckets are handled then any remaining RPCs in the queue are opportunistically handled until it is time to refresh the buckets. That avoids wasting resources on the server. 
+
+This would need to be an option, so that TBF limits are "hard" (as they are currently) and cannot be exceeded, or "soft" as I propose and only provide proportional limits between classes rather than absolute limits. It may be desirable for some users if there is a global setting to change between hard and soft limits.
+
+--- Comment (pjones, Mon, 15 Sep 2014 17:41:25 +0000) ---
+Emoly
+
+Please can you review this patch?
+
+Thanks
+
+Peter
+
+--- Comment (gnlwlb, Mon, 15 Sep 2014 02:54:19 +0000) ---
+It can be used like follows:
+
+start the tbf opcode QoS:
+
+  lctl set_param ost.OSS.ost_io.nrs_policies="tbf opcode"
+
+limit the ost_read operation:
+
+  lctl set_param ost.OSS.ost_io.nrs_tbf_rule="start ost_r 
+
+{ost_read}
+ 200"
+
+limit the ost_write operation:
+
+  lctl set_param ost.OSS.ost_io.nrs_tbf_rule="start ost_w 
+
+{ost_write}
+ 200"
+
+limit both ost_read and ost_write:
+
+  lctl set_param ost.OSS.ost_io.nrs_tbf_rule="start ost_rw 
+
+{ost_read ost_write}
+ 200"
+
+--- Comment (gnlwlb, Mon, 15 Sep 2014 02:47:56 +0000) ---
+Here is the patch: http://review.whamcloud.com/11918

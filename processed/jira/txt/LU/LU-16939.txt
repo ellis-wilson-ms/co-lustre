@@ -1,0 +1,213 @@
+Key:        LU-16939
+Summary:    ldlm: not expand the lock extent when the shared file is under lock contention
+Link:       https://jira.whamcloud.com/browse/LU-16939
+Type:       Improvement
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Qian Yingjin
+Reporter:   Qian Yingjin
+Created:    Tue, 4 Jul 2023 09:42:14 +0000
+Updated:    Mon, 22 Jan 2024 16:29:55 +0000
+Links:      Related: is related to  LU-12550; Related: is related to LU-16669
+
+--- Description ---
+We already have the lock contention detection patch: https://review.whamcloud.com/35287/
+
+With lock contention detection, the lock server will mark the lock resource (a shared OST object) as contention in a time period (2 seconds, by default). And the client requested a extent lock will be informed the lock contention.
+
+Under lock contention, the lock server will not expand the lock extent to avoid unnecessary lock conflict callbacks.
+
+And the client could be switch from buffered I/O to the direct I/O if the I/O size is large enough.
+
+--- Comment (adilger, Wed, 19 Jul 2023 00:11:54 +0000) ---
+previous_count_decay_weight = 0.5
+rate = current_count + previous_count * previous_count_decay_weight;
+
+In this formula, if current_count = previous_count, then  "rate = 1.5 x current_count" which is bad. 
+
+I think one of the important properties of decaying average is that they are equal to the original value if it is constant.  For example:
+
+decay_weight = 0.3
+new_value = current_value * (1 - decay_weight) + previous_value * decay_weight
+
+That means that the weighted sum = 1.0 no matter what the weight is, and if previous_value = current_value, then new_value will be the same. 
+
+In the above formulas
+
+--- Comment (qian_wc, Tue, 11 Jul 2023 15:13:59 +0000) ---
+Hi Andreas,
+
+Could you please give out the detailed formula or algorithm for the decaying calculation?
+
+ 
+
+The above gives our two decaying algorithm based on the fixed time-based sliding windows.
+
+The time window length is 2:
+
+	previous_count
+
+	current_count
+
+A. Fixed decaying weight for the previous_count: i.e. previous_count_decay_weight = 0.5
+
+rate = current_count + previous_count * previous_count_decay_weight;
+
+B. dynamic decaying weight for the previous_count based on the current time pos in the current time winodw:
+
+rate = current_count + previous_count * (window_size - (time() % window_size)) / window_size;
+
+Thanks,
+
+Qian
+
+--- Comment (adilger, Tue, 11 Jul 2023 14:54:37 +0000) ---
+I think a simple decaying average is probably OK, and the contention should go to zero if there are no new locks within 2-3 decay intervals.
+
+--- Comment (qian_wc, Tue, 11 Jul 2023 09:41:11 +0000) ---
+I found two URLs that can be used for the lock contention rate calculation based on fixed time sliding window:
+
+https://medium.com/@avocadi/rate-limiter-sliding-window-counter-7ec08dbe21d6
+
+previous_window_request_count = 8
+current_window_request_count = 5
+previous_window_count_weight = 0.47
+Hence, 8 * 0.47 + 5 = 8.76
+
+https://docs.konghq.com/gateway/latest/kong-plugins/rate-limiting/algorithms/rate-limiting/
+
+current window rate: 10
+previous window rate: 40
+window size: 60
+window position: 30 (seconds past the start of the current window)
+weight = .5 (60 second window size - 30 seconds past the window start)
+
+rate = 'current rate' + 'previous weight' * 'weight'
+     = 10             + 40                * ('window size' - 'window position') / 'window size'
+     = 10             + 40                * (60 - 30) / 60
+     = 10             + 40                * .5
+     = 30
+
+the formula used to define the weighting percentage is as follows:
+
+weight = (window_size - (time() % window_size)) / window_size
+
+--- Comment (qian_wc, Mon, 10 Jul 2023 09:56:20 +0000) ---
+Patrick, Andreas,
+
+Thanks for your helpful comments!
+
+I am just worried about the lock contention accounting in the current implementation maybe not correct.
+
+We clear the contention locks only when the contention information on the resource is older than the time window (2s):
+
+/* If our contention info is older than the time window, clear it */
+	if (now > res->lr_contention_age + ns->ns_contention_time)
+		res->lr_contended_locks = 0;
+
+For example, 
+
+time wind:    lock contention count:       account:
+
+In [0s, 2s)  - lock contents count: 32    @lr_contended_locks = 32
+
+In [2s, 4s) -  lock contents count: 1       @lr_contended_locks = 33
+
+In [4s, 6s) -  lock contents count: 1       @lr_contended_locks = 34
+
+In [6s, 8s) -  lock contents count: 1       @lr_contended_locks = 35
+
+...
+
+The accounting contended locks is not decaying even with low lock contention conflict.
+
+So I am thinking about improving the accounting for lock contention based on time windows (similar to heat):
+
+obd_heat_decay();
+
+obd_heat_add();
+
+obd_heat_get();
+
+*
+ * The file heat is calculated for every time interval period I. The access
+ * frequency during each period is counted. The file heat is only recalculated
+ * at the end of a time period.  And a percentage of the former file heat is
+ * lost when recalculated. The recursion formula to calculate the heat of the
+ * file f is as follow:
+ *
+ * Hi+1(f) = (1-P)*Hi(f)+ P*Ci
+ *
+ * Where Hi is the heat value in the period between time points i*I and
+ * (i+1)*I; Ci is the access count in the period; the symbol P refers to the
+ * weight of Ci. The larger the value the value of P is, the more influence Ci
+ * has on the file heat.
+ */
+
+What's your opioion?
+
+Thanks,
+
+Qian
+
+--- Comment (adilger, Fri, 7 Jul 2023 21:08:13 +0000) ---
+There is an OST tunable ldlm.namespaces.*.contended_locks that controls how many lockers are needed on a resource before it considers the file "contended".  IIRC, once there were more than 4 contending clients the lock would not grow downward, and after contended_locks=32 contending clients the lock would also not grow upward.  Even under some contention, if the client is doing e.g. 16MB writes in a 1GB section per process it still makes sense to expand the DLM lock up to the start of the next extent (i.e. 1GB boundary) so that it doesn't have to get a separate lock for each write.
+
+I think the right solution is to use the DLM contention information to do lockless (sync+direct) writes instead of getting any DLM locks at all.  At that point the many clients writing to the file should be saturating the OSS so it will have enough outstanding RPCs to fill its pipeline and the clients are blocked on sending so the sync writes will not really hurt performance.  That also allows the OST to merge the writes during submission instead of doing read-modify-write.
+
+--- Comment (paf0186, Tue, 4 Jul 2023 15:11:49 +0000) ---
+So, I think we have to be careful here.  When I first developed lockahead, I tested turning off lock expansion when doing multi-client shared file.  So exactly what you're suggesting here.
+
+I found it hurt performance in the shared file case.
+
+The reason is a little challenging to explain (and the graphs I made for this are lost long ago, heh).
+
+Normally, when (for example) two clients are writing a single OST object with one process each, we imagine the process is something like this.
+
+Client 1 writes [0, 1 MiB).  Requests lock, call it lock 'A'.  Server expands lock A, 0 - infinity.
+
+Client 2 writes [1,2 MiB).  Requests lock B.  Server cancels lock A.  Server expands lock B, 0 - infinity.  (Or maybe it's 1 MiB to infinity?  Doesn't matter)
+
+Client 1 writes [2, 3 Mib).  Requests lock C...  etc, etc.
+
+Here is what actually happens.
+
+Client 1 writes [0, 1 MiB).  Acquires lock A, 0 - infinity.
+
+Client 2 tries to write [1, 2 MiB), sends request to server, etc.
+
+Client 1 writes [2, 3 MiB) using lock A.
+
+Client 1 writes [4, 5 MiB) using lock A...
+
+Client 1 writes [6. 7 MiB) using lock A...
+
+[...]
+
+Server calls back lock A, but only after client 1 has done some number of writes.  (In my testing, I think it was like 4 1 MiB writes on average?)
+
+So client 2 is waiting for client 1, but client 1 gets a bunch of work done before the lock is called back.
+
+This is very important, because if you turn off lock expansion, now the client write process looks like this.
+
+Start write
+
+Request lock
+
+Lock request goes to server
+
+Get lock from server
+
+Do write...
+
+We have added an extra round trip to the server for every write.
+
+So what I found in my testing was that until contention was very high (many clients to a single object), the overhead of doing a lock request for every write was worse than waiting for the other client.  Note if there is > 1 process writing to each OST object on the same client, they also benefit from sharing the expanded lock.  So disabling lock expansion on contention often made performance worse, because the overhead of asking for a lock for every write was worse than the serialization of waiting for the other client(s).
+
+This is just something to be aware of and test for.  My testing was on disk, flash may change things.  I think disabling expansion will help under heavy contention, but only under heavy contention (many clients to one object).  So we should do some careful testing of write performance with disabling expansion on contention, with both a small and a large number of clients and processes per object.
+
+--- Comment (paf0186, Tue, 4 Jul 2023 14:55:51 +0000) ---
+I'm glad you found LU-12550, that's important.
+
+The switch from buffered to direct is good too - I was planning to do that eventually using LU-12550.  We do need unaligned DIO first.  I have some more thoughts on this specific ticket which I'll put here in a moment.

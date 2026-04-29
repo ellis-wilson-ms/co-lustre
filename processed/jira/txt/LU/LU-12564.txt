@@ -1,0 +1,346 @@
+Key:        LU-12564
+Summary:    ptlrpcd daemon sleeps while holding imp_lock spinlock
+Link:       https://jira.whamcloud.com/browse/LU-12564
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Oleg Drokin
+Reporter:   Ann Koehler
+Created:    Thu, 18 Jul 2019 16:40:43 +0000
+Updated:    Thu, 23 Oct 2025 23:25:44 +0000
+Resolved:   Thu, 3 Dec 2020 14:42:00 +0000
+Links:      Related: is related to  LU-10756; Related: is related to LU-19514; Related: is related to LU-14024
+
+--- Description ---
+RCU stalls occurring in ptlrpc_check_set were tracked to a ptlrpcd daemon that was sleeping while holding an import lock spinlock.
+
+PID: 12920  TASK: ffff880834b47040  CPU: 7   COMMAND: "ptlrpcd_03_02"
+ #0 [ffffc90005d5bb20] __schedule at ffffffff816a067c
+ #1 [ffffc90005d5bba8] __cond_resched_lock at ffffffff810855ea
+ #2 [ffffc90005d5bbc0] __purge_vmap_area_lazy at ffffffff811a2210
+ #3 [ffffc90005d5bbf0] free_vmap_area_noflush at ffffffff811a22bd
+ #4 [ffffc90005d5bc08] remove_vm_area at ffffffff811a4477
+ #5 [ffffc90005d5bc28] __vunmap at ffffffff811a44b6
+ #6 [ffffc90005d5bc50] vfree at ffffffff811a459e
+ #7 [ffffc90005d5bc68] null_free_repbuf at ffffffffa08190d8 [ptlrpc]
+ #8 [ffffc90005d5bc80] sptlrpc_cli_free_repbuf at ffffffffa080b3d0 [ptlrpc]
+ #9 [ffffc90005d5bca0] __ptlrpc_req_finished at ffffffffa07cfb35 [ptlrpc]
+#10 [ffffc90005d5bcd0] ptlrpc_free_request at ffffffffa07d03ca [ptlrpc]
+#11 [ffffc90005d5bce8] ptlrpc_free_committed at ffffffffa07d2bca [ptlrpc]
+#12 [ffffc90005d5bd30] ptlrpc_check_set at ffffffffa07d5eb1 [ptlrpc]
+#13 [ffffc90005d5bdd0] ptlrpcd_check at ffffffffa08022dc [ptlrpc]
+#14 [ffffc90005d5be18] ptlrpcd at ffffffffa080284e [ptlrpc]
+#15 [ffffc90005d5bf08] kthread at ffffffff8107c167
+#16 [ffffc90005d5bf50] ret_from_fork at ffffffff8180024a
+
+Examining the code in ptlrpc_check_set()->after_reply() shows that ptlrpc_free_committed is called while holding the imp_lock.
+
+1408 static int after_reply(struct ptlrpc_request *req)
+1409 {
+1410         struct obd_import *imp = req->rq_import;
+.....
+1551         if (imp->imp_replayable) {
+1552                 spin_lock(&imp->imp_lock);
+1553                 /*
+1554                  * No point in adding already-committed requests to the replay
+1555                  * list, we will just remove them immediately. b=9829
+1556                  */
+1557                 if (req->rq_transno != 0 &&
+1558                     (req->rq_transno >
+1559                      lustre_msg_get_last_committed(req->rq_repmsg) ||
+1560                      req->rq_replay)) {
+1561                         /** version recovery */
+1562                         ptlrpc_save_versions(req);
+1563                         ptlrpc_retain_replayable_request(req, imp);
+1564                 } else if (req->rq_commit_cb &&
+1565                            list_empty(&req->rq_replay_list)) {
+1566                         /*
+1567                          * NB: don't call rq_commit_cb if it's already on
+1568                          * rq_replay_list, ptlrpc_free_committed() will call
+1569                          * it later, see LU-3618 for details
+1570                          */
+1571                         spin_unlock(&imp->imp_lock);
+1572                         req->rq_commit_cb(req);
+1573                         spin_lock(&imp->imp_lock);
+1574                 }
+1575
+1576                 /*
+1577                  * Replay-enabled imports return commit-status information.
+1578                  */
+1579                 committed = lustre_msg_get_last_committed(req->rq_repmsg);
+1580                 if (likely(committed > imp->imp_peer_committed_transno))
+1581                         imp->imp_peer_committed_transno = committed;
+1582
+1583                 ptlrpc_free_committed(imp);
+.....
+1599                 spin_unlock(&imp->imp_lock);
+1600         }
+1601
+1602         RETURN(rc);
+1603 }
+
+This causes a deadlock when another ptlrpcd daemon spins on a CPU trying to get the lock and the holder of the lock gets scheduled on the same CPU.
+
+crash_x86_64> bt -t 12918
+PID: 12918  TASK: ffff880825b3a1c0  CPU: 7   COMMAND: "ptlrpcd_03_00"
+              START: __schedule at ffffffff816a067c
+  [ffffc9000536bd10] lustre_msg_set_transno at ffffffffa07e1df7 [ptlrpc]
+  [ffffc9000536bd20] _raw_spin_lock at ffffffff816a5951      bt -l 12918 | grep -A 1 ptlrpc_check_set
+ #2 [ffffc9000536bd30] ptlrpc_check_set at ffffffffa07d5e3e [ptlrpc]
+    /home/abuild/rpmbuild/BUILD/cray-lustre-2.11.0.200_cray_90_g022bd19/lustre/ptlrpc/client.c: 1474
+
+ptlrpcd_03_00 is trying to get the imp_lock; ptlrpd_03_02 holds it:
+
+CPU 7 RUNQUEUE: ffff88085f9e1f00
+  CURRENT: PID: 12918  TASK: ffff880825b3a1c0  COMMAND: "ptlrpcd_03_00"
+  RT PRIO_ARRAY: ffff88085f9e2140
+     [no tasks queued]
+  CFS RB_ROOT: ffff88085f9e1fb0
+     [120] PID: 3968   TASK: ffff88050760afc0  COMMAND: "kworker/7:0"
+     [120] PID: 13361  TASK: ffff88083f701080  COMMAND: "gunicorn"
+     [120] PID: 32734  TASK: ffff880333e06480  COMMAND: "tail"
+     [120] PID: 13384  TASK: ffff880837144140  COMMAND: "gunicorn"
+     [120] PID: 15161  TASK: ffff880825ea1240  COMMAND: "sssd_nss"
+     [120] PID: 14128  TASK: ffff88076005a040  COMMAND: "mongod"
+     [120] PID: 10737  TASK: ffff880836f86240  COMMAND: "cron"
+     [120] PID: 44     TASK: ffff88082372b000  COMMAND: "ksoftirqd/7"
+     [120] PID: 12920  TASK: ffff880834b47040  COMMAND: "ptlrpcd_03_02"
+
+--- Comment (gerrit, Thu, 4 Mar 2021 08:35:52 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/40110/
+
+Subject: LU-12564 libcfs: Use vfree_atomic instead of vfree
+
+Project: fs/lustre-release
+
+Branch: b2_12
+
+Current Patch Set: 
+
+Commit: 1dc31de15ff270befceb64257bd84f15ffe75000
+
+--- Comment (pjones, Thu, 3 Dec 2020 14:42:00 +0000) ---
+Landed for 2.14
+
+--- Comment (gerrit, Thu, 3 Dec 2020 07:26:19 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/40136/
+
+Subject: LU-12564 libcfs: Use vfree_atomic instead of vfree
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 7a9c0ca690eb00a6e314322b62fb1fd3e9b31f0e
+
+--- Comment (gerrit, Sun, 4 Oct 2020 03:52:23 +0000) ---
+Oleg Drokin (green@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/40136
+
+Subject: LU-12564 libcfs: Use vfree_atomic instead of vfree
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: e58c298d094cefe67a7d9625107188f2589afefe
+
+--- Comment (adilger, Thu, 1 Oct 2020 08:22:39 +0000) ---
+It seems that the sleepiness of vfree() has been hit in other places, since vfree_atomic() does exactly what Patrick suggested - putting the memory on a linked list and then freeing it in a work queue.
+
+--- Comment (gerrit, Thu, 1 Oct 2020 06:29:38 +0000) ---
+Oleg Drokin (green@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/40110
+
+Subject: LU-12564 Use vfree_atomic instead of vfree
+
+Project: fs/lustre-release
+
+Branch: b2_12
+
+Current Patch Set: 1
+
+Commit: 3fc8f4d0fdc3f37b3764681c2208f7a40c794922
+
+--- Comment (gerrit, Tue, 29 Sep 2020 01:08:32 +0000) ---
+Oleg Drokin (green@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/40080
+
+Subject: LU-12564 ptlrpc: Do not free requests under spinlock in ptlrpc_free_committed
+
+Project: fs/lustre-release
+
+Branch: b2_12
+
+Current Patch Set: 1
+
+Commit: 084e27911d36e6033bce616e30f8c8abcaa724d1
+
+--- Comment (pfarrell, Fri, 19 Jul 2019 16:29:18 +0000) ---
+Ah, all right, thank you.  I think maybe - amk - that's the thing to try, and we can politely ask Neil Brown to look at it.  (A work queue feels hacky, though obviously valid, so if we can avoid it... though again another reason for asking Neil is I imagine he knows what the normal pattern is in this sort of situation.)
+
+"Another pattern I use is moving the free 'req' entries to a local list_head and free them in bulk outside the spinlock."
+
+Yeah, I considered this as the first option.  In this case, "outside the spinlock" can be several functions away, and there are various callers in to the chain who hold the spinlock for their own purposes, so it seemed impractical.  (To add to the confusion, as you probably noticed, the relevant area is sometimes called without the lock held.  So that case would be straightforward to fix, since the freeing code only needs the spinlock relatively briefly...  But it's also called by stuff that holds it over much larger swathes of code...)
+
+--- Comment (stancheff, Fri, 19 Jul 2019 14:27:52 +0000) ---
+I started looking through the code for the RCU option and I got a little lost  so I couldn't confirm that RCU is a good choice there ... a similar in_atomic() like scheme would also work .. pushing to a work queue if the kvfree could sleep.
+
+I think an RCU-alike would also work here and sleeping in the call_rcu()/kfree_rcu() type of context should be okay.
+
+Another pattern I use is moving the free 'req' entries to a local list_head and free them in bulk outside the spinlock.
+
+--- Comment (pfarrell, Fri, 19 Jul 2019 14:00:07 +0000) ---
+James,
+
+Do you have a ticket for the udev, etc, conversion, assuming that's the source of the kasprintf stuff?  Shaun's suggestion looks very useful (thank you) and we should get it associated with that.  (And also try to move the discussion of that issue there.)
+
+Shaun,
+
+Any comment on my RCU suggestion for the memory freeing issue (a little earlier in the LU, before James brought up the related kasprintf issue)?
+
+--- Comment (stancheff, Fri, 19 Jul 2019 13:09:11 +0000) ---
+Seems like a GFP_ATOMIC needs to be passed to kasprintf(), sometimes.
+
+This is a really hacky workaround variant of in_atomic():
+
+ 
+
+static inline int _in_atomic_context(void)
+
+{{{}}
+
+#ifdef PREEMPT_ACTIVE
+
+#define PREEMPT_COUNT_MASK (~PREEMPT_ACTIVE)
+
+#else
+
+#define PREEMPT_COUNT_MASK (~0)
+
+#endif
+
+         if (irqs_disabled() ||
+
+             is_idle_task(current) ||
+
+             (rcu_preempt_depth() + (preempt_count() & PREEMPT_COUNT_MASK)))
+
+                 return 1;
+
+         return 0;
+
+}
+
+...
+
+gfp_t gfp_mask = _in_atomic_context() ? GFP_ATOMIC : GFP_KERNEL;
+
+envp[0] = kasprintf(gfp_mask, "PARAM=%s.%.*s", param, (int) keylen, key);
+
+--- Comment (pfarrell, Thu, 18 Jul 2019 22:25:29 +0000) ---
+Ah, I see what you mean.
+
+Well, unfortunately, the plan here (at least my stab at one) doesn't involve changing the use of imp_spinlock - Just moving something out from under it in a clever way.  I don't know what you could do about that alloc while printing thing...  eek.  I assume that's the CDEBUG rework.
+
+--- Comment (simmonsja, Thu, 18 Jul 2019 21:46:05 +0000) ---
+[ 28.985694] BUG: sleeping function called from invalid context at mm/slab.c:3054
+
+ [ 28.987603] in_atomic(): 1, irqs_disabled(): 0, pid: 3053, name: mount.lustre
+
+ [ 28.988683] 1 lock held by mount.lustre/3053:
+
+ [ 28.989707] #0: (&type->s_umount_key#38/1){......}, at: [] sget+0x258/0x470
+
+ [ 28.992807] CPU: 1 PID: 3053 Comm: mount.lustre Tainted: G OE ------------ 3.10.0-debug #1
+
+ [ 28.994066] Hardware name: Bochs Bochs, BIOS Bochs 01/01/2011
+
+ [ 28.994744] ffff8800aef4c600 00000000873b1d09 ffff880099283910 ffffffff816fd400
+
+ [ 28.996169] ffff880099283928 ffffffff810b0109 0000000000000000 ffff8800992839c0
+
+ [ 28.997832] ffffffff811cd902 ffff8800992839d0 ffffffffa064bf21 ffffffffa064bf21
+
+ [ 28.999740] Call Trace:
+
+ [ 29.000459] [] dump_stack+0x19/0x1b
+
+ [ 29.001075] [] __might_sleep+0xe9/0x110
+
+ [ 29.001994] [] __kmalloc_track_caller+0x112/0x660
+
+ [ 29.002756] [] ? vsnprintf+0x201/0x6a0
+
+ [ 29.003751] [] ? kasprintf+0x4e/0x70
+
+ [ 29.004815] [] kvasprintf+0x61/0xa0
+
+ [ 29.005820] [] kasprintf+0x4e/0x70
+
+ [ 29.006871] [] import_set_state_nolock+0xa8/0x2f0 [ptlrpc]
+
+ [ 29.007959] [] ptlrpc_connect_import+0x1dd/0x12a0 [ptlrpc]
+
+ [ 29.009100] [] client_connect_import+0x22a/0x470 [ptlrpc]
+
+ [ 29.010193] [] lustre_start_mgc+0x1b9d/0x2560 [obdclass]
+
+So the import spin_lock has bitten me before. I could work around it but haven't sat down to think it out.
+
+Now is you move RCU then this becomes less of a problem.
+
+--- Comment (pfarrell, Thu, 18 Jul 2019 20:55:06 +0000) ---
+By the way, simmonsja, I don't understand how this relates to your udev issue?  Where's udev involved here?  This is ptlrpc sleeping while freeing memory.
+
+--- Comment (pfarrell, Thu, 18 Jul 2019 20:53:51 +0000) ---
+simmonsja,
+
+No.  It's similar, but unrelated.  This one is sleeping while holding a spinlock (which is not strictly banned but is really not a good idea, and we're seeing one aspect of the 'not a good idea' part when another thread waits on the spinlock the whole time this thread is sleeping, which is both very wasteful and can easily cause a deadlock if all CPUs get busy with spinning threads).
+
+LU-12362 on the other hand, is a different, weirder problem (but similar).  The task is not in the running state because it's just checking the condition on a wait queue, so it's not considered to be running.  Newer kernels complain about sleeping in this scenario, which seems reasonable.  I don't know exactly what can go wrong in this case*, but you're supposed to do as little as possible when checking the condition for the wait queue.  It's not a callback for doing work - It's a condition for sleeping.  But we're using it as a callback for doing work.
+
+*Because it's allowed without warning in earlier kernels, I suspect it's "nothing specific, but don't do it because it's bad and weird and the scheduler can't track you correctly". : )
+
+--- Comment (simmonsja, Thu, 18 Jul 2019 17:36:05 +0000) ---
+Patrick is LU-12362 also related to this?
+
+--- Comment (simmonsja, Thu, 18 Jul 2019 17:31:07 +0000) ---
+Currently the udev event system internally takes spin locks which causes a sleep in context error. If you fix this then it resolves my uevent problems
+
+--- Comment (pfarrell, Thu, 18 Jul 2019 17:19:10 +0000) ---
+amk,
+
+Hmm.  I'm thinking RCU is the way to go, and maybe stancheff can assist here.
+
+Looking at:
+
+https://review.whamcloud.com/#/c/35038/
+
+ I wonder if it's possible to just stick them on an RCU head (forget what I said about lists in the previous version of this - these things have their own rules you'd have look in to) and then free them independently, via RCU callback.
+
+A few thoughts.
+
+ 1. If that route is taken, I think we'd need to add an rcu_barrier in whatever code frees the import (there's at least one example in the Lustre code of this, though it's at module exit.  Since we want the list protected by the import lock (I think ?), we'd have to do it at import free time)
+
+ 2. I wonder if it's safe to sleep in an RCU callback.  I suspect it is, but that's something we'd need to double-check.
+
+--- Comment (pfarrell, Thu, 18 Jul 2019 17:13:13 +0000) ---
+Definitely don't want imp_lock to be a mutex, it's used too many places for too much in the RPC machinery.  I'm pretty sure sleeping would hurt performance pretty badly.
+
+It looks like a bit of a pain, but I think we have to move the freeing of the request outside of the imp_lock.  (Once they're off the various lists, requests can't be found.)
+
+Unless it's possible to convert these to use RCU or something, I think we need something like a "ready to be freed" list...?
+
+This looks like a slightly obnoxious reorganization, sorry.
+
+By the way, whatever patch this is, could it also remove:
+
+ptlrpc_req_finished_with_imp_lock ?
+
+Which is unused and confusing...
+
+--- Comment (amk, Thu, 18 Jul 2019 16:49:04 +0000) ---
+An obvious solution is to convert the spinlock to a mutex. But is there a better solution? Any ideas/suggestions?

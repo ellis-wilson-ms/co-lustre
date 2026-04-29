@@ -1,0 +1,130 @@
+Key:        LU-8355
+Summary:    VFS: Busy inodes after unmount of md0 ... causes kernel panic or at least memory leak
+Link:       https://jira.whamcloud.com/browse/LU-8355
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Sergey Cheremencev
+Created:    Thu, 30 Jun 2016 12:12:21 +0000
+Updated:    Fri, 1 Jul 2016 17:38:03 +0000
+
+--- Description ---
+If we try to start mdt when using read only device or device with disabled journal we will have following message:
+
+VFS: Busy inodes after unmount of md0. Self-destruct in 5 seconds.  Have a nice day... 
+
+In such case one of the inode's counter has extra increment. Further it may cause kernel panic or at least memory leak.
+
+According to my investigation this inode is s_buddy_cache (created in ldiskfs_mb_init_backend).
+
+I used kprobe(added handler_pre to __iget) and found that extra increment comes from fsnotify_unmount_inodes:
+
+kprobe handler_pre __iget: inode ffff880079a09528 i_ino 21328 i_count 2 i_state 8
+Pid: 12211, comm: mount.lustre Tainted: G        W  ---------------    2.6.32-431.17.1.x1.6.39.x86_64 #1
+Call Trace:
+   [] ? handler_pre+0x41/0x44 [kprobe_example]
+ [] ? kprobe_exceptions_notify+0x3d5/0x430
+ [] ? notifier_call_chain+0x55/0x80
+ [] ? atomic_notifier_call_chain+0x1a/0x20
+ [] ? notify_die+0x2e/0x30
+ [] ? do_int3+0x35/0xb0
+ [] ? int3+0x33/0x40
+ [] ? __iget+0x1/0x70
+ >  [] ? fsnotify_unmount_inodes+0x10f/0x120
+ [] ? invalidate_inodes+0x5b/0x190
+ [] ? __sync_blockdev+0x24/0x50
+ [] ? generic_shutdown_super+0x4c/0xe0
+ [] ? kill_block_super+0x31/0x50
+ [] ? ldiskfs_kill_block_super+0x16/0x60 [ldiskfs]
+ [] ? deactivate_super+0x57/0x80
+ [] ? mntput_no_expire+0xbf/0x110
+ [] ? osd_mount+0x6f5/0xcb0 [osd_ldiskfs]
+ [] ? osd_device_alloc+0x4cf/0x970 [osd_ldiskfs]
+ [] ? obd_setup+0x1bf/0x290 [obdclass]
+ [] ? class_setup+0x208/0x870 [obdclass]
+ [] ? class_process_config+0xc6c/0x1ad0 [obdclass]
+ [] ? libcfs_log_return+0x28/0x40 [libcfs]
+ [] ? lustre_cfg_new+0x312/0x690 [obdclass]
+ [] ? do_lcfg+0x158/0x440 [obdclass]
+ [] ? lustre_start_simple+0x94/0x200 [obdclass]
+ [] ? server_fill_super+0x97d/0x1a7c [obdclass]
+ [] ? libcfs_log_return+0x28/0x40 [libcfs]
+ [] ? lustre_fill_super+0x1d0/0x5b0 [obdclass]
+ [] ? lustre_fill_super+0x0/0x5b0 [obdclass]
+ [] ? get_sb_nodev+0x5f/0xa0
+ [] ? lustre_get_sb+0x25/0x30 [obdclass]
+ [] ? vfs_kern_mount+0x7b/0x1b0
+ [] ? do_kern_mount+0x52/0x130
+ [] ? do_mount+0x2fb/0x930
+ [] ? sys_mount+0x90/0xe0
+ [] ? system_call_fastpath+0x16/0x1b
+
+Reading /proc/slabinfo after unloading ldiskfs may cause kernel panic because ldiskfs_inode_cache was not cleaned correctly(it still has busy inodes).
+
+fsnotify_unmount_inodes and inotify_unmount_inodes have bugs in handling of inodes with I_NEW.
+
+               /* In case the dropping of a reference would nuke next_i. */                                           
+                if ((&next_i->i_sb_list != list) &&
+                    atomic_read(&next_i->i_count) &&
+                    !(next_i->i_state & (I_CLEAR | I_FREEING | I_WILL_FREE))) {                                
+                        __iget(next_i);
+                        need_iput = next_i;                                                                            
+                }
+
+We do __iget for next_i but on the next loop iteration we pass iput because inode has I_NEW state:
+
+               /*
+                 * We cannot __iget() an inode in state I_CLEAR, I_FREEING,
+                 * I_WILL_FREE, or I_NEW which is fine because by that point                                           
+                 * the inode cannot have any associated watches.                                                       
+                 */
+                if (inode->i_state & (I_CLEAR|I_FREEING|I_WILL_FREE|I_NEW))                                            
+                        continue;       
+
+The problem faced on 2.6.32-431.17.1. But as I see another kernels also have this bug.
+
+--- Comment (cheneva1, Fri, 1 Jul 2016 17:38:03 +0000) ---
+Per triage call, this seems to be a corner case; decrease from "Major" to "Minor"
+
+--- Comment (sergey, Thu, 30 Jun 2016 12:14:01 +0000) ---
+delete extra iget in fsnotify_unmount_inodes 
+
+Don't increment i_next counter in fsnotify_unmount_inodes 
+if inode has I_NEW state. Next loop iteration is skipped 
+because of I_NEW and iput(need_iput_tmp) is not called. 
+But if I_NEW inode is last in s_inodes list extra increment 
+will never be decremented. 
+The problem occured when mount lustre FS(server-side) 
+on RO device(in such case mount should fail). 
+Mount fails after creating 4 inodes. One of them is 
+s_buddy_cache that has I_NEW state. This inode is not 
+freed after generic_shutdown_super and it causes msg: 
+VFS: Busy inodes after unmount of md0. Self-dectruct ... 
+In such case ldiskfs_inode_cache can not be cleared and 
+"cat /proc/slabinfo" after ldiskfs module unloading may 
+cause kernel panic.
+
+--- fs/notify/inotify/inotify.c	2013-07-30 04:16:44.000000000 +0400
++++ inotify.c	2014-12-16 17:36:23.000000000 +0400
+@@ -404,7 +404,7 @@
+ 		if ((&next_i->i_sb_list != list) &&
+ 				atomic_read(&next_i->i_count) &&
+ 				!(next_i->i_state & (I_CLEAR | I_FREEING |
+-					I_WILL_FREE))) {
++					I_WILL_FREE | I_NEW))) {
+ 			__iget(next_i);
+ 			need_iput = next_i;
+ 		}
+--- fs/notify/inode_mark.c	2013-07-30 04:16:42.000000000 +0400
++++ inode_mark.c	2014-12-16 17:36:40.000000000 +0400
+@@ -398,7 +398,7 @@
+ 		/* In case the dropping of a reference would nuke next_i. */
+ 		if ((&next_i->i_sb_list != list) &&
+ 		    atomic_read(&next_i->i_count) &&
+-		    !(next_i->i_state & (I_CLEAR | I_FREEING | I_WILL_FREE))) {
++		    !(next_i->i_state & (I_CLEAR | I_FREEING | I_WILL_FREE | I_NEW))) {
+ 			__iget(next_i);
+ 			need_iput = next_i;
+ 		}

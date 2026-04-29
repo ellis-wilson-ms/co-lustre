@@ -1,0 +1,101 @@
+Key:        LU-13832
+Summary:    "lfs migrate -m" leads to inconsistent ldiskfs directories
+Link:       https://jira.whamcloud.com/browse/LU-13832
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Cannot Reproduce
+Assignee:   Lai Siyao
+Reporter:   Andreas Dilger
+Created:    Thu, 30 Jul 2020 08:37:04 +0000
+Updated:    Wed, 1 Jun 2022 15:34:36 +0000
+Resolved:   Wed, 1 Jun 2022 15:34:17 +0000
+Links:      Related: is related to  LU-14719
+
+--- Description ---
+I created a test directory with striped DNE directories as follows:
+
+# export MDSCOUNT=8
+# export DIR=/mnt/testfs/allmdt
+# lfs mkdir -c -1 $DIR
+# for D in $(seq $MDSCOUNT); do
+    lfs mkdir -c 2 $DIR/dirstr$D
+    rsync -a --exclude "policy.*" /etc/ $DIR/dirstr$D/
+done
+
+This created the test directories with a variety of files that can be verified.  Then, migrate each directory and verify the contents have not changed (the rsync should not report any files that need to be updated):
+
+# for D in $(seq $MDSCOUNT); do
+    echo $DIR/dirstr$D
+    lfs migrate -m $((RANDOM % MDSCOUNT)) -c2 $DIR/dirstr$D
+    rsync -av --exclude "policy.*" --dry-run /etc/ $DIR/dirstr$D/
+done
+
+I ran this a couple of times, then ran e2fsck on the MDTs, and all of them showed the same problem on a lot of remote directories:
+
+e2fsck 1.45.2.wc1 (27-May-2019)
+Pass 1: Checking inodes, blocks, and sizes
+Pass 2: Checking directory structure
+Directory entry for '.' in ... (25191) is big. Split? yes
+Missing '..' in directory inode 25191. Fix? yes
+Setting filetype for entry '..' in ... (25191) to 2.
+:
+Pass 3: Checking directory connectivity   [[[ WHEN NOT FIXING ]]]
+'..' in /REMOTE_PARENT_DIR/0x200000407:0x6f5:0x0 (26203) is  (0), should be /REMOTE_PARENT_DIR (25001).
+Fix? no
+[[[ OR ]]]
+Pass 3: Checking directory connectivity  [[[ WHEN FIXING ]]]
+Unconnected directory inode 25191 (/???)
+Connect to /lost+found? yes
+:
+Pass 4: Checking reference counts
+Inode 2 ref count is 0, should be 11.  Fix? yes
+
+Inode 25191 ref count is 3, should be 2.  Fix? yes
+
+Looking at the directories under REMOTE_PARENT_DIR it appears that the ".." entry is missing from the directory, so "." is a single 4096-byte entry that consumes the whole block.  It may be that this hasn't been noticed in the past because these directories are all small and do not need to be split for HTREE, which would add a ".." as part of struct dx_info.
+
+--- Comment (laisiyao, Wed, 16 Sep 2020 02:04:35 +0000) ---
+commit 3f608461b387df056c9563d4c2879b05fb54a5a5 does remove the optimization for empty directory migration, which is to simplify the code since empty directory should be rare.
+
+I haven't been able to reproduce yet, Andreas, are you testing with master branch?
+
+--- Comment (panda, Tue, 15 Sep 2020 09:43:13 +0000) ---
+I wonder if laisiyao reproduced this issue with some old code. We were able to get the test that led to corruption in our case. It was simply
+
+lfs setdirstripe -i 0 -c 2 /mnt/lustre/d
+lfs migrate -m 0 /mnt/lustre/d
+
+Apparently, the issue was related to the fact that an empy dir did not receive LMV_HASH_FLAG_MIGRATION as part of migration. Eventually, mdt_dir_layout_shrink() was not able to complete migration and returned -EALREADY.
+
+This issue was silently fixed by
+
+commit 3f608461b387df056c9563d4c2879b05fb54a5a5
+Author: Lai Siyao 
+Date:   Sat Feb 15 21:26:36 2020 +0800
+
+    LU-11025 dne: refactor dir migration
+
+--- Comment (panda, Mon, 17 Aug 2020 12:08:20 +0000) ---
+laisiyao, do I understand it correctly that your reproducer does not contain any failover or parallelism of any sort? The test looks linear with respect to mkdir/migrate.
+
+--- Comment (spitzcor, Fri, 7 Aug 2020 20:43:57 +0000) ---
+I can't answer the regression question yet either.  I'm sure that we'll get an answer as we zero-in on root cause. FWIW, we've seen this condition on a 2.12 LTS filesystem (albeit with some patches and back ports from 2.13.5x).
+
+--- Comment (adilger, Fri, 7 Aug 2020 20:00:20 +0000) ---
+PS: so far this is not a data loss scenario, though the on-disk consistency is affected. From my brief testing, it appears that e2fsck fixes this issue.
+
+--- Comment (adilger, Fri, 7 Aug 2020 19:57:57 +0000) ---
+Cory, I can't say whether this is a newer regression or not. As for whether it is a 2.14 blocker depends on whether it was introduced in 2.13.5x patches, or if it has existed for a long time already.
+
+--- Comment (spitzcor, Fri, 7 Aug 2020 13:44:13 +0000) ---
+This bug can be reproduced.  Also, is this a regression? (I mean since after the introduction of `lfs migrate -m` functionality.)
+
+Why is a back-end consistency issue only "Minor"?  If there isn't a good reason then it seems that we should raise the priority and target 2.14.0.
+
+--- Comment (adilger, Thu, 30 Jul 2020 08:43:49 +0000) ---
+This is at least the most common issue that I saw.  It was present on all of the MDTs.
+
+I definitely saw a LOT of problems when MDT0000 ran out of space (blocks) during migration, but that does not need to be the first problem fixed.
+
+When I didn't run out of space on MDT0000 the migrations worked mostly OK, but rsync was complaining about differences on many directories, even though I couldn't see what it was.  I suspect that it was the missing ".." entry causing the difference, but I'm not sure.

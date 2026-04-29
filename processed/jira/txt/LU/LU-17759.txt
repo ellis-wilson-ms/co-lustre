@@ -1,0 +1,114 @@
+Key:        LU-17759
+Summary:    lnet errors "md 0x%p already unlinked"
+Link:       https://jira.whamcloud.com/browse/LU-17759
+Type:       Bug
+Priority:   Minor
+Status:     Closed
+Resolution: Duplicate
+Assignee:   WC Triage
+Reporter:   Dominique Martinet
+Created:    Fri, 19 Apr 2024 14:33:46 +0000
+Updated:    Thu, 25 Apr 2024 22:03:46 +0000
+Resolved:   Thu, 25 Apr 2024 21:58:04 +0000
+Links:      Duplicate: duplicates LU-17704
+Attachments: dk4.elm-rcf-mr-h02s01.xz
+
+--- Description ---
+This is on lustre 2.15.62 with LU-17700's lnet ping buffer size backported, on EL9.3 systems with RoCE on ConnectX6 (mlx5_0) for Stanford new cluster scheduled to start production soonish.
+
+ 
+
+When running benchmarks everything seems to start up well, but some lnet errors quickly show up and transfers grind to a halt waiting for nodes to reconnect.
+
+Looking at dk logs, this seems to be interesting (I've attached the whole file I'm looking at in case it helps, it has 3 occurrences, all similar to the snippet below)
+
+ 
+
+00000100:00000200:17.0:1713479405.286641:0:7433:0:(events.c:99:reply_in_callback()) @@@ type 6, status 0  req@0000000011322484 x1796700924489856/t0(0) o36->elm-MDT0001-mdc-ffff940378cab000@10.4.0.12@o2ib9:12/10 lens 544/624 e 0 to 0 dl 1713479428 ref 3 fl Rpc:R/200/ffffffff rc 0/-1 job:'' uid:134429 gid:14429
+00000100:00000200:17.0:1713479405.286645:0:7433:0:(events.c:121:reply_in_callback()) @@@ unlink  req@0000000011322484 x1796700924489856/t0(0) o36->elm-MDT0001-mdc-ffff940378cab000@10.4.0.12@o2ib9:12/10 lens 544/624 e 0 to 0 dl 1713479428 ref 3 fl Rpc:RU/200/ffffffff rc 0/-1 job:'' uid:134429 gid:14429
+00000400:00000200:17.0:1713479405.286649:0:7433:0:(lib-md.c:42:lnet_md_unlink()) Queueing unlink of md 00000000ebe9f0a6 
+00000400:00000200:24.0:1713479405.286662:0:1532:0:(lib-msg.c:958:lnet_msg_detach_md()) md 0x00000000ebe9f0a6 already unlinked
+00000400:00000200:24.0:1713479405.286663:0:1532:0:(lib-md.c:46:lnet_md_unlink()) Unlinking md 00000000ebe9f0a6
+00000100:00000200:24.0:1713479405.286669:0:1532:0:(events.c:58:request_out_callback()) @@@ type 5, status -110  req@0000000011322484 x1796700924489856/t0(0) o36->elm-MDT0001-mdc-ffff940378cab000@10.4.0.12@o2ib9:12/10 lens 544/624 e 0 to 0 dl 1713479428 ref 3 fl UnregRPC:RU/200/ffffffff rc 0/-1 job:'' uid:134429 gid:14429
+00000100:00000400:17.0:1713479405.286680:0:7433:0:(client.c:2334:ptlrpc_expire_one_request()) @@@ Request sent has failed due to network error: [sent 1713479405/real 1713479405]  req@0000000011322484 x1796700924489856/t0(0) o36->elm-MDT0001-mdc-ffff940378cab000@10.4.0.12@o2ib9:12/10 lens 544/624 e 0 to 1 dl 1713479428 ref 2 fl Rpc:ReXQU/200/ffffffff rc 0/-1 job:'' uid:134429 gid:14429
+00000100:02000400:17.0:1713479405.286691:0:7433:0:(import.c:198:ptlrpc_set_import_discon()) elm-MDT0001-mdc-ffff940378cab000: Connection to elm-MDT0001 (at 10.4.0.12@o2ib9) was lost; in progress operations using this service will wait for recovery to complete 
+
+We can see two threads unlinking the same md
+
+ 
+
+	7433 gets a LNET_EVENT_UNLINK in reply_in_callback() and queues 00000000ebe9f0a6 unlink
+
+	1532 was doing a health check with it which succeeded so the md is also staled for unlinking, but lnet_msg_detach_md() notices the queued unlink (LNET_MD_FLAG_ABORTED set) and fails the ping, leading to disconnection observed.
+
+ 
+
+I didn't take the time to try to reproduce on my test bed yet, but looking at the git log the check in lnet_msg_detach_md() was added in LU-10931 because if the request is still slated for reception at this time it won't come and we need to raise an error to ensure we don't get stuck, but in our case the healthcheck is already successful and over so if I undersand this right we shouldn't need this? And an ugly workaround would be to skip the check if we're coming from a healthcheck (e.g. extra argument we'd set to true if we go through the if (lnet_is_health_check()))... But I didn't try looking at why we're getting the event unlink earlier in the first place, so this might be hiding a race or something – I'll check a bit more tomorrow.
+
+I'd appreciate confirmation that I'm reading this right, and if someone has a better idea it's all welcome 
+
+Thanks!
+
+--- Comment (asmadeus, Thu, 25 Apr 2024 21:58:04 +0000) ---
+Confirmed reverting the commit as proposed in LU-17704 fixes the issue, closing as dup
+
+--- Comment (asmadeus, Tue, 23 Apr 2024 12:05:06 +0000) ---
+tl;dr this is probably a dup of LU-17704
+
+ 
+
+We got traces out of perf probe + record with backtrace on an occurence:
+
+minio 206899 [026] 497534.120469:     probe:lnet_md_unlink_L22: (ffffffffc12290f9) md=0xffff99e0859453b8 md_refcount=1 md_flags=0x17
+        ffffffffc12290fa lnet_md_unlink+0x12a (/lib/modules/5.14.0-362.24.1.el9_3.x86_64/extra/lustre-client/net/lnet.ko)
+        ffffffffc12293a2 __LNetMDUnlink+0x1c2 (/lib/modules/5.14.0-362.24.1.el9_3.x86_64/extra/lustre-client/net/lnet.ko)
+        ffffffffc1c625e3 ptlrpc_unregister_reply+0x423 ([ptlrpc])
+        ffffffffc1c6acc5 ptlrpc_check_set+0x10d5 ([ptlrpc])
+        ffffffffc1c6be78 ptlrpc_set_wait+0x378 ([ptlrpc])
+        ffffffffc1c6c1a4 ptlrpc_queue_wait+0x84 ([ptlrpc])
+        ffffffffc1ce1e11 ldlm_cli_enqueue+0x4a1 ([ptlrpc])
+        ffffffffc1e5f3ad osc_enqueue_base+0x2ad ([osc])
+        ffffffffc1e69dca osc_lock_enqueue+0x38a ([osc])
+        ffffffffc1919c51 cl_lock_enqueue+0x61 ([obdclass])
+        ffffffffc1edd9b7 lov_lock_enqueue+0xa7 ([lov])
+        ffffffffc1919c51 cl_lock_enqueue+0x61 ([obdclass])
+        ffffffffc191a566 cl_lock_request+0x66 ([obdclass])
+        ffffffffc191e71d cl_io_lock+0x11d ([obdclass])
+        ffffffffc191ff18 cl_io_loop+0x88 ([obdclass])
+        ffffffffc1f4cfcd ll_file_io_generic+0x53d ([lustre])
+        ffffffffc1f4de0f ll_file_write_iter+0x4bf ([lustre])
+        ffffffff8e81cd9f new_sync_write+0xff ([kernel.kallsyms])
+        ffffffff8e81fcef vfs_write+0x1ef ([kernel.kallsyms])
+        ffffffff8e8200cf ksys_write+0x5f ([kernel.kallsyms])
+        ffffffff8f05746c do_syscall_64+0x5c ([kernel.kallsyms])
+        ffffffff8f2000ea entry_SYSCALL_64_after_hwframe+0x72 ([kernel.kallsyms])
+                    720e [unknown] (/usr/bin/minio)
+                   8aa66 [unknown] (/usr/bin/minio)
+                   889bb [unknown] (/usr/bin/minio)
+                   b32ff [unknown] (/usr/bin/minio)
+                   bce71 [unknown] (/usr/bin/minio)
+                 20a8a70 [unknown] (/usr/bin/minio)
+                 206c016 [unknown] (/usr/bin/minio)
+                  36c462 [unknown] (/usr/bin/minio)
+                   722c1 [unknown] (/usr/bin/minio)
+
+kiblnd_sd_07_01  1854 [014] 497534.120508: probe:lnet_msg_detach_md_L21: (ffffffffc1225a1d) md=0xffff99e0859453b8 md_refcount=0 md_flags=0x17
+        ffffffffc1225a1e lnet_msg_detach_md+0x2ce (/lib/modules/5.14.0-362.24.1.el9_3.x86_64/extra/lustre-client/net/lnet.ko)
+        ffffffffc1227818 lnet_finalize+0x58 (/lib/modules/5.14.0-362.24.1.el9_3.x86_64/extra/lustre-client/net/lnet.ko)
+        ffffffffc1498061 kiblnd_tx_done+0xf1 ([in_kernel_ko2iblnd])
+        ffffffffc14a49d1 kiblnd_scheduler+0x6c1 ([in_kernel_ko2iblnd])
+        ffffffff8e533d10 kthread+0xe0 ([kernel.kallsyms])
+        ffffffff8e40312c ret_from_fork+0x2c ([kernel.kallsyms])
+
+Looking at the code around here, it looks like that by the time the kiblnd frees up its sent request (kiblnd_scheduler() → kiblnd_complete() → kiblnd_tx_complete() → kiblnd_tx_done() → lnet_finalize() → lnet_msg_detach_md()), the main thread already has caught it and unlinked it (ptlrpc_check_set() → unregistered = ptlrpc_unregister_reply() → _LNetMDUnlink(request>rq_req_md_h, discard)), but _LNetMDUnlink() flags the request as ABORTED and lnet_msg_detach_md() doesn't like it and fails the request in its callback.
+
+Looking at recent commits that touched this part of the code, the most likely cause is https://review.whamcloud.com/c/fs/lustre-release/+/53937 which has already been suggested for revert in LU-17704 (from bisecting)
+
+ 
+
+I'm not sure if healthchecks have the same cause, but I'd suspect that traces being somewhat different for healthchecks was a red herring and this is the common culprit for both. We'll try the revert and report back if this wasn't enough.
+
+--- Comment (asmadeus, Fri, 19 Apr 2024 21:49:54 +0000) ---
+Just a quick update here, focusing on health checks seems to be missing the forest behind the tree – there's plenty of other disconnections with different messages.
+
+They all seem to be related to the "Queueing unlink of md" messages though, there must be a race somewhere or md reused when they shouldn't be. Checking if we can figure a bit more where they come from & I'll comment again if/when we figure something out

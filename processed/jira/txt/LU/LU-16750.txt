@@ -1,0 +1,161 @@
+Key:        LU-16750
+Summary:    optimize ldiskfs internal metadata allocation for hybrid storage LUNs
+Link:       https://jira.whamcloud.com/browse/LU-16750
+Type:       Improvement
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Zhenyu Xu
+Reporter:   Andreas Dilger
+Created:    Thu, 20 Apr 2023 01:41:06 +0000
+Updated:    Mon, 9 Feb 2026 09:24:26 +0000
+Resolved:   Thu, 25 Sep 2025 14:57:04 +0000
+Labels:     ldiskfs
+Links:      Related: is related to  LU-6220; Related: is related to  LU-14438; Related: is related to  LU-14712; Related: is related to  LU-17980; Related: is related to LU-15002
+
+--- Description ---
+With hybrid storage LUNs (combined HDD + SSD, or QLC+TLC flash) it is desirable to be able to separate ldiskfs metadata allocations (that need small random IOs) from data allocations (that are better suited for large sequential IOs) depending on the type of underlying storage.  With LVM it is possible to create an LV with SSD storage at the beginning of the LV, and HDD storage at the end of the LV.  Between 0.5-1% of the OST capacity would need to be high-IOPS storage in order to hold all of the internal ldiskfs metadata.
+
+This would improve performance for inode and other metadata access, such as ls -l, (lfs) find, e2fsck, and in general file access latency, modification, truncate, unlink, transaction commit, etc.
+
+For mke2fs, the following options look interesting for hybrid storage, so that all of the static ldiskfs metadata (group descriptors, block/inode bitmaps, inode tables, journal) is located at the start of the device in the (fast) flash region:
+
+mkfs.lustre --mgsname testfs --ost --index=0 --mkfsoptions="-O sparse_super2 -E num_backup_sb=2,packed_meta_blocks=1" ... /dev/vgost0/lvost0
+
+sparse_super2
+      This feature indicates that there will only be at most two
+      backup superblocks and block group descriptors.   The block
+      groups used to store the backup superblock(s) and blockgroup
+      descriptor(s) are stored in the superblock, but typically, one
+      will be located at the beginning of block group #1, and one in
+      the last block group in the file system.  This feature is essentially
+      a more extreme version of sparse_super and is designed to
+      allow a much larger percentage of the disk to have contiguous
+      blocks available for data files.
+
+num_backup_sb=
+      If the sparse_super2 file system feature is enabled
+      this option controls whether there will be 0, 1, or
+      2 backup superblocks created in the file system.
+
+packed_meta_blocks=
+      Place  the allocation bitmaps and the inode table at
+      the beginning of the disk.  This option requires
+      that the flex_bg file system feature to be enabled
+      in order for it to have effect, and will also create
+      the journal at the beginning of the file system.
+      This option is useful for flash devices that use SLC
+      flash at the beginning of the disk.  It also maximizes
+      the range of contiguous data blocks, which can be
+      be useful for certain specialized use cases, such as
+      supported Shingled Drives.
+
+Unfortunately, there is not (yet) any mechanism to force dynamic metadata (directory blocks, indirect/index blocks, xattr blocks) to be allocated in the fast region at the start of the device.  It makes sense for mke2fs and/or tune2fs to be able to mark "fast" groups in the group descriptor with a flag, like:
+
+#define EXT4_BG_IOPS     0x0010
+
+(note that EXT4_BG_WAS_TRIMMED = 0x0008 is tentatively reserved).
+
+This could be set at format time (e.g. "-E iops=0-1024G,4096-8192G" or similar to indicate where the "IOPS" storage lived), but since it is a per-group field, it could also be used at a 128MB granularity for more arbitrary separation of "IOPS" vs. "slow" storage (e.g. add "IOPS" storage at the end of the device, or interleaved in smaller or larger chunks in case of filesystem resize after creation). 
+
+The mballoc code could then use the IOPS flag in the group descriptor to decide which groups to allocate dynamic filesystem metadata, which prefers high-IOPS storage.  Since the block allocator knows that the storage is IOPS oriented, it can make these (mostly individual) block allocations densely-packed rather than trying to align large allocations.
+
+Having separate block groups for IOPS allocations will also isolate the non-IOPS groups from having such allocations, better allowing it to do large streaming read/write operations, similar to the benefits seen with DoM + HDD OSTs at the Lustre file level, but without the runtime/Lustre layout complexity.
+
+For the new mballoc list-based allocator (LU-12970) the presence of groups marked IOPS would be best handled by creating a second size-array of list_heads sorting the IOPS groups by free blocks size.  Then, when doing a block allocation for a directory, or an indirect/index block, or an xattr block, mballoc can look into the IOPS array instead of the regular array.  The fact that these metadata blocks are not close to the referencing inodes is mostly irrelevant, since they are on a different block device, and (by nature of the underlying storage) have no seek latency.
+
+--- Comment (adilger, Mon, 9 Feb 2026 09:24:26 +0000) ---
+It looks like ext4-mballoc-for-hybrid.patch is missing from the new ldiskfs/kernel-patches/series/ldiskfs-6.12-rhel10.0.series file.  It seems possible that there are conflicts between changes in the upstream mballoc allocator code and the hybrid device functionality, but I don't think that patch went upstream.
+
+--- Comment (adilger, Mon, 3 Nov 2025 17:46:10 +0000) ---
+Some non-rigorous benchmarks for a hybrid OST with a 128GiB M.2 NVMe device and a single 5.8TiB HDD combined via LVM on one of my home OSTs and reformatted in hybrid mode and then filled with data to match an OST formatted in 2017 (Lustre 2.10?). 
+
+This configuration reduced the cold-cache "dumpe2fs" time (load allocation metadata) for similar 5.8TB HDD-only OSTs from 60s to 5s (NB dumpe2fs -h is not affected by filesystem fullness). The dumpe2fs command used to take several minutes on this OST before it was reformatted as hybrid, but it was previously formatted in 2009 and lacked performance-improving options like flexbg. 
+
+The cold cache e2fsck time with 220GiB and 131K inodes in use takes 21s on the HDD OST and under 2s on the hybrid OST.
+
+--- Comment (pjones, Thu, 25 Sep 2025 14:57:04 +0000) ---
+Merged for 2.17
+
+--- Comment (gerrit, Thu, 25 Sep 2025 13:18:02 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/51625/
+
+Subject: LU-16750 ldiskfs: optimize metadata allocation for hybrid LUNs
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 05e487a01b40da4e9f952eafa68bfde28074a385
+
+--- Comment (gerrit, Thu, 31 Aug 2023 17:36:24 +0000) ---
+"Andreas Dilger " merged in patch https://review.whamcloud.com/c/tools/e2fsprogs/+/52091/
+
+Subject: LU-16750 tune2fs: add "-E iops" to set/clear IOPS groups
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 
+
+Commit: a59ac3441448d61d66880e2e5329585191c98716
+
+--- Comment (gerrit, Fri, 25 Aug 2023 09:11:16 +0000) ---
+"Zhenyu Xu " uploaded a new patch: https://review.whamcloud.com/c/tools/e2fsprogs/+/52091
+
+Subject: LU-16750 tune2fs: add "-E iops" to set/clear IOPS storage group
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 1
+
+Commit: 3f5b37336ca396128352512878de87f65cd07193
+
+--- Comment (gerrit, Mon, 7 Aug 2023 14:09:43 +0000) ---
+"Andreas Dilger " merged in patch https://review.whamcloud.com/c/tools/e2fsprogs/+/51735/
+
+Subject: LU-16750 mke2fs: add "-E iops" to set IOPS storage group
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 
+
+Commit: 7ac1b50954cb02d2db18ce462b83ef4ba653b0dc
+
+--- Comment (gerrit, Fri, 21 Jul 2023 19:14:50 +0000) ---
+"Zhenyu Xu " uploaded a new patch: https://review.whamcloud.com/c/tools/e2fsprogs/+/51735
+
+Subject: LU-16750 mke2fs: add "-E iops" to set IOPS storage group
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 1
+
+Commit: 177299183e81be66b1c8ead4755357452e87f8a2
+
+--- Comment (gerrit, Tue, 11 Jul 2023 05:44:46 +0000) ---
+"Zhenyu Xu " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/51625
+
+Subject: LU-16750 ldiskfs: optimize metadata allocation for hybrid LUNs
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: c9e31dd0512bbb10bea5bf093ed607222b84f782
+
+--- Comment (adilger, Tue, 13 Jun 2023 09:40:48 +0000) ---
+It is expected that the size of the IOPS storage is relatively small compared to the non-IOPS storage.  About 0.5% is enough to hold the static metadata (inode tables, bitmaps, etc.) plus enough extra space for dynamically allocated metadata (directory blocks, indirect/index blocks, xattr blocks unless there are many large xattrs).  As such, it makes sense to reserve the IOPS storage exclusively for metadata usage, and the non-IOPS storage should be preferred for data unless there is no free IOPS space.
+
+The IOPS storage should not normally be used for data, but it makes sense to have a tunable parameter (e.g. /sys/fs/ext4/sdX/iops_free_threshold or similar) that controls at what percentage of free space the IOPS groups could be used for data allocations.  Normally this would be =0, meaning the IOPS space should never be used for data, but it could be set to e.g. 1% or 5% (or whatever) free (e.g. when filesystem is above 99% or 95% full) if there is a lot of IOPS space and the administrator really wants to use it for data.

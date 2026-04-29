@@ -1,0 +1,115 @@
+Key:        LU-11695
+Summary:    disabling the xattr cache on client for LSOM
+Link:       https://jira.whamcloud.com/browse/LU-11695
+Type:       Improvement
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Qian Yingjin
+Reporter:   Qian Yingjin
+Created:    Fri, 23 Nov 2018 08:06:42 +0000
+Updated:    Tue, 28 Mar 2023 13:08:12 +0000
+Resolved:   Mon, 11 Jul 2022 12:56:27 +0000
+Links:      Related: is related to  LU-15431; Related: is related to  LU-15609; Related: is related to  LU-15593; Related: is related to  LU-12332
+
+--- Description ---
+Currently, to get uptodate LSOM data, we need to set llite.*.xattr_cache=0 to disable the xattr cache on client completely. This may lead that other kind of xattr can not be cached on client too.
+
+This ticket mainly focues on the heavy-weight solution to disable caching only for LSOM xattr data ("trusted.som") on client.
+
+--- Comment (gerrit, Tue, 28 Mar 2023 07:09:35 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/49952/
+
+Subject: LU-11695 som: disabling xattr cache for LSOM on client
+
+Project: fs/lustre-release
+
+Branch: b2_15
+
+Current Patch Set: 
+
+Commit: dcd842e870a099e18a9afcb817f382648c96bed0
+
+--- Comment (gerrit, Thu, 9 Feb 2023 02:56:52 +0000) ---
+"Jian Yu " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/49952
+
+Subject: LU-11695 som: disabling xattr cache for LSOM on client
+
+Project: fs/lustre-release
+
+Branch: b2_15
+
+Current Patch Set: 1
+
+Commit: e32b3e958a1210c8b082668a7afc936c3e5f16fe
+
+--- Comment (pjones, Mon, 11 Jul 2022 12:56:27 +0000) ---
+Landed for 2.16
+
+--- Comment (gerrit, Mon, 11 Jul 2022 06:48:55 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/33711/
+
+Subject: LU-11695 som: disabling xattr cache for LSOM on client
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 192902851d73ec246af92a2ff7be8f23b08c4343
+
+--- Comment (adilger, Wed, 9 Mar 2022 20:34:43 +0000) ---
+It turns out that the trusted.som xattr is not used directly on the client for anything except "lfs getsom", so keeping it in the xattr cache doesn't help any real workload, and only serves to confuse tests that are using getsom and see a cached value that is stale.
+
+I've un-abandoned patch https://review.whamcloud.com/33711 "LU-11695 som: disabling xattr cache for LSOM on client", but it will need to be rebased to resolve conflicts.
+
+--- Comment (adilger, Fri, 15 May 2020 14:35:55 +0000) ---
+Now that the statx() patch is landing, I think this patch should be abandoned, and this ticket closed.
+
+--- Comment (lixi_wc, Mon, 26 Nov 2018 06:58:10 +0000) ---
+I think at least currently, there is no requirement to use the client side interface to acess the LSOM. So, I'd suggest to delay the implement of this API until we started to see some real requirement for it. After all, LSOM is designed for MDT scanning, not client side accessment. And I think Yingjin's patch is enough to fix the test problem for now.
+
+--- Comment (adilger, Fri, 23 Nov 2018 11:03:03 +0000) ---
+As I mentioned previously, there is no need to disable the xattr cache for trusted.som completely.  Virtually all files in the filesystem will not be recently modified, so disabling the cache just means more overhead for the common case where the trusted.som xattr is valid.  Also, the current implementation of LSOM is mainly intended to be used from the MDS by scanning the MDT disk filesystem directly, not to be used on the client, so adding overhead on the client to manage what is supposed to be "lazy" doesn't make sense. 
+
+Even if the trusted.som xattr is fetched repeatedly, there is still a chance that it is out-of-date (e.g. file has not been closed, llsom_sync is not running, or MDS is an older version without LSOM), so we can't ever rely on it to be completely accurate, and shouldn't try too hard to make it so.  The file size will normally be accurate shortly after close, it is only the blocks count which may be inaccurate.  If the application depends on the blocks count to be relatively accurate, then the userspace application should check something like:
+
+        struct lustre_som_attrs lsom;
+
+        rc = lgetxattr(file, "trusted.som", &lsom, sizeof(lsom));
+        size = lsom.lsa_size;
+        blocks = lsom.lsa_blocks;  /* what unit is "lsa_blocks" in? it should be documented */
+
+        /* if xattr fetch failed or is short, or if we care about blocks being relatively accurate */
+        if (rc  1048576 && lsom.lsa_blocks == 0 && lsom.lsa_valid != SOM_FL_STRICT) {
+                /* LSOM data is likely stale (unless file is totally empty) */
+                fd = open(file, O_RDONLY);
+                if (fd >= 0) {
+                        rc = fstat(fd, st);
+                        size = st.st_size;
+                        blocks = st.st_blocks;
+
+                        /* closing the file will update the LSOM data for next time */
+                        close(fd);  
+                }
+        }
+
+Two lighter-weight solutions exist that will still allow accurate trusted.som xattrs to be fetched to the client:
+
+	cancel the mdc DLM locks via lctl set_param ldlm.namespaces.mdc.lru_size=clear to discard all locks.  This is enough for testing that LSOM works, which is (IMHO) mostly what the "lfs getsom" interface is for.  I don't think that applications will be using "lfs getsom" or the trusted.som xattr directly, and it isn't needed for the lfs find or statx() interface in the future.  Note that trusted.som is only accessible to the root user, so this makes it not very useful for regular users, and a much better reason to implement statx() for regular users instead of trying to guess.
+
+	implement a heuristic on the client to re-fetch the trusted.som xattr if the mtime/ctime of the inode is within the past e.g. 15 minutes (longer than what llsom_sync needs to update trusted.som, but use it from cache if the inode is older than this.  The MDS will already keep the inode up-to-date for the mtime/ctime (which is needed for POSIX), and if llsom_sync hasn't update trusted.som in this time, then it is likely that it is not running and LSOM will not be more uptodate than what the client has.  This will allow 99.999999% of (not-just-created) files to have the trusted.som xattr fetched on lookup and cached on the client, rather than making each access generate another RPC (which could as well get the accurate file size directly from the OSTs).
+
+--- Comment (gerrit, Fri, 23 Nov 2018 08:17:43 +0000) ---
+Yingjin Qian (qian@ddn.com) uploaded a new patch: https://review.whamcloud.com/33711
+
+Subject: LU-11695 som: disabling xattr cache for LSOM on client
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 6fe19dcc84106eddfa6616d411b58e516cbaaaf2

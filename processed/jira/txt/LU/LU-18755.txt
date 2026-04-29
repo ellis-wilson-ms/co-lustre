@@ -1,0 +1,156 @@
+Key:        LU-18755
+Summary:    landing a LU-17480 don't fixes an LBUG in CM event handler.
+Link:       https://jira.whamcloud.com/browse/LU-18755
+Type:       Bug
+Priority:   Critical
+Status:     Open
+Resolution: Unresolved
+Assignee:   Alexey Lyashkov
+Reporter:   Alexey Lyashkov
+Created:    Wed, 26 Feb 2025 12:07:51 +0000
+Updated:    Fri, 28 Feb 2025 17:07:28 +0000
+Links:      Duplicate: duplicates LU-18260; Related: is related to  LU-17480; Related: is related to LU-18260
+
+--- Environment ---
+RHEL 9.5 + MOFED
+
+--- Description ---
+in testing on IB fabric client hits a panic.
+
+[36321.312999] LNetError: 1098489:0:(o2iblnd_cb.c:3312:kiblnd_cm_callback()) LBUG
+[36321.313013] Pid: 1098489, comm: kworker/15:1 5.14.0-503.14.1.el9_5.x86_64 #1 SMP PREEMPT_DYNAMIC Fri Nov 15 12:04:32 UTC 2024
+[36321.313019] Call Trace TBD:
+[36321.313022] Kernel panic - not syncing: LBUG
+[36321.341599] CPU: 15 PID: 1098489 Comm: kworker/15:1 Kdump: loaded Tainted: G S         OE     -------  ---  5.14.0-503.14.1.el9_5.x86_64 #1
+[36321.355581] Hardware name: Intel Corporation S2600JF/S2600JF, BIOS SE5C600.86B.02.04.0003.102320141138 10/23/2014
+[36321.367042] Workqueue: ib_cm cm_work_handler [ib_cm]
+[36321.372616] Call Trace:
+[36321.375349]  
+[36321.377695]  dump_stack_lvl+0x34/0x48
+[36321.381795]  panic+0x107/0x2bb
+[36321.385205]  lbug_with_loc.cold+0x18/0x18 [libcfs]
+[36321.390587]  kiblnd_cm_callback+0x1305/0x1310 [ko2iblnd]
+[36321.396553]  cma_cm_event_handler+0x1e/0xd0 [rdma_cm]
+[36321.402211]  cma_ib_handler+0x8d/0x2f0 [rdma_cm]
+[36321.407383]  cm_process_work+0x25/0x1a0 [ib_cm]
+[36321.412459]  ? cm_queue_work_unlock+0x2f/0xd0 [ib_cm]
+[36321.418121]  cm_rej_handler+0xe5/0x290 [ib_cm]
+[36321.423106]  cm_work_handler+0x493/0x500 [ib_cm]
+[36321.428280]  process_one_work+0x194/0x380
+[36321.432766]  worker_thread+0x2fe/0x410
+[36321.436960]  ? __pfx_worker_thread+0x10/0x10
+[36321.441729]  kthread+0xdd/0x100
+[36321.445238]  ? __pfx_kthread+0x10/0x10
+[36321.449426]  ret_from_fork+0x29/0x50
+[36321.453424]  
+
+looking into crash - I see a o2ib connection in the disconnected state, but IB stack see it's in the connecting state.
+
+it's looks like this is bug in the LU-17480 in the timeout handling.
+
+on connection timeout - it called an 
+
+kiblnd_abort_connreq(struct kib_conn *conn)
+{
+        /* ignore, if already handled by the CM */
+        if (kiblnd_deregister_connreq(conn))
+                return;
+
+        kiblnd_connreq_done(conn, -ENETDOWN);
+        kiblnd_conn_decref(conn);
+}
+
+which moves an o2ib connection in disconnect state but rdma_disconnect don't called an CM connection don't closed. It cased a situation when peer might respond with RDMA_CM_EVENT_REJECTED in window when kiblnd change state to disconnected via path 
+
+kiblnd_abort_connreq -> 
+  kiblnd_connreq_done -> 
+   kiblnd_finalise_conn -> 
+     kiblnd_set_conn_state(conn, IBLND_CONN_DISCONNECTED);  
+
+but CM connection isn't closed. It caused an LBUG hits.
+
+--- Comment (shadow, Fri, 28 Feb 2025 17:06:49 +0000) ---
+Etienne, you point to code don't related to CM QP. Pointed code used to send "FIN" (in tcp terms) aka connection terminate request to peer. Of course, it don't needs to be send if connection don't established. 
+
+But, I say about rdma_disconnect itself.
+
+static int cma_modify_qp_err(struct rdma_id_private *id_priv)
+{
+        struct ib_qp_attr qp_attr;
+        int ret;
+
+        mutex_lock(&id_priv->qp_mutex);
+        if (!id_priv->id.qp) {
+                ret = 0;
+                goto out;
+        }
+
+        qp_attr.qp_state = IB_QPS_ERR;
+        ret = ib_modify_qp(id_priv->id.qp, &qp_attr, IB_QP_STATE);
+out:
+        mutex_unlock(&id_priv->qp_mutex);
+        return ret;
+}
+
+int rdma_disconnect(struct rdma_cm_id *id)
+{
+        struct rdma_id_private *id_priv;
+        int ret;
+
+        id_priv = container_of(id, struct rdma_id_private, id);
+        if (!id_priv->cm_id.ib)
+                return -EINVAL;
+
+        if (rdma_cap_ib_cm(id->device, id->port_num)) {
+                ret = cma_modify_qp_err(id_priv);
+
+--- Comment (eaujames, Fri, 28 Feb 2025 13:19:06 +0000) ---
+rdma_disconnect call needs before move connection to the disconnect state
+
+This is not true because the connection is not in established state:
+
+rdma_disconnect() -> cm_send_dreq_locked
+
+static int cm_send_dreq_locked(struct cm_id_private *cm_id_priv,
+                               const void *private_data, u8 private_data_len)
+....
+       if (cm_id_priv->id.state != IB_CM_ESTABLISHED) {
+               trace_icm_dreq_skipped(&cm_id_priv->id);
+               return -EINVAL;
+       }
+
+--- Comment (gerrit, Thu, 27 Feb 2025 08:04:53 +0000) ---
+"Alexey Lyashkov " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/58251
+
+Subject: LU-18755 o2iblnd: lets disconnect at anycases
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: d95798b213825af593aff2eecf4778f7778ac41c
+
+--- Comment (shadow, Thu, 27 Feb 2025 06:01:24 +0000) ---
+Andreas, it looks like rdma_disconnect call needs before move connection to the disconnect state, I have a patch and after short testing will post for discussion / land.
+
+same race tries to fix with 
+
+commit c37f55ebb7f337b31ab8caf914dfb064feeca2d3
+
+Author: Etienne AUJAMES 
+
+but fix don't seems right, because 
+
++               if (kiblnd_deregister_connreq(conn) == -EALREADY)
+
+will tries to have access to already freed memory.
+
+so it needs to be reverted.
+
+--- Comment (adilger, Thu, 27 Feb 2025 02:45:39 +0000) ---
+eaujames, it looks like you were author of the LU-17480 patch, any ideas here?
+
+--- Comment (shadow, Wed, 26 Feb 2025 12:08:57 +0000) ---
+CM connection needs closed first, when o2ib connection state change.

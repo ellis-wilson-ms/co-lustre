@@ -1,0 +1,62 @@
+Key:        LU-16920
+Summary:    CSDC_v2: store and report compression flag on OST and MDT objects
+Link:       https://jira.whamcloud.com/browse/LU-16920
+Type:       Improvement
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   Zhenyu Xu
+Reporter:   Andreas Dilger
+Created:    Wed, 21 Jun 2023 19:39:02 +0000
+Updated:    Wed, 10 Sep 2025 12:55:58 +0000
+Labels:     csdc
+Links:      Related: is related to LU-16603
+
+--- Description ---
+In order to allow device-level scanners to detect compressed OST objects (and to a lesser extent compressed MDT DoM objects) during scanning, it makes sense to store a flag on each OST object that is storing compressed data.  This will allow the scanner to identify compressed objects, for example to compute the compression ratio during an OST-levels scan, and/or implement other policies during scanning without having the full file layout.
+
+While there is an existing EXT4_COMPR_FL that could be stored on the ldiskfs inode for this purpose, it may have adverse interactions with ext4 or e2fsck now or in the future, if ext4-level compression is ever implemented.
+
+Instead, we should store the compressed object state with LMAC_COMPRESSED=0x00000080 in the trusted.lma xattr on each object.  I don't believe that the storage of compressed objects should need an LMAI_COMPRESSED (incompatible) flag, since there is nothing on the OST that needs to be aware of this state during a read, since the decompression is handled entirely on the client.
+
+The OST would be informed by the client about the presence of compressed data with the OBD_BRW_COMPRESSED flag added in patch https://review.whamcloud.com/50154 "LU-16603 protocol: add OBD_BRW_COMPRESSED".
+
+Other than saving the flag on the OST object one time, there is no other action required by the OST in this case.
+
+For non-DoM files, the MDT will not see the OBD_BRW_COMPRESSED flag.  The MDS could set the LMAC_COMPRESSED flag in trusted.xattr as soon as a compressed component is instantiated.
+
+The MDS should report the LMAC_COMPRESSED flag in the inode flags as LUSTRE_COMPR_FL=FS_COMPR_FL=0x00000004, similar to LUSTRE_ENCRYPT_FL, so that the compression state can be displayed on the client via lsattr.  It should report STATX_ATTR_COMPRESSED=0x00000004 via statx(), similar to STATX_ATTR_ENCRYPTED.
+
+--- Comment (adilger, Thu, 29 Jun 2023 03:50:20 +0000) ---
+If we're going to store "compressed or not" in the server side objects, would it be reasonable to also store the compression chunk size?  I understand if space usage or other concerns dominate, but this would make it possible for the server to round lock grants to chunk size.
+
+Storing the compression chunk size on the OST objects would be desirable to help LFSCK reconstruct the LOV file layout in case it was corrupted/lost on the MDT. We already store other parts of the file layout on each OST object for this exact reason, so it makes sense to do the same for the compressed chunk size.   However, this is not critical, since it would also be possible for LFSCK to read the first (or any) allocated chunk of a file to determine the chunk size used and other compression parameters, as long as it knows that this is a compressed file.
+
+#define LLCH_MAGIC 0xC0398E55DA7A
+/* Compression chunk header */
+struct ll_compr_hdr {
+        __u64 llch_magic:48;     /* LLCH_MAGIC */
+        __u8  llch_header_size;  /* = 32, for future extensions */
+        __u8  llch_exta_flags;
+        __u8  llch_compr_type;    /* LL_COMPR_TYPE_* */
+        __u8  llch_compr_level:4; /* per-algorithm mapped level */
+        __u8  llch_flags:4;
+        __u8  llch_chunk_log_bits;  /* log2(chunk_size) - 16 */
+        __u32 llch_compr_size;    /* bytes of compressed data */
+        __u32 llch_reserved;     /* unused, initialize to 0 */
+        __u32 llch_uncompr_csum; /* crc32 of raw data, or 0 */
+        __u32 llch_compr_csum;   /* crc32 of compressed data, or 0 */
+        __u32 llch_hdr_csum;     /* crc32 of magic..compr_csum, or 0 */
+};
+
+--- Comment (paf0186, Thu, 22 Jun 2023 01:34:26 +0000) ---
+Andreas pointed out elsewhere that we actually already round all LDLM lock grants to be aligned to the start/end of the lock as requested by the client.  This will ensure that all locks are chunk aligned as granted by the server.  Very nice.
+
+--- Comment (paf0186, Wed, 21 Jun 2023 20:20:23 +0000) ---
+Andreas,
+
+Hmm.  If we're going to store "compressed or not" in the server side objects, would it be reasonable to also store the compression chunk size?  I understand if space usage or other concerns dominate, but this would make it possible for the server to round lock grants to chunk size.  This comes up specifically for locks the server is extending, where the server controls the lock boundary that results.
+
+It's a relatively small case - in practice, we'll have the clients rounding their dlmlock requests to chunk size boundaries, and that should (again, in practice) result in the server always ending up on chunk boundaries, even under contention.  (Because it is under contention that locks can end up at unusual sizes.  Without contention it doesn't happen.)
+
+But it would have a certain comfort factor for the server to only grant locks on chunk boundaries as well, which would be straightforward if the server also had the chunk bits.  (Technically only the OST objects would need this, since DOM locks are always full object, but...)

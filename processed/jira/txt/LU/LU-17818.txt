@@ -1,0 +1,109 @@
+Key:        LU-17818
+Summary:    LMR: Lustre Metadata Redundancy
+Link:       https://jira.whamcloud.com/browse/LU-17818
+Type:       Bug
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Andreas Dilger
+Created:    Thu, 23 Dec 2021 12:05:34 +0000
+Updated:    Tue, 24 Feb 2026 06:04:57 +0000
+Labels:     LMR, exatbd
+Links:      Related: is related to  LU-12310; Related: is related to  LU-19915; Related: is related to  LU-19917; Related: is related to  LU-10329; Related: is related to  LU-4215; Related: is related to  LU-7319; Related: is related to  LU-7427; Related: is related to  LU-9206; Related: is related to LU-19916; Related: is related to LU-18015
+Attachments: Lustre_Metadata_Redundancy-202112.pptx, lmr_another_approach.txt
+
+--- Description ---
+Top-level tracking ticket for Metadata replication.
+
+Parts of this work could be split into smaller features and implementation phases in order to reduce the amount of effort needed to get something usable out of the development within a reasonable timeframe:
+
+	improvements to performance of distributed transactions (LU-7426) so that synchronous/ordered disk transactions are not needed. This would be very useful independent of MDT mirroring to improve creation of remote and striped directories, cross-MDT rename/link, etc.
+
+	improve handling of distributed recovery when an MDT is offline (e.g. save transaction logs, don't block filesystem access for unrelated MDTs (LU-9206 ++)
+
+	fault-tolerance for services that run on MDT0000, such as the quota master, FLDB, MGT, flock,  etc.
+
+	scalability of REMOTE_PARENT_DIR to allow handling more disconnected filesystem objects (LU-10329)
+
+	mirroring of top-level directories in the filesystem (initiallly ROOT/, and then first level of subdirectories below it, etc.) so that the filesystem is "more" available if MDT0000 or other MDTs in a top-level striped directory are unavailable. This would not include mirroring of the regular inodes for files, only the directories themselves. Since the top-level directories are changed relatively less often than lower-level subdirectories, some extra overhead creating directories at this level is worthwhile for higher availability.
+
+	mirrored directories would be similar to striped directories, but each directory entry name could be looked up in at least two different directory shards (e.g. lmv_locate_tgt_by_name(), ...+1, ...+2), depending on replication level, allowing the target to be found even if one MDT is offline (LU-9206)
+
+	each mirrored directory entry would contain two or more different FIDs referencing inodes on separate MDTs (for subdirectories), or the same FID (for regular files)
+
+	each mirrored directory inode would have the full layout of all shards in the directory, and client can determine which shard to use for lookup
+
+	updates to the mirrored directory would always need distributed transactions that inserted or removed the redundant dirents together
+
+	normal DNE distributed transaction recovery would apply to recover incomplete transactions if an MDT is offline during an update
+
+--- Comment (laisiyao, Fri, 28 Feb 2025 08:53:32 +0000) ---
+Lai Siyao, it would be easier to comment on the document if it was a wiki page or Word document in Sharepoint, but I'll add some comments here:
+
+The revised version is here: Another Approach to Lustre Metadata Redundancy
+
+fault-tolerant MGS ("Phase 4") seems like a separate project would probably be better to design/implement before the other parts of LMR since a robust MGS is a prerequisite for almost any LMR design? It isn't clear if this needs a whole MGS re-implementation, or if it could be done with FLR mirroring of MGS files, or a relatively straight-forward extension of the existing code?
+
+The proposal of moving the special MDT0000 services to the MGS (e.g. quota master, FLDB, flock) is interesting, so that MDT0000 becomes more "normal" and removing it from the filesystem seems easier.  As is written in the document then the MGS needs to become "more special" and redundant, so it isn't totally clear if this solves the problem or it just makes the migration of the MGS more complex?
+
+Configuration files are based on llog, which is not easy to use FLR mirror.
+
+Replicated data and replicated service are different, the latter needs consensus to avoid brain split. I updated this part in revision: MGS will be bond with MDT, and it will use distributed transaction for replicated data, while the leader MGS is decided by administrator manually.
+
+If we had a mechanism to mirror only the ROOT directory (LU-17820) that would already be a significant step to being able to migrate all inodes away from MDT0000, even if we didn't have mirroring for any other directory or file.
+
+I don't see any discussion in the design about how the MGS would handle quota, FLDB, flock for multiple different filesystems at the same time?  That is definitely possible, but would need to be covered in the design document.
+
+Design is changed about this part.
+
+it appears that this design proposes a direct 1:N mirroring of each MDT to N other MDTs? This means that if one MDT failed, then 100% of the workload from that MDT would fail over to a second MDT, causing it to be twice as busy. If an MDT failed, then a whole new MDT needs to be added and replicated, instead of possibly surviving with one less MDT for some time. It also means it would be difficult to incrementally grow (or shrink) the MDT cluster, since MDTs would need to be added in groups of N to maintain redundancy.
+
+Yes, if no MDT is removed, the mirroring is often static, but rebuild will relocate sequences allocated to the failed MDT to other MDTs by MDT instance and usage. Ideally it should be distributed to all MDTs evenly if there are lots of files.
+
+I like the proposal of making "special" sequence numbers "0x1000000200000400:OID:VER" that could be used to identify the mirror objects. With this mapping, it seems possible that the 1:N mirroring could be done at a SEQ level, so that each SEQ would be mirrored to N other MDTs, but if one MDT failed, then it is likely that some fraction of its SEQ range would be mapped to each other MDT? However, that would make the FLDB considerably more complex, or at least much larger. Alternately, there could be some algorithm (like CRUSH?) to map each SEQ to a different set of mirror MDTs so that they didn't have to be explicitly listed for each SEQ number, but could be computed by the client and other servers when needed. The algorithm/table (FLDB?) would only need to be updated when MDTs are added or removed permanently.
+
+requiring that MDT mirror addition/removal only be allowed on newly-formatted filesystems is a significant restriction, since it wouldn't be possible to add to any of the thousands of existing filesystems.  Is the only restriction for this because the FLDB on-disk format is changing, or is there some other reason that this needs to be done at format time? There should at least be some plan/mechanism proposed for how to incrementally add an MDT mirror to an existing filesystem, since this operation shouldn't be much different than removing and re-replicating an MDT mirror during "normal" usage.
+
+Each sequence is allocated to one MDT. Lustre doesn't have the config for total MDT count, so it's not handy to use hash here, and IMHO FLD relocation is more flexible.
+
+requiring that the entire filesystem be read-only during MDT removal/replication seems like a very significant restriction, making this almost useless for systems that want increased reliability.  Yes, it is better than losing the whole filesystem if an MDT is fatally corrupted, but in most cases this would cause as many problems as it solves. At a minimum, if only directories with the primary on the failed MDT were read-only, this would mean only 1/num_mdts fraction of the filesystem is read-only, and users/admins could create new subdirectories on one of the remaining MDTs to continue using the filesystem.
+
+On second thought, I think this is not needed, but I've updated in the revision.
+
+Much better would be if there was some "SEQ reassignment" mechanism where the primary MDT for each SEQ was reassigned to one of the backup MDTs in the FLDB, and then it would take over responsibility for those SEQ numbers and operations would "return to normal" again? This "SEQ reassignment" should need very little real work (maybe just having a flag in the FLDB that says "mirror 1 is now primary for each SEQ instead of mirror 0"?), since all of the directories and inodes would already be mirrored to the backup MDTs, and only the responsibility for the "primary MDT" needs to be changed (maybe cancelling all of the DLM locks for reassigned SEQ, updating the FLDB).
+
+Yes, there is, but I didn't make it clear. I've updated in the revision.
+
+the "Future Enhancements" items "per-directory replica count" and "per-file replica count" are of course desirable.  There would need to be some understanding/plan of how this can be done as an incremental improvement over the first phases.  I don't think we could move forward with "maybe there is a way to do it in the future" without knowing at least some ideas for achieving this, even if it cannot be implemented initially.
+
+Updated.
+
+--- Comment (adilger, Mon, 24 Feb 2025 22:47:12 +0000) ---
+laisiyao, it would be easier to comment on the document if it was a wiki page or Word document in Sharepoint, but I'll add some comments here:
+
+	fault-tolerant MGS ("Phase 4") seems like a separate project would probably be better to design/implement before the other parts of LMR since a robust MGS is a prerequisite for almost any LMR design?  It isn't clear if this needs a whole MGS re-implementation, or if it could be done with FLR mirroring of MGS files, or a relatively straight-forward extension of the existing code?
+
+	The proposal of moving the special MDT0000 services to the MGS (e.g. quota master, FLDB, flock) is interesting, so that MDT0000 becomes more "normal" and removing it from the filesystem seems easier.  As is written in the document then the MGS needs to become "more special" and redundant, so it isn't totally clear if this solves the problem or it just makes the migration of the MGS more complex?
+
+	If we had a mechanism to mirror only the ROOT directory (LU-17820) that would already be a significant step to being able to migrate all inodes away from MDT0000, even if we didn't have mirroring for any other directory or file.
+
+	I don't see any discussion in the design about how the MGS would handle quota, FLDB, flock for multiple different filesystems at the same time?  That is definitely possible, but would need to be covered in the design document.
+
+	it appears that this design proposes a direct 1:N mirroring of each MDT to N other MDTs?  This means that if one MDT failed, then 100% of the workload from that MDT would fail over to a second MDT, causing it to be twice as busy.  If an MDT failed, then a whole new MDT needs to be added and replicated, instead of possibly surviving with one less MDT for some time.  It also means it would be difficult to incrementally grow (or shrink) the MDT cluster, since MDTs would need to be added in groups of N to maintain redundancy.
+
+	I like the proposal of making "special" sequence numbers "0x1000000200000400:OID:VER" that could be used to identify the mirror objects.  With this mapping, it seems possible that the 1:N mirroring could be done at a SEQ level, so that each SEQ would be mirrored to N other MDTs, but if one MDT failed, then it is likely that some fraction of its SEQ range would be mapped to each other MDT?  However, that would make the FLDB considerably more complex, or at least much larger.  Alternately, there could be some algorithm (like CRUSH?) to map each SEQ to a different set of mirror MDTs so that they didn't have to be explicitly listed for each SEQ number, but could be computed by the client and other servers when needed.  The algorithm/table (FLDB?) would only need to be updated when MDTs are added or removed permanently.
+
+	requiring that MDT mirror addition/removal only be allowed on newly-formatted filesystems is a significant restriction, since it wouldn't be possible to add to any of the thousands of existing filesystems.  Is the only restriction for this because the FLDB on-disk format is changing, or is there some other reason that this needs to be done at format time?  There should at least be some plan/mechanism proposed for how to incrementally add an MDT mirror to an existing filesystem, since this operation shouldn't be much different than removing and re-replicating an MDT mirror during "normal" usage.
+
+	requiring that the entire filesystem be read-only during MDT removal/replication seems like a very significant restriction, making this almost useless for systems that want increased reliability.  Yes, it is better than losing the whole filesystem if an MDT is fatally corrupted, but in most cases this would cause as many problems as it solves.  At a minimum, if only directories with the primary on the failed MDT were read-only, this would mean only 1/num_mdts fraction of the filesystem is read-only, and users/admins could create new subdirectories on one of the remaining MDTs to continue using the filesystem.
+
+	Much better would be if there was some "SEQ reassignment" mechanism where the primary MDT for each SEQ was reassigned to one of the backup MDTs in the FLDB, and then it would take over responsibility for those SEQ numbers and operations would "return to normal" again?  This "SEQ reassignment" should need very little real work (maybe just having a flag in the FLDB that says "mirror 1 is now primary for each SEQ instead of mirror 0"?), since all of the directories and inodes would already be mirrored to the backup MDTs, and only the responsibility for the "primary MDT" needs to be changed (maybe cancelling all of the DLM locks for reassigned SEQ,  updating the FLDB).
+
+	the "Future Enhancements" items "per-directory replica count" and "per-file replica count" are of course desirable.  There would need to be some understanding/plan of how this can be done as an incremental improvement over the first phases.  I don't think we could move forward with "maybe there is a way to do it in the future" without knowing at least some ideas for achieving this, even if it cannot be implemented initially.
+
+--- Comment (laisiyao, Fri, 21 Feb 2025 10:23:20 +0000) ---
+Andreas, I have some thoughts on LMR, please check  lmr_another_approach.txt .
+
+--- Comment (adilger, Thu, 23 Dec 2021 12:09:23 +0000) ---
+Need to create separate tracking tickets for each LMR implementation phase, and sub-components and related enhancements needed.

@@ -1,0 +1,314 @@
+Key:        LU-18072
+Summary:    Lock cancel resending overwhelms ldlm canceld thread
+Link:       https://jira.whamcloud.com/browse/LU-18072
+Type:       Bug
+Priority:   Critical
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Oleg Drokin
+Reporter:   Oleg Drokin
+Created:    Sat, 27 Jul 2024 02:02:56 +0000
+Updated:    Fri, 25 Jul 2025 18:08:09 +0000
+Resolved:   Fri, 25 Apr 2025 15:18:55 +0000
+Links:      Related: is related to  LU-793; Related: is related to  LU-1565; Related: is related to  LU-15190; Related: is related to LU-18077; Related: is related to LU-18111; Related: is related to LU-18881
+
+--- Description ---
+Ever since LU-1565 landed it looks like another subtle problem was introduced.
+
+Since LDLM_CANCEL requests don't have any throttling, they could be sent in huge numbers, this is normally not a big problem as processing is relatively lightweight.
+
+But in case there's a resend for such a cancel, suddenly we take this path in ptlrpc_server_check_resend_in_progress() added in LU-793:
+
+ptlrpc_server_check_resend_in_progress(struct ptlrpc_request *req)
+{
+        struct ptlrpc_request *tmp = NULL;        if (!(lustre_msg_get_flags(req->rq_reqmsg) & MSG_RESENT))
+                return NULL;        /*
+         * This list should not be longer than max_requests in
+         * flights on the client, so it is not all that long.
+         * Also we only hit this codepath in case of a resent
+         * request which makes it even more rarely hit
+         */
+        list_for_each_entry(tmp, &req->rq_export->exp_reg_rpcs,
+                                rq_exp_list) {
+                /* Found duplicate one */
+                if (tmp->rq_xid == req->rq_xid)
+                        goto found;
+        }
+        list_for_each_entry(tmp, &req->rq_export->exp_hp_rpcs,
+                                rq_exp_list) {
+                /* Found duplicate one */
+                if (tmp->rq_xid == req->rq_xid)
+
+a case was observed at a customer site where this was entered and the exp_hp_rpc lists for multiple client exports were in tens of thousands as mass cancellations (from lru timing out?) commenced which led to these list iterations under exp_rpc_lock taking really long time and now clogging the ldlm_cn threads so no processing wasreally possible, request delays from network acceptance to req_in handler could reach into tens of seconds as the result for all clients (same thread pool) with the expected disastrous results.
+
+ 
+
+I imagine we need to address this from two directions:
+
+	server side we really need to avoid taking long time for duplicate request search
+
+	client side we already drop unused and actively cancelled ldlm locks, we need to also drop the cancel resends on replay somehow
+
+--- Comment (gerrit, Fri, 9 May 2025 01:45:51 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/58968/
+
+Subject: LU-18072 ptlrpc: do not search for duplicate cancel requests
+
+Project: fs/lustre-release
+
+Branch: b2_15
+
+Current Patch Set: 
+
+Commit: 0b367203de00005ea4d24879910bdb905ddf5ad8
+
+--- Comment (gerrit, Fri, 25 Apr 2025 16:35:07 +0000) ---
+"Frederick Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/58968
+
+Subject: LU-18072 ptlrpc: do not search for duplicate cancel requests
+
+Project: fs/lustre-release
+
+Branch: b2_15
+
+Current Patch Set: 1
+
+Commit: 11481dc9fb9af6a17fc1daf76785b4dfa5d1e050
+
+--- Comment (pjones, Fri, 25 Apr 2025 15:18:55 +0000) ---
+Merged for 2.17
+
+--- Comment (gerrit, Fri, 25 Apr 2025 00:51:18 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/56843/
+
+Subject: LU-18072 ptlrpc: do not search for duplicate cancel requests
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 41bb553efcf58fcfb6bdd427a41c655c191480e0
+
+--- Comment (gerrit, Thu, 31 Oct 2024 19:33:20 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/56843
+
+Subject: LU-18072 ptlrpc: do not search for duplicate cancel requests
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 5d88c8d89c940366aebfa96b0a47c5677a24e071
+
+--- Comment (adilger, Wed, 7 Aug 2024 15:44:12 +0000) ---
+Does Andriy's patch https://review.whamcloud.com/55946 "LU-18111 ptlrpc: don't drop expired cancel request" help this issue at all?
+
+--- Comment (vitaly_fertman, Tue, 6 Aug 2024 17:15:00 +0000) ---
+I think the whole duplicate xid searching is a waste for the case or RPCs like cancel
+
+I tend to agree with Oleg here, but would look at it wider - why in this case to search for dups for RPCs without a tag at all? if so, it is not a matter of portals; and moreover - in this case the list becomes really small - as it was supposed to be originally, and therefore the benefit of dropping the incoming RPC queue (Alex's proposal), is very limited and probably no much sense to bother with it.
+
+iiuc, the main idea of this code was to search for dups is to not execute modification RPC twice, what may lead to corruptions. this would be still in place. the 2nd benefit was (theoretical, iiuc, not confirmed by tests) to not let heavy weight not-modification RPCs to be processed twice. however, in this (2nd) case, if we have already sent a reply, we are not able to detect it is a dup and would handle it twice anyway (only relying on other dropping mechanisms if applicable); if we have not sent a reply yet - all the file data are (almost always) still in mem, and the 2nd handling supposed to be relatively fast.
+
+whereas the original idea (of still detecting such dups for all RPCs) looked reasonable, it resulted in very long lists and completely blocked MDS's, and relatively fast 2nd handling looks much faster here than searching dup for (if already not all RPCs, but still) many other not modification RPCs.
+
+--- Comment (green, Tue, 30 Jul 2024 00:10:23 +0000) ---
+I branched out LU-18077 for the work on the client side handling of cancel resends so we can concentrate on the server side here,
+
+--- Comment (green, Mon, 29 Jul 2024 23:57:56 +0000) ---
+I think the whole duplicate xid searching is a waste for the case or RPCs like cancel, rhashtable is unnecessary complication too.
+
+basically we have two kinds of portals:
+
+	"normal" - those are guarded by max RIF (well, I guess evil clients might exist) - the number of requests in teh queue there is small, some requests might take a long time to process so duplicate search and reconnect makes sense (LU-793)
+
+	"special" - like the cancel portal, unlimited requests, fast processing, no need for duplicate xid search - so we should skip that code path altogether
+
+moreover, just like Alex proposed - every time we receive a reconnect from the client - we should throw away entire incoming queue at once, the reason is twofold:
+
+	we won't service those requests anyway so why let it hog the memory and slow down processing?
+
+	increases speed of reprocessing those duplicate xids search (well, limited value I guess)
+
+	the wrinkle is we need to still keep requests taht are being processed when the reconnect came.
+
+This does not process us against evil clients so we still need some sort of a counter of requests received and waiting for processing so when that gets too big we'd return some error I guess?
+
+--- Comment (adilger, Mon, 29 Jul 2024 22:58:06 +0000) ---
+Returning -EINPROGRESS to the client if the server is OOM or the incoming queue is too large will at least allow the client to resend this RPC without returning an error to the application.  However, we should also print some kind of notice to the MDS console in this case (e.g. "server request queue overloaded by N RPCs, denying new requests" or similar), otherwise we may have an unresponsive server and clients "hanging" without any visible signs in the logs.
+
+Using an rhashtable for the client RPC XID (per export) would be reasonable.  While struct rhashtable is not tiny (176 bytes), it is still relatively small compared to struct obd_export at 1024 bytes:
+
+struct rhashtable {
+        /* size: 176, cachelines: 3, members: 9 */
+        /* sum members: 169, holes: 1, sum holes: 7 */
+        /* last cacheline: 48 bytes */
+};
+
+struct obd_export {
+        /* size: 1024, cachelines: 16, members: 59 */
+        /* sum members: 1000, holes: 5, sum holes: 20 */
+        /* sum bitfield members: 16 bits, bit holes: 1, sum bit holes: 16 bits */
+        /* paddings: 2, sum paddings: 7 */
+        /* forced alignments: 1 */
+
+Ideally, client lock cancellation should always be fast, but if there is something slowing it down (for whatever reason) we don't want it to become exponentially worse as the queue size grows...
+
+It looks like we might also use this RPC XID hash functionality in a few other places, like mdt_steal_ack_locks() which is walking the exp_outstanding_replies list looking for XIDs.
+
+The issue that Oleg pointed out about dropping duplicate RPC XIDs, but then skipping the RPC because it is old should be fixed separately.  I think in that case it makes sense to update the RPC time to ensure it does not get dropped.  However, we also want to ensure that the logs/stats show the original time that the RPC arrived and how long it was waiting, and not the most recent time that the RPC was resent...
+
+--- Comment (green, Mon, 29 Jul 2024 22:24:08 +0000) ---
+just as a case in point on that second item, here are some logs demonstrating the issue:
+
+00000100:00080000:9.1:1721844446.001290:0:42485:0:(service.c:1665:ptlrpc_server_check_resend_in_progress()) @@@ Found duplicate req in processing  req@00000000e093c0c0 x1797962421855424/t0(0) o103->c5c2b0cd-65c2-40b4-94f3-c83728866801@xxx.27@o2ib1:505/0 lens 328/0 e 0 to 0 dl 1721845200 ref 1 fl New:/2/ffffffff rc 0/-1 job:''
+00000100:00080000:9.1:1721844446.001294:0:42485:0:(service.c:1666:ptlrpc_server_check_resend_in_progress()) @@@ Request being processed  req@00000000d5607036 x1797962421855424/t0(0) o103->c5c2b0cd-65c2-40b4-94f3-c83728866801@xxx.27@o2ib1:387/0 lens 328/0 e 0 to 0 dl 1721845082 ref 1 fl New:/2/ffffffff rc 0/-1 job:''
+00000100:00080000:3.1:1721844530.369062:0:42483:0:(service.c:1665:ptlrpc_server_check_resend_in_progress()) @@@ Found duplicate req in processing  req@00000000b8794633 x1797962421855424/t0(0) o103->c5c2b0cd-65c2-40b4-94f3-c83728866801@xxx.27@o2ib1:590/0 lens 328/0 e 0 to 0 dl 1721845285 ref 1 fl New:/2/ffffffff rc 0/-1 job:''
+00000100:00080000:3.1:1721844530.369065:0:42483:0:(service.c:1666:ptlrpc_server_check_resend_in_progress()) @@@ Request being processed  req@00000000d5607036 x1797962421855424/t0(0) o103->c5c2b0cd-65c2-40b4-94f3-c83728866801@xxx.27@o2ib1:505/0 lens 328/0 e 0 to 0 dl 1721845200 ref 1 fl New:/2/ffffffff rc 0/-1 job:''
+
+As you can see we keep getting those resends but when we actually get to process and throw them away see that the "request being processed" is always req@00000000d5607036 which I guess just happens to be the first one so we reconnect it until it is picked up and rejected
+
+Here's another example:
+
+00000100:00100000:3.0:1721844550.258114:0:12200:0:(service.c:2130:ptlrpc_server_handle_req_in()) got req x1795981875388544
+00000100:00080000:3.1:1721844550.258152:0:12200:0:(service.c:1665:ptlrpc_server_check_resend_in_progress()) @@@ Found duplicate req in processing  req@000000006f044e5c x1795981875388544/t0(0) o103->0386f931-246b-438d-aff6-a6097abf4761@xxx.22@tcp:455/0 lens 328/0 e 0 to 0 dl 1721845150 ref 1 fl New:/2/ffffffff rc 0/-1 job:''
+00000100:00080000:3.1:1721844550.258158:0:12200:0:(service.c:1666:ptlrpc_server_check_resend_in_progress()) @@@ Request being processed  req@00000000904139a0 x1795981875388544/t0(0) o103->0386f931-246b-438d-aff6-a6097abf4761@xxx.22@tcp:31/0 lens 328/0 e 0 to 0 dl 1721844726 ref 1 fl New:/2/ffffffff rc 0/-1 job:''
+00000100:00100000:8.0:1721844551.378734:0:12208:0:(service.c:2130:ptlrpc_server_handle_req_in()) got req x1795981875388544
+00000100:00100000:8.0:1721844551.378736:0:12208:0:(service.c:1210:ptlrpc_check_req()) @@@ DROPPING req from old connection 6796 0386f931-246b-438d-aff6-a6097abf4761@xxx.22@tcp:0/0 lens 328/0 e 0 to 0 dl 0 ref 1 fl New:/2/ffffffff rc 0/-1 job:''
+
+so as you can see here we are picking super old requests (90 reconnects back!) from the queue and dropping them even though for unprocessed ones we really want to pick the newest.
+
+--- Comment (green, Mon, 29 Jul 2024 21:23:40 +0000) ---
+They are not processing fast because they have the resent flag, so instead of being processed, all the cn threads are hogging the cpu fighting to get the exp_rpc_lock spinlock for their chance to iterate the incoming RPCs list searching for duplicates. Available core files show that there are tens of thousands of requests on those lists from dozen or so clients. This takes a lot of CPU. While the spinlock is separate per client, I imagine those RPCs arrive in batches right after a reconnect.
+
+Dropping them on reconnect server-side certainly makes sense because at least we quickly trim the list, but still need sensible resent handling esp. for portals where it does nto help to reconnect to old requests like the cancel portal.
+
+Personally I think optimizing of duplicates search is not going to buy us as much as not running it where it makes no sense at all.
+
+The other thing is considering duplicates search really only makes sense for requests that are in processing, why don't we have a separate lists for such requests? that one is sure going to be super short (limited by number of server threads at the most).
+
+ 
+
+If we go back to LU-793 - the whole idea there was that for long running requests we want to attach resends into the existing processing so the response is sent as a reply to the resent request and is actually delivered, instead of us retryign the real expensive operation anyway.
+
+Doing this for requests that are not yet starting processing is counterproductive for two reasons:
+
+	the not yet started request is not going to be processed anyway because due to the reconnect it will be dropped thanks to the ptlrpc_check_req() filtering
+
+	But reconnecting a new resend into the old request like that all we do is ensure even the resent request is not going to be processed because all we do is just tell the client "hey this is old generation request" even though it really was not!
+
+--- Comment (tappro, Mon, 29 Jul 2024 20:15:03 +0000) ---
+then the question is why they are not processing fast but staying in incoming queue. Is that canceld overload and busy? Or that is result of NRS policy which doesn't prioritize cancels properly? Still, I think if we can't control client flow, then we need to control it on server, why to fill memory with tons incoming cancels from all clients along with all their resent duplicates? Even if they can be dropped, OOM on server is still worse than -EBUSY response for clients with too many requests waiting
+
+Then I'd think about moving to rhash to find duplicates - that way we would avoid duplicates - less memory usage as result and search will be in reasonable time, sort of compromise. I still have no whole picture for this, only some ideas about possible approaches
+
+--- Comment (green, Mon, 29 Jul 2024 19:43:04 +0000) ---
+plus we used to respect max-rpcs-in-flight on the clients in the past?
+
+ldlm cancels never had max RIF, if you have to send a lock cancel and there are no slots, what are you going to do? wait it out? that's the most sure way to get evicted for unresponsiveness there is.
+
+That's why they go to their own separate portal - so other requests don't affect cancellations and the other way around - cancellations don't affect the other requests
+
+--- Comment (bzzz, Mon, 29 Jul 2024 17:34:58 +0000) ---
+Server cannot stop the flood, we can stop accepting requests in some cases
+
+right, server can reject PRCs. plus we used to respect max-rpcs-in-flight on the clients in the past?
+
+--- Comment (green, Mon, 29 Jul 2024 17:22:48 +0000) ---
+Server cannot stop the flood, we can stop accepting requests in some cases, though right now we don't even have a counter of how many requests we have in any particular unprocesses queue it looks like, so making that decision is hard.
+
+--- Comment (tappro, Mon, 29 Jul 2024 17:07:10 +0000) ---
+I'd say sever needs also own protection from such thing, not capability to serve in timely manner but also limits for such DDOS - we can limit size of incoming queue and just return any new resent without any duplication check with -EBUSY if that client export has too many waiting requests. I.e. 'external' flood control for client on server
+
+--- Comment (bzzz, Mon, 29 Jul 2024 16:58:56 +0000) ---
+well, enough clients send their huge rpc batches and it's just matter of number of clients to hit timeout-reconnect-resend, right? of course it's server who must stop this flood.
+
+--- Comment (green, Mon, 29 Jul 2024 16:55:29 +0000) ---
+While this is indeed not ideal and we definitely need to make client-side improvements, servers should be robust enough in the face of somewhat adversary network traffic anyway so handling it sensibly server side is still important.
+
+--- Comment (bzzz, Mon, 29 Jul 2024 16:50:15 +0000) ---
+IMO, this is not quite correct that we let clients to DDoS servers essentially - due to lack of any flow control.
+
+--- Comment (green, Mon, 29 Jul 2024 16:44:09 +0000) ---
+yes, I agree. Hence why I originally proposed not applying this logic to some services like cancels, but that clearly is not going to be enough alone.
+
+The idea to drop entire queue on reconnect sounds promising here in addition to that?
+
+Should we add a counter for such a "totally unprocessed" queue and if it gets high print something, that way we can see if any other services are affected potentially?
+
+--- Comment (bzzz, Mon, 29 Jul 2024 16:35:58 +0000) ---
+the original algo was not supposed to handle tens of thousands requests in flight:
+
+	/*
+	 * This list should not be longer than max_requests in
+	 * flights on the client, so it is not all that long.
+	 * Also we only hit this codepath in case of a resent
+	 * request which makes it even more rarely hit
+	 */
+
+so we have to adapt it to the new requirement..
+
+--- Comment (green, Mon, 29 Jul 2024 16:29:39 +0000) ---
+tappro But does it really make sense to find duplicates in the not yet started to be processed list anyway? All the duplicate search does is reconnecting old request and new request so the client will get a result of serving old request to new request matchbits, alas it's actually counterproductive for yet not started requests because once we start processign them they are dropped because gneration is wrong?
+
+"DROPPING req from old connection" from ptlrpc_check_req(), and indeed when we check client logs we see the same xid from the same request being rejected like this after the duplicate was found, so the new request is rejected as if it's old?
+
+ 
+
+I agree dropping entire incoming queue on reconnect sound like a godo idea, probably should file a separate ticket for it?
+
+--- Comment (tappro, Mon, 29 Jul 2024 16:26:24 +0000) ---
+following Oleg's idea to don't bother about old generation request, I agree with Alex above comment, but again - if we are going to check only request in processing (not waiting) then these lists are not about that. Either we need another list of request whic are exactly in processing (coherent with inc/dec of exp_rpc_count) or check request state/flag to make sure it is in processing
+
+--- Comment (bzzz, Mon, 29 Jul 2024 16:13:38 +0000) ---
+probably we could drop request from the lists in ptlrpc_server_check_resend_in_progress() if generation is old and request is not being processed at the moment? or move to another list where "dropping" could be done lockless.
+
+but ideally we should move the whole list upon generation change.
+
+--- Comment (tappro, Mon, 29 Jul 2024 15:53:21 +0000) ---
+That is not quite correct understanding of what LU-15190 is doing. Its purpose was to prevent accumulation of resends with same xid in these request lists checked in ptlrpc_server_check_resend_in_progress(). So while your statement 1) is true, it misses that if we have zero exp_rpc_count we will add each resend in the list as we don't check for it, so that list become longer by duplicated resends and makes future checks more troublesome as there is more items to check. That is why statement 2) is not true - iterating each time makes things better because it doesn't allow list to grow with useless duplicates
+
+As I was thinking about LU-15190 - it fixes LU-793 which has used exp_rpc_count just as fast way to check both lists are empty, but that is not the same - both lists may have many requests waiting for processing but exp_rpc_count is not about that - it is incremented only when request is taken from that list to be handled, so we might have 10 requests in list and 1 being processing, as it finished exp_rpc_count become 0 and resend check is not done anymore though lists are not empty. So my understanding is that exp_rpc_count can't be used to decide if we have requests in lists or no, and we can just go though these lists directly - if they are empty that is almost for free. So the main purpose of LU-15190 is to don't use exp_rpc_count to check if lists are empty as they are not coherent
+
+Note also, about you statement 1) - it is not true that it finds request being processed - it always finds request in the list which are all incoming requests, so basically it just get it by XID and never check its state - is it waiting or being processed
+
+Situation you have with too long check in ptlrpc_server_check_resend_in_progress() is a bit different I think and happens because there are many waiting requests in these lists which is result of request spamming from client. Nevertheless, there was Alex patch in LU-15190 also to use rhash instead of list walk, so if we consider such spamming as allowed client behavior that is right way to go - just make XID search faster
+
+--- Comment (green, Mon, 29 Jul 2024 14:33:48 +0000) ---
+Here's why I think LU-15190 is wrong and why the crashdump does not demonstrate a problem:
+
+1. The duplicate xid finding code was added as part of LU-793 to find a request that is already being processed and connect the new incoming resend to it so the client will get a reply into the new buffer when the current processing ends. If we have zero requests being processed currently, then there's nothing to reconnect so lookign for a duplicate is a waste of effort.
+
+2. Sure, if there's any RPC being processed and we get a resend we will still iterate over the list  and it might be slow if it's long, but iterating every time does not make it better for sure. I think we might want to add extra checks to exclude certain servics like canceld from this check at all but that does not address the item #1 that if there's nothing in processing then there's no need to match the xid.
+
+ 
+
+4. We cannot assume a well behaving client so we have to have safeguards on the server.
+
+--- Comment (bzzz, Mon, 29 Jul 2024 08:27:40 +0000) ---
+I disagree that  LU-15190 is a root cause:
+
+1) LU-15190 is supposed to fix the real problem as demonstrated in the crash dump.
+
+2) the original check for exp_rpc_count is an optimization which doesn't work when any RPC on a given export is being processed.
+
+3) you say that enormous number of cancels were sent, so if we can't handle them instantly all those cancels will be on the list anyway and we will have to scan for dups anyway.
+
+4) I think throttling on the client side is what we really need.
+
+--- Comment (green, Sat, 27 Jul 2024 02:55:23 +0000) ---
+I guess server-side we can just introduce a counter in the list iteration and once it reaches some max RIF value - stop iterating.
+
+All the requests that would benefit from such iteration are bound by max requests in flight so there could not be too many of them and as such continutity won't matter if the count is exceeded. This is probably better than just hardcoding a particular request id.
+
+Alternatively we can just have a flag in service portal that would instruct intake code to not run this check where it does not matter (e.g. definitely for canceld threads).
+
+Additionally it looks like this problem is introduced by LU-15190? Alex even demonstrated the case of duplicate xids in that ticket with ldlm cancel requests (opc 103) which don't need any of this handling. This code is mostly for the case of "long running request causes client timeout and resend the request, and we need to eply into the new request once we are finally done (LU-793), if we have duplicate xid but neither of them started processing - that's totally fine, ptlrpc_check_req will notice old request from old connection and will drop it on the floor, so no problem here. bzzz tappro - please verify my understanding here?
+
+ 
+
+Now client side I don't see any easy non-invasive ways to drop certain resends across recovery boundary.

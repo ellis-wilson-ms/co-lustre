@@ -1,0 +1,94 @@
+Key:        LU-6676
+Summary:    Excessive blocking ast RPC for LDLM locks in waiting list
+Link:       https://jira.whamcloud.com/browse/LU-6676
+Type:       Improvement
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Jinshan Xiong
+Created:    Tue, 2 Jun 2015 17:06:47 +0000
+Updated:    Fri, 10 Jul 2015 18:47:06 +0000
+
+--- Description ---
+In current implementation of LDLM lock, if a lock is in waiting list and blocks a newly enqueued lock, the waiting lock will be added into work_list and blocking AST will be sent against this lock.
+
+This is a waste of effort because the lock is not granted yet, usually the client holds a reader/writer counter so blocking AST can't do anything to the lock;
+
+Actually the server doesn't need to send the blocking AST RPC for waiting locks, instead it can just set LDLM_FL_AST_SENT flag and this flag will be piggied back by completion AST later.
+
+--- Comment (jay, Wed, 3 Jun 2015 15:38:39 +0000) ---
+For example, for extent lock, in ldlm_process_extent_lock():
+
+ldlm_process_extent_lock() {
+        ...
+        rc2 = ldlm_extent_compat_queue(&res->lr_waiting, lock, flags, err,
+                                       &rpc_list, &contended_locks);
+        ...
+}
+
+ldlm_extent_compat_queue()
+{
+                        ...
+                        if (!work_list)
+                                RETURN(0);
+
+                        /* don't count conflicting glimpse locks */
+                        if (lock->l_req_mode == LCK_PR &&
+                            lock->l_policy_data.l_extent.start == 0 &&
+                            lock->l_policy_data.l_extent.end == OBD_OBJECT_EOF)
+                                check_contention = 0;
+
+                        *contended_locks += check_contention;
+
+                        compat = 0;
+                        if (lock->l_blocking_ast)
+                                ldlm_add_ast_work_item(lock, req, work_list);
+                        ...
+}
+
+If the lock is in the waiting list, can we assume that the CP AST is not sent for this lock? If that is the case, we don't need to add the lock into the @work_list, instead we can set the AST_SENT bit directly because we know there exists a CP AST down the road.
+
+And in ldlm_server_completion_ast():
+
+        ...
+        /* We only send real blocking ASTs after the lock is granted */
+        lock_res_and_lock(lock);
+        if (ldlm_is_ast_sent(lock)) {
+                body->lock_flags |= ldlm_flags_to_wire(LDLM_FL_AST_SENT);
+                /* Copy AST flags like LDLM_FL_DISCARD_DATA. */
+                body->lock_flags |= ldlm_flags_to_wire(lock->l_flags &
+                                                       LDLM_FL_AST_MASK);
+        ...
+
+If it has bit AST_SENT, it will be brought to client, so that client will have CP_PENDING set correspondingly.
+
+--- Comment (green, Wed, 3 Jun 2015 14:43:19 +0000) ---
+Which waiting list do you mean?
+
+The resource waiting list? we absolutely must add the locks there because that's how we know to grant them once the lock that blocks them goes away.
+
+The waiting list for timer to evict the clients? we don't add there until the lock is actually granted.
+
+Can you please elaborate?
+
+--- Comment (jay, Tue, 2 Jun 2015 20:09:14 +0000) ---
+I missed this part. But again this is not good because those locks in waiting list don't have to be added into work_list in the first place.
+
+--- Comment (green, Tue, 2 Jun 2015 18:07:33 +0000) ---
+Do we really send blocking AST, though?
+
+In ldlm_Server_blockingast we have this bit:
+
+        lock_res_and_lock(lock);
+        if (lock->l_granted_mode != lock->l_req_mode) {
+                /* this blocking AST will be communicated as part of the
+                 * completion AST instead */
+                unlock_res_and_lock(lock);
+
+                ptlrpc_req_finished(req);
+                LDLM_DEBUG(lock, "lock not granted, not sending blocking AST");
+                RETURN(0);
+        }
+
+So nothing is sent.

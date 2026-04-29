@@ -1,0 +1,149 @@
+Key:        LU-15171
+Summary:    corrupted in-inode xattr
+Link:       https://jira.whamcloud.com/browse/LU-15171
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Andrew Perepechko
+Reporter:   Shaun Tancheff
+Created:    Thu, 28 Oct 2021 00:56:33 +0000
+Updated:    Wed, 10 Aug 2022 03:23:21 +0000
+Resolved:   Sat, 20 Nov 2021 14:36:43 +0000
+Labels:     rhel8.3
+Links:      Related: is related to LU-16082
+
+--- Description ---
+LDISKFS-fs error (device md6): ldiskfs_get_inode_usage:818: inode #310: comm ll_ost_io00_570: corrupted in-inode xattr
+Aborting journal on device md6-8.
+Kernel panic - not syncing: LDISKFS-fs (device md6): panic forced after error
+
+LDISKFS-fs error (device md6): ldiskfs_journal_check_start:61: Detected aborted journal
+LDISKFS-fs error (device md6): ldiskfs_journal_check_start:61: Detected aborted journal
+LDISKFS-fs (md6): Remounting filesystem read-only
+CPU: 9 PID: 55386 Comm: ll_ost_io00_570 4.18.0-305.10.2.x6.0.29.x86_64 #1
+Hardware name: Seagate Laguna Seca/Laguna Seca, BIOS v02.0043 09/24/2019
+Call Trace:
+  dump_stack+0x5c/0x80
+  panic+0xe7/0x2a9
+  ldiskfs_handle_error.cold.139+0x13/0x13 [ldiskfs]
+  __ldiskfs_error_inode+0xaf/0x130 [ldiskfs]
+  __xattr_check_inode+0x4a/0x70 [ldiskfs]
+  ldiskfs_get_inode_usage+0x195/0x290 [ldiskfs]
+  __dquot_transfer+0x8a/0x5d0
+  dquot_transfer+0x8e/0x130
+  osd_quota_transfer+0x188/0x310 [osd_ldiskfs]
+  osd_attr_set+0xd4/0x740 [osd_ldiskfs]
+  ofd_write_attr_set+0x7bf/0x1070 [ofd]
+  ofd_commitrw_write+0x222/0x1a50 [ofd]
+  ofd_commitrw+0x458/0xa60 [ofd]
+  tgt_brw_write+0x18de/0x2390 [ptlrpc]
+  tgt_request_handle+0xc93/0x1a00 [ptlrpc]
+  ptlrpc_server_handle_request+0x323/0xbd0 [ptlrpc]
+  ptlrpc_main+0xc06/0x1550 [ptlrpc]
+
+--- Comment (pjones, Sat, 20 Nov 2021 14:36:43 +0000) ---
+Landed for 2.15
+
+--- Comment (gerrit, Sat, 20 Nov 2021 06:24:45 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/45424/
+
+Subject: LU-15171 osd-ldiskfs: xattr_sem locking is missing for dquot_transfer
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: e6c7fcdaf40b130c39af2e3ee8b108c6e31a8ca8
+
+--- Comment (gerrit, Sun, 31 Oct 2021 20:08:00 +0000) ---
+"Andrew Perepechko " uploaded a new patch: https://review.whamcloud.com/45424
+
+Subject: LU-15171 osd-ldiskfs: xattr_sem locking is missing for dquot_transfer
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: fb9f97b3481214017be8de89555076262ecaa6e1
+
+--- Comment (panda, Sun, 31 Oct 2021 20:07:47 +0000) ---
+It seems that this issue is not really a corruption. At least I haven't found any corruption in the buffer heads from the crash dump
+
+Commit 7a9ca53ae (~v4.13) added the requirement for xattr_sem locking when calling *dquot_transfer:
+
+commit 7a9ca53aea10ad4677a0f347ad7639c304b80194
+Author: Tahsin Erdogan 
+Date:   Thu Jun 22 11:46:48 2017 -0400
+
+    quota: add get_inode_usage callback to transfer multi-inode charges
+
+...
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 962f28a0e176..d9733aa955e9 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -5295,7 +5295,14 @@ int ext4_setattr(struct dentry *dentry, struct iattr *attr)
+                        error = PTR_ERR(handle);
+                        goto err_out;
+                }
++
++               /* dquot_transfer() calls back ext4_get_inode_usage() which
++                * counts xattr inode references.
++                */
++               down_read(&EXT4_I(inode)->xattr_sem);
+                error = dquot_transfer(inode, attr);
++               up_read(&EXT4_I(inode)->xattr_sem);
++
+                if (error) {
+                        ext4_journal_stop(handle);
+                        return error;
+diff --git a/fs/ext4/ioctl.c b/fs/ext4/ioctl.c
+index dde8deb11e59..42b3a73143cf 100644
+--- a/fs/ext4/ioctl.c
++++ b/fs/ext4/ioctl.c
+@@ -373,7 +373,13 @@ static int ext4_ioctl_setproject(struct file *filp, __u32 projid)
+ 
+        transfer_to[PRJQUOTA] = dqget(sb, make_kqid_projid(kprojid));
+        if (!IS_ERR(transfer_to[PRJQUOTA])) {
++
++               /* __dquot_transfer() calls back ext4_get_inode_usage() which
++                * counts xattr inode references.
++                */
++               down_read(&EXT4_I(inode)->xattr_sem);
+                err = __dquot_transfer(inode, transfer_to);
++               up_read(&EXT4_I(inode)->xattr_sem);
+                dqput(transfer_to[PRJQUOTA]);
+                if (err)
+                        goto out_dirty;
+...
+
+In Lustre, we do not take this lock. It seems that a first write race is possible when one thread attempts to modify inode xattrs and another thread performs dquot_transfer which analyzes xattr consistency (and eventually fails).
+
+It seems that we can simply wrap *dquot_transfer() calls with xattr locking for the newer kernels. It should be ok performance-wise for the OST side and, hopefully, for the MDT side either. A proof of concept path will be uploaded for review.
+
+--- Comment (adilger, Fri, 29 Oct 2021 22:47:10 +0000) ---
+Shaun, it would be useful in this case to use debugfs and/or "dd" to dump the inode and its xattr and attach it here, to see how it is corrupted.  Unfortunately, the ldiskfs_get_inode_usage()->__xattr_check_inode()->ldiskfs_xattr_check_entries() code does not say how the xattr was corrupted, and this is important to determine how to handle this error better.
+
+I hit a similar issue on my home system running 2.14.0 on a RHEL8.2 kernel (though I don't mount with errors=panic, so it just prevents access to one file instead of rebooting the server):
+
+ldiskfs_xattr_inode_get:497: inode #2405396: comm mdt00_002: EA inode hash validation failed
+(mdt_handler.c:1429:mdt_getattr_internal()) myth-MDT0000: getattr error for [0x20002da99:0x3cc:0x0]: rc = -117
+
+In my case, it looks like it is caused by a slight incompatibility between how the RHEL7-patched ea_inode code is storing xattrs (not storing a checksum in the xattr), compared to how this functionality was implemented when it landed in the upstream kernel for RHEL8 and above.  I can't say in your case whether your xattr is totally corrupted, or has a similar minor error.
+
+It would be useful to fix this on several fronts:
+
+	correct how ldiskfs in RHEL7 is storing those xattrs, to be forward compatible with RHEL8
+
+	patch ldiskfs in RHEL8 to be more forgiving about minor inconsistencies (e.g. checksum=0, but not a random checksum error)
+
+	update e2fsck to correct such errors (at least e2fsck from e2fsprogs-1.46.2.wc3 does not correct this xattr, even though the kernel rejects it).
+
+--- Comment (stancheff, Thu, 28 Oct 2021 02:36:09 +0000) ---
+Last seen with HPE: v2_14_55-54-g0a74a33f87 based on WC: v2_14_55-41-g14d07b6237

@@ -1,0 +1,92 @@
+Key:        LU-16276
+Summary:    stale data read with simple IOR testing.
+Link:       https://jira.whamcloud.com/browse/LU-16276
+Type:       Bug
+Priority:   Blocker
+Status:     Open
+Resolution: Unresolved
+Assignee:   Alexey Lyashkov
+Reporter:   Alexey Lyashkov
+Created:    Fri, 28 Oct 2022 13:53:15 +0000
+Updated:    Wed, 14 Dec 2022 16:04:37 +0000
+
+--- Description ---
+CLIO violates a Linux kernel MM protocol. 
+
+ Linux kernel expect vmpage ref will released immedetely after
+
+    page->private clear. But CLIO broke it.
+
+    It caused race ll_releasepage vs bl ast handler,
+
+    ll_releasepage remove a page->private, but bl_ast handler take a
+
+    cl_page reference in same time.
+
+    It caused vmpage still in the mapping after __remove_mapping call,
+
+    because vmpage->_refcount isn't decresed.
+
+    So we needs to stay with kernel protocol and release a pageref after
+
+    cl_page_delete call.
+
+lustre debug logs indicate it
+
+00000008:00000001:9.0:1666910059.632700:0:5016:0:(osc_cache.c:3088:osc_page_gang_lookup()) Process entered
+
+bl ast enter and interrrupted by ll_releasepage aka cache flush.
+but cl_page ref was hold where
+
+00000020:00000001:8.0:1666910059.632703:0:11668:0:(cl_page.c:545:cl_vmpage_page()) Process leaving (rc=18446624413482391544 : -119660227160072 : ffff932b6eaa97f8)
+00000020:00000001:8.0:1666910059.632708:0:11668:0:(cl_page.c:444:cl_page_state_set0()) page@ffff932b6eaa97f8[3 ffff932b5cd3f2b0 1 1 0000000000000000]
+00000020:00000001:8.0:1666910059.632709:0:11668:0:(cl_page.c:445:cl_page_state_set0()) page fffff2cc04e941c0 map ffff932c62810218 index 82632 flags 17ffffc0002015 count 3 priv ffff932b6eaa97f8:
+00000020:00000001:8.0:1666910059.633545:0:11668:0:(cl_page.c:489:cl_pagevec_put()) page@ffff932b6eaa97f8[2 ffff932b5cd3f2b0 5 1 0000000000000000]
+00000020:00000001:8.0:1666910059.633546:0:11668:0:(cl_page.c:490:cl_pagevec_put()) page fffff2cc04e941c0 map ffff932c62810218 index 82632 flags 17ffffc0000015 count 3 priv 0:
+00000080:00008000:8.0:1666910059.633548:0:11668:0:(rw26.c:175:ll_releasepage()) page fffff2cc04e941c0 map ffff932c62810218 index 82632 flags 17ffffc0000015 count 3 priv 0: clpage ffff932b6eaa97f8 : 1
+ll_releasepage exit and expect to free a cl_page but ref hold by BL AST thread.
+and vmpage still with 3 refs while __remove_mapping whats 2. 
+so __remove_mapping will fail with freeze refs.
+
+00000020:00000001:9.0:1666910059.642999:0:5016:0:(cl_page.c:489:cl_pagevec_put()) page@ffff932b6eaa97f8[1 ffff932b5cd3f2b0 5 1 0000000000000000]
+00000020:00000001:9.0:1666910059.643000:0:5016:0:(cl_page.c:490:cl_pagevec_put()) page fffff2cc04e941c0 map ffff932c62810218 index 82632 flags 17ffffc0000014 count 2 priv 0:
+00000020:00000010:9.0:1666910059.643003:0:5016:0:(cl_page.c:178:__cl_page_free()) slab-freed 'cl_page': 472 at ffff932b6eaa97f8.
+
+cl_page freed -> vmpage ref released, vmpage with 2refs and it may removed from pagecache, but none want's to do it and uptodate page still in pagecache.
+
+bug introduced 
+
+fbf5870b984 (nikita         2008-11-07 23:54:43 +0000  56) static void vvp_page_fini_common(struct ccc_page *cp)
+fbf5870b984 (nikita         2008-11-07 23:54:43 +0000  57) {
+fbf5870b984 (nikita         2008-11-07 23:54:43 +0000  58)         cfs_page_t *vmpage = cp->cpg_page;
+fbf5870b984 (nikita         2008-11-07 23:54:43 +0000  59)
+fbf5870b984 (nikita         2008-11-07 23:54:43 +0000  60)         LASSERT(vmpage != NULL);
+fbf5870b984 (nikita         2008-11-07 23:54:43 +0000  61)         page_cache_release(vmpage);
+fbf5870b984 (nikita         2008-11-07 23:54:43 +0000  62)         OBD_SLAB_FREE_PTR(cp, vvp_page_kmem);
+fbf5870b984 (nikita         2008-11-07 23:54:43 +0000  63) }
+
+--- Comment (shadow, Wed, 14 Dec 2022 16:04:37 +0000) ---
+in fact this bug was don't seen until.
+
+commit d033f2f120abc20374535de7bc28d2dd385c8181
+Author: Jinshan Xiong 
+Date:   Tue Apr 17 21:40:24 2012 -0700
+    LU-1320 llite: fix a race between readpage and releasepage
+    This is a race between page stealing and readpage. If a just read
+    page is stolen, readpage will find the page is not uptodate, this
+    makes it panic so -EIO is returned to the reading application.
+    Signed-off-by: Jinshan Xiong 
+    Change-Id: Ib16d12d3bc3cc8c0545aa27f0836e4fd89c3a809
+    Reviewed-on: http://review.whamcloud.com/2591
+    Reviewed-by: Oleg Drokin 
+    Tested-by: Hudson
+    Reviewed-by: Bobi Jam 
+    Tested-by: Maloo 
+
+This patch adds a conditionally remove a page from page cache with racy checks.
+
+In fact, these checks don't help in cases.
+
+1. readpage vs drop caches. read page holds an vm ref before lock page, this check skips, and cl_page freeds at end of ll_releasepage function. so blocking ast don't found anything to work.
+
+2. active->inactive LRU refill vs drop caches. and some other cases. similar case, cl_page freed, page still live in page cache.

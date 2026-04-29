@@ -1,0 +1,152 @@
+Key:        LU-5566
+Summary:    Lustre waiting in TASK_INTERRUPTIBLE with all signals blocked results in unkillable processes
+Link:       https://jira.whamcloud.com/browse/LU-5566
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Patrick Farrell
+Created:    Fri, 29 Aug 2014 22:13:31 +0000
+Updated:    Fri, 23 Jan 2026 22:51:36 +0000
+Links:      Related: is related to  LU-12511; Related: is related to LU-19825
+
+--- Description ---
+Lustre does much of its waiting on Linux in a TASK_INTERRUPTIBLE state with all signals blocked.
+
+This was changed briefly to TASK_UNINTERRUPTIBLE as part of bugzilla 16842 (https://projectlava.xyratex.com/show_bug.cgi?id=16842), then changed back because it led to extremely high reported load averages on Lustre servers:
+
+https://projectlava.xyratex.com/show_bug.cgi?id=16842#c28
+
+These sorts of reported load averages would be expected to cause issues 
+
+This is because the kernel calculates load average by counting tasks in TASK_UNINTERRUPTIBLE.  (See the definition of "task_contributes_to_load".).
+
+This method of waiting in TASK_INTERRUPTIBLE with all signals blocked (including SIGKILL) causes a problem with delivery of signals in shared_pending which can result in unkillable processes.
+
+The situation is this:
+
+Lustre is waiting as described, in TASK_INTERRUPTIBLE with all signals blocked.  A SIGKILL is sent to the process group of a user process in a syscall in to Lustre.  This goes in the shared_pending mask for the process.  This would normally wake a process sleeping in TASK_INTERRUPTIBLE, but is not handled because Lustre is waiting with all signals blocked.
+
+Separately, a SIGSTOP is sent directly to the process.  This is commonly used as part of our debugging/tracing software, and normally SIGSTOP and SIGKILL arriving to the same process is not a problem:
+
+For a process waiting in TASK_INTERRUPTIBLE (without SIGKILL blocked), SIGKILL will cause that task to exit (whether it arrives before SIGSTOP or after - the effect is the same).
+
+For a task waiting in TASK_UNINTERRUPTIBLE, the task finishes waiting, then on return to userspace, the signals (SIGKILL in the shared mask & SIGSTOP in the per-process mask) are handled correctly & the process exits.
+
+But somehow, waiting in TASK_INTERRUPTIBLE with all signals blocked confuses things, and the result is stopped processes that do not exit.  Sending another SIGKILL works, but any other process would have exited by this point.
+
+It's very clear why Lustre does its waiting in TASK_INTERRUPTIBLE (Oleg reported load averages on a health server of >3000 in the bugzilla bug linked above), and since a complex system like Lustre is not good at being interrupted arbitrarily, it's understandable why it waits with all signals blocked.
+
+At the same time, it's clearly wrong to be waiting in TASK_INTERRUPTIBLE while blocking all signals.  Whatever scheduler behavior is causing these zombie processes is not the central problem.
+
+The cleanest solution I can see is to add a new wait state to the Linux kernel, one that allows a process to wait uninterruptibly but not contribute to load.  I'm thinking of proposing a patch to this effect (to start the conversation) on fs-devel or the LKML, and I wanted to get input from anyone at Intel who'd like to give it before starting that conversation.
+
+I can provide further details of the non-exiting processes, etc, if needed, including dumps, but I think the description above should be sufficient.
+
+--- Comment (adilger, Fri, 5 Sep 2014 17:55:09 +0000) ---
+Patrick, before we stir the hornet's nest upstream, it probably makes sense to see if we can change the Lustre code to better match the upstream kernel before we ask the kernel to change to match Lustre.  There have been several improvements in the upstream kernel since l_wait_event() was first written that might be useful to us today.  Also, it may be useful to have a different implementation for waiting on the client and on the server, since clients waiting on RPCs should contribute to the load average just like they would if they were waiting on the disk.
+
+--- Comment (paf, Wed, 3 Sep 2014 18:01:05 +0000) ---
+Here's a proposed note to LKML about this change.  In Lustre, this would mean re-writing l_wait_event so instead of blocking all signals and waiting at TASK_INTERRUPTIBLE, it would wait in a new scheduler state, one with the signal ignoring properties of TASK_UNINTERRUPTIBLE but without contributing to load average.
+
+-------
+
+Back in 2002, Linus proposed splitting TASK_UNINTERRUPTIBLE in to two flags -
+
+TASK_NOSIGNAL, and TASK_LOADAVG, so ignoring signals and contributing to load
+
+could be handled separately:
+
+https://lkml.org/lkml/2002/8/1/186
+
+I've been looking at this, because the Lustre file system client makes heavy
+
+use of waiting in TASK_INTERRUPTIBLE with all signals blocked – 
+
+including SIGKILL and SIGSTOP.
+
+This is to manage load average, as Lustre regularly has very long waits for
+
+networked IO, during which it can't be interrupted, and if Lustre is changed
+
+to wait in TASK_UNINTERRUPTIBLE, load averages get out of control.
+
+But the choice to block all signals while waiting in TASK_INTERRUPTIBLE causes
+
+an issue with tasks not exiting that I am hesitant to call a bug, because I
+
+think the root problem is that we're (effectively) lying to the scheduler by
+
+using TASK_INTERRUPTIBLE with all signals blocked.  If I'm wrong and that's
+
+acceptable behavior, I'd be happy to share the gory details of the exact
+
+problem we're having.
+
+Linus' suggestions from 2002 fits this use case perfectly, but it was never
+
+implemented.
+
+It nearly made it in 2007, with this from Matthew Wilcox:
+
+https://lkml.org/lkml/2007/8/29/219
+
+But Matthew dropped the split of TASK_LOADAVG off from TASK_UNINTERRUPTIBLE in
+
+the second version, stating:
+
+"- Don't split up TASK_INTERRUPTIBLE and TASK_UNINTERRUPTIBLE.
+
+   TASK_WAKESIGNAL and TASK_LOADAVG were pretty much equivalent, and since
+
+   we had to keep __TASK_{UN,}INTERRUPTIBLE anyway, splitting them made
+
+   little sense."
+
+https://lkml.org/lkml/2007/9/1/232
+
+So:
+
+Would a resurrection of the TASK_LOADAVG implementation from Matthew's first
+
+patch likely meet with approval?
+
+It fits the Lustre use case perfectly, and would let us stop doing something
+
+decidedly nasty without paying any price.
+
+--- Comment (paf, Tue, 2 Sep 2014 16:07:55 +0000) ---
+I've got a more specific suggestion, from Cray's Paul Cassella.
+
+He found this old lkml message about a proposed change for almost exactly this problem, suggested by Linus:
+
+http://marc.info/?l=linux-kernel&m=102822913830599&w=1
+
+On Wed, 31 Jul 2002, David Howells wrote:
+
+> 
+
+> Can you comment on whether a driver is allowed to block signals like this, and
+
+> whether they should be waiting in TASK_UNINTERRUPTIBLE?
+
+They should be waiting in TASK_UNINTERRUPTIBLE, and we should add a flag 
+
+to distinguish between "increases load average" and "doesn't". So you 
+
+could have
+
+	TASK_WAKESIGNAL - wake on all signals
+
+	TASK_WAKEKILL	- wake on signals that are deadly
+
+	TASK_NOSIGNAL	- don't wake on signals
+
+	TASK_LOADAVG	- counts toward loadaverage
+
+	#define TASK_UNINTERRUPTIBLE	(TASK_NOSIGNAL | TASK_LOADAVG)
+
+	#define TASK_INTERRUPTIBLE	TASK_WAKESIGNAL
+
+So it seems like this would fill Lustre's need nicely, and if done correctly, would presumably meet with approval upstream.

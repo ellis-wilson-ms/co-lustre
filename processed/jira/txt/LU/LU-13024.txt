@@ -1,0 +1,201 @@
+Key:        LU-13024
+Summary:    Lustre HSM support for a directory
+Link:       https://jira.whamcloud.com/browse/LU-13024
+Type:       New Feature
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Qian Yingjin
+Created:    Wed, 27 Nov 2019 16:38:44 +0000
+Updated:    Mon, 11 Aug 2025 17:51:57 +0000
+Links:      Related: is related to LU-19251
+
+--- Description ---
+Currently Lustre only supports HSM for a regular file. There is a growing demand to add Lustre HSM support for a directory to meet the potential requirements coming from PCC and WBC.
+
+The draft proposal design could be as follows:
+
+lfs hsm_archive $DIR
+
+Before archive the directory $DIR, it must ensure that there are no any locks granted to clients for all sub directories and files under the directory $DIR on MDT.
+
+ It could be achieved:
+
+	HSMDIR(DIR):
+
+ HSM naming structure on HSM backend for a Lustre directory DIR:
+
+ "%04x/%04x/%04x/%04x/%04x/%04x/" DFID_NOBRACE FID(DIR)
+
+	Version(entry):
+
+ version of the metadata object, could be same as version number used by COS;
+
+	DataVersion(entry):
+
+ Data version of the regular file @entry, return 0 if @entry is not a regular file;
+
+	FID(entry): FID of the file @entry;
+
+	LayoutGen(entry):
+
+ Layout generation of the regular file @entry;
+
+	HsmVersion(hsmcopy):
+
+ Field of EA for HSM copy - hsmcopy.hsm_meta_ver
+
+	HsmDataversion(hsmcopy):
+
+ Field of EA for HSM copy - hsmcopy.hsm_data_ver
+
+	HsmLayoutGen(hsmcopy):
+
+ Field of EA for HSM copy - hsmcopy.hsm_layout_gen;
+
+Revoke_subtree_locks(dir) { 
+    for entry in dir {
+        AcquireLock(entry, LCK_EX);
+        if (entry->d_type == DT_DIR)
+            Revoke_subtree_locks(entry);
+        ReleaseLock(entry, LCK_EX);
+   }
+}
+AcquireLock(DIR, LCK_EX);
+Revoke_subtree_locks(DIR);
+
+Copy_files(): {
+    If use POSIX copytool (lhsm_posix), create a directory according to HSM naming structure on HSM backend:
+HSMDIR(DIR): "%04x/%04x/%04x/%04x/%04x/%04x/" DFID_NOBRACE FID(DIR)
+The copytool copies all directories and files under $DIR into HSM HSMDIR(DIR).
+Here we may need to a special open flag O_IGNORE_IBITS_LOCK | O_IGNORE_EXTENT_LOCK (similar to O_LOV_DELAY_CREATE) to indicate that operations such as open/close, readdir(), read()/write() should not take any lock (lockless IO for metadata or data IO).
+Meanwhile, we define a data structure named hsm_copy_attrs to store the necessary information in the EA of HSM copy:
+/*  HSM on-disk attributes stored in a separate xattr for HSM copy. */
+struct hsm_copy_attrs
+{ 
+    /* Bitfield for supported data in this structure. For future use. */ 
+    __u32 hsm_compat;
+    /* HSM flags, see hsm_flags enum below */ 
+    __u32 hsm_flags;
+    /* backend archive id associated with the file */
+    __u64 hsm_arch_id;
+    /* version associated with the last archiving, if any */
+    __u64 hsm_data_ver; /* data version Only used for regular files */
+    __u64 hsm_meta_ver; /* version of metadata used by COS */
+    __u64 hsm_layout_gen; /* layout generation only for regular files */
+    /* original fid if want to keep FID unchanged after restore */
+    struct lu_fid  hsm_fid;
+};
+
+Once copy a file or a directory @entry into HSM, set the corresponding HSM attrs (data structure hsm_copy_attrs)for the PCC copy in a form of EA: 
+    hsmcopy.hsm_data_ver = DataVersion(entry); // 0 for directory
+    hsmcopy.hsm_meta_ver = Version(entry);
+    hsmcopy.hsm_layout_gen = LayoutGen(entry);
+    hsmcopy.hsm_fid = FID(entry);
+}
+
+ReleaseLock(DIR, LCK_EX);
+
+lfs hsm_release $DIR
+
+ 
+CheckReleaseDir(dir, hsmbasedir){
+    if (Version(dir) != HsmVersion(hsmbasedir)) {
+       // dir was modified.
+       // resync @dir and @hsmbasedir
+       forall: if one child directory or file in @hsmbasedir is not in @dir:
+                  remove this child directory or file
+       fi
+       forall: if one child directory or file in @dir is not in @hsmbasedir:
+                  Copy_file();
+       fi
+    }
+    // after resync above, two directories should be consistent. 
+    for entry in dir {
+        AcquireLock(entry, LCK_EX); 
+        hsment = hsmbasedir + "/" + entry; 
+        if (Version(entry) != HsmVersion(hsment)
+            resync metadata attributes which may be changed;
+        if (entry->d_type == DT_REGULAR) { 
+             if (LayoutGen(entry) != HsmLayoutGen(hsment) ||
+                  DataVersion(entry) != HsmDataVersion(hsment)) {
+                       resync data;
+            } 
+       } else if (entry->d_type == DI_DIR) {
+                  CheckReleaseDir(dir + "/" + entry, hsment);
+       } 
+       ReleaseLock(entry, LCK_EX);
+       delete @entry from Lustre file system;
+ }
+ 
+When try to lock @dir, it still need to check whether @DIR is currently keeping opened, if so, stop HSM release for the directory.
+
+AcquireLock(DIR, LCK_EX);
+CheckReleaseDir(DIR, HSMDIR(DIR));
+ReleaseLock(DIR, LCK_EX);
+ 
+
+lfs hsm_remove $DIR
+
+Remove the archived HSMDIR($DIR) entirely from HSM;
+
+lfs hsm_restore $DIR
+
+$DIR should be an empty directory in Lustre file system.
+
+ AcquireLock(DIR, LCK_EX);
+
+ RestoreDir(DIR, HSMDIR(DIR), level)
+
+ ReleaseLock(DIR, LCK_EX);
+
+ Similar to archive, when restore a directory, we should also use open flags O_IGNORE_IBITS_LOCK | O_IGNORE_EXTENT_LOCK to create files and resync data without taking any locks.
+
+ During restore, we could restore level by level:
+
+@dir: Lustre directory which is HSM released;
+@hsmdir: the corresponding HSMDIR(dir);
+@level: directory level to restore
+RestoreDir(dir, hsmdir, level){
+    for entry in hsmdir {
+         pathname = dir + "/" + entry;
+         create(pathname, O_IGNORE_IBITS_LOCK | O_IGNORE_EXTENT_LOCK | O_DIRECT); 
+         if (level else {
+             if (entry->d_type == DT_REGULAR) {
+                  restore data from hsmdir/entry to @pathname;
+             } else {
+                  RestoreDir(dir/entry, hsmdir/entry, level - 1);
+             }
+       }
+ }
+}
+
+Incremental backup for a Lustre subtree via HSM archive
+
+lfs hsm_archive -i archive_id --tag $TAG $DIR
+
+ Via HSM archive for a directory, we could backup a Lustre subtree into HSM backend;
+
+ If we want to save space usage, we can event release a Lustre subtree once it was archived;
+
+ We could add tag to implement incremental backup where @tag could be monotonically increasing number (version) or timestamp when to backup.
+
+ If the HSM backend, which is determined by archive_id, are same for archives with different tags, we can event reuse the backup data with same metadata version number for directories in the HSM archive or same data version and layout generation for regular files in the HSM archive.
+
+ Of course, we could also restore dedicated archive into a dedicated destination directory as follows:
+
+ lfs hsm_restore --tag $TAG --dest $TARGET $DIR
+
+--- Comment (adilger, Thu, 28 Nov 2019 03:58:19 +0000) ---
+I think one of the important considerations for HSM archiving a whole directory is that it needs to be efficient in terms of handling lots of small files (potentially HSM stubs for already-archived large files).  I think the right approach for this is to use Client Container Images (CCI) to archive a directory tree (see LAD'19 Lustre 2.14 and Beyond, essentially an ext4 filesystem image that can be created with "mke2fs -d " to populate the image at format time from the source directory, and then release the files in the directory tree.  By packing many small files/stubs into a single image file, this can efficiently be stored on an OST, and/or archived to tape, unlike processing thousands or millions of small files. Handling all of the files in an archived directory as a single file will run at the IO bandwidth of large files (GB/s = Mfiles/s). 
+
+I'd originally thought about using a tar file to store the archived directory tree, but an ext4 (or ldiskfs) image is much more useful in a number of ways:
+
+	the ext4 image can be loopback mounted directly from the image file and accessed in read-write mode, unlike a tarball that has to be extracted completely before it is modified and then tarred up again.
+
+	the ext4 image can be mounted directly by the MDS at the appropriate mountpoint and exported to clients for access in a shared manner
+
+	ext4 images are more robust containers than tar files, since they can be checked and repaired with e2fsck, have embedded metadata checksums (and soon fsverify data checksums), and have redundant metadata to help repairs.
+
+	the ext4/ldiskfs format can hold all of the important Lustre metadata efficiently, and can be mounted directly by the ldiskfs module, which we can modify as needed to maintain proper Lustre state in the image if needed.

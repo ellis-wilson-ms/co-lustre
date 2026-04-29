@@ -1,0 +1,163 @@
+Key:        LU-3519
+Summary:    EIO on directory access
+Link:       https://jira.whamcloud.com/browse/LU-3519
+Type:       Bug
+Priority:   Critical
+Status:     Closed
+Resolution: Duplicate
+Assignee:   Di Wang
+Reporter:   Ned Bass
+Created:    Wed, 26 Jun 2013 23:12:14 +0000
+Updated:    Wed, 3 Jul 2013 21:04:37 +0000
+Resolved:   Wed, 3 Jul 2013 21:04:37 +0000
+Links:      Duplicate: duplicates LU-2627
+
+--- Environment ---
+client and server: lustre-2.1.4-5chaos_2.6.32_358.6.1.3chaos.ch5.1.x86_64.x86_64
+
+--- Description ---
+We have found two directories on our lscratchc filesystem for which getdents() returns EIO.  This error occurs on all clients and across reboots/remounts.  Analysis below suggests a client-side page caching problem.  No MDS_READPAGE RPC is ever sent.
+
+# cab14 /root > strace -e trace=getdents ls /p/lscratchc/hood/Ag/s_local/fcc
+getdents(3, 0x61fcc8, 32768)            = -1 EIO (Input/output error)
+ls: reading directory /p/lscratchc/hood/Ag/s_local/fcc: Input/output error
+# cab14 /root > dmesg | tail
+LustreError: 123961:0:(dir.c:477:ll_get_dir_page()) read cache page: [0x38353ea534c:0x1:0x0] at 0: rc -5
+LustreError: 123961:0:(dir.c:648:ll_readdir()) error reading dir [0x38353ea534c:0x1:0x0] at 0: rc -5
+
+No errors appear on the servers.
+
+With +vfstrace +trace debugging on the client we get:
+
+00000002:00000001:7.0:1370559009.547576:0:20012:0:(mdc_locks.c:159:mdc_set_lock_data()) Process leaving (rc=0 : 0 : 0)
+00000080:00000001:7.0:1370559009.547577:0:20012:0:(obd_class.h:2119:md_set_lock_data()) Process leaving (rc=0 : 0 : 0)
+00000080:00020000:7.0:1370559009.547581:0:20012:0:(dir.c:438:ll_get_dir_page()) dir page locate: [0x38353ea534c:0x1:0x0] at 0: rc -5
+00000080:00000001:7.0:1370559009.557292:0:20012:0:(dir.c:439:ll_get_dir_page()) Process leaving via out_unlock (rc=18446744073709551611 : -5 : 0xfffffffffffffffb)
+
+                                                                      
+Corresponding code in ll_get_dir_page():
+
+ 426         } else {                                                                
+ 427                 /* for cross-ref object, l_ast_data of the lock may not be set, 
+ 428                  * we reset it here */                                          
+ 429                 md_set_lock_data(ll_i2sbi(dir)->ll_md_exp, &lockh.cookie,       
+ 430                                  dir, NULL);                                    
+ 431         }                                                                       
+ 432         ldlm_lock_dump_handle(D_OTHER, &lockh);                                 
+ 433                                                                                 
+ 434         cfs_down(&lli->lli_readdir_sem);                                        
+ 435         page = ll_dir_page_locate(dir, &lhash, &start, &end);                   
+ 436         if (IS_ERR(page)) {                                                     
+ 437                 CERROR("dir page locate: "DFID" at "LPU64": rc %ld\n",          
+ 438                        PFID(ll_inode2fid(dir)), lhash, PTR_ERR(page));          
+ 439                 GOTO(out_unlock, page);                                         
+ 440         }                           
+
+                                                                      
+
+Looking at the source for ll_dir_page_locate(),
+
+                                                                      
+ 340                 if (PageUptodate(page)) {                                       
+...                                                                             
+ 352                         CDEBUG(D_VFSTRACE, "page %lu [%llu %llu], hash "LPU64"\n",
+...                                                                             
+ 369                 } else {                                                        
+ 370                         page_cache_release(page);                               
+ 371                         page = ERR_PTR(-EIO);                                   
+ 372                 }                                                          
+
+                                                                      
+
+It looks like the page that it finds using radix_tree_gang_lookup() fails PageUptodate(page) which results in EIO being returned.
+
+The FIDs of the two directories are [0x6da716ef142:0x1:0x0] and [0x38353ea534c:0x1:0x0].  Note that we have burned through a huge number of FID sequences on this filesystem due to LU-1632.  I wonder if we've stumbled on a few "magic" numbers that expose a strange corner-case in the hashing code.
+
+LLNL-bug-ID: TOSS-2026
+
+--- Comment (nedbass, Wed, 3 Jul 2013 21:04:37 +0000) ---
+Closing as duplicate of LU-2627.  I will create a follow-on ticket to improve handling of large non-dx directories created as a result of LU-2638.
+
+--- Comment (nedbass, Wed, 3 Jul 2013 05:22:51 +0000) ---
+I believe the error occurs for directories that don't have EXT4_INDEX_FL and that span multiple extents.  I'm not sure how these directories came to exist on our filesystem.  Perhaps they existed before we upgraded from 1.8, although I think their creation date is more recent than the upgrade.
+
+I can reproduce this on a test filesystem by mounting the MDT with the dir_index feature disabled, create a directory from a client with about 500 files, then remounting the MDT with dir_index reenabled.  Then getdents() on the new directory returns EIO as described above.
+
+--- Comment (nedbass, Tue, 2 Jul 2013 22:50:33 +0000) ---
+Nevermind, it looks like those are valid rec_len values after all. The size of the last entry is always large enough to span to the end of the block.
+
+--- Comment (nedbass, Tue, 2 Jul 2013 21:13:38 +0000) ---
+I found that the affected directories both have entries with a corrupt rec_len field.
+
+For example, the last block allocated to one directory is 311251665.  We dump that block and find the directory entry for the last file output from debugfs.ldiskfs ls:
+
+# sumom-mds1 /root > debugfs.ldiskfs -c -R 'ls /ROOT/hood/Ag/s_local/fcc' /dev/sdb  | tail -2
+debugfs.ldiskfs 1.42.3.wc1.1chaos (28-May-2012)
+/dev/sdb: catastrophic mode - not reading inode or group bitmaps
+ 622493978  (216) ag_4x4x4_7.78_1c    622493988  (24) ag_4x4x4_7.80_2c   
+ 622494005  (2144) ag_4x4x4_7.842_4c   
+# sumom-mds1 /root > printf "%x\n" 622494005
+251a8135
+
+# sumom-mds1 /root > dd if=/dev/sdb skip=311251665 bs=4k count=1 | hexdump -C | less
+[snip]
+000007a0  35 81 1a 25 60 08 11 01  61 67 5f 34 78 34 78 34  |5..%`...ag_4x4x4|
+000007b0  5f 37 2e 38 34 32 5f 34  63 80 1a 25 ca 85 1a 25  |_7.842_4c..%...%|
+000007c0  40 00 18 01 61 67 5f 34  78 34 78 34 5f 37 2e 38  |@...ag_4x4x4_7.8|
+[snip]
+
+This directory does not have EXT4_INDEX_FL flag set, so it using a linear array of ext4_dir_entry_2:
+
+struct ext4_dir_entry_2 {                                                       
+        __le32  inode;                  /* Inode number */                      
+        __le16  rec_len;                /* Directory entry length */            
+        __u8    name_len;               /* Name length */                       
+        __u8    file_type;                                                      
+        char    name[EXT4_NAME_LEN];    /* File name */                         
+};      
+
+The dirent for our inode 622494005 begins on line 000007a0 above.  Note the rec_len value is 0x860, or 2144 bytes, which the other fields appear intact.  The expected value is 28 (0x1c).  Repeating this analysis for the other bad directory also found an invalid rec_len value of 1780 (0x6f4) with other fields intact.  This pattern makes me wonder if a Lustre or ldiskfs bug is corrupting this field.
+
+--- Comment (nedbass, Fri, 28 Jun 2013 19:42:11 +0000) ---
+On closer inspection, it appears the EIO error is originating from the MDS.  The debug data above was taken after the client had cached the directory page.  With a cold cache on the client, I see the error coming from here on the MDS (line 3639 below).  So we may just have some on-disk corruption on the MDT and need to run fsck.
+
+00000004:00000001:10.0:1372447578.208371:0:21576:0:(osd_handler.c:3628:osd_ldiskfs_it_fill()) Process entered
+00000004:00000001:10.0:1372447578.208372:0:21576:0:(osd_handler.c:3645:osd_ldiskfs_it_fill()) Process leaving (rc=18446744073709551611 : -5 : fffffffffffffffb)
+00000004:00000001:10.0:1372447578.208373:0:21576:0:(osd_handler.c:3680:osd_it_ea_next()) Process leaving (rc=18446744073709551611 : -5 : fffffffffffffffb)
+00000004:00000400:10.0:1372447578.208374:0:21576:0:(mdd_object.c:2441:__mdd_readpage()) build page failed: -5!
+
+3621 static int osd_ldiskfs_it_fill(const struct dt_it *di)
+3622 {
+3623         struct osd_it_ea   *it    = (struct osd_it_ea *)di;
+3624         struct osd_object  *obj   = it->oie_obj;
+3625         struct inode       *inode = obj->oo_inode;
+3626         int                result = 0;
+3627 
+3628         ENTRY;
+3629         it->oie_dirent = it->oie_buf;
+3630         it->oie_rd_dirent = 0;
+3631 
+3632         cfs_down_read(&obj->oo_ext_idx_sem);
+3633         result = inode->i_fop->readdir(&it->oie_file, it,
+3634                                        (filldir_t) osd_ldiskfs_filldir);
+3635 
+3636         cfs_up_read(&obj->oo_ext_idx_sem);
+3637 
+3638         if (it->oie_rd_dirent == 0) {
+3639                 result = -EIO;
+3640         } else {
+3641                 it->oie_dirent = it->oie_buf;
+3642                 it->oie_it_dirent = 1;
+3643         }
+3644 
+3645         RETURN(result);
+3646 }
+
+--- Comment (pjones, Thu, 27 Jun 2013 05:12:19 +0000) ---
+Di
+
+Could you please comment?
+
+Thanks
+
+Peter

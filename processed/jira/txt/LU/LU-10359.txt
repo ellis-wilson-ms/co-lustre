@@ -1,0 +1,70 @@
+Key:        LU-10359
+Summary:    remove NIDs from config llogs
+Link:       https://jira.whamcloud.com/browse/LU-10359
+Type:       Improvement
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Andreas Dilger
+Created:    Fri, 8 Dec 2017 20:59:55 +0000
+Updated:    Mon, 2 Feb 2026 22:34:35 +0000
+Links:      Duplicate: is duplicated by LU-18164; Gantt End to Start: has to be done after LU-18884; Related: is related to  LU-18041; Related: is related to  LU-10360; Related: is related to  LU-10391; Related: is related to LU-19700; Related: is related to LU-18280; Related: is related to LU-5881; Related: is related to LU-13340
+
+--- Description ---
+It would be useful if the MGS did not store NIDs in the configuration records at all, rather than the current use of static IP addresses, so that the servers are able to have relatively dynamic IP addresses (assigned at boot time, not necessarily changing at runtime).
+
+The clients can already locate the MGS by a hostname, since mount.lustre will do DNS (or /etc/hosts) name resolution at mount time before initiating the MGC->MGS connection.  However, the config llog records currently only store static IP addresses (NIDs, actually) because the config log is processed in the kernel, which did not have any DNS name resolution capabilities at the time of implementation.
+
+It should be noted that the config records mostly store the client NID in ASCII format (e.g. 192.168.20.1@tcp), though there is also a binary lnet_nid_t in at least one case.  It may be relatively straight-forward to store an ASCII hostname@net record in place of the numeric NID in the config records, and then do hostname->IP resolution in the kernel during config log processing before passing the NID to the LNet layer.
+
+With MDT/OST connections" class="issue-link" data-issue-key="LU-10360">LU-10360 allowing the use of IR logs from the MGS to advertise server NIDs to clients, it seems possible to remove the use of NIDs in the client config llog entirely and simplify configuration.
+
+--- Comment (simmonsja, Sun, 30 Mar 2025 02:05:22 +0000) ---
+Note the UUIDs are not NIDs instead of true UUIDs. This is wrong behavior.
+
+--- Comment (adilger, Sun, 30 Mar 2025 01:09:47 +0000) ---
+tappro, the current config logs have records for each target like below:
+
+# lctl llog_print myth-client
+- { index: 10, event: add_uuid, nid: 192.168.20.1@tcp(0x20000c0a81401), node: 192.168.20.1@tcp }
+- { index: 11, event: attach, device: myth-MDT0000-mdc, type: mdc, UUID: myth-clilmv_UUID }
+- { index: 12, event: setup, device: myth-MDT0000-mdc, UUID: myth-MDT0000_UUID, node: 192.168.20.1@tcp }
+
+Clearly we don't want the add_uuid lines in the config logs anymore, but it also makes sense to remove the "node: NID" part of the setup line as well.
+
+In theory, we might not need to have anything in the client config llog, and all of the targets could be added dynamically from the MGS IR Table, but there are complications with this. Later in the FSNAME-client and params llog there may be parameters that reference targets:
+
+- { index: 68, event: add_pool, device: myth-clilov, fsname: myth, pool: audio, ost: myth-OST0001_UUID }
+- { index: 71, event: add_pool, device: myth-clilov, fsname: myth, pool: audio, ost: myth-OST0002_UUID }
+- { index: 74, event: add_pool, device: myth-clilov, fsname: myth, pool: video, ost: myth-OST0003_UUID }
+- { index: 77, event: add_pool, device: myth-clilov, fsname: myth, pool: video, ost: myth-OST0004_UUID }
+
+so if these add_pool records are processed before the OSTs are configured then they will fail.  Similarly, for params records created by "lctl set_param -P" they may be applying tunings that would not be seen by devices added after initial config llog processing, since the corresponding "osc.*.*" parameter would not exist yet:
+
+- { index: 26, event: set_param, device: general, parameter: osc.*.grant_shrink_interval, value: 10 }
+
+So it seems that for now the attach and setup records should be kept to inform the clients about the OST/MDT devices early in the configuration process, even if their LNet connections are not configured yet.
+
+--- Comment (adilger, Thu, 5 Mar 2020 20:24:32 +0000) ---
+There are two different configuration records that need to be changed to allow this functionality:
+
+	MGS config llogs ($fsname-config, $fsname-MDTnnnn, ...) that store binary lnet_nid_t in LCFG_ADD_UUID and LCFG_ADD_CONN records
+
+	each target CONFIGS/mountdata file created by mkfs.lustre that stores the ASCII-formatted MGS NID(s) in ldd_params used by the servers when each target is mounted to connect to the MGS
+
+Rather than updating the MGS config llogs to store hostnames (which would need to be resolved by the kernel when the client mounts), it would be better to implement MDT/OST connections" class="issue-link" data-issue-key="LU-10360">LU-10360 to have the clients use the MGS Target Status Table that is dynamically generated when the OSTs and MDTs are mounted rather than store any hostnames in the config log at all.  That avoids the need to update the config logs when the hostnames change, or new failover configurations are added, etc.
+
+For the mountdata file, the ldd_params field stores ASCII strings anyway, so it seems straight forward enough to store the MGS hostname there and resolve this at mount time rather than resolving the MGS hostname by mkfs.lustre and storing the IP address in ldd_params.
+
+--- Comment (jay, Fri, 8 Dec 2017 21:44:00 +0000) ---
+As the first step, we can still write static IP address for the MGS, also include failover servers. Otherwise it would be difficult for the other servers to figure out the failover IP address of the MGS during recovery.
+
+However, for the other servers, they can be configured with hostnames. At the startup time, those 'regular' servers will report their IP address to the MGS, and the MGS will announce those new IP addresses to clients.
+
+--- Comment (adilger, Fri, 8 Dec 2017 21:15:35 +0000) ---
+It is possible that only one of LU-10359 and MDT/OST connections" class="issue-link" data-issue-key="LU-10360">LU-10360 will be needed, but I haven't looked into how much effort each one is to implement.
+
+If servers are using DHCP and the IP address may change while the server is running, instead of only at mount time, there may be more work needed to handle the runtime address changes.  IR would inform the client that the target NID has changed, but the client may need some work in the ptlrpc/LNet layer to consider that NID as valid for the specific target.
+
+In theory, the client/server would just consider the NID change and resulting loss of network connection to be the same as any other network error and reconnect to the new NID to perform recovery at the PtlRPC layer.

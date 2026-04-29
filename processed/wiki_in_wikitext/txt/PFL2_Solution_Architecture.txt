@@ -1,0 +1,129 @@
+Title:        PFL2 Solution Architecture
+URL:          https://wiki.lustre.org/PFL2_Solution_Architecture
+Page ID:      1018
+Last Updated: 2025-09-25T19:24:34Z
+Last Editor:  Adilger
+Edit Comment: Move to common Architecture category
+
+--- Content (MediaWiki markup) ---
+==Introduction==
+The [[Progressive File Layouts]] (PFL) Prototype validated the approach of increasing the stripe count to get the benefits of both low metadata overhead for small files with high aggregate throughput for large files.  In order to have a production-quality PFL implementation, a number of issues must be addressed in the code.  The addition of composite layouts increases complexity in layout handling on both the client and server, and needs to be implemented in a manner that isolates the complexity of creation and handling composite layouts.  Clients, and applications running thereon, must be able to add, modify, and remove composite layouts and individual components of the layout on the MDS while the file in active use.  The PFL Prototype implementation needs to be reworked to address a number of defects and implementation shortcuts.
+
+The [[PFL2 Scope Statement]] describes the overall goals and intended outcomes of this project in more detail, and will not be repeated here.  This [[PFL2 Solution Architecture]] document describes how the goals of the PFL project may be implemented, and how to measure the completion and outcomes of this project. This document further builds upon the [[PFL Prototype Solution Architecture]] and [[PFL Prototype High Level Design]]. Some use cases describe functionality that will not be implemented as part of the PFL Phase 2 implementation, but are included here as the design is intended to also cover the later PFL Phase 3 implementation.
+
+==Interoperability==
+Old clients will not able to access composite files created by new clients. They will return an error due to not understanding the new PFL file layout. There is also no way for these clients to be provided an alternate layout that would cover all the file data, so no server-mediated compatibility mode is possible without full IO redirection through some OSS node, which is not practical for performance reasons. 
+
+Accessing Lustre filesystems from clients of different versions is a supported configuration. A large site may have a file system shared between different clusters where the clients are upgraded independently. Since files are only created with composite layouts by request, it is possible for PFL-capable clients connected to a PFL-capable server to create PFL files while non-PFL clients are still accessing the filesystem. To completely avoid an old client seeing errors when trying to access PFL files created with composite layouts by a new client, clients should be upgraded to a PFL-capable release before the servers, or before users start creating PFL files.
+
+==User Use Cases==
+===U01. User creates new file with fixed-size layout component===
+The lfs setstripe command will be enhanced to allow creating a new file with a composite layout, passing an initial extent range for the first component in addition to existing setstripe parameters for this component, such as --stripe-count, --stripe-size, --ostlist, and --pool.
+===U02. User adds component(s) with fixed-size extent(s) to an existing composite file===
+The lfs setstripe command will be enhanced to allow adding a new component to an existing file with a composite layout, passing the extent range in addition to existing setstripe parameters for the added component. The added component(s) must be contiguous with the end of the previous component. The component ID will be assigned by the MDS automatically and will be unique for all components added on the file.
+===U03. User adds final component to existing composite file===
+The lfs setstripe command will assume the final component is being added to the composite layout when no extent range is specified with setstripe options.  This will cause the final component extent to cover up to the maximum possible file offset (OSD_OBJECT_EOF). When no component extent range is specified at all during file creation, it is assumed that a plain (non-composite) file is being created that covers the range [0, OSD_OBJECT_EOF], maintaining compatibility with current behavior.
+===U04. User requests the layout for an existing file===
+The lfs getstripe command will print out all components of a composite file. This will include the composite header fields when printed verbosely. The new per-component fields such as component ID, extent range, and flags will be printed for each component.
+===U05. User gets layout parameters to existing component by ID===
+The lfs getstripe command will allow fetching of the layout of individual components by the component ID.  The use of "wildcard" component IDs such as LCME_ID_INIT shall be possible in addition to the use of numerical component IDs.
+===U05.1 User gets specific layout parameters===
+When requesting the individual layout parameters such as stripe_count, stripe_size, and pool, if the component ID is specified then these parameters will be returned for the specific component.  If no component ID is specified, then these parameters will be returned for the last initialized component of the file.
+===U06. User accesses or modifies components in an existing file===
+The user shall be able to use normal applications that write(2), read(2), truncate(2), and perform other standard file operations on initialized PFL files using standard POSIX interfaces. Setting file ownership using chown(1) and chgrp(1) and related syscalls shall properly assign ownership to all component OST objects of the file for quota accounting purposes.  See use cases A09 through A11, and A13 through A15 for details of handling read(2) and write(2) at file offsets before or after the end of the last initialized component, depending on the implementation phase.
+===U07. User deletes composite file===
+The deletion of composite files should not need any special handling by the user. Normal commands such as rm(1) or unlink(1) can be used to delete the file. All objects allocated to the composite file will be destroyed.
+===U08. User creates a new composite file describing multiple components===
+The lfs setstripe command shall allow creating a composite file with multiple components by specifying a series of layout parameters as in U01 in component order. In the PFS Phase 2 implementation, the MDS will initialize all of the objects in a multi-component file at file creation time. In the PFS Phase 3 implementation, the MDS will store the multi-component layout as an uninitialized layout template and initialize each component as it is written to.
+===U09. User migrates composite file===
+The lfs migrate command shall allow migrating from a composite file to a plain file, or allow specifying layout parameters as with lfs setstripe when migrating to a new composite file.
+===U10. User searches for composite files===
+The lfs find command shall allow searching for files based on the specific layout pattern (raid0 or composite types). New options shall be added to allow searching for component attribute flags. Normal parameters for lfs find shall continue to work for composite files as appropriate.
+
+When searching for files with specific parameters (e.g. stripe_count, stripe_size) this matches the stripe count or stripe size of the last initialized component of the file, and not the total number of stripes of all components, nor those of any uninitialized components.  The reasoning is that the stripe count of the last component is the one that is currently affecting the performance of the file.  If a PFL file has grown to its final size, then if that file is copied to a new file with a static layout (e.g. backup/restore or a non-PFL Lustre filesystem) where the stripe count is specified by a single integer, then the stripe count of the final component is the most important value.
+
+When searching for files using a specific pool, this shall match if any component is using the specified pool.
+===U11. User specifies default composite file template for directory (Phase 3)===
+The lfs setstripe command shall allow specifying a composite file template for a directory, which will be stored on the directory and used for new files created within that directory unless a layout is specified for a new file.
+====U11.1 User wants increased multi-client read/write bandwidth for large files in their output directory====
+The user has an output directory that contains two types of output files, both large files accessed in parallel by many clients that are each 8GB or larger in size, as well as many smaller files written separately by each of their MPI process that are only 32MB in size. In such a case, it isn't possible to specify a plain default layout that performs optimally for both file types.  The user creates a default composite layout template for the directory that contains both a 1-stripe component for files smaller than 64MB, as well as a fully-striped component for files larger than 64MB:
+ 1	0	64MB	1	1MB
+ 2	64MB	EOF	-1	4MB
+
+The user leaves some margin above the 32MB small file size, in case their dataset parameters change slightly, but wants to have maximum bandwidth for the large files, and does not provide an intermediate "mid-sized" layout as they might for a filesystem-wide layout.
+===U12. Administrator specifies composite file template for root directory (Phase 3)===
+The lfs setstripe command shall allow specifying a composite file template for the filesystem root directory, which will be used as the filesystem-wide default layout for all new files created in the filesystem, unless there is a layout template on the parent directory or explicitly specified for the file.  As the root directory is normally only writable by the root or other privileged user, there are appropriate safeguards in place to prevent unprivileged users from setting a layout that would affect other users.  A filesystem-wide PFL default layout should only be set after all clients accessing the filesystem have been upgraded to be PFL aware, otherwise all newly-created files will be unreadable by older clients.
+====U12.1 Administrator wants space balancing for large files in the filesystem====
+The administrator wants to provide increased performance and avoid out-of-space conditions for large files written to the filesystem, while keeping small files on a single OST to minimize overhead.  Since this is a shared filesystem with a large variety of workloads, there is are two intermediate stages to compromise between the two extremes.  The filesystem has 720 OSTs in total, so specifying a fixed stripe count of 32 is well within the available number of OSTs.
+ 1	0	64MB	1	1MB
+ 2	64MB	256MB	4	1MB
+ 3	256MB	2GB	32	1MB
+ 4	2GB	EOF	700	4MB
+
+===U13. User deletes uninitialized stripe component from file by ID (Phase 3)===
+The lfs setstripe command will allow selecting individual file components to be deleted by their component ID as reported by lfs getstripe. For PFL files, only the last component may be deleted, and only if the component is still uninitialized.
+===U14. User deletes uninitialized stripe component from file by flags (Phase 3)===
+It is possible for lfs setstripe to select one or more components by flags rather than specifying an individual component ID. Since the component IDs are assigned by the MDS and not necessarily known in advance, for scripts it may be simpler to select components by their attribute flags.
+== Application Interface Use Cases ==
+===A01. Application creates a new composite file with fixed-size component===
+There shall be an llapi_layout library interface for creating new composite files with an initial component that covers an initial extent of the file for use by lfs setstripe and other applications, as described in U01.
+===A02. Application adds fixed-size component to an existing composite file===
+There shall be an llapi_layout library interface for adding one or more components that cover a limited extent of the file to existing composite files for use by lfs setstripe and other applications, as described in U02.
+===A03. Application adds last component to existing composite file===
+If no extent is specified for an additional component of a composite file, the llapi_layout library shall add a final component to cover the end of the file for use by lfs setstripe and other applications, as described in U03.
+===A04. Application requests the entire layout for an existing composite file===
+There shall be an llapi_layout interface for requesting the whole layout of a composite file from the kernel. The interface shall be able to efficiently manage composite files with at least as many components as supported by the underlying implementation. The existing llapi_layout interfaces may be expanded as needed to allow reporting parameters of the aggregate composite file.
+===A05. Application selects an existing component by ID===
+There shall be an llapi_layout interface for selecting an individual component of a composite file by its ID value. The user or application is responsible for determining the correct ID value to select in this case. Once an existing component is selected, further operations will affect only that component.
+===A06. Application accesses each component in an existing file===
+There shall be an llapi_layout iterator that allows accessing multiple components of a composite file in order, so that the application does not need to know in advance the IDs of each component or the total number of components. It shall be possible to select a subset of components using the attribute flags. As each component is accessed in turn, further operations will only affect the current component.
+===A07. Application access attributes of a selected component===
+There shall be llapi_layout interfaces to allow applications to access attributes of the layout component without requiring them to understand the on-disk layout of the composite file or individual components. This shall be suitable for use by lfs getstripe to print out the layout of each component.
+===A08. Application sets layout attributes of the selected component===
+There shall be an llapi_layout interface to set the attribute flags of a component that has previously been selected from the file.
+===A09. Application truncates composite file below component extent boundary===
+Once a layout component has been initialized, truncating down the file at an offset below the start of the component will not affect the state of that or any later components. The OST objects allocated to the component will remain allocated.
+===A10. Application writes beyond last defined file component===
+Writing to a file offset beyond the last defined file component shall return an error to the application. There is no mechanism for the MDS to add additional components to a file by itself. For PFL Phase 2 components can be added to an existing file, and for PFL Phase 3 it is expected that uninitialized template layouts covering the whole file shall be specified at file creation time or inherited from the parent directory in their entirety.
+===A11. Application reads beyond last defined file component===
+Reading from a file offset beyond the last defined file component shall return a short read to the application, similar to reads beyond EOF for a plain file.
+===A12. Application creates composite file template with multiple components===
+The llapi_layout interface shall allow multiple components with different layout parameters to be specified before the file is created. For the PFL Phase 2 implementation, all components of the file will be initialized by the MDS at file creation time. In the PFL Phase 3 implementation, the MDS will create the file with an uninitialized layout template, and only initialize layout components as they are written to.
+===A13. Application writes within a uninitialized file component (Phase 3)===
+Writing to a file offset within an uninitialized file component shall cause the client to indicate to the MDS that it needs to initialize the component(s) within that extent, and the MDS shall allocate OST objects for the affected component(s) and store them into the layout. This shall cause layout revocation from any other clients accessing the same file and cause them to refresh their layout (if they are still accessing the file) so that they can see the changes to the affected component(s).
+===A14. Application reads from an uninitialized file component (Phase 3)===
+Reading from a file offset within an uninitialized file component shall return no data, as there will not be any OST objects to read. If the read is within the file size, the client will zero-fill the buffers and return an appropriate number of bytes to the caller.
+===A15. Application truncates beyond last initialized file component (Phase 3)===
+In order to store the size of a file that is truncated up beyond the start of an uninitialized layout component, the component must be initialized by the MDS before truncating the OST objects to the appropriate size.
+===A16. Multiple clients write beyond last initialized file component (Phase 3)===
+In the PFL Phase 3 implementation, uninitialized components may exist on a file that is being modified by multiple clients concurrently. Any writes or truncates to uninitialized components by the client will request that the MDS initialize the components that cover the requested extent of the file. If multiple clients request the MDS initialize the same or different components concurrently, the MDS will serialize these requests with the layout lock of the file and initialize all of the requested components.
+===A17. Application deletes selected uninitialized stripe component (Phase 3)===
+There shall be an llapi_layout interface to delete a component that has previously been selected from the file. For the PFL implementation, this shall only be allowed for the last component of a file, and only if that component is uninitialized (i.e. no OST objects are currently allocated to the component), as this may otherwise cause data loss.
+== Server Use Cases ==
+===S01. MDS receives composite layout with new file create RPC===
+In a similar manner to existing Lustre file creation the MDS may receive requests to create new files with a composite file layout. In PFL Phase 2, or if a PFL Phase 3 MDS receives an open request from a PFL Phase 2 client, the MDS shall immediately allocate all OST objects as specified in the layout before returning the layout to the client. In PFL Phase 3, the MDS will only allocate the OST objects for the first component by default for PFL 3 clients, and store the composite layout template for the remaining component(s) with the file and allocate the OST objects upon request from the client. For the PFL project, the component extents must not be disjoint, and may not overlap.
+===S02. MDS receives layout add RPC for new component(s)===
+In a similar manner to new Lustre file creation, the MDS may receive requests to add components to an existing file. In PFL Phase 2, the MDS shall immediately allocate the OST objects for the added component(s) before replying to the client. In PFL Phase 3, the MDS may store the uninitialized layout template with the file and allocate the OST objects upon request from the client. The added component extents must follow immediately after the end of the last component extent, and may not overlap. If a PFL Phase 2 client accesses a file created by a Phase 3 client on a Phase 3 server with uninitialized components, the MDS shall allocate OST objects for all components before granting the client access to the file.
+===S03. MDS receives layout add RPC for overlapping or disjoint component===
+If the layout template specified for a file or directory have partially overlapping or disjoint component extents, the MDS shall return an error to the client and not add any components to the file.
+===S04. MDS receives concurrent layout add RPCs for the same file===
+If multiple clients request that the MDS add components to the same file concurrently, the MDS shall serialize these requests with the layout lock of the file and add the components in the order received. Each later layout add request must obey the existing rules for the layout, such as contiguous and non-overlapping extents, stripe size boundaries, etc. If a client is attempting to add a component to a file that exactly matches an existing component, this shall return success (0) with no other action.
+===S05. MDS fails during creation or modification of composite file===
+The handling of resent and replayed RPCs that are creating or modifying composite file layouts shall be handled using standard Lustre recovery mechanisms.  File creation and component addition shall be atomic w.r.t. RPC replay to a recovered MDS.  The client will resend layout modification RPCs after reconnecting to a recovered MDS. The MDS will use the existing RPC XID to identify whether the layout operation was already committed to disk or needs to be replayed. 
+===S06. MDS receives layout template for non-root directory (Phase 3)===
+Similar to existing Lustre mechanisms, the MDS shall allow specifying a file layout template on any directory in the filesystem. This will be used as the default layout template for any new files created within that directory, and will be inherited by new subdirectories created therein. If a layout template already exists for the directory, the new template replaces the old one completely.
+===S07. MDS receives layout template for root directory (Phase 3)===
+Similar to existing Lustre mechanisms, the MDS shall allow specifying a file layout template on the filesystem root directory. This will be used as the default layout template for any new files created within the filesystem, unless there is a layout template on the parent directory or was explicitly specified for the new file. Since the root directory template applies to all new files within the filesystem, newly created directories do not explicitly inherit the template.
+===S08. MDS creates file in directory with layout template (Phase 3)===
+In a similar manner to existing directory default layout handling, newly created files will use the layout template of the parent directory, or from the filesystem root directory if none exists on the parent directory.  Any layout explicitly specified by the client at file creation will override the default directory layout. 
+===S09. MDS receives a layout initialization RPC (Phase 3)===
+When a client wants to write or truncate a file at an offset where the layout component is not initialized, the client requests that the MDS initialize the component(s) that cover the file extent of interest. The MDS will allocate OST object(s) for the component(s) that overlap the extent of interest.
+====S09.1. MDS receives multiple layout initialization RPCs at same time (Phase 3)====
+If multiple clients request that the MDS initialize and allocate OST objects for the same component of a file at the same time, the MDS will serialize these requests using the layout lock to ensure that all clients see a consistent view of the layout.  As each RPC is processed, it may result in later RPCs being no-ops as they are requesting initialization of components that were already processed.
+===S10. LFSCK process ignores composite layouts during layout scan (Phase 2)===
+For the PFL Phase 2 implementation, the Lustre File System Check (LFSCK) tool shall ignore files with a composite or any other unknown layout. In such a case, OST orphan object handling shall consider the OST object in use if it references a file with an unknown layout, without actually verifying the file layout contains that OST object.
+===S11. LFSCK processes composite layouts during layout scan (Phase 3)===
+For the PFL Phase 3 implementation, the LFSCK tool shall correctly process files with a composite layout, verifying all OST objects referenced by the layout exist, and have a "fid" xattr that correctly references the component and sub-layout index in which the object appears.
+[[Category:Architecture]]
+[[Category:PFL]]
+[[Category:Layout]]

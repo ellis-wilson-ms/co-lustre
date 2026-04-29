@@ -1,0 +1,116 @@
+Key:        LU-8229
+Summary:    SSK: allow multiple keys on a single nodemap
+Link:       https://jira.whamcloud.com/browse/LU-8229
+Type:       Improvement
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   Sebastien Buisson
+Reporter:   Andreas Dilger
+Created:    Wed, 1 Jun 2016 22:18:12 +0000
+Updated:    Wed, 4 Mar 2026 14:43:10 +0000
+Labels:     SSK
+Links:      Related: is related to  LU-3289; Related: is related to LU-17431; Related: is related to LU-19069
+
+--- Description ---
+The current Shared Secret Key implementation only allows a single key to be set for any nodemap.  However, this makes it complex to update the secret key and expire the old key because the key on all the clients and servers need to be updated at the same time.
+
+It would be better to allow multiple keys to be active on a single nodemap at one time, so that a new key can be added on the servers, the key can be updated on the clients for their next remount/reconnect, and then the old key can be removed when all clients have been reconnected.
+
+--- Comment (gerrit, Tue, 18 Nov 2025 14:55:21 +0000) ---
+"Marc Vef " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/62593
+
+Subject: LU-8229 ssk: support removing keys from keyring via lgss_sk
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: d7825a736f867d6c68389387d4842f1f57e11f83
+
+--- Comment (gerrit, Tue, 18 Nov 2025 14:55:20 +0000) ---
+"Marc Vef " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/62592
+
+Subject: LU-8229 ssk: support auth against multiple similar keys
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: d20ae0ffec6c52cdfc128fb03a6d4d5deeef4319
+
+--- Comment (gerrit, Tue, 18 Nov 2025 14:55:19 +0000) ---
+"Marc Vef " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/62591
+
+Subject: LU-8229 ssk: support adding multiple similar server keys
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 50211d790a519f9b4e94700d795e16094cef28f1
+
+--- Comment (adilger, Sun, 4 May 2025 23:59:15 +0000) ---
+If the keyctl show mechanism doesn't work, it seems reasonable to have a fixed number of keys for a nodemap (e.g. max 32) or a specific name like ".alt" or ".old" or ".prev" or similar.  At least having two keys for the nodemap would allow some transition time if a key needs to be revoked for some reason, without totally taking the compute nodes offline.
+
+--- Comment (sebastien, Wed, 19 Mar 2025 09:07:47 +0000) ---
+I need to have a look at how 'keyctl show' is implemented, but this command is able to list all keys in a specified keyring. So I think we should be able to do the same.
+
+--- Comment (adilger, Wed, 19 Mar 2025 09:02:55 +0000) ---
+Sure, if there is a way to list the key names/descriptions then that is even better.  I was kind of thinking the keyring would be a black box and you could just ask "do you have key XXXX" or "does my key match one of your stored keys".
+
+--- Comment (sebastien, Wed, 19 Mar 2025 08:56:48 +0000) ---
+Indeed, we could modify lgss_sk in userspace so that it tweaks the descriptor of the key it loads (lgss_sk -l) if it detects a key with the same descriptor is already loaded. Using '.' makes sense as it is a forbidden char in nodemap names.
+
+lgss_sk -l:
+   description = "lustre:fsname:nodemap"
+   key = keyctl_search(KEY_SPEC_USER_KEYRING, "user", description)
+   idx = 1
+   while (key exists) and (payload is not identical) do
+      description = "description".idx
+      key = keyctl_search(KEY_SPEC_USER_KEYRING, "user", description)
+      idx++
+   done
+   if (key not exists) or (payload is not identical) then
+      add_key("user", description, KEY_SPEC_USER_KEYRING)
+
+Unfortunately, it is not possible to record the number of keys for a given nodemap in the nodemap struct, as the keys are loaded independently on each server. The MGS has dedicated keys if communications with it are using SSK, and OSS/MDS have a different set of keys that are loaded only if communications with ost or mdt targets are configured to use SSK. Moreover, the nodemap struct is in the kernel, whereas all the gss context negotiation happens in userland.
+
+The lsvcgssd daemon, responsible for carrying out SSK authentication, should try with all the keys in the kernel keyring whose description is "lustre:fsname:nodemap" or starts with "lustre:fsname:nodemap." I think just searching for "lustre:fsname:nodemap.$idx" keys in a loop would be fragile to gaps in the sequence, depending on how admins inserted keys with lgss_sk -l.
+
+lsvcgssd:
+   description = "lustre:fsname:nodemap"
+   for each key in KEY_SPEC_USER_KEYRING with desc starting with description do
+      verify hmac with key
+      if success then break
+   done
+
+--- Comment (adilger, Tue, 18 Mar 2025 17:53:16 +0000) ---
+What about registering additional keys with "lustre:FSNAME:NODEMAP.1" ... if there are additional ones registered, and the nodemap struct will track the maximum number of keys to search?
+
+--- Comment (sebastien, Tue, 18 Mar 2025 17:25:09 +0000) ---
+Unfortunately, I now realize by doing more tests that it is not possible for multiple keys to be active on a single nodemap at one time. It is true that this is not the nodemap that references the key, but the key that references the nodemap, allowing several keys to be generated for the same nodemap at one time. But it is not possible to have several keys for the same nodemap loaded into the kernel keyring at the same time. Indeed, the key descriptor for our SSK keys has the following syntax:
+
+lustre::
+
+Consequently, 2 SSK keys generated for the same nodemap would have the same descriptor. As the key descriptor is a unique key identifier in the kernel keyring, used to search for keys, only one key with a given descriptor can be loaded at one time.
+
+This means servers cannot load, and cannot support multiple SSK keys for the same nodemap simultaneously. The kernel keyring search mechanism implemented for Lustre is also a problem, as it calls keyctl_search with a key descriptor built with the nodemap name. Moreover keyctl_search can only return one key exactly matching the descriptor.
+
+So today this is not possible to easily expire old keys and roll out new keys, unless clients and servers keys are updated at the same time. We would have to change the syntax for key descriptors used by Lustre, e.g. by adding something like a time stamp or a hash. And we would also have to change the SSK key retrieval mechanism, as searching for an exact descriptor match would not possible. For instance we would cycle through the keys in the KEY_SPEC_USER_KEYRING, and do the partial key descriptor matching by ourselves.
+
+--- Comment (adilger, Tue, 18 Mar 2025 07:05:37 +0000) ---
+sebastien, according to our recent discussion, this is already possible today, because it is the SSK key that references the nodemap, and not the nodemap referencing the key.  
+
+So it should be possible to create multiple SSK keys for the same nodemap (e.g. to allow transition/expiry of SSK keys), though a single client mountpoint can only use one key at a time.
+
+If this is correct, please close the ticket as "Done".
+
+--- Comment (adilger, Thu, 2 Jun 2016 17:57:35 +0000) ---
+This is not a necessarily a requirement for SSK functionality, but it is something that was discussed early on that would simplify administration of SSK in a real-world environment.

@@ -1,0 +1,421 @@
+Key:        LU-16713
+Summary:    Writeback and commit pages under memory pressure to avoid OOM
+Link:       https://jira.whamcloud.com/browse/LU-16713
+Type:       Improvement
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Qian Yingjin
+Reporter:   Qian Yingjin
+Created:    Wed, 5 Apr 2023 14:13:15 +0000
+Updated:    Thu, 11 Jul 2024 22:44:34 +0000
+Resolved:   Tue, 26 Sep 2023 14:36:06 +0000
+Links:      Related: is related to  LU-16697; Related: is related to LU-17151; Related: is related to LU-17183; Related: is related to LU-16696
+
+--- Description ---
+We've tried to solve this in the past by integrating NFS unstable pages tracking in to Lustre, but this is fraught - it treats our uncommitted pages as dirty, which means we get rate limited on them.  The kernels idea of an appropriate number of outstanding pages is based on local file systems, and isn't enough for us, so this causes performance issues.  The SOFT_SYNC feature we created to work with unstable pages also just asks the OST nicely to do a commit, and includes no way for the client to be notified quickly.
+
+This means it can't be responsive enough to avoid tasks getting OOM-killed.
+
+Linux kernel already has matured solution for OOM with cgroup.
+
+The most related codes are in balance_dirty_pages:
+
+If the dirtied and uncommitted pages are over "background_thresh" for global memory limitation and memory cgroup limitation, the write back threads are woken to perform some whiteout.
+
+In this ticket, we give a solution similar to NFS:
+
+In the completion of writeback for the dirtied pages (@brw_interpret), __mark_inode_dirty(), which will attach the @bdi_writeback (each memory cgroup can have its own bdi_writeback) to the inode.
+
+Once the writeback threads is woken up, and @for_background is set, it will check whether @wb_over_bg_thresh. For background writeout, stop when we are below the background dirty threshold.
+
+So what we should do in Lustre client is:
+
+When writeback thread for background cals ll_writepages() to write out data, If the inode has dirtied pending pages, flush dirtied pages to OST and sync them to commit the unlined pages. If all pages has cleared dirtied flags, but still in unstable (uncommitted) state, we should send a dedicated sync  RPC to the OST and thus the uncommitted pages will be released finally.
+
+As unstable page account in kernel may have bad impact on the performance, thus we need to optimize the unstable page account code in next phase work.
+
+--- Comment (pjones, Tue, 26 Sep 2023 14:36:06 +0000) ---
+Landed for 2.16
+
+--- Comment (gerrit, Tue, 26 Sep 2023 14:33:55 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/52485/
+
+Subject: LU-16713 llite: remove unused ccc_unstable_waitq
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 03a795efa44253e06d6feef0ad613f2da0269c5b
+
+--- Comment (gerrit, Tue, 26 Sep 2023 14:33:42 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/50544/
+
+Subject: LU-16713 llite: writeback/commit pages under memory pressure
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 8aa231a994683a9224d42c0e7ae48aaebe2f583c
+
+--- Comment (gerrit, Sat, 23 Sep 2023 06:08:48 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/52485
+
+Subject: LU-16713 llite: remove unused ccc_unstable_waitq
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: ac78bfbf610e6d524f024b1b263f23046cabcfcb
+
+--- Comment (qian_wc, Thu, 17 Aug 2023 16:50:45 +0000) ---
+These expensive frequent fsync() calls will lead much frequent journal commit on the stroage server, and the journaling overhead becomes rather significant, causing performance drops.
+
+We have designed a mechanism called soft sync. The client accounts the number of unstable pages bwtween the client/server pair. Upon the completion of a write I/O request, the client adds the corresponing inode, which has pinned uncommitted pages, into dirty list of the super block or cgroup. And then it increases the unstable account accordingly. Any reply from the server will piggyback the last committed transno (last_committed) on this server, the client will commit write I/O request with transno smaller than last_committed, unpin the uncommitted pages and decreases the unstable page account accordingly. When the system is under memory pressure, the kernel writeback thread will be woken up, and start to write out data of the inodes in dirty list to reclaim pages. If the writeback purpose is to commit the pinned pages, the client first flush dirty pages to servers if any. If unstable page count between this client/server pair is zero, it means all unstable pages have already committed, the client just returns immediately. Otherwise, the client sends a soft sync request to the server with a factor to indicate the urgency degree of its memory pressure. The intention for this operation is to commit pages belonging to a client which has too many outstanding unstable pages in its cache. The server will determine whether to begin an asynchronous journal commit based on the number of the soft sync the clients requesting and the time since its last commit. The server has a tunable global limit (named soft_sync_thrsh) across all clients. It defines how many soft sync request allowed before a asynchronous journal commit will be triggered. And its value is 16 by default. Every soft sync request from a client contributes the soft sync value on the server. The soft sync factor is calculated based on the memory usage on a client by the formula: (1 - free_memory / tot_memory) * soft_sync_thrsh where free_memory is the free memory size, tot_memory is the total memory size, they could be entire system based or cgroup based.
+
+Once the accumulated soft sync value is larger than the predefined threshold, a asynchronous sync() is called on the server to start journal commit. The soft sync mechanism makes a tradeoff between the urgency of reducing memory pressure and server throughput. It will dynamically shorten the journal commit interval on the server to avoid pinning pages longer if a client is under memory pressure.
+
+--- Comment (JIRAUSER17900, Wed, 26 Jul 2023 12:53:21 +0000) ---
+2023-07-26: Two patches for the ticket, one patch landed to master, another patch's depending patch is being worked on.
+
+--- Comment (gerrit, Tue, 9 May 2023 05:47:09 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/50625/
+
+Subject: LU-16713 llite: add __GFP_NORETRY for read-ahead page
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 8db5d39f669f03aa6d8ad4962f82453b3cc11b42
+
+--- Comment (JIRAUSER17900, Mon, 8 May 2023 04:41:57 +0000) ---
+2023-05-13: Two patch for the ticket, one patch landed to master, another one is being worked on.
+
+--- Comment (gerrit, Thu, 13 Apr 2023 12:32:40 +0000) ---
+"Qian Yingjin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/50625
+
+Subject: LU-16713 llite: add __GFP_NORETRY for read-ahead page
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 0eeec25cb304a178258ce2fceaf2fa854ac491b7
+
+--- Comment (qian_wc, Thu, 13 Apr 2023 08:28:21 +0000) ---
+Two process:
+
+One is under the memcg control with memory limits varying from 1G to 128G;
+
+Another is not under memcg control;
+
+Each writes 128G data in total
+
+Test scripts:
+
+error() {
+        echo "$@"
+        exit 1
+}
+
+DIR="/exafs"
+tdir="milti"
+tfile="test"
+dir=$DIR/$tdir
+file=$dir/$tfile
+cgfile=$dir/${tfile}.cg
+cg_basedir=/sys/fs/cgroup/memory
+cgdir=$cg_basedir/$tfile
+memlimit_mb=$1
+
+rm -rf $dir
+sleep 2
+mkdir $dir || error "failed to mkdir $dir"
+
+cgdir=$cg_basedir/${tfile}
+mkdir $cgdir || error "failed to mkdir $cgdir"
+echo $((memlimit_mb * 1024 * 1024)) > $cgdir/memory.limit_in_bytes
+cat $cgdir/memory.limit_in_bytes
+
+echo 3 > /proc/sys/vm/drop_caches
+(
+bash -c "echo \$$ > $cgdir/tasks && dd if=/dev/zero of=${cgfile} bs=1M count=128000"
+)&
+cgpid=$!
+dd if=/dev/zero of=$file bs=1M count=128000 &
+pid=$!
+
+wait $cgpid
+wait $pid
+rmdir $cgdir
+
+The results are shown as following:
+
+./t2p.sh $memlimit_mb
+
+[root@ice01 scripts]# ./t2p.sh 1024
+134217728000 bytes (134 GB, 125 GiB) copied, 61.5799 s, 2.2 GB/s
+134217728000 bytes (134 GB, 125 GiB) copied, 103.386 s, 1.3 GB/s
+
+[root@ice01 scripts]# ./t2p.sh 4096
+134217728000 bytes (134 GB, 125 GiB) copied, 62.1537 s, 2.2 GB/s
+134217728000 bytes (134 GB, 125 GiB) copied, 101.473 s, 1.3 GB/s
+
+[root@ice01 scripts]# ./t2p.sh 16384
+134217728000 bytes (134 GB, 125 GiB) copied, 60.7237 s, 2.2 GB/s
+134217728000 bytes (134 GB, 125 GiB) copied, 93.3043 s, 1.4 GB/s
+
+[root@ice01 scripts]# ./t2p.sh 32768
+134217728000 bytes (134 GB, 125 GiB) copied, 61.221 s, 2.2 GB/s
+134217728000 bytes (134 GB, 125 GiB) copied, 88.7582 s, 1.5 GB/s
+
+[root@ice01 scripts]# ./t2p.sh 65536
+134217728000 bytes (134 GB, 125 GiB) copied, 62.0085 s, 2.2 GB/s
+134217728000 bytes (134 GB, 125 GiB) copied, 75.543 s, 1.8 GB/s
+
+[root@ice01 scripts]# ./t2p.sh 131072
+134217728000 bytes (134 GB, 125 GiB) copied, 63.2751 s, 2.1 GB/s
+134217728000 bytes (134 GB, 125 GiB) copied, 64.2502 s, 2.1 GB/s
+
+The results demonstrates that the process with memcg limits nearly has no impact on the performance of the process without memcg limits.
+
+--- Comment (qian_wc, Wed, 12 Apr 2023 14:59:15 +0000) ---
+Multiple cgroups testing results (dd writes performance):
+
+The test scripts:
+
+error() {
+        echo "$@"
+        exit 1
+}
+
+DIR="/exafs"
+tdir="milti"
+tfile="test"
+dir=$DIR/$tdir
+file=$dir/$tfile
+cg_basedir=/sys/fs/cgroup/memory
+cgdir=$cg_basedir/$tfile
+memlimit_mb=$1
+cnt=$2
+declare -a pids
+
+rm -rf $dir
+sleep 2
+mkdir $dir || error "failed to mkdir $dir"
+
+for i in $(seq 1 $cnt); do
+        cgdir=$cg_basedir/${tfile}.$i
+        mkdir $cgdir || error "failed to mkdir $cgdir"
+        echo $((memlimit_mb * 1024 * 1024)) > $cgdir/memory.limit_in_bytes
+        cat $cgdir/memory.limit_in_bytes
+done
+
+echo 3 > /proc/sys/vm/drop_caches
+for i in $(seq 1 $cnt); do
+        cgdir=$cg_basedir/$tfile.$i
+        (
+        bash -c "echo \$$ > $cgdir/tasks && dd if=/dev/zero of=$dir/${tfile}.$i bs=1M count=$((memlimit_mb * 2))"
+        )&
+        pids[i]=$!
+done
+
+for i in $(seq 1 $cnt); do
+        wait ${pids[$i]}
+        cgdir=$cg_basedir/$tfile.$i
+        rmdir $cg_basedir/${tfile}.$i || error "failed to rm $cgdir"
+done
+
+wait
+sleep 3
+
+Results:
+
+CMD: ./tmult.sh $memlimit_mb $cgcnt
+==== 4 cgroups ====
+
+[root@ice01 scripts]# ./tmult.sh 1024 4
+2048+0 records in
+2048+0 records out
+2147483648 bytes (2.1 GB, 2.0 GiB) copied, 1.47427 s, 1.5 GB/s
+2048+0 records in
+2048+0 records out
+2147483648 bytes (2.1 GB, 2.0 GiB) copied, 1.49274 s, 1.4 GB/s
+2048+0 records in
+2048+0 records out
+2147483648 bytes (2.1 GB, 2.0 GiB) copied, 1.49886 s, 1.4 GB/s
+2048+0 records in
+2048+0 records out
+2147483648 bytes (2.1 GB, 2.0 GiB) copied, 1.52199 s, 1.4 GB/s
+
+[root@ice01 scripts]# ./tmult.sh 2048 4
+4294967296 bytes (4.3 GB, 4.0 GiB) copied, 2.93491 s, 1.5 GB/s
+4294967296 bytes (4.3 GB, 4.0 GiB) copied, 2.94163 s, 1.5 GB/s
+4294967296 bytes (4.3 GB, 4.0 GiB) copied, 2.94337 s, 1.5 GB/s
+4294967296 bytes (4.3 GB, 4.0 GiB) copied, 2.97721 s, 1.4 GB/s
+
+[root@ice01 scripts]# ./tmult.sh 4096 4
+8589934592 bytes (8.6 GB, 8.0 GiB) copied, 5.7354 s, 1.5 GB/s
+8589934592 bytes (8.6 GB, 8.0 GiB) copied, 5.87343 s, 1.5 GB/s
+8589934592 bytes (8.6 GB, 8.0 GiB) copied, 5.95922 s, 1.4 GB/s
+8589934592 bytes (8.6 GB, 8.0 GiB) copied, 5.99732 s, 1.4 GB/s
+
+[root@ice01 scripts]# ./tmult.sh 8192 4
+17179869184 bytes (17 GB, 16 GiB) copied, 11.7261 s, 1.5 GB/s
+17179869184 bytes (17 GB, 16 GiB) copied, 11.8024 s, 1.5 GB/s
+17179869184 bytes (17 GB, 16 GiB) copied, 11.8868 s, 1.4 GB/s
+17179869184 bytes (17 GB, 16 GiB) copied, 11.9072 s, 1.4 GB/s
+
+===== 8 cgroups ====
+
+[root@ice01 scripts]# ./tmult.sh 1024 8
+2147483648 bytes (2.1 GB, 2.0 GiB) copied, 1.68561 s, 1.3 GB/s
+2147483648 bytes (2.1 GB, 2.0 GiB) copied, 1.69721 s, 1.3 GB/s
+2147483648 bytes (2.1 GB, 2.0 GiB) copied, 1.70013 s, 1.3 GB/s
+2147483648 bytes (2.1 GB, 2.0 GiB) copied, 1.71561 s, 1.3 GB/s
+2147483648 bytes (2.1 GB, 2.0 GiB) copied, 1.71978 s, 1.2 GB/s
+2147483648 bytes (2.1 GB, 2.0 GiB) copied, 1.74053 s, 1.2 GB/s
+2147483648 bytes (2.1 GB, 2.0 GiB) copied, 1.76275 s, 1.2 GB/s
+2147483648 bytes (2.1 GB, 2.0 GiB) copied, 1.87241 s, 1.1 GB/s
+
+[root@ice01 scripts]# ./tmult.sh 2048 8
+4294967296 bytes (4.3 GB, 4.0 GiB) copied, 3.40484 s, 1.3 GB/s
+4294967296 bytes (4.3 GB, 4.0 GiB) copied, 3.46257 s, 1.2 GB/s
+4294967296 bytes (4.3 GB, 4.0 GiB) copied, 3.47629 s, 1.2 GB/s
+4294967296 bytes (4.3 GB, 4.0 GiB) copied, 3.4952 s, 1.2 GB/s
+4294967296 bytes (4.3 GB, 4.0 GiB) copied, 3.50229 s, 1.2 GB/s
+4294967296 bytes (4.3 GB, 4.0 GiB) copied, 3.52185 s, 1.2 GB/s
+4294967296 bytes (4.3 GB, 4.0 GiB) copied, 3.53337 s, 1.2 GB/s
+4294967296 bytes (4.3 GB, 4.0 GiB) copied, 3.60111 s, 1.2 GB/s
+
+[root@ice01 scripts]# ./tmult.sh 4096 8
+8589934592 bytes (8.6 GB, 8.0 GiB) copied, 6.5593 s, 1.3 GB/s
+8589934592 bytes (8.6 GB, 8.0 GiB) copied, 6.60015 s, 1.3 GB/s
+8589934592 bytes (8.6 GB, 8.0 GiB) copied, 6.721 s, 1.3 GB/s
+8589934592 bytes (8.6 GB, 8.0 GiB) copied, 6.75103 s, 1.3 GB/s
+8589934592 bytes (8.6 GB, 8.0 GiB) copied, 6.77716 s, 1.3 GB/s
+8589934592 bytes (8.6 GB, 8.0 GiB) copied, 6.85576 s, 1.3 GB/s
+8589934592 bytes (8.6 GB, 8.0 GiB) copied, 6.85757 s, 1.3 GB/s
+8589934592 bytes (8.6 GB, 8.0 GiB) copied, 6.89447 s, 1.2 GB/s
+
+[root@ice01 scripts]# ./tmult.sh 8192 8
+17179869184 bytes (17 GB, 16 GiB) copied, 12.7842 s, 1.3 GB/s
+17179869184 bytes (17 GB, 16 GiB) copied, 12.7889 s, 1.3 GB/s
+17179869184 bytes (17 GB, 16 GiB) copied, 12.9504 s, 1.3 GB/s
+17179869184 bytes (17 GB, 16 GiB) copied, 12.9577 s, 1.3 GB/s
+17179869184 bytes (17 GB, 16 GiB) copied, 13.4066 s, 1.3 GB/s
+17179869184 bytes (17 GB, 16 GiB) copied, 13.5397 s, 1.3 GB/s
+17179869184 bytes (17 GB, 16 GiB) copied, 13.5769 s, 1.3 GB/s
+17179869184 bytes (17 GB, 16 GiB) copied, 13.6605 s, 1.3 GB/s
+
+--- Comment (qian_wc, Wed, 12 Apr 2023 09:45:50 +0000) ---
+Some benchmark results:
+
+Total memory: 512G
+
+a. without memcg limits:
+
+stripe_count: 1
+
+cmd: 
+
+dd if=/dev/zero of=test bs=1M count=$size
+
+ 
+
+IO size
+128G
+256G
+512G
+1024G
+
+master
+2.2 GB/s
+2.2 GB/s
+2.1 GB/s
+2.0 GB/s 
+
+w/ patch
+2.2 GB/s
+2.2 GB/s
+2.1 GB/s
+2.0 GB/s
+
+ 
+
+b. with memcg limits on the patched master:
+
+stripe_count: 1
+
+cmd: 
+
+bash -c "echo \$$ > $cgdir/tasks && dd if=/dev/zero of=$DIR/$tfile bs=1M count=$((memlimit_mb * time))"
+
+io_size = $time X $memlimit_mb ==> $time = {2, 1, 0.5}
+
+memcg limits
+1G
+2G
+4G
+8G
+16G
+32G
+64G
+
+2 X memlimit
+1.7 GB/s
+1.7 GB/s
+1.6 GB/s
+1.7 GB/s
+1.8 GB/s
+1.8 GB/s
+1.7 GB/s
+
+1 X memlimit
+1.9 GB/s
+1.9 GB/s
+1.9 GB/s
+1.9 GB/s
+2.2 GB/s
+2.2 GB/s
+2.2 GB/s
+
+0.5 X memlimit
+2.3 GB/s
+2.3 GB/s
+2.3 GB/s
+2.2 GB/s
+2.2 GB/s
+2.2 GB/s
+2.3 GB/s
+
+ 
+
+The performance have no obvious degradation with memcg limits.
+
+--- Comment (gerrit, Wed, 5 Apr 2023 14:22:26 +0000) ---
+"Qian Yingjin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/50544
+
+Subject: LU-16713 llite: writeback/commit pages under memory pressure
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 94a8579c83bacaad24866a8f62b5372189cc8241

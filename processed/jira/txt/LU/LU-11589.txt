@@ -1,0 +1,83 @@
+Key:        LU-11589
+Summary:    kernel BUG at ldiskfs.h:1907!
+Link:       https://jira.whamcloud.com/browse/LU-11589
+Type:       Technical task
+Priority:   Critical
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Andreas Dilger
+Created:    Wed, 31 Oct 2018 22:40:05 +0000
+Updated:    Wed, 24 Apr 2024 08:54:29 +0000
+Labels:     ldiskfs
+Links:      Cloners: Clones LU-11584; Related: is related to LU-5603
+
+--- Description ---
+After a filesystem corruption event and e2fsck 1.44.3.wc1 running to repair it, the server keeps crashing with the following error:
+
+Lustre: nbp13-OST0008: trigger OI scrub by RPC for the [0x100080000:0x217edd:0x0] with flags 0x4a, rc = 0
+------------[ cut here ]------------
+kernel BUG at /tmp/rpmbuild-lustre-jlan-ItUrr9b3/BUILD/lustre-2.10.5/ldiskfs/ldiskfs.h:1907!
+invalid opcode: 0000 [#1] SMP 
+CPU: 5 PID: 11348 Comm: lfsck Tainted: G           OE  ------------   3.10.0-693.21.1.el7.20180508.x86_64.lustre2105 #1
+RIP: 0010:[]  [] ldiskfs_rec_len_to_disk.part.9+0x4/0x10 [ldiskfs]
+Call Trace:
+   htree_inlinedir_to_tree+0x445/0x450 [ldiskfs]
+   ldiskfs_htree_fill_tree+0x137/0x2f0 [ldiskfs]
+   ldiskfs_readdir+0x61c/0x850 [ldiskfs]
+   osd_ldiskfs_it_fill+0xbe/0x260 [osd_ldiskfs]
+   osd_it_ea_load+0x37/0x100 [osd_ldiskfs]
+   lfsck_open_dir+0x11c/0x3a0 [lfsck]
+   lfsck_master_oit_engine+0x9a2/0x1190 [lfsck]
+   lfsck_master_engine+0x8f6/0x1360 [lfsck]
+   kthread+0xd1/0xe0
+
+--- Comment (adilger, Thu, 1 Nov 2018 02:42:36 +0000) ---
+So in this case, the BUG() seems warranted...
+
+--- Comment (dongyang, Wed, 31 Oct 2018 23:52:06 +0000) ---
+I think the real issue here is in the ext4-data-in-dirent.patch:
+
+@@ -1348,7 +1348,7 @@ int htree_inlinedir_to_tree(struct file
+                        fake.name_len = 1;
+                        strcpy(fake.name, ".");
+                        fake.rec_len = ext4_rec_len_to_disk(
+-                                               EXT4_DIR_REC_LEN(fake.name_len),
++                                               EXT4_DIR_REC_LEN(&fake),
+                                                inline_size);
+                        ext4_set_de_type(inode->i_sb, &fake, S_IFDIR);
+                        de = &fake;
+@@ -1358,7 +1358,7 @@ int htree_inlinedir_to_tree(struct file
+                        fake.name_len = 2;
+                        strcpy(fake.name, "..");
+                        fake.rec_len = ext4_rec_len_to_disk(
+-                                               EXT4_DIR_REC_LEN(fake.name_len),
++                                               EXT4_DIR_REC_LEN(&fake),
+                                                inline_size);
+                        ext4_set_de_type(inode->i_sb, &fake, S_IFDIR);
+                        de = &fake;
+
+The new EXT4_DIR_REC_LEN introduced by dirdata calls ext4_get_dirent_data_len(de), in this case the de is just on the stack and contains garbage, so the BUG() was triggered when we pass the value to ext4_rec_len_to_disk.
+
+We should use __EXT4_DIR_REC_LEN(fake.name_len) instead.
+
+--- Comment (adilger, Wed, 31 Oct 2018 22:43:43 +0000) ---
+Making this a separate ticket, since it looks like it is a bug in the inline_data handling in ldiskfs.  The code in question is:
+
+static inline __le16 ldiskfs_rec_len_to_disk(unsigned len, unsigned blocksize)
+{                                                       
+        if ((len > blocksize) || (blocksize > (1 if (PAGE_CACHE_SIZE >= 65536)
+        if (len return cpu_to_le16(len);
+        if (len == blocksize) {
+                if (blocksize == 65536)
+                        return cpu_to_le16(LDISKFS_MAX_REC_LEN);
+                else              
+                        return cpu_to_le16(0);
+        }
+        return cpu_to_le16((len & 65532) | ((len >> 16) & 3));
+#else           
+        return cpu_to_le16(len);
+#endif
+}
+
+which has BUG() as an error handling mechanism.  We should never BUG() when processing data from disk.  In this case, the problem is that the calling convention of ldiskfs_rec_len_to_disk() means there is no way to return an error to the caller.  That means we can only pass verified values to this function, or change the function to take rec_len as an argument and return 0 or an error code.

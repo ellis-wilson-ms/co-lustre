@@ -1,0 +1,67 @@
+Key:        LU-17934
+Summary:    client does not retry mount/llog processing on error
+Link:       https://jira.whamcloud.com/browse/LU-17934
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Mikhail Pershin
+Reporter:   Andreas Dilger
+Created:    Tue, 11 Jun 2024 18:07:57 +0000
+Updated:    Wed, 12 Jun 2024 14:21:14 +0000
+Labels:     easy, medium
+
+--- Environment ---
+Client: 2.15.63 (Janitor VM)
+
+Server: 2.15.63 (Janitor VM)
+
+--- Description ---
+It appears in some cases when the Gerrit Janitor is starting up a large number of test sessions at one time that there can be occasional errors with the client processing the MGS config log.  Rather than retry the llog read, it appears that the client returns an error and fails the mount completely:
+
+[   54.413858] Lustre: Lustre: Build Version: 2.15.63_2_g37bb2f4
+[   55.114449] LNet: Added LNI 192.168.201.60@tcp [8/256/0/180]
+[   55.119888] LNet: Accept secure, port 988
+[   56.831735] Key type lgssc registered
+[   57.948899] Lustre: Echo OBD driver; http://www.lustre.org/
+[  148.089328] Lustre: 5403:0:(client.c:2343:ptlrpc_expire_one_request()) @@@ Request sent has failed due to network error: [sent 1716253832/real 1716253832]  req@ffff8800ab486680 x1799622480626496/t0(0) o503->MGC192.168.201.160@tcp@192.168.201.160@tcp:26/25 lens 272/8416 e 0 to 1 dl 1716253848 ref 3 fl Rpc:ReXQU/200/ffffffff rc 0/-1 job:'' uid:0 gid:0
+[  148.099734] LustreError: 166-1: MGC192.168.201.160@tcp: Connection to MGS (at 192.168.201.160@tcp) was lost; in progress operations using this service will fail
+[  148.116413] LustreError: 5403:0:(mgc_request.c:1953:mgc_process_config()) MGC192.168.201.160@tcp: can't process params llog: rc = -5
+[  148.120094] Lustre: MGC192.168.201.160@tcp: Connection restored to  (at 192.168.201.160@tcp)
+[  148.128188] LustreError: 15c-8: MGC192.168.201.160@tcp: Confguration from log lustre-client failed from MGS -5. Communication error between node & MGS, a bad configuration, or other errors. See syslog for more info
+[  148.160555] Lustre: Unmounted lustre-client
+[  148.179518] LustreError: 5403:0:(super25.c:189:lustre_fill_super()) llite: Unable to mount : rc = -5
+
+This can be seen several time with patch https://review.whamcloud.com/54840 "LU-16692 tests: force_new_seq_all interop version checking" that modifies several test scripts and triggered 575 separate test jobs to run at the same time:
+
+https://testing.whamcloud.com/gerrit-janitor/42749/results.html
+
+There were 8 similar failures among those jobs, one of them in sanityn with the failure of mounting the second mount point, so the status looks slightly different and has more useful logs.  However, I suspect something similar could happen with a large production cluster mounting thousands of clients at the same time.
+
+Rather than giving up on mounting completely, it makes sense to have a limited retry mechanism, either at the PtlRPC level and/or at the mount.lustre level (which .  It may be that the llog RPCs are intentionally not using RPC retry to avoid blocking recovery, but I haven't looked at the code, and it would make sense to at least retry such an important RPC a few times before giving up.  The gerrit-janitor sanityn test results should have full client debug logs for review (it isn't clear if the server even sees the LLOG_ORIGIN_HANDLE_READ_HEADER  = 503 RPC that the client sent).
+
+The "lightweight" option would be to retry the failed RPC in the kernel without tearing down the whole mountpoint.  The "heavyweight" option (but easier to implement) is to set mount_lustre.c::parse_options() to set mop->mo_retry = 5 or similar for client mounts (before the "retry=N" option is parsed!) but don't retry multiple times during server failover and slow down the recovery (which will be retried externally by HA anyway).
+
+--- Comment (tappro, Wed, 12 Jun 2024 14:21:14 +0000) ---
+As I see from debug log:
+
+00000100:00100000:3.0:1716253711.324926:0:7154:0:(service.c:2096:ptlrpc_server_handle_req_in()) unwrap req x1799622289793792
+00000100:00100000:3.0:1716253711.324934:0:7154:0:(service.c:2161:ptlrpc_server_handle_req_in()) got req x1799622289793792
+00000100:00100000:3.0:1716253711.324986:0:7154:0:(nrs_fifo.c:179:nrs_fifo_req_get()) NRS start fifo request from 12345-192.168.201.31@tcp, seq: 307
+00000100:00100000:3.0:1716253711.324992:0:7154:0:(service.c:2335:ptlrpc_server_handle_request()) Handling RPC req@ffff8800a820e450 pname:cluuid+ref:pid:xid:nid:opc:job ll_mgs_0001:788c556a-a5a4-48b4-9c6c-951096440e58+9:9849:x1799622289793792:12345-192.168.201.31@tcp:502:llog_process_th.0
+00000100:00100000:3.0:1716253711.325330:0:7154:0:(service.c:2384:ptlrpc_server_handle_request()) Handled RPC req@ffff8800a820e450 pname:cluuid+ref:pid:xid:nid:opc:job ll_mgs_0001:788c556a-a5a4-48b4-9c6c-951096440e58+9:9849:x1799622289793792:12345-192.168.201.31@tcp:502:llog_process_th.0 Request processed in 336us (562us total) trans 0 rc 0/0
+
+That request was processed on server without errors
+
+Meanwhile on client:
+
+00000100:00100000:1.0:1716253712.018364:0:9849:0:(client.c:1776:ptlrpc_send_new_req()) Sending RPC req@ffff8800b0053b80 pname:cluuid:pid:xid:nid:opc:job llog_process_th:788c556a-a5a4-48b4-9c6c-951096440e58:9849:1799622289793792:192.168.201.131@tcp:502:llog_process_th.0
+00000100:00100000:1.0:1716253712.018716:0:9849:0:(client.c:2542:ptlrpc_set_wait()) set ffff8800b63d1f00 going to sleep for 11 seconds
+00000100:00000400:1.0:1716253712.021157:0:9849:0:(client.c:2343:ptlrpc_expire_one_request()) @@@ Request sent has failed due to network error: [sent 1716253712/real 1716253712]  req@ffff8800b0053b80 x1799622289793792/t0(0) o502->MGC192.168.201.131@tcp@192.168.201.131@tcp:26/25 lens 272/8472 e 0 to 1 dl 1716253728 ref 2 fl Rpc:ReXQU/200/ffffffff rc 0/-1 job:'llog_process_th.0' uid:0 gid:0
+00000100:00080000:1.0:1716253712.031229:0:9849:0:(import.c:86:import_set_state_nolock()) ffff88012e333800 MGS: changing import state from FULL to DISCONN
+
+so there was network glitch and request was cancelled with rq_net_err set. It is not clear what triggered that though. Anyway, it didn't wait for 11s as expected but exited immediately from ptlrpc_set_wait().
+
+I beware to interfere in fragile MGC config processing there with another retry mechanic, but such cases can be distinguished by rq_net_err set and no timeout happened. We could return special return code (-ECOMM maybe?) then upper level can retry mount
+
+Also as I can see these llog RPCs don't disable resend, they are normal RPC and there are no rq_no_resend set among request flags as well. I am not sure yet why it decided to exit immediately without retrying, probably the reason is related to that rq_net_err set

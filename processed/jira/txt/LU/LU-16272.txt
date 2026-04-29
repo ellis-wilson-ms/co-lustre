@@ -1,0 +1,377 @@
+Key:        LU-16272
+Summary:    High CPU usage in libcfs_hash_for_each_empty()
+Link:       https://jira.whamcloud.com/browse/LU-16272
+Type:       Improvement
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Alexander Zarochentsev
+Reporter:   Alexander Zarochentsev
+Created:    Thu, 27 Oct 2022 16:05:11 +0000
+Updated:    Fri, 12 Apr 2024 21:27:34 +0000
+Resolved:   Fri, 13 Jan 2023 15:04:31 +0000
+
+--- Description ---
+Here are ftrace logs for cancelling of 10k ldlm locks on client disconnect
+
+ldlm_cancel_locks_for_export() / cfs_hash_for_each_relax():
+
+First function calls are fast:
+
+# tracer: function_graph
+#
+# CPU  DURATION                  FUNCTION CALLS
+# |     |   |                     |   |   |   |
+ 0) + 30.305 us   |  cfs_hash_for_each_relax [libcfs]();
+ 0) + 13.570 us   |  cfs_hash_for_each_relax [libcfs]();
+ 0) + 16.458 us   |  cfs_hash_for_each_relax [libcfs]();
+ 1) + 22.303 us   |  cfs_hash_for_each_relax [libcfs]();
+ 0) + 11.710 us   |  cfs_hash_for_each_relax [libcfs]();
+ 0) + 10.227 us   |  cfs_hash_for_each_relax [libcfs]();
+ 1) + 12.137 us   |  cfs_hash_for_each_relax [libcfs]();
+ 0) + 10.632 us   |  cfs_hash_for_each_relax [libcfs]();
+ 1) + 11.427 us   |  cfs_hash_for_each_relax [libcfs]();
+
+the last ones are critically slow:
+
+3) ! 408.016 us  |  cfs_hash_for_each_relax [libcfs]();
+ 3) ! 425.611 us  |  cfs_hash_for_each_relax [libcfs]();
+ 3) ! 411.456 us  |  cfs_hash_for_each_relax [libcfs]();
+ 3) ! 408.476 us  |  cfs_hash_for_each_relax [libcfs]();
+ 3) ! 410.266 us  |  cfs_hash_for_each_relax [libcfs]();
+ 3) ! 409.032 us  |  cfs_hash_for_each_relax [libcfs]();
+ 3) ! 408.790 us  |  cfs_hash_for_each_relax [libcfs]();
+ 3) ! 409.062 us  |  cfs_hash_for_each_relax [libcfs]();
+ 3) ! 409.492 us  |  cfs_hash_for_each_relax [libcfs]();
+ 3) ! 839.014 us  |  cfs_hash_for_each_relax [libcfs]();
+ 3) ! 409.712 us  |  cfs_hash_for_each_relax [libcfs]();
+
+i.e. cfs_hash_for_each_relax becoming slow when first hash buckets are emptied.
+
+it matches the perf (cpu profiling) results in one of the above comments, that CPU consumed mostly by
+
+cfs_hash_hh_hhead() – the function is used to check whether hlists in a bucket are empty.
+
+     3.83%     0.00%  [k] ret_from_fork                                         -      -            
+            |          
+             --3.81%--kthread
+                       |          
+                       |--1.85%--ldlm_bl_thread_main
+                       |          ldlm_export_cancel_locks
+                       |          cfs_hash_for_each_empty
+                       |          cfs_hash_for_each_relax
+                       |          |          
+                       |           --1.09%--cfs_hash_hh_hhead
+                       |          
+ 
+
+ldlm_export_cancel_locks() call consumes 2.3 seconds:
+
+[root@devvm3 tests]# cat ~/trace.txt
+# tracer: function_graph
+#
+# CPU  DURATION                  FUNCTION CALLS
+# |     |   |                     |   |   |   |
+ 2) $ 2397334 us  |  ldlm_export_cancel_locks [ptlrpc]();
+ 1)               |  ldlm_export_cancel_locks [ptlrpc]() {
+ 0) $ 2384598 us  |  } /* ldlm_export_cancel_locks [ptlrpc] */
+[root@devvm3 tests]# 
+
+with a small libcfs_hash improvement (will be submitted soon), the function call takes only 0.1 sec:
+
+# tracer: function_graph
+#
+# CPU  DURATION                  FUNCTION CALLS
+# |     |   |                     |   |   |   |
+ 0)               |  ldlm_export_cancel_locks [ptlrpc]() {
+ 0)   8.154 us    |    lu_env_init [obdclass]();
+ 0) * 91503.19 us |    cfs_hash_for_each_empty [libcfs]();
+ 3)               |  ldlm_export_cancel_locks [ptlrpc]() {
+ 3)   7.818 us    |    lu_env_init [obdclass]();
+ 3) * 92138.99 us |    cfs_hash_for_each_empty [libcfs]();
+ 0) + 34.008 us   |    ldlm_reprocess_list [ptlrpc]();
+ 0)   1.183 us    |    libcfs_debug_msg [libcfs]();
+ 0) + 13.812 us   |    lu_env_fini [obdclass]();
+ 0) * 91564.21 us |  }
+ 3) + 36.190 us   |    ldlm_reprocess_list [ptlrpc]();
+ 3)   1.249 us    |    libcfs_debug_msg [libcfs]();
+ 3)   9.312 us    |    lu_env_fini [obdclass]();
+ 3) * 92197.71 us |  }
+
+my test script, for a reference:
+
+cd /sys/kernel/debug/tracing/
+echo ldlm_export_cancel_locks > set_graph_function 
+# echo cfs_hash_for_each_relax > set_graph_function
+# echo ldlm_cancel_locks_for_export_cb > set_graph_function 
+# echo ldlm_export_cancel_locks > /sys/kernel/debug/tracing/set_ftrace_filter 
+echo > /sys/kernel/debug/tracing/set_ftrace_filter 
+echo 1 > max_graph_depth
+echo function_graph > current_tracer 
+echo > trace
+cd -
+
+for n in {1..20}; do touch /mnt/lustre/foo-$n; for x in {1..1000}; do echo ladvise -a lockahead -s $(( 2 * x ))M -l 1M -m WRITE /mnt/lustre/foo-$n; done; done | ../utils/lfs 
+../utils/lctl get_param ldlm.namespaces.filter-*.lock_count
+LUUID=$(../utils/lctl get_param -n llite.*.uuid)
+../utils/lctl set_param obdfilter.lustre-OST*.evict_client=$LUUID
+sleep 3
+../utils/lctl get_param ldlm.namespaces.filter-*.lock_count
+cat /sys/kernel/debug/tracing/trace > ~/trace.txt
+cat ~/trace.txt
+
+--- Comment (adilger, Fri, 12 Apr 2024 21:27:34 +0000) ---
+https://review.whamcloud.com/#/c/fs/lustre-release/+/45882
+
+should resolve this but we have to wait until 2.17 when RHEL7 support will be totally dropped.
+
+I would be OK to drop el7.9 support from 2.16, as long as Janitor testing can continue to run effectively.  We definitely find a lot of bugs with that testing before a patch is landed...
+
+--- Comment (simmonsja, Thu, 14 Mar 2024 16:03:27 +0000) ---
+https://review.whamcloud.com/#/c/fs/lustre-release/+/45882
+
+should resolve this but we have to wait until 2.17 when RHEL7 support will be totally dropped.
+
+--- Comment (eaujames, Thu, 14 Mar 2024 11:04:58 +0000) ---
+I have the following crash (in https://testing.whamcloud.com/test_sets/b8a7106c-53ec-4362-a87b-243faa579dbf) that might be related to this issue:
+
+[ 3556.215374] watchdog: BUG: soft lockup - CPU#0 stuck for 22s! [ldlm_bl_02:10434]
+[ 3556.220366] watchdog: BUG: soft lockup - CPU#1 stuck for 22s! [ldlm_bl_01:10433]
+[ 3556.414212] CPU: 0 PID: 10434 Comm: ldlm_bl_02 Kdump: loaded Tainted: P           OE    --------- -  - 4.18.0-513.9.1.el8_lustre.x86_64 #1
+[ 3556.414211] CPU: 1 PID: 10433 Comm: ldlm_bl_01 Kdump: loaded Tainted: P           OE    --------- -  - 4.18.0-513.9.1.el8_lustre.x86_64 #1
+[ 3556.436873] Hardware name: Red Hat KVM, BIOS 0.5.1 01/01/2011
+[ 3556.439237] Hardware name: Red Hat KVM, BIOS 0.5.1 01/01/2011
+[ 3556.440408] RIP: 0010:cfs_hash_for_each_relax+0x17b/0x480 [libcfs]
+[ 3556.552042] Code: 24 40 00 00 00 00 8b 40 2c 89 44 24 20 49 8b 46 38 48 8d 74 24 38 4c 89 f7 48 8b 00 e8 ce 59 fb db 48 85 c0 0f 84 f1 01 00 00  8b 18 48 85 db 0f 84 cb 01 00 00 49 8b 46 28 48 89 de 4c 89 f7
+[ 3556.555582] RSP: 0018:ffffac2bc1197d68 EFLAGS: 00010282 ORIG_RAX: ffffffffffffff13
+[ 3556.564030] RAX: ffffac2bc76e6008 RBX: 0000000000000000 RCX: 000000000000000e
+[ 3556.565446] RDX: ffffac2bc76bd000 RSI: ffffac2bc1197da0 RDI: ffff9d52800ba300
+[ 3556.566840] RBP: 0000000000000000 R08: 0000000000000008 R09: 000000000000000e
+[ 3556.568245] R10: ffffac2bc1197d30 R11: ffff9d526ad17c6c R12: 0000000000000000
+[ 3556.569641] R13: 0000000000000001 R14: ffff9d52800ba300 R15: 0000000000000001
+[ 3556.571032] FS:  0000000000000000(0000) GS:ffff9d52ffc00000(0000) knlGS:0000000000000000
+[ 3556.441526] RIP: 0010:native_safe_halt+0xe/0x20
+[ 3556.572609] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[ 3556.573542] Code: 00 f0 80 48 02 20 48 8b 00 a8 08 75 c0 e9 79 ff ff ff 90 90 90 90 90 90 90 90 90 90 e9 07 00 00 00 0f 00 2d 56 66 5f 00 fb f4  6d d7 3e 00 66 66 2e 0f 1f 84 00 00 00 00 00 66 90 e9 07 00 00
+[ 3556.574681] CR2: 00005646f510c4c8 CR3: 0000000031410006 CR4: 00000000001706f0
+[ 3556.578196] RSP: 0018:ffffac2bc118fd10 EFLAGS: 00000246 ORIG_RAX: ffffffffffffff13
+[ 3556.579600] Call Trace:
+[ 3556.581064] RAX: 0000000000000003 RBX: ffffac2bc76bd000 RCX: 0000000000000008
+[ 3556.582992] RDX: 0000000000000000 RSI: 0000000000000003 RDI: ffffac2bc76bd000
+[ 3556.584384] RBP: ffff9d52ffd33f00 R08: 0000000000000008 R09: 00000000000000e8
+[ 3556.585785] R10: ffffac2bc118fd30 R11: ffff9d527b36c9b6 R12: 0000000000000000
+[ 3556.587194] R13: 0000000000000001 R14: 0000000000000100 R15: 0000000000080000
+[ 3556.588593] FS:  0000000000000000(0000) GS:ffff9d52ffd00000(0000) knlGS:0000000000000000
+[ 3556.590155] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[ 3556.591296] CR2: 000055ffd9fd3598 CR3: 0000000031410004 CR4: 00000000001706e0
+[ 3556.592683] Call Trace:
+[ 3556.727324]  
+[ 3556.727328]  
+[ 3556.797893]  ? watchdog_timer_fn.cold.10+0x46/0x9e
+[ 3556.797901]  ? watchdog_timer_fn.cold.10+0x46/0x9e
+[ 3556.842765]  ? watchdog+0x30/0x30
+[ 3556.843737]  ? watchdog+0x30/0x30
+[ 3556.844435]  ? __hrtimer_run_queues+0x101/0x280
+[ 3556.845123]  ? __hrtimer_run_queues+0x101/0x280
+[ 3556.916011]  ? hrtimer_interrupt+0x100/0x220
+[ 3556.916944]  ? hrtimer_interrupt+0x100/0x220
+[ 3556.917819]  ? smp_apic_timer_interrupt+0x6a/0x130
+[ 3556.918688]  ? smp_apic_timer_interrupt+0x6a/0x130
+[ 3556.919654]  ? apic_timer_interrupt+0xf/0x20
+[ 3556.920624]  ? apic_timer_interrupt+0xf/0x20
+[ 3556.921512]  
+[ 3556.922383]  
+[ 3556.922859]  ? cfs_hash_for_each_relax+0x17b/0x480 [libcfs]
+[ 3556.923331]  ? native_safe_halt+0xe/0x20
+[ 3556.924442]  ? cfs_hash_for_each_relax+0x172/0x480 [libcfs]
+[ 3556.925270]  kvm_wait+0x58/0x60
+[ 3557.070727]  __pv_queued_spin_lock_slowpath+0x268/0x2a0
+[ 3557.172076]  _raw_spin_lock+0x1e/0x30
+[ 3557.172862]  cfs_hash_for_each_relax+0x14a/0x480 [libcfs]
+[ 3556.926384]  ? ldlm_lock_mode_downgrade+0x2f0/0x2f0 [ptlrpc]
+[ 3557.173967]  ? ldlm_lock_mode_downgrade+0x2f0/0x2f0 [ptlrpc]
+[ 3557.727515]  ? ldlm_lock_mode_downgrade+0x2f0/0x2f0 [ptlrpc]
+[ 3557.736378]  ? ldlm_lock_mode_downgrade+0x2f0/0x2f0 [ptlrpc]
+[ 3557.737539]  cfs_hash_for_each_nolock+0x124/0x200 [libcfs]
+[ 3557.738666]  cfs_hash_for_each_nolock+0x124/0x200 [libcfs]
+[ 3557.739802]  ldlm_reprocess_recovery_done+0x8b/0x100 [ptlrpc]
+[ 3557.740877]  ldlm_reprocess_recovery_done+0x8b/0x100 [ptlrpc]
+[ 3557.892270]  ldlm_export_cancel_locks+0x177/0x180 [ptlrpc]
+[ 3557.892270]  ldlm_export_cancel_locks+0x177/0x180 [ptlrpc]
+[ 3557.892413]  ldlm_bl_thread_main+0x6d7/0x950 [ptlrpc]
+[ 3557.893562]  ldlm_bl_thread_main+0x6d7/0x950 [ptlrpc]
+[ 3557.899312]  ? finish_wait+0x80/0x80
+[ 3557.897754]  ? finish_wait+0x80/0x80
+[ 3557.907216]  ? ldlm_handle_bl_callback+0x3f0/0x3f0 [ptlrpc]
+[ 3557.907968]  ? ldlm_handle_bl_callback+0x3f0/0x3f0 [ptlrpc]
+[ 3557.909079]  kthread+0x134/0x150
+[ 3557.910211]  kthread+0x134/0x150
+[ 3557.911405]  ? set_kthread_struct+0x50/0x50
+[ 3557.911569]  ? set_kthread_struct+0x50/0x50
+[ 3557.912453]  ret_from_fork+0x35/0x40
+[ 3557.913300]  ret_from_fork+0x35/0x40
+[ 3557.914247] Kernel panic - not syncing: softlockup: hung tasks
+
+2 threads seems to race in cfs_hash_for_each_relax().
+
+--- Comment (adilger, Fri, 8 Dec 2023 18:53:52 +0000) ---
+Alex, are your comments that the 48972 patch is or is not fixing the problem?
+
+--- Comment (gerrit, Mon, 27 Nov 2023 14:47:52 +0000) ---
+"Etienne AUJAMES " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/53252
+
+Subject: LU-16272 libcfs: cfs_hash_for_each_empty optimization
+
+Project: fs/lustre-release
+
+Branch: b2_15
+
+Current Patch Set: 1
+
+Commit: e48faf2b37c01eaf99f7c97c6c6c33c7dd1dc12c
+
+--- Comment (bzzz, Fri, 13 Oct 2023 19:28:25 +0000) ---
+here is a race:
+
+00010000:00020000:1.0:1697224811.088493:0:31361:0:(ldlm_lockd.c:1479:ldlm_handle_enqueue()) ### lock on destroyed export 00000000fc58c50a ns: mdt-lustre-MDT0001_UUID lock: 0000000088760baf/0x8b83035ffb756f74 lrc: 3/0,0 mode: PR/PR res: [0x240000bd0:0x7f:0x0].0x0 bits 0x1b/0x0 rrc: 2 type: IBT gid 0 flags: 0x50200000000000 nid: 0@lo remote: 0x8b83035ffb756f58 expref: 6 pid: 31361 timeout: 0 lvb_type: 0
+00000001:00000001:0.0:1697224811.091533:0:7065:0:(hash.c:1714:cfs_hash_for_each_nolock()) Process leaving (rc=0 : 0 : 0)
+00010000:00000001:0.0:1697224811.091536:0:7065:0:(ldlm_lock.c:2473:ldlm_reprocess_recovery_done()) Process leaving
+00010000:00020000:0.0:1697224811.091537:0:7065:0:(ldlm_lock.c:2748:ldlm_export_cancel_locks()) Export 00000000fc58c50a, canceled 51 locks, left on hash table 1.
+...
+
+--- Comment (zam, Mon, 27 Mar 2023 10:15:42 +0000) ---
+bzzz can you try to enable spin lock debugging and repeat the test?
+
+--- Comment (bzzz, Fri, 10 Mar 2023 06:49:19 +0000) ---
+still hitting this from time to time:
+
+[ 3153.685924] BUG: sleeping function called from invalid context at kernel/locking/mutex.c:934
+[ 3153.698414] in_atomic(): 1, irqs_disabled(): 0, pid: 5896, name: ldlm_bl_01
+[ 3153.698514] 2 locks held by ldlm_bl_01/5896:
+[ 3153.698586]  #0: ffff8c9de894ae18 (&hs->hs_lock.rw){....}-{2:2}, at: cfs_hash_for_each_relax+0x291/0x470 [libcfs]
+[ 3153.698741]  #1: ffff8c9dabd29e18 (&new_bkts[i]->hsb_lock.rw){....}-{2:2}, at: cfs_hash_for_each_relax+0x2a2/0x470 [libcfs]
+[ 3153.704358] CPU: 0 PID: 5896 Comm: ldlm_bl_01 Tainted: G        W  O     --------- -  - 4.18.0 #2
+[ 3153.704488] Hardware name: Bochs Bochs, BIOS Bochs 01/01/2011
+[ 3153.704576] Call Trace:
+[ 3153.704621]  dump_stack+0x5c/0x80
+[ 3153.704679]  ___might_sleep.cold.21+0x9b/0xa8
+[ 3153.704753]  __mutex_lock+0x41/0x930
+[ 3153.704826]  ? qmt_lvbo_free+0xb1/0x250 [lquota]
+[ 3153.704907]  qmt_lvbo_free+0xb1/0x250 [lquota]
+[ 3153.705047]  ldlm_resource_putref+0x148/0x220 [ptlrpc]
+[ 3153.705170]  ldlm_lock_put+0x265/0x670 [ptlrpc]
+[ 3153.705256]  cfs_hash_for_each_relax+0x2e0/0x470 [libcfs]
+[ 3153.705367]  ? ldlm_cancel_lock_for_export.isra.12+0x340/0x340 [ptlrpc]
+[ 3153.705497]  ? ldlm_export_lock_object+0x10/0x10 [ptlrpc]
+[ 3153.705611]  ? ldlm_cancel_lock_for_export.isra.12+0x340/0x340 [ptlrpc]
+[ 3153.705709]  cfs_hash_for_each_empty+0x87/0x200 [libcfs]
+[ 3153.705819]  ldlm_export_cancel_locks+0x8b/0x150 [ptlrpc]
+[ 3153.707282]  ldlm_bl_thread_main+0x70f/0x8c0 [ptlrpc]
+[ 3153.707365]  ? wait_woken+0xa0/0xa0
+[ 3153.707458]  ? ldlm_handle_bl_callback+0x3e0/0x3e0 [ptlrpc]
+[ 3153.707538]  kthread+0x129/0x140
+[ 3153.707594]  ? kthread_flush_work_fn+0x10/0x10
+
+guess it's matter of time when production will hit.
+
+--- Comment (bzzz, Mon, 16 Jan 2023 16:19:17 +0000) ---
+one more similar crash:
+
+LustreError: 13000:0:(ldlm_lockd.c:1055:ldlm_server_completion_ast()) ASSERTION( data != ((void *)0) ) failed: in recovery-small / 27
+...
+PID: 13000  TASK: ffff985970e31b00  CPU: 0   COMMAND: "umount"
+ #0 [ffff985970d1f8f8] panic at ffffffff8d0b9786
+    /tmp/kernel/kernel/panic.c: 299
+ #1 [ffff985970d1f978] ldlm_server_completion_ast at ffffffffc06f8ba2 [ptlrpc]
+    /home/lustre/master-mine/lustre/ptlrpc/../../lustre/ldlm/ldlm_lockd.c: 1055
+ #2 [ffff985970d1f9e8] cleanup_resource_queue at ffffffffc06d504f [ptlrpc]
+    /home/lustre/master-mine/lustre/ptlrpc/../../lustre/ldlm/ldlm_resource.c: 1084
+ #3 [ffff985970d1fa38] ldlm_resource_cleanup at ffffffffc06d5114 [ptlrpc]
+    /home/lustre/master-mine/lustre/ptlrpc/../../lustre/ldlm/ldlm_resource.c: 1109
+ #4 [ffff985970d1fa50] ldlm_resource_clean_hash at ffffffffc06d514c [ptlrpc]
+    /home/lustre/master-mine/lustre/ptlrpc/../../lustre/ldlm/ldlm_resource.c: 1122
+ #5 [ffff985970d1fa60] cfs_hash_for_each_relax at ffffffffc020913f [libcfs]
+    /home/lustre/master-mine/libcfs/libcfs/hash.c: 1645
+ #6 [ffff985970d1fae0] cfs_hash_for_each_nolock at ffffffffc020c906 [libcfs]
+    /home/lustre/master-mine/libcfs/include/libcfs/libcfs_hash.h: 402
+ #7 [ffff985970d1fb08] ldlm_namespace_cleanup at ffffffffc06d54e6 [ptlrpc]
+    /home/lustre/master-mine/lustre/ptlrpc/../../lustre/ldlm/ldlm_resource.c: 1166
+ #8 [ffff985970d1fb20] __ldlm_namespace_free at ffffffffc06d55ad [ptlrpc]
+    /home/lustre/linux-4.18.0-305.25.1.el8_4/include/linux/compiler.h: 276
+ #9 [ffff985970d1fb98] ldlm_namespace_free_prior at ffffffffc06d5a86 [ptlrpc]
+    /home/lustre/master-mine/lustre/ptlrpc/../../lustre/ldlm/ldlm_resource.c: 1253
+#10 [ffff985970d1fbc8] mdt_device_fini at ffffffffc0ddc901 [mdt]
+    /home/lustre/master-mine/lustre/mdt/mdt_handler.c: 5874
+#11 [ffff985970d1fc20] class_cleanup at ffffffffc0354856 [obdclass]
+    /home/lustre/master-mine/lustre/include/obd_class.h: 613
+#12 [ffff985970d1fc98] class_process_config at ffffffffc03552bb [obdclass]
+    /home/lustre/master-mine/libcfs/include/libcfs/libcfs_debug.h: 155
+#13 [ffff985970d1fd28] class_manual_cleanup at ffffffffc0357d3c [obdclass]
+    /home/lustre/master-mine/lustre/obdclass/obd_config.c: 2359
+#14 [ffff985970d1fdc0] server_put_super at ffffffffc07682bb [ptlrpc]
+    /home/lustre/master-mine/libcfs/include/libcfs/libcfs_fail.h: 79
+#15 [ffff985970d1fe90] generic_shutdown_super at ffffffff8d1d17cf
+    /tmp/kernel/./include/linux/compiler.h: 276
+
+--- Comment (bzzz, Mon, 16 Jan 2023 07:48:51 +0000) ---
+hit on the fresh master:
+
+[  193.056624] Lustre: dir [0x240000402:0x180:0x0] stripe 1 readdir failed: -2, directory is partially accessed!
+[  193.515228] LustreError: 5402:0:(ldlm_lockd.c:261:expired_lock_main()) ### lock callback timer expired after 100s: evicting client at 0@lo  ns: mdt-lustre-MDT0000_UUID lock: 00000000209e1bb3/0x83b6d793c0eaa64f lrc: 3/0,0 mode: PR/PR res: [0x200000403:0x5c:0x0].0x0 bits 0x13/0x0 rrc: 12 type: IBT gid 0 flags: 0x60200400000020 nid: 0@lo remote: 0x83b6d793c0eaa625 expref: 73 pid: 7057 timeout: 193 lvb_type: 0
+[  193.516385] LustreError: 8007:0:(hash.c:1751:cfs_hash_for_each_empty()) ASSERTION( atomic_read(&hs->hs_count) == 0 ) failed: 
+[  193.516479] LustreError: 8007:0:(hash.c:1751:cfs_hash_for_each_empty()) LBUG
+
+the trace:
+
+PID: 8007   TASK: ffff9d14ca4f1b40  CPU: 0   COMMAND: "ldlm_bl_04"
+ #0 [ffff9d14d4b4bd60] panic at ffffffffa30b9786
+    /tmp/kernel/kernel/panic.c: 299
+ #1 [ffff9d14d4b4bdf0] cfs_hash_for_each_empty at ffffffffc02b9bd8 [libcfs]
+    /home/lustre/master-mine/libcfs/libcfs/hash.c: 1751
+ #2 [ffff9d14d4b4be30] ldlm_export_cancel_locks at ffffffffc078092b [ptlrpc]
+    /home/lustre/master-mine/libcfs/include/libcfs/libcfs_debug.h: 155
+ #3 [ffff9d14d4b4be98] ldlm_bl_thread_main at ffffffffc07a911f [ptlrpc]
+    /home/lustre/master-mine/lustre/ptlrpc/../../lustre/ldlm/ldlm_lockd.c: 2975
+ #4 [ffff9d14d4b4bf10] kthread at ffffffffa30d5199
+    /tmp/kernel/kernel/kthread.c: 340
+ #5 [ffff9d14d4b4bf50] ret_from_fork at ffffffffa360019f
+    /tmp/kernel/arch/x86/entry/entry_64.S: 325
+
+the test:
+
+FSTYPE=ldiskfs MDSCOUNT=2 SLOW=yes DURATION=2700 MDSSIZE=250000 OSTSIZE=400000 OSTCOUNT=2 REFORMAT=yes REFORMAT=yes bash racer.sh
+
+--- Comment (pjones, Fri, 13 Jan 2023 15:04:31 +0000) ---
+Landed for 2.16
+
+--- Comment (gerrit, Fri, 13 Jan 2023 07:25:05 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/48972/
+
+Subject: LU-16272 libcfs: cfs_hash_for_each_empty optimization
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 306a9b666e5ea2882f704d93483355e7e147544f
+
+--- Comment (zam, Thu, 27 Oct 2022 16:29:01 +0000) ---
+Looks like there is a similar patch in LU-15204 https://review.whamcloud.com/c/fs/lustre-release/+/45512
+
+--- Comment (bzzz, Thu, 27 Oct 2022 16:17:03 +0000) ---
+https://review.whamcloud.com/c/fs/lustre-release/+/45512
+
+--- Comment (gerrit, Thu, 27 Oct 2022 16:10:29 +0000) ---
+"Alexander Zarochentsev " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/48972
+
+Subject: LU-16272 libcfs: cfs_hash_for_each_empty optimization
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 7969901d3a41c5eabe8e113bb721a0685aa9759d

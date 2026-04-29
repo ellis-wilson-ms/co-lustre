@@ -1,0 +1,134 @@
+Key:        LU-4912
+Summary:    ldlm_cancel_locks_for_export() causes IO during umount
+Link:       https://jira.whamcloud.com/browse/LU-4912
+Type:       Question/Request
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Mikhail Pershin
+Reporter:   Brian Behlendorf
+Created:    Tue, 15 Apr 2014 18:54:36 +0000
+Updated:    Tue, 27 Aug 2019 17:28:37 +0000
+Labels:     llnl
+
+--- Description ---
+After observing substantial read I/Os on our systems during an OST umount I took a look at exactly what was causing them.  They root cause turns out to be ldlm_cancel_locks_for_export() is calling ofd_lvbo_update() to update the LVB from disk for every lock as its canceled.  When there are millions of locks on the server this translates in to a huge amount of IO.
+
+After reading through the code it's not at all clear to me why this is done.  How could it be out of date?  Why is this required before the lock can be canceled?
+
+[] cv_wait_common+0x8c/0x100 [spl]
+[] __cv_wait_io+0x18/0x20 [spl]
+[] zio_wait+0xfb/0x1b0 [zfs]
+[] dbuf_read+0x3fd/0x740 [zfs]
+[] __dbuf_hold_impl+0x189/0x480 [zfs]
+[] dbuf_hold_impl+0x86/0xc0 [zfs]
+[] dbuf_hold+0x20/0x30 [zfs]
+[] dmu_buf_hold+0x97/0x1d0 [zfs]
+[] zap_get_leaf_byblk+0x4f/0x2a0 [zfs]
+[] zap_deref_leaf+0x6a/0x80 [zfs]
+[] fzap_lookup+0x60/0x120 [zfs]
+[] zap_lookup_norm+0xe1/0x190 [zfs]
+[] zap_lookup+0x33/0x40 [zfs]
+[] osd_fid_lookup+0xb0/0x2e0 [osd_zfs]
+[] osd_object_init+0x1a1/0x6d0 [osd_zfs]
+[] lu_object_alloc+0xcd/0x300 [obdclass]
+[] lu_object_find_at+0x205/0x360 [obdclass]
+[] lu_object_find+0x16/0x20 [obdclass]
+[] ofd_object_find+0x35/0xf0 [ofd]
+[] ofd_lvbo_update+0x366/0xdac [ofd]
+[] ldlm_cancel_locks_for_export_cb+0x88/0x200 [ptlrpc]
+[] cfs_hash_for_each_relax+0x17f/0x360 [libcfs]
+[] cfs_hash_for_each_empty+0xfe/0x1e0 [libcfs]
+[] ldlm_cancel_locks_for_export+0x2f/0x40 [ptlrpc]
+[] server_disconnect_export+0x64/0x1a0 [ptlrpc]
+[] ofd_obd_disconnect+0x6a/0x1f0 [ofd]
+[] class_disconnect_export_list+0x337/0x660 [obdclass]
+[] class_disconnect_exports+0x116/0x2f0 [obdclass]
+[] class_cleanup+0x16f/0xda0 [obdclass]
+[] class_process_config+0x10bc/0x1c80 [obdclass]
+[] class_manual_cleanup+0x179/0x6f0 [obdclass]
+[] server_put_super+0x5bc/0xf00 [obdclass]
+[] generic_shutdown_super+0x5b/0xe0
+[] kill_anon_super+0x16/0x60
+[] lustre_kill_super+0x36/0x60 [obdclass]
+[] deactivate_super+0x57/0x80
+[] mntput_no_expire+0xbf/0x110
+[] sys_umount+0x7b/0x3a0
+
+--- Comment (adilger, Wed, 16 Apr 2014 01:02:46 +0000) ---
+What might make sense in the lock cancellation in case of client eviction case is to mark the LVB stale in the resource, and then it will be refreshed from disk only if the lock is used again.  That would avoid the need to update the LVB repeatedly during cancellation of many locks, and avoids any work if the resource is never used again.
+
+I also notice the comment in  ldlm_glimpse_ast() implies that "filter_intent_policy()" is handling this, but the new ofd_intent_policy() uses ldlm_glimpse_locks() which does not appear to call ldlm_res_lvbo_update(res, NULL, 1) if the glimpse fails.
+
+/**
+ * ->l_glimpse_ast() for DLM extent locks acquired on the server-side. See
+ * comment in filter_intent_policy() on why you may need this.
+ */
+int ldlm_glimpse_ast(struct ldlm_lock *lock, void *reqp)
+{
+        /*
+         * Returning -ELDLM_NO_LOCK_DATA actually works, but the reason for
+         * that is rather subtle: with OST-side locking, it may so happen that
+         * _all_ extent locks are held by the OST. If client wants to obtain
+         * current file size it calls ll{,u}_glimpse_size(), and (as locks are
+         * on the server), dummy glimpse callback fires and does
+         * nothing. Client still receives correct file size due to the
+         * following fragment in filter_intent_policy():
+         *
+         * rc = l->l_glimpse_ast(l, NULL); // this will update the LVB
+         * if (rc != 0 && res->lr_namespace->ns_lvbo &&
+         *     res->lr_namespace->ns_lvbo->lvbo_update) {
+         *         res->lr_namespace->ns_lvbo->lvbo_update(res, NULL, 0, 1);
+         * }
+         *
+         * that is, after glimpse_ast() fails, filter_lvbo_update() runs, and
+         * returns correct file size to the client.
+         */
+        return -ELDLM_NO_LOCK_DATA;
+}
+
+So it looks like there are a few improvements that could be done:
+
+	replace comments mentioning filter_intent_policy() with ofd_intent_policy()
+
+	change ldlm_res_lvbo_update() to a new ldlm_res_lvbo_invalidate() during client eviction (should mark the resource LVB stale)
+
+	update the LVB from disk only if it is marked stale
+
+--- Comment (green, Wed, 16 Apr 2014 00:50:07 +0000) ---
+Hm, indeed, the (somewhat cryptic) comment was added only in ldlm_handle_ast_error when the problem was first discovered.
+
+As for not updating the lvb, the lvb is actually stored in the resource, not in the lock. So we are updating the lvb content in order for other locks to get correct information.
+
+In case of OSTs it's possible to introduce a further optimization: not updating lvb in case a lock is non-modifying or if granted lock offsets are smaller than current offset in lvb (since the size could not be increased in this case).
+
+In case of MDT - for intent lock I guess it's safe to ignore lvb update in case of cancel, not sure about the quota case.
+
+This means that lvb update handler would need the lock and information whenever we have a cancel on our hands (possibly req being a NULL as a proxy for that, but I did not check it in any details).
+
+And yes, if the data is not cached, at least on the OST you can get quite an IO storm if this particular client (group of them) had a lot of locks. Hence the patch from Vitaly I referenced (because there's also going to be quite a cpu usage spike in such a case, esp if you have many clients being evicted at the same time, all with many locks).
+
+--- Comment (behlendorf, Tue, 15 Apr 2014 23:38:34 +0000) ---
+Thanks Oleg, that sheds some light on why this call is here.  Having that little bit of wisdom in a comment would have been tremendously helpful.
+
+> This should not really cause an IO because I would expect the file size is cached somewhere?
+
+Is this strictly necessary for the ldlm_cancel_locks_for_export()?  It seems inefficient to proactively update the LVB here when there's a high likelihood that the lock is going to be immediately destroyed.  Particularly, because I wouldn't have any expectation that the OIs or object itself are still cached.  Updating this data from disk proactively when canceling a million locks can result in millions of I/O being issued to the storage.  It would be best to avoid avoid this if at all possible.
+
+Correct me if I'm wrong, but this means that when an MDT/OST evicts a client (for whatever reason) it can easily create a huge IO load on the disk.
+
+--- Comment (green, Tue, 15 Apr 2014 22:40:50 +0000) ---
+The need for the size update is necessary because for the life of the lock we usually ask the client having the highest offset lock to tell us how big is the underlying object size.
+
+When we forcefully terminate the lock (i.e. not a client doing voluntary cancel, but an eviction or client disconnected otherwise) - this info could no longer be trusted because it's possible that not all writes has made it to the disk, so we need to refresh the actual file size from the filesystem.
+
+This should not really cause an IO because I would expect the file size is cached somewhere?
+
+Also on a side note, there's a patch from Vitaly that's under inspections now that makes this process much less synchronous: http://review.whamcloud.com/#/c/5843
+
+--- Comment (pjones, Tue, 15 Apr 2014 22:37:46 +0000) ---
+Oleg
+
+Could you please comment?
+
+Peter

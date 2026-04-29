@@ -1,0 +1,222 @@
+Key:        LU-1129
+Summary:    filter_handle_precreate()) ASSERTION(diff >= 0) failed
+Link:       https://jira.whamcloud.com/browse/LU-1129
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Jian Yu
+Reporter:   Oleg Drokin
+Created:    Wed, 22 Feb 2012 23:57:29 +0000
+Updated:    Fri, 22 Feb 2013 11:12:58 +0000
+Resolved:   Fri, 22 Feb 2013 11:12:58 +0000
+Links:      Related: is related to LU-1121
+
+--- Description ---
+It seems my async journal code for 2.0 port had a bug in it regarding recovery.
+
+When the object is not created we try to recreate it, but we also need to set a recreate flag.
+
+The solution is something like this. In filter_preprw_write:
+
+                        if (oa == NULL) {
+                                OBDO_ALLOC(noa);
+                                if (noa == NULL)
+                                        GOTO(recreate_out, rc = -ENOMEM);
+                                noa->o_id = obj->ioo_id;
+                                noa->o_valid = OBD_MD_FLID;
+                        }
++                if ((oa->o_valid & OBD_MD_FLFLAGS) == 0) {
++                        oa->o_valid |= OBD_MD_FLFLAGS;
++                        oa->o_flags = OBD_FL_RECREATE_OBJS;
++                } else {
++                        oa->o_flags |= OBD_FL_RECREATE_OBJS;
++                }
+
+                        if (filter_create(exp, noa, NULL, oti) == 0) {
+
+Without it we always end up in precreate code that tries to allocate multiple objects and if we happen to allocate below last_id (which should be pretty rare I guess? I cannot come with any very plausible scenarios, but it does happen apparently), this assertion triggers as the result.
+
+--- Comment (yujian, Thu, 19 Jul 2012 19:20:22 +0000) ---
+Patches were landed on master and b2_1 branches.
+
+--- Comment (yujian, Fri, 13 Jul 2012 08:39:04 +0000) ---
+Patch for master branch is in http://review.whamcloud.com/3391.
+
+In the OFD codes, ofd_preprw_write() uses dt_create() instead of ofd_create() to recreate missing object. The dt_write_lock() is used to avoid racing with recreating missing object during the MDS->OST orphan recovery period. In addition, in ofd_precreate_object(), which is called by ofd_create(), the following codes also exist to handle the race condition:
+
+        if (unlikely(ofd_object_exists(fo))) {
+                /* object may exist being re-created by write replay */
+                CDEBUG(D_INODE, "object %u/"LPD64" exists: "DFID"\n",
+                       (unsigned) group, id, PFID(&info->fti_fid));
+                rc = dt_trans_start_local(env, ofd->ofd_osd, th);
+                if (rc)
+                        GOTO(trans_stop, rc);
+                GOTO(last_id_write, rc);
+        }
+
+So, we do not need patch the OFD codes.
+
+--- Comment (yujian, Thu, 12 Jul 2012 04:57:15 +0000) ---
+While different ll_ost_io threads handling different OST_WRITE requests (which all need recreating missing precreated objects) in parallel during recovery, the "if (dentry->d_inode == NULL) {}" in filter_preprw_write() is a race condition which needs to be protected. It's likely that one request goes into that condition, recreates missing precreated objects and sets new LAST_ID, while the other request also goes into that condition but finally finds the o_id become 
+
+The above analysis is incorrect. By looking into filter_prep()->target_recovery_init(), we can find there is still only one target_recovery_thread (tgt_recov) started to handle replayed requests from all of the clients in transaction number order serially. There is no possibility for the recovery thread to handle different replayed OST_WRITE requests in parallel. So, the above race can not happen.
+
+Instead, the race can happen while handling replayed OST_WRITE request during the MDS->OST orphan recovery period:
+
+After an OST is restarted and re-establishes communication with the MDS, the MDS and OST automatically perform orphan recovery to destroy any objects that belong to files that were deleted while the OST was unavailable. This is done by mds_lov_clear_orphans() to send an OST_CREATE request with OBD_FL_DELORPHAN flag to the OST. This create handled inside filter_handle_precreate() will in fact either create or destroy: if the LAST_ID on OST is less than the record on MDS, then the missing precreated objects will be recreated; if the LAST_ID on OST is greater than the record on MDS, then the orphan objects on the OST will be deleted.
+
+So, while the OST recovery thread handling a replayed OST_WRITE request from one client, it finds the precreated object is missing and goes into filter_handle_precreate() to recreate it, at the same time, the missing precreated objects are also being recreated as per the above MDS->OST synchronization mechanism. If the latter first holds the fo_create_locks, then the LAST_ID will be updated with a new value. And after the former acquires the fo_create_locks, it finds the o_id become less than the LAST_ID which causes the assertion failure.
+
+To handle the above race condition, we can just add a check into LASSERTF(diff >= 0,...) to see whether the OST is in recovery period or not. If yes, then no assertion failure occurs, filter_handle_precreate() just returns back to filter_preprw_write(), which will perform filter_fid2dentry() again to find the recreated object. If the OST is not in recovery period, then assertion failure occurs as normal.
+
+Patch for b2_1 branch is updated in http://review.whamcloud.com/3264.
+
+--- Comment (yujian, Tue, 10 Jul 2012 11:37:40 +0000) ---
+I've run recovery-mds-scale(FLAVOR=OSS) test for about 20 times on solid Lustre 2.1.1 but failed to reproduce the issue.
+
+By looking into filter_preprw_write() again, I found the patch set 1 in http://review.whamcloud.com/#change,3264 was incorrect. Since the codes inside "if (exp->exp_obd->obd_recovering) {}" are intended to recreate the missing precreated object, the o_id will > LAST_ID. If we set OBD_FL_RECREATE_OBJS flag over there, then after the code goes into filter_create(), it will hit the following error:
+
+                if (!obd->obd_recovering ||
+                    oa->o_id > filter_last_id(filter, oa->o_seq)) {
+                        CERROR("recreate objid "LPU64" > last id "LPU64"\n",
+                               oa->o_id, filter_last_id(filter, oa->o_seq));
+                        rc = -EINVAL;
+                    ......
+                }
+
+So, we should not apply that patch set.
+
+In addition, I found OBD_FL_RECREATE_OBJS flag was only set in ll_lov_recreate(), which was finally only used by ll_file_ioctl(). It seems all of the codes under (oa->o_flags & OBD_FL_RECREATE_OBJS) conditions in filter_create() and filter_precreate() will never be performed unless the LL_IOC_RECREATE_OBJ and LL_IOC_RECREATE_FID ioctl commands are used.
+
+Now, I also think that the race condition of recreating missing precreated objects is more like the cause of the issue than recreating a missing o_id While different ll_ost_io threads handling different OST_WRITE requests (which all need recreating missing precreated objects) in parallel during recovery, the "if (dentry->d_inode == NULL) {}" in filter_preprw_write() is a race condition which needs to be protected. It's likely that one request goes into that condition, recreates missing precreated objects and sets new LAST_ID, while the other request also goes into that condition but finally finds the o_id become I'll look more and try to create a patch.
+
+--- Comment (yujian, Wed, 4 Jul 2012 05:12:55 +0000) ---
+Yu Jian,
+
+can you please also submit a patch for master, since it can get much more testing after lustre-review testing, by being landed to the master branch and undergoing full/scale/recovery testing.
+
+Also, this change likely affects OFD, so the master version of this patch should include a fix for the OFD code.
+
+Sure, I'll run recovery-mds-scale subtest failover_ost to reproduce this issue (I hit it before in LU-1121). After I understand and figure out the root cause of this problem, I'll create a patch for master branch also.
+
+--- Comment (jaylan, Tue, 3 Jul 2012 17:37:30 +0000) ---
+I have not seen this again yet. Those are production systems so the focus is to take the dump and get the systems back to service ASAP. 
+
+Certainly we would not encourage our users try to reproduce the problem. 
+
+A lot of people lose their productivity when a lustre server crashes.
+
+--- Comment (adilger, Tue, 3 Jul 2012 17:03:19 +0000) ---
+Looking at the patch more closely, I'm not sure the problem analysis of this bug is correct.
+
+The code that is being patched is intended to be run in the case where a very recent object precreate (which is currently asynchronous) is lost because of no journal commit.  After the OSS crash/recovery, the client may submit its writes before the MDS->OSS object recovery has completed, so the async write needs to recreate the object.
+
+However, in the error case being hit here the precreate was NOT lost, since LAST_ID is written to disk and is triggering the assertion failure.  This instead implies that the object being written to was missing for some other reason, such as filesystem corruption/e2fsck, or possibly being unlinked/destroyed while the write was still in progress.  This latter case shouldn't happen, since the OST will cancel all extent locks on the object before it is destroyed.
+
+Rather, I suspect the root of this problem may be that two threads are racing to "recreate" the missing objects during recovery?  I think that recovery is now multi-threaded in 2.x, and the fo_create_lock on the precreate call is only taken inside filter_handle_precreate(), so the check done in filter_preprw_write() may be outdated by the time filter_handle_precreate() is called.
+
+Is this problem reproducible?  It would be good to have a test case for this.
+
+If yes, it would be useful to print in filter_preprw_write() what the current LAST_ID value is at the time the object is missing.  This will allow us to determine whether the precreate and write are racing (if LAST_ID  o_id inside filter_handle_precreate()), or if the object is missing for some other reason (if LAST_ID >= o_id in filter_preprw_write()).
+
+--- Comment (adilger, Tue, 3 Jul 2012 16:45:22 +0000) ---
+Yu Jian,
+
+can you please also submit a patch for master, since it can get much more testing after lustre-review testing, by being landed to the master branch and undergoing full/scale/recovery testing.
+
+Also, this change likely affects OFD, so the master version of this patch should include a fix for the OFD code.
+
+--- Comment (yujian, Tue, 3 Jul 2012 10:31:11 +0000) ---
+Patch for b2_1 branch is in http://review.whamcloud.com/3264.
+
+--- Comment (pjones, Fri, 29 Jun 2012 00:43:37 +0000) ---
+Yujian
+
+Could you please look into this one
+
+Thanks
+
+Peter
+
+--- Comment (jaylan, Tue, 26 Jun 2012 18:29:17 +0000) ---
+BTW, the OSS was running 2.1.1 with some LU patches that fixed LBUG problems:
+
+   LU 685, 1092, 1095, 1098, 1166, 1350, 1467.
+
+Could you put your patch through testing and review cycle, if you have completed the patch. Thanks!
+
+--- Comment (jaylan, Tue, 26 Jun 2012 14:21:28 +0000) ---
+I think we hit this LBUG today at NASA Ames after recovery.
+
+LustreError: 7249:0:(ost_handler.c:1067:ost_brw_write()) client csum 3b637596, original server csum 7f5de8f4, server csum now 7f5de8f4^M
+
+LustreError: 7250:0:(filter.c:3685:filter_handle_precreate()) ASSERTION(diff >= 0) failed: nbp1-OST0025: 44069624 - 44069830 = -206^M
+
+LustreError: 7249:0:(filter.c:3685:filter_handle_precreate()) ASSERTION(diff >= 0) failed: nbp1-OST0065: 42271430 - 42271591 = -161^M
+
+LustreError: 7249:0:(filter.c:3685:filter_handle_precreate()) LBUG^M
+
+Pid: 7249, comm: ll_ost_io_126^M
+
+^M
+
+Call Trace:^M
+
+ []  2l3i bouctf so_fd eb2u4g _cdpuusm pisnt ackkd+b0,x w5a5i/t0ixn8g0  [floirb tchfes ]r^Me
+
+st, timeout in 10 second(s)^M
+
+ [] lbug_with_loc+0x75/0xe0 [libcfs]^M
+
+ [] filter_create+0x160d/0x1640 [obdfilter]^M
+
+ [] ? filter_alloc_iobuf+0x170/0x850 [obdfilter]^M
+
+ [] filter_preprw_write+0x6c1/0x1f10 [obdfilter]^M
+
+ [] ? cfs_alloc+0x63/0x90 [libcfs]^M
+
+ [] ? null_alloc_rs+0x19d/0x320 [ptlrpc]^M
+
+ [] ? LNetPut+0x2bf/0x7f0 [lnet]^M
+
+ [] ? sptlrpc_svc_alloc_rs+0x74/0x2d0 [ptlrpc]^M
+
+ [] ? lustre_msg_add_version+0x94/0x110 [ptlrpc]^M
+
+ [] ? lustre_pack_reply_v2+0x215/0x2e0 [ptlrpc]^M
+
+ [] ? lustre_msg_buf+0x85/0x90 [ptlrpc]^M
+
+ [] filter_preprw+0x68/0x90 [obdfilter]^M
+
+ [] obd_preprw+0x11e/0x420 [ost]^M
+
+ [] ost_brw_write+0x9fe/0x1850 [ost]^M
+
+ [] ? lustre_msg_get_opc+0x94/0x100 [ptlrpc]^M
+
+ [] ost_handle+0x3325/0x4ba0 [ost]^M
+
+ [] ? vvp_session_key_init+0x76/0x1d0 [lustre]^M
+
+ [] ? lustre_msg_get_opc+0x94/0x100 [ptlrpc]^M
+
+ [] ptlrpc_main+0xb7e/0x18f0 [ptlrpc]^M
+
+ [] ? ptlrpc_main+0x0/0x18f0 [ptlrpc]^M
+
+ [] child_rip+0xa/0x20^M
+
+ [] ? ptlrpc_main+0x0/0x18f0 [ptlrpc]^M
+
+ [] ? ptlrpc_main+0x0/0x18f0 [ptlrpc]^M
+
+ [] ? child_rip+0x0/0x20^M
+
+^M
+
+Kernel panic - not syncing: LBUG^M
+
+Pid: 7249, comm: ll_ost_io_126 Not tainted 2.6.32-220.4.1.el6.20120130.x86_64.lustre211 #1^M

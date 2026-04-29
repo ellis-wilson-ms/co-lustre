@@ -1,0 +1,172 @@
+Key:        LU-16308
+Summary:    cl_object_put_last() is stuck in wait_event(atomic_read(&header->loh_ref) == 1)
+Link:       https://jira.whamcloud.com/browse/LU-16308
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Lai Siyao
+Reporter:   Lai Siyao
+Created:    Fri, 11 Nov 2022 03:48:45 +0000
+Updated:    Wed, 4 Jan 2023 02:24:26 +0000
+Resolved:   Tue, 13 Dec 2022 23:35:44 +0000
+
+--- Description ---
+client may get stuck in cl_object_put_last():
+
+[465342.626191] INFO: task nwchem:108679 blocked for more than 120 seconds.
+[465342.632934]       Tainted: G           OE    --------- -t - 4.18.0-193.el8.x86_64 #1
+[465342.640783] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[465342.648720] nwchem          D    0 108679 108659 0x00004082
+[465342.655115] Call Trace:
+[465342.658245]  ? __schedule+0x24f/0x650
+[465342.662607]  schedule+0x2f/0xa0
+[465342.666446]  cl_inode_fini+0x137/0x1e0 [lustre]
+[465342.671705]  ? wake_up_q+0x70/0x70
+[465342.675813]  ll_clear_inode+0x1b3/0x570 [lustre]
+[465342.681197]  ll_delete_inode+0x58/0x220 [lustre]
+[465342.686571]  evict+0xd2/0x1a0
+[465342.690291]  do_unlinkat+0x250/0x2e0
+[465342.694604]  do_syscall_64+0x5b/0x1a0
+[465342.698910]  entry_SYSCALL_64_after_hwframe+0x65/0xca
+[465342.704672] RIP: 0033:0x7fd72cf373cb
+[465342.708989] Code: Bad RIP value.
+[465342.712929] RSP: 002b:00007ffe0b19b5d8 EFLAGS: 00000246 ORIG_RAX: 0000000000000057
+[465342.721236] RAX: ffffffffffffffda RBX: 0000000000000000 RCX: 00007fd72cf373cb
+[465342.729119] RDX: 0000000000000010 RSI: 0000000000000000 RDI: 00007ffe0b19ba10
+[465342.736982] RBP: 00007ffe0b19ba10 R08: 0000000000000000 R09: 0000000000000000
+[465342.744820] R10: 0000000000000011 R11: 0000000000000246 R12: 0000000000000000
+[465342.752638] R13: 00007ffe0b19dd70 R14: 00007ffe0b19beb0 R15: 00000000010a9e9d
+
+It should be woken up by lu_object_free():
+
+        if (waitqueue_active(wq))
+                wake_up(wq);
+
+But according to description of waitqueue_active(), a smp_mb()/spinlock is needed to wake up reliably.
+
+--- Comment (pjones, Tue, 13 Dec 2022 23:35:44 +0000) ---
+Landed for 2.16
+
+--- Comment (gerrit, Tue, 6 Dec 2022 02:44:07 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/49130/
+
+Subject: loh_ref) == 1)" class="issue-link" data-issue-key="LU-16308">LU-16308 llite: wake_up after cl_object_kill
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 77107d8e78ffd952af7882a160c84012aea0e22b
+
+--- Comment (ys, Wed, 30 Nov 2022 05:44:45 +0000) ---
+Hi, Neil,
+
+Yes, We have two instances for this issue. All of them stuck on:
+
+static void cl_object_put_last(struct lu_env *env, struct cl_object *obj)
+{
+        struct lu_object_header *header = obj->co_lu.lo_header;
+
+        if (unlikely(atomic_read(&header->loh_ref) != 1)) {
+                struct lu_site *site = obj->co_lu.lo_dev->ld_site;
+                wait_queue_head_t *wq;
+
+                wq = lu_site_wq_from_fid(site, &header->loh_fid);
+
+                wait_event(*wq, atomic_read(&header->loh_ref) == 1); 
+
+And the header is :
+
+struct lu_object_header {
+  loh_fid = {
+    f_seq = 0x20005e972,
+    f_oid = 0x189fc,
+    f_ver = 0x0
+  },
+  loh_flags = 0x5,
+  loh_ref = {
+    counter = 0x1
+  },
+
+So the loh_ref  has already reached 1 but the thread still waiting for it, It is obviously lost the wakeup. Also only the stuck thread in the waitqueue.
+
+This issue just hit on es52 branch, It use old code. We don't encounter this issue on master branch since your patch invoke wakeup in lu_object_put() unconditionally. 
+
+What issue you point out still exists in 2.13 code.  Many thanks for the insight. I think we should backport your patches to the branch to fix the issue.
+
+Thanks,
+
+YangSheng
+
+--- Comment (neilb, Tue, 29 Nov 2022 21:10:24 +0000) ---
+Hi YangSheng,
+
+do you have a crash-dump from a time when this hang was happening, or are you able to reproduce it?
+
+It would be helpful to find out what other tasks are blocked - to confirm that lu_object_find_at() isn't waiting, and to see if anything else is.
+
+I think there must be something else holding onto a reference to the object.  Maybe we just need to audit all code that takes a reference to ensure that it drops it in a timely fashion.
+
+In which version of Lustre has this problem been seen?
+
+--- Comment (ys, Tue, 29 Nov 2022 07:17:20 +0000) ---
+Hi, Neil,
+
+As you said, The lu_object_find_at() will wait LU_OBJECT_HEARD_BANSHEE to be set. In fact, It is only place to do that. It intends to wait the object either LU_OBJECT_HEARD_BANSHEE or LU_OBJECT_INITED. The LU_OBJECT_INITED was set by lu_object_start() successful, the LU_OBJECT_HEARD_BANSHEE was set while lu_object_start failed. In other word, the wait_event call will end while lu_find_object_at() return. It is impossible to react with cl_object_kill() and cl_object_put_last().
+
+Thanks,
+
+YangSheng
+
+--- Comment (neilb, Mon, 28 Nov 2022 23:13:59 +0000) ---
+I'm sorry but I don't understand what point you are trying to make.
+
+Yes, wake_up is called  in lu_object_put().  Every time loh_ref is decremented wake_up is called.  That is good, but that is not the problem.
+
+The problem relates to LU_OBJECT_HEARD_BANSHEE.  wake_up must be called whenever that is set.
+
+Some code holds a reference (and so keeps loh_ref elevated) while waiting for LU_OBJECT_HEARD_BANSHEE to be set.
+
+Specifically lu_object_find_at waits either for that flag to be set, or for LU_OBJECT_INITED to be set.  If HEARD_BANSHEE is set, then it will call lu_object_put() which will decrement loh_ref and then call wake_up().  But if the flag is set but not wake_up happens, then it can block indefinitely holding a reference.
+
+So if cl_inode_fini() runs while lu_object_find_at() is waiting, then a deadlock will happen because cl_inode_fini()->cl_object_put_last() will wait for all other references to the object to be droppped, but lu_object_find_at() is still holding a reference which it won't drop until it gets a wakeup.
+
+ 
+
+As you say, back in 2.13 and earlier the local is_dying variable is lu_object_put() was racy.  If anyone is still using 2.13 or earlier, it should probably be fixed.  Remove the variable and call wake_up unconditionally.  But that is a separate problem.
+
+--- Comment (ys, Mon, 28 Nov 2022 21:29:55 +0000) ---
+Hi, Neil,
+
+The wake_up was called every time in lu_object_put()  while loh_rec!=1. So i don't  think the issue you pointed exists in master branch.  But it exists in other branch that still use old code before your wait_event patches.  In the old code the lu_object_put() use a local variable is_dying to save the value of lu_object_is_dying() then decrease the loh_ref and wakeup only when the is_dying is true. So it may lost the chance to wakeup the waiter on cl_object_put_last(). 
+
+Thanks,
+
+YangSheng
+
+--- Comment (neilb, Thu, 17 Nov 2022 22:15:36 +0000) ---
+I think the problem here is not related to that waitqueue_active().
+
+The code that is blocking is waiting for ->loh_ref to be one.  All code that decrements ->loh_ref goes on to call wake_up() unconditionally - ->loh_ref must still be at least two
+
+Just before cl_inode_fini() calls cl_object_put_last(), it calls cl_object_kill() which only sets LU_OBJECT_HEARD_BANSHEE.  However it does NOT then wake up the wq.  So some other thread may be holding a reference and waiting for LU_OBJECT_HEARD_BANSHEE to be set.  It will wait indefinitely.
+
+All other callers of cl_object_kill() then call cl_object_put() which will do the wake_up().  cl_object_put_last() does NOT do a wakeup, and hence the hang.
+
+To fix this you need to add a wakeup call, either in cl_object_kill or cl_object_put_last, or in cl_inode_fini between the two calls.
+
+--- Comment (gerrit, Fri, 11 Nov 2022 04:01:24 +0000) ---
+"Lai Siyao " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/49130
+
+Subject: loh_ref) == 1)" class="issue-link" data-issue-key="LU-16308">LU-16308 obdclass: wakeup cl_inode_fini() reliably
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 7d7ed230de0de7a3499a5f393300fae64e7846ec

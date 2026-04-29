@@ -1,0 +1,107 @@
+Key:        LU-3891
+Summary:    leases for HSM - some questions
+Link:       https://jira.whamcloud.com/browse/LU-3891
+Type:       Bug
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Vitaly Fertman
+Created:    Thu, 5 Sep 2013 23:42:31 +0000
+Updated:    Fri, 2 Dec 2016 23:42:08 +0000
+
+--- Description ---
+AFAICS, some lease code landed for HSM needs.
+
+Unfortunately, leases have the same problems as SOM had in past, related to evictions.
+
+On eviction, locks are cancelled on MDS and client. However, a new lease may conflict with open files, but after client eviction and later re-connect, client does not re-open files, while they are still opened on the client and it is able to proceed with its IO.
+
+However, HSM has a layout lock as well, which is supposed to block such new IO.
+
+do I understand correctly, that lease is always taken together with an exclusive layout lock? so that all the other clients, even if they were evicted in past, would be blocked on layout lock with their new IO ?
+
+if not, lease lock gives no guarantee for recently evicted clients.
+
+The 2nd problem is that the evicted state has a latency being propagated from MDS to client, when client does not know it has connection problems while it is already evicted - could be up to obd_timeout which could be also pretty long.
+
+layout lock will not help here. The solution could be the same as with SOM - just deny all the HSM releases for X*obd_timeouts period after the last eviction, to be sure clients are aware about their evictions and have cancelled layout locks.
+
+are these lease lock issues known and somehow resolved?
+
+--- Comment (vitaly_fertman, Fri, 2 Dec 2016 23:42:08 +0000) ---
+summarising the current state of the HSM locking, the main question is if the copy is valid after the release, the whole logic can be viewed starting from ll_hsm_release:
+
+	take a lease, blocks new opens
+
+	get data version from OST
+
+—— flush all the cached data from clients
+
+	mdt_hsm_release is initiated for this version
+
+—— compare this version & the archive version
+
+—— check the lease exists - skip release if this client was evicted
+
+—— MDS_INODELOCK_LAYOUT EX - just a protection for the layout change, nothing about IO here (a client may be not informed about its eviction yet and may still operate under its previous layout lock);
+
+	cancel lease
+
+also, the release happens ~2weeks later or more after the last access.
+
+therefore, everything is protected if:
+
+	no eviction happens;
+
+	an open happened after an eviction;
+
+	IO happened before the version check or after the file release;
+
+	IO tried to happen after the release had taken the layout lock and the client was informed about sits eviction;
+
+however it is not protected even with the 2 weeks delay if a new IO and an eviction have happened just before the release and:
+
+	lockless IO / punch / enqueue + IO happens between the data version check and the release;
+
+	the same even during the release itself as the client may be not informed about its eviction thus may still operate under its previous layout lock;
+
+possible improvements could be:
+
+1.  move the data version check under the layout lock;
+
+2. never release during at_max after a client eviction or MDS failover completion, so that the client is informed about its eviction and would not initiate a new IO without a new layout lock (has no effect without (1) as IO may happen just between the version check and the release);
+
+--- Comment (vitaly_fertman, Tue, 24 Sep 2013 19:58:50 +0000) ---
+AFAICS, the following is possible:
+
+	client is evicted
+
+	copy is made.
+
+	check for a copy succeeds, under a granted lease
+
+	IO from evicted client happens
+
+	release happens, lease is cancelled, no more IO errors
+
+whereas the window size is relatively small between the check and release, it seems still possible, and it will lead to data loss
+
+--- Comment (jay, Tue, 24 Sep 2013 05:37:35 +0000) ---
+Indeed. The problem is that when the MDT grants an open lease to the release client, an evicted client may still keep writing to the file, so that the file may lose some status after release. But this problem should be minor, because the opening file on the evicted file will be returned with EIO eventually after the release because OST objects have already disappeared.
+
+--- Comment (vitaly_fertman, Tue, 10 Sep 2013 12:23:26 +0000) ---
+this does not answer the original question, because the lease lock will be there but will still guarantee nothing.
+
+I looked at mdt_hsm_release() and see it takes an exclusive layout lock, what is good as it covers the 1st issue.
+
+2nd one is still open.
+
+--- Comment (jay, Fri, 6 Sep 2013 05:29:37 +0000) ---
+I thought about this problem, heh. The lease implementation is okay for HSM. Check out the code mdt_hsm_release() you will find that the lease_broken is actually checked on the MDT side. So the HSM release operation is performed as follows:
+
+1. open + lease the file
+
+2. do some operations on the client
+
+3. close + release the file, MDT will check if the lease lock is still there otherwise release won't happen and the operation becomes a pure close.

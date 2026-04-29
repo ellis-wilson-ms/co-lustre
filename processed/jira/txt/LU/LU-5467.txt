@@ -1,0 +1,174 @@
+Key:        LU-5467
+Summary:    process stuck in cl_locks_prune()
+Link:       https://jira.whamcloud.com/browse/LU-5467
+Type:       Bug
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   Zhenyu Xu
+Reporter:   Ned Bass
+Created:    Fri, 8 Aug 2014 21:46:37 +0000
+Updated:    Tue, 7 Jun 2016 15:38:29 +0000
+Labels:     llnl
+
+--- Environment ---
+https://github.com/chaos/lustre/commits/2.4.2-13chaos
+
+--- Description ---
+User processes are stuck in cl_locks_prune().  The system is classified so files from the system can't be uploaded.  We currently have two lustre clients in this state.
+
+Stack trace from stuck process:
+
+cfs_waitq_wait
+cl_locks_prune
+lov_delete_raid0
+lov_object_delete
+lu_object_free
+lu_object_put
+cl_object_put
+cl_inode_fini
+ll_clear_inode
+clear_inode
+ll_delete_inode
+generic_delete_inode
+generic_drop_inode
+...
+sys_unlink
+
+They are waiting for lock user count to drop to 0:
+
+2063 again:
+2064                 cl_lock_mutex_get(env, lock);
+2065                 if (lock->cll_state cll_users if (unlikely(lock->cll_users == 1)) {
+2068                                 struct l_wait_info lwi = { 0 };
+2069                                                                                 
+2070                                 cl_lock_mutex_put(env, lock);
+2071                                 l_wait_event(lock->cll_wq,
+2072                                              lock->cll_users == 0, 
+2073                                              &lwi);
+2074                                 goto again; 
+2075                         }
+
+On one node I also found a user process stuck in osc_io_setattr_end() line 500:
+
+489 static void osc_io_setattr_end(const struct lu_env *env,
+490                                const struct cl_io_slice *slice)
+491 { 
+492         struct cl_io     *io  = slice->cis_io;
+493         struct osc_io    *oio = cl2osc_io(env, slice);
+494         struct cl_object *obj = slice->cis_obj;
+495         struct osc_async_cbargs *cbargs = &oio->oi_cbarg;
+496         int result = 0;
+497
+498         if (cbargs->opc_rpc_sent) {
+499                 wait_for_completion(&cbargs->opc_sync);
+500                 result = io->ci_result = cbargs->opc_rc;
+501         } 
+
+On both stuck nodes, I also notice the ptlrpcd_rcv thread blocked with this backtrace:
+
+sync_page
+__lock_page
+vvp_page_own
+cl_page_own0
+cl_page_own
+check_and_discard_cb
+cl_page_gang_lookup
+cl_lock_discard_pages
+osc_lock_flush
+osc_lock_cancel
+cl_lock_cancel0
+cl_lock_cancel
+osc_ldlm_blocking_ast
+ldlm_cancel_callback
+ldlm_lock_cancel
+ldlm_cli_cancel_list_local
+ldlm_cancel_lru_local
+ldlm_replay_locks
+ptlrpc_import_recov_state_machine
+ptlrpc_connect_interpret
+ptlrpc_check_set
+ptlrpcd_check
+ptlrpcd
+
+I haven't checked anything on the server side yet.  Please let us know ASAP if you want any more debug data from the clients before we reboot them.
+
+--- Comment (morrone, Tue, 9 Sep 2014 00:02:20 +0000) ---
+It looks like we hit a similar problem on a BGQ I/O Node (lustre client).  The backtrace for the prlrpc_rcv thread is identical to the backtrace that Ned listed above.  There are two OSCs stuck in the REPLAY_LOCKS state as Ned reported in the earlier instance on x86_64.
+
+There is no thread in cl_locks_prune() this time.
+
+The OSTs appear to be fine.  Other nodes can use them.
+
+Many other threads are stuck waiting under an open():
+
+cfs_waitq_timedwait
+ptlrpc_set_wait
+ptlrpc_queue.wait
+ldlm_cli_enqueue
+mdc_enqueue
+mdc_intent_lock
+lmv_intent_lookup
+lmv_intent_lock
+ll_lookup_it
+ll_lookup_nd
+do_lookup
+__link_path_walk
+path_walk
+filename_lookup
+do_filp_open
+do_sys_open
+
+One thread had nearly and identical stack as the open() ones, but got there through fstat():
+
+[see open() stack for the rest]
+filename_lookup
+user_path_at
+vfs_fstatat
+
+Finally, a couple of threads where in this backtrace:
+
+cfs_waitq_timedwait
+ptlrpc_set_wait
+ptlrpc_queue_wait
+mdc_close
+lmv_close
+ll_close_inode_openhandle
+ll_md_real_close
+ll_file_release
+ll_dir_release
+__fput
+filp_close
+pu_files_struct
+do_exit
+do_group_exit
+set_signal_to_deliver
+do_signal_pending_clone
+do_signal
+
+Do you still think that http://review.whamcloud.com/11418 will address this problem?  We have not yet pulled in that patch.
+
+--- Comment (jay, Tue, 12 Aug 2014 16:41:20 +0000) ---
+I back ported the patch to b2_4 at: http://review.whamcloud.com/11418
+
+--- Comment (jay, Tue, 12 Aug 2014 02:23:51 +0000) ---
+From the stack trace, I guess this is the same issue of LU-4300 and LU-4786. I'd like to port those patches back to b2_4.
+
+--- Comment (nedbass, Tue, 12 Aug 2014 01:14:45 +0000) ---
+Jinshan, I can't get full dmesg output because the system is classified.
+
+I noticed 'lfs check servers' shows resource temporarily unavailable for the same 5 OSTs on both affected clients.
+
+The 'imports' file under /proc/fs/lustre/osc/... shows state 'REPLAY_LOCKS'.  Also the import's current_connection shows the fail over partner's NID, not the NID of the active server.  There is no export for the client under /proc/fs/lustre/obdfilter on the OST.
+
+--- Comment (jay, Sat, 9 Aug 2014 02:21:59 +0000) ---
+What's the status of corresponding OST? Can you please show me the output of dmesg?
+
+--- Comment (pjones, Fri, 8 Aug 2014 23:08:04 +0000) ---
+Bobijam
+
+What do you advise here?
+
+Thanks
+
+Peter

@@ -1,0 +1,202 @@
+Key:        LU-19237
+Summary:    NFS v4 reexport support
+Link:       https://jira.whamcloud.com/browse/LU-19237
+Type:       Bug
+Priority:   Medium
+Status:     Reopened
+Resolution: Unresolved
+Assignee:   Oleg Drokin
+Reporter:   Oleg Drokin
+Created:    Tue, 5 Aug 2025 21:55:52 +0000
+Updated:    Tue, 13 Jan 2026 13:21:31 +0000
+Attachments: test.c
+
+--- Description ---
+There were several reports of Lustre reexport via nfsv4 having a stale metadata problem that initially was determined to be lack of nanosecond timestamps support, but upon further research it looks like starting from about Linux kernel v5.5 the new i_version inode field is supposed to help even with coarse timestamp resolution.
+
+ 
+
+Here's wha thte comment in linux/iversion.h says:
+
+ * The inode->i_version field:
+ * ---------------------------
+ * The change attribute (i_version) is mandated by NFSv4 and is mostly for
+ * knfsd, but is also used for other purposes (e.g. IMA). The i_version must
+ * appear larger to observers if there was an explicit change to the inode's
+ * data or metadata since it was last queried.
+ *
+ * An explicit change is one that would ordinarily result in a change to the
+ * inode status change time (aka ctime). i_version must appear to change, even
+ * if the ctime does not (since the whole point is to avoid missing updates due
+ * to timestamp granularity). If POSIX or other relevant spec mandates that the
+ * ctime must change due to an operation, then the i_version counter must be
+ * incremented as well.
+
+ * Not all filesystems properly implement the i_version counter. Subsystems that
+ * want to use i_version field on an inode should first check whether the
+ * filesystem sets the SB_I_VERSION flag (usually via the IS_I_VERSION macro).
+ *
+ * Those that set SB_I_VERSION will automatically have their i_version counter
+ * incremented on writes to normal files. If the SB_I_VERSION is not set, then
+ * the VFS will not touch it on writes, and the filesystem can use it how it
+ * wishes. Note that the filesystem is always responsible for updating the
+ * i_version on namespace changes in directories (mkdir, rmdir, unlink, etc.).
+ * We consider these sorts of filesystems to have a kernel-managed i_version.
+ *
+ * It may be impractical for filesystems to keep i_version updates atomic with
+ * respect to the changes that cause them.  They should, however, guarantee
+ * that i_version updates are never visible before the changes that caused
+ * them.  Also, i_version updates should never be delayed longer than it takes
+ * the original change to reach disk.
+ * 
+
+ 
+
+With this in mind the simpliest way here is probably to set SB_I_VERSION for Lustre and then update the blocking AST to handler in llite to increase i_version for directories when an update (or update and some other bits) lock loss. Since inode normally does not go away, a re-lookup and re-obtaining the lock would find the inode and reuse it with the now increased i_version.
+
+It's unclear how actual monotonically increasing i_version is important in practice.
+
+ 
+
+Alternatively we can store i_version on disk (We already do for ldiskfs backend) and then transfer it to client, but that constitutes a protocol change for a not very clear benefit.
+
+--- Comment (gerrit, Sat, 10 Jan 2026 19:45:43 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/63305
+
+Subject: LU-19237 llite: Update i_version when losing osc/dom lock
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 81ebc3c7cd1de047c45472373baa44c46faffdfb
+
+--- Comment (green, Sat, 10 Jan 2026 19:40:43 +0000) ---
+Looks like the write path is also a problem when Lustre is reexported fro multiple clients, writes done to one NFS server is not visible to clients of hte other nfs server because there is no incrementing of the iversion from the vfs and we still don't have the nanosecond timestamps.
+
+As such need to increment i_version when we lose an osc lock (and a DOM lock too)
+
+--- Comment (pjones, Thu, 28 Aug 2025 12:53:31 +0000) ---
+Merged for 2.17
+
+--- Comment (gerrit, Wed, 20 Aug 2025 03:06:41 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/60563/
+
+Subject: LU-19237 llite: adopt i_version use to guard directory cache
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 7b82f368b498af8f53f8b9b00551fb8e47574440
+
+--- Comment (gerrit, Wed, 20 Aug 2025 03:06:34 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/60562/
+
+Subject: LU-19237 ldiskfs: drop outdated i_version configure check
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: fb6d4e95c725aa387599973b592035b5c9276955
+
+--- Comment (gerrit, Wed, 6 Aug 2025 19:00:54 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/60563
+
+Subject: LU-19237 llite: adopt i_version use to guard directory cache
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 9c1e7faedafd0d8bf2fa48481cfd9fc28c4a4e87
+
+--- Comment (gerrit, Wed, 6 Aug 2025 19:00:53 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/60562
+
+Subject: LU-19237 ldiskfs: drop outdated i_version configure check
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 4ac7aee5191e018a181c9f9529485110a4626e0d
+
+--- Comment (green, Wed, 6 Aug 2025 15:23:07 +0000) ---
+Further testing and investigation indicated that updating inode i_version alone is not enough to achieve ns v4 properly working because it's not propagated anywhere.
+
+The reason is in fs/stat.c::vfs_getattr_nosec():
+
+        if ((request_mask & STATX_CHANGE_COOKIE) && IS_I_VERSION(inode)) {
+                stat->result_mask |= STATX_CHANGE_COOKIE;
+                stat->change_cookie = inode_query_iversion(inode);
+        }
+
+so if we don't set SB_I_VERSION the kernel would not propagate it. ext4 sets the flag.
+
+But in fact that same function would also call inode's i_op->getattr method and that provides us an opportunity to do the same thing.
+
+In fact ceph does it like this in their getattr:
+
+        if (request_mask & STATX_CHANGE_COOKIE) {
+                stat->change_cookie = inode_peek_iversion_raw(inode);
+                valid_mask |= STATX_CHANGE_COOKIE;
+        }
+
+But since we have this control, I wonder if we should avoid these pretenses and instead use something else? e.g. we can use lower 32 bits of lock handle, it also grows up outside of recovery events which is ok, as nfs also has this extra code:
+
+/*
+ * We could use i_version alone as the change attribute.  However, i_version
+ * can go backwards on a regular file after an unclean shutdown.  On its own
+ * that doesn't necessarily cause a problem, but if i_version goes backwards
+ * and then is incremented again it could reuse a value that was previously
+ * used before boot, and a client who queried the two values might incorrectly
+ * assume nothing changed.
+ *
+ * By using both ctime and the i_version counter we guarantee that as long as
+ * time doesn't go backwards we never reuse an old value. If the filesystem
+ * advertises STATX_ATTR_CHANGE_MONOTONIC, then this mitigation is not
+ * needed.
+ *
+ * We only need to do this for regular files as well. For directories, we
+ * assume that the new change attr is always logged to stable storage in some
+ * fashion before the results can be seen.
+ */
+u64 nfsd4_change_attribute(const struct kstat *stat, const struct inode *inode)
+{
+
+though I guess complication here would be striped directories as there's more than one lock guarding e.g. readdir cache potentially.
+
+--- Comment (green, Wed, 6 Aug 2025 01:04:36 +0000) ---
+in a way i_version is not very important I think (if we don't do clustered export which nfs v4 does not allow due to statefulness anyway).
+
+Imagine nfs cached something about an inode, then the dlm lock was dropped on nfs server/lustre client. (this might not might not be due to server side changes - could be lru or whatnot), we increase the in memory i_version anyway and as long as that inode does not disappear from cache we'll find it later and even if there were multiple changes - just the different value is enough to invalidate the cache on the nfs client inquiring about this inode - things still work normally.
+
+Overall as an nfs kludge that seems to be an ok workaround IMO, vs creating all sorts of compatibility nightmares with protocol changes to properly track i_version (note that zfs backend totally does not export it either and would need changes)
+
+--- Comment (adilger, Tue, 5 Aug 2025 22:37:46 +0000) ---
+the simpliest way here is probably to set SB_I_VERSION for Lustre and then update the blocking AST to handler in llite to increase i_version for directories when an update (or update and some other bits) lock loss.
+
+The osd-ldiskfs inode->i_version field stores the transno for the last modification to that object.  This allows VBR to determine if the inode is in the same as it was when a replayed RPC was originally sent, so we cannot change the version that is stored on the OSD side.
+
+The client does get the transno back in case of any modifying RPC sent to a file, which should match the inode version at the time of the modification, but I'm not sure if a non-modifying RPC will return the current transno of a file.
+
+I'm not very keen on SB_I_VERSION updating the client i_version to some random values on every inode change, since it would get outdated compared to the MDT inode version, and at the same time not take into account the updates to OST objects that might happen on other nodes.
+
+I think the blocking AST handler would be a minimal way to notify the client that the inode has changed, but if the DLM lock expires due to LRU age and then is changed the client will not know about it.  It would be best if there was some way to update the client version when the client gets a new DLM lock, to detect if the file was changed while it didn't have any lock.
+
+--- Comment (green, Tue, 5 Aug 2025 21:56:54 +0000) ---
+Here's a very simple reproducer that demonstrates the stale metadata issue on nfs v4, run it inside a nfs mountpoint that mounts lustre reexported via nfs v4.
+
+test.c

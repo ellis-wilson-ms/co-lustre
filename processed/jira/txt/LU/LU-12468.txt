@@ -1,0 +1,68 @@
+Key:        LU-12468
+Summary:    Add writeahead state tracking
+Link:       https://jira.whamcloud.com/browse/LU-12468
+Type:       Improvement
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Patrick Farrell
+Reporter:   Patrick Farrell
+Created:    Mon, 24 Jun 2019 16:50:20 +0000
+Updated:    Fri, 9 Jul 2021 19:55:35 +0000
+Labels:     performance
+Links:      Related: is related to  LU-12550
+
+--- Description ---
+This ticket is to add write state tracking to the current read state tracking used for writeahead.  It is called "writeahead state tracking", and attempts to predict future writes based on past writes.  Because it does not need to deal with a variable size window (where we sometimes read part of the window due to readahead limits), it can be massively simpler than the readahead code.
+
+The eventual goal of this is to recognize strided patterns, and in combination with the server reporting lock contention back to the client, do automatic lockahead.
+
+This is also being done to help start a conversation while we (mostly wshilong  ) are considering how to update/improve the readahead code.  It maybe possible to share some code, or at least an approach.
+
+--- Comment (wshilong, Wed, 3 Jul 2019 11:19:06 +0000) ---
+This makes a lot of sense to me, thanks for very much detailed explain!
+
+--- Comment (pfarrell, Mon, 1 Jul 2019 14:34:38 +0000) ---
+Hmm, so lockahead is just going to request new locks.  It's probably best to explain how I plan for that patch to work...
+
+The idea is this.
+
+The client is detecting the write pattern, using this patch.
+
+The server detects lock contention (Patch for that soon, but the definition of contention I use is "most lock requests have to cancel another lock". It's different than the existing code), and reports this to the client. (Not by returning -EUSERS and not giving a lock as in the existing code. Instead, it just sets a flag on the lock it returns.)
+
+The client notices there is contention on a file (It is passed up from the LDLM resource to the llite level). If the client is not writing in strided, it doesn't do anything. If the client is writing in strided, it does the following:
+
+1. Sets "no expand" on the file
+
+2. Requests the next few locks it expects to need, and notes that it did this. There is a window for how many locks to request.
+
+3. At the start of each write, track how many locks we've used and request more a little before we expect to need them (This assumes we are still doing strided writing)
+
+"No expand" is for the case where lockahead lock is not present for a write. The client will send a lock request for the i/o to the server. No expand means the server will not expand that request - This is necessary because otherwise the expanded lock would block lockahead requests.
+
+It's important to remember that lockahead lock requests are asynchronous and non-blocking (a lock request cannot be async and blocking due to LDLM internals). This means that when we request lockahead locks, if there is an existing lock, they will be blocked by it.
+
+So the expectation for how this works is this:
+
+Several clients are writing to a stripe, in strided mode. They are getting large locks, one at a time, and exchanging them back and forth.
+
+The server reports contention. Some clients notice before others.
+
+The clients which notice go in to lockahead mode. Often, their first few lock requests will be blocked by a client that is not in lockahead mode yet. But fairly quickly, all of the clients receive the contention notice, and all begin doing lockahead. If there is an existing lock when this starts, the first few lockahead requests are lost, but then that lock is cancelled by the 'normal' lock request done as part of an i/o (this is an i/o that wanted to use a lockahead lock, but the lockahead request failed so it does not). This request is "no expand", so it cancels the existing "big" lock, but is not expanded, clearing the file for future lockahead requests.
+
+So when contention is first detected, there is a moment where the clients switch to the lockahead pattern and some requests are wasted, but very quickly they settle in to the new pattern. (Note that this means the server will no longer report contention. This is OK - The client does not care, it will continue to do lockahead as long as it detects the strided pattern. If the server stops reporting contention before one client talks to it, so one client does not switch to lockahead mode, that client will cause contention and so will also switch. [blocked lockahead requests count towards 'contention'])
+
+Giving the client control over what to do lets the client pick a good optimization when contention occurs. In the case of totally random i/o, the client might want to switch to lockless - once it's fixed - but the point is the client has the required information to do that.
+
+So to your question:
+
+Lockahead is just going to ask for locks where the client plans to write. It will not do anything to the gaps. Other clients will be responsible for those. Does that make sense? (It would be nice to do blocking async requests, but the LDLM problem that prevents this is very tricky.)
+
+--- Comment (wshilong, Mon, 1 Jul 2019 07:02:56 +0000) ---
+Patrick,
+
+   I though that for lockahead purpose, we need not only detect gap, but also exact consecutive write bytes, the exact consecutive write bytes shall be where we should grab lock, and gap is area where lock should be invalidated.
+
+--- Comment (pfarrell, Mon, 24 Jun 2019 16:52:48 +0000) ---
+https://review.whamcloud.com/35286

@@ -1,0 +1,238 @@
+Key:        LU-12362
+Summary:    kernel warning 'do not call blocking ops when !TASK_RUNNING ' in ptlrpcd
+Link:       https://jira.whamcloud.com/browse/LU-12362
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   James A Simmons
+Reporter:   Ruth Klundt
+Created:    Thu, 30 May 2019 18:43:36 +0000
+Updated:    Tue, 29 Nov 2022 09:07:54 +0000
+Resolved:   Sun, 10 Oct 2021 13:44:25 +0000
+Labels:     arm
+Links:      Blocker: is blocking LU-10756; Related: is related to  LU-10756; Related: is related to  LU-10467; Related: is related to  LU-10300; Related: is related to LU-12431; Related: is related to LU-12511
+
+--- Environment ---
+ARM client running TOSS kernel 4.14.0-115.6.1.1chaos.ch6a.aarch64
+
+--- Description ---
+kernel: do not call blocking ops when !TASK_RUNNING; state=1 set at ] ptlrpcd+0x410/0x5c0 [ptlrpc]
+kernel: ------------[ cut here ]------------
+kernel: WARNING: CPU: 35 PID: 14128 at kernel/sched/core.c:5988 __might_sleep+0x84/0x8c
+
+--- Comment (gerrit, Sun, 10 Oct 2021 03:30:46 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/45069/
+
+Subject: LU-12362 ptlrpc: use wait_woken() in ptlrpcd()
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 885b494632ca16d95fd09685a571b76d80d09414
+
+--- Comment (xinliang, Wed, 29 Sep 2021 09:44:31 +0000) ---
+Thanks Neil's patch, "wait_woken"  should fix such using sleeping locking in sleeping(a.k.a nested sleeping primitives) context issues. See more details here: https://lwn.net/Articles/628628/. I wonder if there is other wait event place in Lustre need to be fix too, as only opening the kernel debug option (CONFIG_DEBUG_ATOMIC_SLEEP) this warning will print.
+
+--- Comment (gerrit, Tue, 28 Sep 2021 05:28:38 +0000) ---
+"Neil Brown " uploaded a new patch: https://review.whamcloud.com/45069
+
+Subject: LU-12362 ptlrpc: use wait_woken() in ptlrpcd()
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 296a0dd12f4e5c7f0615d8cd00a983ecf0b59ab3
+
+--- Comment (neilb, Tue, 28 Sep 2021 00:52:26 +0000) ---
+It turns out that this is really easy to fix.  Since Linux 3.19 we have had a "wait_woken" function.
+
+This effective implements that "change every place that calls wake_up in ->set_wait to also set a flag." option that I have above.
+
+The "wake_up" is made to call woken_wake_function which sets WQ_FLAG_WOKEN, and wait_woken() waits for that flag to be set, then clears it.
+
+The only difficult part of adding that functionality for older kernels (do we still support kernels before 3.19??).  Apart from that, the patch is "1 file changed, 19 insertions, 8 deletions"
+
+--- Comment (pfarrell, Mon, 17 Jun 2019 15:52:58 +0000) ---
+Thanks for weighing in, Neil.
+
+I think either is fine, my glance through the code suggested that the 'condition' being checked is kind of complicated.  Perhaps there is some simplification I missed, but it seemed like there were various ways/reasons it would decide it had nothing to do.
+
+--- Comment (neilb, Sun, 16 Jun 2019 23:25:37 +0000) ---
+That code is rather convoluted...
+
+The possible problem here is that the wait loop could spin rather than waiting.  If the 'condition' ever comes close to sleeping, it will reset the task state to RUNNING and the subsequent schedule() call will do nothing, causing l_wait_event() to loop around and call the condition() function again.
+
+If the condition() does this every time through, then the wait loop becomes a busy-wait.  If it only does it occasionally, then there is no real problem.
+
+I can see two approaches to "fixing" it.
+
+One is to change every place that calls wake_up in ->set_wait to also set a flag.  Then ptlrpcd() waits for that flag to be set, then calls ptlrpcd_check().
+
+The other is to factor out the checks in ptlrpcd_check() from the work.  Then do the work before calling l_wait_event(), then just do the checks inside l_wait_event().
+
+I couldn't suggest which is better without first following through all the code and working out that it is really doing.
+
+--- Comment (pfarrell, Wed, 5 Jun 2019 20:23:05 +0000) ---
+So the problem is we're calling ptlrpcd_check() as the condition, and it sends RPCs, etc, rather than just checking a condition.
+
+BTW, in case anyone else was going to check, Neil didn't fix this for us already (: ) ):
+
+http://lists.lustre.org/pipermail/lustre-devel-lustre.org/2018-February/006500.html
+
+--- Comment (pfarrell, Wed, 5 Jun 2019 20:19:21 +0000) ---
+Yes, that's the main thing, and that's a shame that it's not in RHEL 7.
+
+Oh, this is interesting - Actually, wait_event() has the same behavior.  It calls condition() after setting task_state to whatever has been requested.  So, actually, I think the problem might be with the nature of our condition().  So in fact we'd still have this problem even with Neil's patch.  My bad.
+
+In fact, now that I look at it, our condition here is pretty weird.  It's using condition() to do the main work of the loop.
+
+Having sampled about 20-30 of the uses of l_wait_event in Lustre, this is the only one I can find where condition() is anything more than trivial.  Most of them are a single read of some variable, others are trivial state checking functions.
+
+So I'd say we're pretty clearly misusing condition() here, and we need to move the work of this function out of the condition().
+
+--- Comment (adilger, Wed, 5 Jun 2019 20:05:57 +0000) ---
+I think it's too early for us to be able to give up RHEL7...  One option would be to map wait_event_idle_*() to an equivalent l_wait_event() implementation so that we can migrate the code over to kernel style without dropping support.  I suspect that would likely need several patches to change from setting the "style" of wait in LWI to being arguments to differently-named functions.
+
+--- Comment (simmonsja, Wed, 5 Jun 2019 18:46:45 +0000) ---
+To my understanding the key to using wait_event_idle*() that landed upstream in 4.17 is that it used the TASK_IDLE state. That was introduced with kernel commit 
+
+80ed87c8a9ca0cad7ca66cf3bbdfb17559a66dcf
+
+ 
+
+Looking at the RHEL7 kernel code I don't see that handling  It was introduce in kernel version 4.1-rc4. So pretty much its supported every where but RHEL7.
+
+--- Comment (pfarrell, Wed, 5 Jun 2019 15:55:36 +0000) ---
+Right, so he submitted the new variants upstream and also stuck them in to his Lustre separately while waiting for them to land (partly because he wasn't sure he could get them landed without Lustre to use them).
+
+I'm pretty sure the only thing we need is the new task state for that wait without load behavior - Which I believe is in RHEL7, but I will have to double check.  (Neil didn't add that.)
+
+--- Comment (adilger, Wed, 5 Jun 2019 15:24:24 +0000) ---
+One of the reasons l_wait_event() was written is that the upstream kernel didn't have the proper primitives for a service thread to wait without increasing the load. Also, l_wait_event() will wake one thread exclusively to process an incoming request, rather than waking all of them each time. 
+
+I recall that he added a wait_event_*() variant to handle the first case, but we need to check what kernel that went into, and whether it was backporred to RHEL7.  Without that the MDS and OSS would always show a load of 500 due to sleeping service threads, and clients would always have a load of +10 or so due to LDLM and other client threads running/sleeping.
+
+--- Comment (pfarrell, Wed, 5 Jun 2019 14:57:13 +0000) ---
+The final version of Neil's patches is here:
+
+http://lists.lustre.org/pipermail/lustre-devel-lustre.org/2018-February/thread.html#6510
+
+First one in the series is here:
+
+http://lists.lustre.org/pipermail/lustre-devel-lustre.org/2018-February/006479.html
+
+--- Comment (pfarrell, Wed, 5 Jun 2019 14:56:39 +0000) ---
+So to summarize, this is existing (for a very long time) Lustre behavior which is not actually a problem, but it trips up a sanity check in newer kernels because what we do here is technically incorrect.  There's no functional bug here, in that nothing is going to go wrong, but we obviously don't want Lustre tripping sanity checks and printing errors.  The easy fix is to switch ourselves to using the kernel wait infrastructure, which Neil has done the heavy lifting for already.
+
+So, ruth.klundt@gmail.com, nothing for you to worry about operationally, but this is something we should address.
+
+When I get a little time, I'll look at how much work it will be to bring Neil's patches in.  There will be some drift from what he applied them to, and he also didn't do server code, so this might be a fair bit of work.  It's a good thing to do - it's much nicer not to open code basic functionality like this, now that the kernel has what we need - but it's going to take a bit.
+
+--- Comment (pfarrell, Wed, 5 Jun 2019 14:52:21 +0000) ---
+OK, I think I've figured this out.  This is a check which is not present in older kernels.
+
+The messages here contain clues:
+
+ "kernel: do not call blocking ops when !TASK_RUNNING; state=1 set at [] ptlrpcd+0x410/0x5c0 [ptlrpc]"
+
+In particular, it points out where the state is stat - ptlrpcd+0x410.  I don't have the modules in use here, but there's only one call in ptlrpcd() that should do that, it's l_wait_event.
+
+                l_wait_event(set->set_waitq, ptlrpcd_check(&env, pc), &lwi);
+
+And we see that ptlrpcd_check() is the condition() for this wait_event, and that's the function in the stack trace for the warning.
+
+Looking at l_wait_event, we indeed call condition() with TASK_INTERRUPTIBLE set.  The obvious solution to simple change the task state before calling condition().
+
+The problem is this subtle race condition described in the code means we can't:
+
+/* To guarantee that the condition check will be done */ \
+ /* after setting the thread state as TASK_INTERRUPTIBLE. */ \
+ /* Otherwise, out-of-order execution may cause some race. */ \
+ /* Consider the following real execution order: */ \
+ \
+ /* 1. Thread1 checks condition on CPU1, gets false. */ \
+ /* 2. Thread2 sets condition on CPU2. */ \
+ /* 3. Thread2 calls wake_up() on CPU2 to wake the threads */ \
+ /* with state TASK_INTERRUPTIBLE | TASK_UNINTERRUPTIBLE. */ \
+ /* But the Thread1's state is TASK_RUNNING at that time. */ \
+ /* 4. Thread1 sets its state as TASK_INTERRUPTIBLE on CPU1, */ \
+ /* then schedule. */ 
+
+(from __l_wait_event definition in lustre_lib.h)
+
+So we can't switch the state before calling condition().
+
+I thought about this for a few minutes and there's no obvious way to fix it in the code...  However, we've got another option entirely.
+
+Recently(-ish), Neil Brown removed l_wait_event and replaced it with the kernel wait_event() macros.
+
+Presumably, these macros do not have this problem with how they call their condition, since they're in the upstream kernel.  We could try to figure out what's different and incorporate it in our code, but I think it's much saner to just bring Neil's patches (which also fix a few other small things) in to our tree.
+
+I'm going to add another message here with a summary.
+
+--- Comment (adilger, Thu, 30 May 2019 23:21:48 +0000) ---
+This error seems very strange.  How can the task not be "running" when it is clearly running and calling this function?  Is it possible that the task state has been changed and not reset once it is woken up, or set too early before it is scheduled?
+
+--- Comment (simmonsja, Thu, 30 May 2019 18:55:23 +0000) ---
+I have seen this in the upstream kernel.
+
+--- Comment (ruth.klundt@gmail.com, Thu, 30 May 2019 18:44:13 +0000) ---
+kernel: do not call blocking ops when !TASK_RUNNING; state=1 set at [] ptlrpcd+0x410/0x5c0 [ptlrpc]
+kernel: ------------[ cut here ]------------
+kernel: WARNING: CPU: 35 PID: 14128 at kernel/sched/core.c:5988 __might_sleep+0x84/0x8c
+kernel: Modules linked in: mgc(OE) lustre(OE) lmv(OE) mdc(OE) fid(OE) osc(OE) lov(OE) fld(OE) ko2iblnd(OE) ptlrpc(OE) obdclass(OE) lnet(OE) libcfs(OE) 8021q garp mrp stp llc rdma_ucm(OE) ib_ucm(OE) rdma_cm(OE) iw_cm(OE) ib_ipoib(OE) ib_cm(OE) ib_umad(OE) mlx5_fpga_tools(OE) mlx4_en(OE) mlx4_ib(OE) mlx4_core(OE) crc32_ce ghash_ce sha2_ce sha256_arm64 sha1_ce ast i2c_algo_bit ttm drm_kms_helper drm ipmi_ssif fb_sys_fops syscopyarea ipmi_devintf sysfillrect sysimgblt ipmi_msghandler sdhci_acpi sdhci mmc_core tpm_crb tpm_tis tpm_tis_core tpm gpio_xlp i2c_xlp9xx i2c_smbus sch_fq_codel binfmt_misc xpmem(OE) numatools(OE) tx2mon_kmod(OE) thunderx2_pmu_v1(OE) knem(OE) ip_tables overlay nfsv3 nfs_acl nfs lockd grace sunrpc fscache bonding mlx5_ib(OE) ib_uverbs(OE) sg ib_core(OE) mlx5_core(OE) mlxfw(OE)
+kernel:  devlink mlx_compat(OE) ptp pps_core [last unloaded: cdrom]
+kernel: CPU: 35 PID: 14128 Comm: ptlrpcd_01_27 Tainted: G           OE  ------------   4.14.0-115.6.1.1chaos.ch6a.aarch64 #1
+kernel: Hardware name: HPE Apollo 70             /C01_APACHE_MB         , BIOS L50_5.13_1.0.9 03/01/2019
+kernel: task: ffff809f5c489900 task.stack: ffff00001ac20000
+kernel: PC is at __might_sleep+0x84/0x8c
+kernel: LR is at __might_sleep+0x84/0x8c
+kernel: pc : [] lr : [] pstate: 60400009
+kernel: sp : ffff00001ac2f930
+kernel: x29: ffff00001ac2f930 x28: 0000000000000000
+kernel: x27: 0000000000000000 x26: ffff809ee011bd00
+kernel: x25: ffff808f4001f900 x24: ffff000002a672f4
+kernel: x23: 0000000000000200 x22: 00000000000000e0
+kernel: x21: 0000000000000000 x20: 00000000000001a5
+kernel: x19: ffff000008ad9aa0 x18: 0000ffffffff4a70
+kernel: x17: 00004000033e1010 x16: ffff0000082b1a9c
+kernel: x15: 00000000000403bf x14: 66663c5b20746120
+kernel: x13: 74657320313d6574 x12: 617473203b474e49
+kernel: x11: 4e4e55525f4b5341 x10: 5421206e65687720
+kernel: x9 : 0000000000000619 x8 : ffff00000854230c
+kernel: x7 : ffff809f789929d0 x6 : ffff809f789929e0
+kernel: x5 : ffff809f789929e0 x4 : 0000000000000000
+kernel: x3 : ffff809f789a9240 x2 : 04e31d2f2e594400
+kernel: x1 : 04e31d2f2e594400 x0 : 000000000000006d
+kernel: Call trace:
+kernel: Exception stack(0xffff00001ac2f7f0 to 0xffff00001ac2f930)
+kernel: f7e0:                                   000000000000006d 04e31d2f2e594400
+kernel: f800: 04e31d2f2e594400 ffff809f789a9240 0000000000000000 ffff809f789929e0
+kernel: f820: ffff809f789929e0 ffff809f789929d0 ffff00000854230c 0000000000000619
+kernel: f840: 5421206e65687720 4e4e55525f4b5341 617473203b474e49 74657320313d6574
+kernel: f860: 66663c5b20746120 00000000000403bf ffff0000082b1a9c 00004000033e1010
+kernel: f880: 0000ffffffff4a70 ffff000008ad9aa0 00000000000001a5 0000000000000000
+kernel: f8a0: 00000000000000e0 0000000000000200 ffff000002a672f4 ffff808f4001f900
+kernel: f8c0: ffff809ee011bd00 0000000000000000 0000000000000000 ffff00001ac2f930
+kernel: f8e0: ffff000008104b78 ffff00001ac2f930 ffff000008104b78 0000000060400009
+kernel: f900: ffff000002a473d0 ffff000002a473d0 ffffffffffffffff 0000000000000001
+kernel: f920: ffff00001ac2f930 ffff000008104b78
+kernel: [] __might_sleep+0x84/0x8c
+kernel: [] __kmalloc+0x174/0x2b4
+kernel: [] null_alloc_repbuf+0x164/0x518 [ptlrpc]
+kernel: [] sptlrpc_cli_alloc_repbuf+0x160/0x288 [ptlrpc]
+kernel: [] ptl_send_rpc+0x8d0/0x10d8 [ptlrpc]
+kernel: [] ptlrpc_send_new_req+0x70c/0xe70 [ptlrpc]
+kernel: [] ptlrpc_check_set+0xa6c/0x2fb0 [ptlrpc]
+kernel: [] ptlrpcd_check+0x46c/0x7b8 [ptlrpc]
+kernel: [] ptlrpcd+0x42c/0x5c0 [ptlrpc]
+kernel: [] kthread+0x118/0x144
+kernel: [] ret_from_fork+0x10/0x18
+kernel: ---[ end trace 4bc0fba0117214df ]---

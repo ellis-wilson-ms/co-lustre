@@ -1,0 +1,68 @@
+Key:        LU-2716
+Summary:    DNE on ZFS create remote directory suffers from long sync.
+Link:       https://jira.whamcloud.com/browse/LU-2716
+Type:       Bug
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Di Wang
+Created:    Tue, 11 Sep 2012 22:21:10 +0000
+Updated:    Wed, 23 Jul 2025 18:23:00 +0000
+Labels:     dne, performance, zfs
+Links:      Related: is related to  LU-4009; Related: is related to LU-19189
+
+--- Description ---
+The ZFS transaction sync operation will passively wait for a txg commit, instead of actively requesting TXG commit start before waiting.  This causes each synchronous operation to wait up to 5s for the normal txg flush.
+
+Until such a time that we have implemented Lustre ZIL support (LU-4009), it makes sense that transaction handles that are marked as synchronous start a TXG commit instead of passively waiting.  This might impact aggregate performance, but DNE operations will be relatively rare, and should not impact normal operations noticeably.  That is especially true for flash-based ZFS devices, since the IOPS to update the überblock copies at the start of each block device do not need multiple mechanical full-patter seeks, so the cost of forcing a commit is relatively low.
+
+As an optimization, there could be a "batch wait and reschedule" for TXG sync, as there is for jbd2 since commit v2.6.28-5737-ge07f7183a486 "jbd2: improve jbd2 fsync batching" so that it allows multiple active threads to join the same TXG before it is closed for commit but does not wait unnecessarily between commits.
+
+--- Comment (behlendorf, Wed, 25 Oct 2023 19:40:24 +0000) ---
+We do have a couple of options for forcing more frequent TXG syncs which I agree probably makes sense for Lustre on flash pools.  The easiest option which exists today would be to reduce the zfs "zfs_txg_timeout" kmod option.  This option ensures a txg sync happens at least even N seconds (default 5).  It'd be easy to tweak that option to allow a time in milliseconds to be set to experiment with.  My major concern would be that a full TXG sync can is a pretty heavy weight operation, and we want to allow as much async batching as possible.  Even on flash.  Forcing constant, frequent TXG syncs would also probably hurt resilver and scrub speeds which run as part of the txg_sync process and expect typical multi-second TXG sync times.  While I'm sure we could account for this, it seems like this could badly throw off the jbd2 algorithm.
+
+Another option might be for Lustre to call the ZFS txg_kick() function when it needs a TXG sync to happen immediately.  You could call this for the relevant DNE operations, and even do your own intelligent batching at the Lustre layer.  We don't currently export this symbol, but we could.
+
+You an always dump the /proc/spl/kstat/zfs//txgs proc file to get an idea of how often and how long TXG syncs are taking.
+
+--- Comment (adilger, Wed, 25 Oct 2023 04:53:03 +0000) ---
+behlendorf, I came across this issue again in a discussion about DIO performance from clients, which require server transaction commits before they complete.  In the absence of ZIL support, I think it would be fairly easily to change the code to frequently force TXG commits on flash VDEVs, and I think this would dramatically improve DNE operations for ZFS storage.  The algorithm in kernel commit v2.6.28-5737-ge07f7183a486 "jbd2: improve jbd2 fsync batching" is a fairly simple way to decide how frequently to start a TXG commit based on the latency of the underlying storage.  However, instead of checking the PID of the thread doing the sync write, it probably makes sense to use the client NID or similar to detect serial writers.
+
+--- Comment (bzzz, Wed, 25 Oct 2023 04:33:52 +0000) ---
+static boolean_t
+txg_wait_synced_impl(dsl_pool_t *dp, uint64_t txg, boolean_t wait_sig)
+{
+	tx_state_t *tx = &dp->dp_tx;
+
+	ASSERT(!dsl_pool_config_held(dp));
+
+	mutex_enter(&tx->tx_sync_lock);
+	ASSERT3U(tx->tx_threads, ==, 2);
+	if (txg == 0)
+		txg = tx->tx_open_txg + TXG_DEFER_SIZE;
+	if (tx->tx_sync_txg_waiting tx_sync_txg_waiting = txg;
+
+...
+
+then the sync thread:
+
+		/*
+		 * We sync when we're scanning, there's someone waiting
+		 * on us, or the quiesce thread has handed off a txg to
+		 * us, or we have reached our timeout.
+		 */
+		timer = (delta >= timeout ? 0 : timeout - delta);
+		while (!dsl_scan_active(dp->dp_scan) &&
+		    !tx->tx_exiting && timer > 0 &&
+		    tx->tx_synced_txg >= tx->tx_sync_txg_waiting &&
+		    !txg_has_quiesced_to_sync(dp)) {
+			dprintf("waiting; tx_synced=%llu waiting=%llu dp=%p\n",
+			    (u_longlong_t)tx->tx_synced_txg,
+			    (u_longlong_t)tx->tx_sync_txg_waiting, dp);
+			txg_thread_wait(tx, &cpr, &tx->tx_sync_more_cv, timer);
+			delta = ddi_get_lbolt() - start;
+			timer = (delta > timeout ? 0 : timeout - delta);
+		}
+
+I don't think that we do wait passively

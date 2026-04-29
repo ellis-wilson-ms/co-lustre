@@ -1,0 +1,154 @@
+Key:        LU-1573
+Summary:    avoid data corruption for direct io data
+Link:       https://jira.whamcloud.com/browse/LU-1573
+Type:       Bug
+Priority:   Critical
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Alex Zhuravlev
+Reporter:   Alexey Lyashkov
+Created:    Wed, 27 Jun 2012 03:51:08 +0000
+Updated:    Fri, 3 Feb 2017 00:43:46 +0000
+Resolved:   Fri, 3 Feb 2017 00:43:46 +0000
+
+--- Environment ---
+any lustre version
+
+--- Description ---
+when we call a shutdown (without -f) we a set a 'notransno' flag to put all requests in replay queue.
+
+case 'A':
+                                LCONSOLE_WARN("Failing over %s\n",
+                                              obd->obd_name);
+                                obd->obd_fail = 1;
+                                obd->obd_no_transno = 1;
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+if that will be raced with obd_commitrw_write() which process a DIO request - reply will be sent without last_commited trasno update.
+
+ptlrpc client will be put that request in replay queue as transno > last_commited and send a completion event to user land application... we have a request with brw pages directly pointed in user data in replay queue.
+
+OOPS.
+
+If user land application will be reused a same buffer for different data after exit from write(2) call, ptlrpc will started to replay that request, but send a invalid data to the OST. so we a corrupt data on OST side.
+
+replicate that bug is very easy.
+
+use lctl --device notransno command and use directio write. that will don't blocked and exited - but ptlrpc request will have a pointer to userspace.
+
+we found that bug in testing DIO under failover.
+
+we call a default replay_barier / fail functions on ost side and see - sometimes file a corrupted.
+
+corruption fully addressed to the requests replayed after reconnect.
+
+after disable sending a reply from a OST to the client for sync journal case - we have found that bug fixes,
+
+but looks it's affected not just testing environment - but race window be smaller.
+
+--- Comment (pjones, Fri, 3 Feb 2017 00:43:46 +0000) ---
+Landed for 2.10
+
+--- Comment (gerrit, Fri, 3 Feb 2017 00:26:53 +0000) ---
+Oleg Drokin (oleg.drokin@intel.com) merged in patch https://review.whamcloud.com/16680/
+
+Subject: LU-1573 recovery: Avoid data corruption for DIO during FOFB
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 1d2fbade1b658db4386091e7938d9483f7aa4a05
+
+--- Comment (gerrit, Wed, 18 Jan 2017 17:18:24 +0000) ---
+James Nunez (james.a.nunez@intel.com) uploaded a new patch: https://review.whamcloud.com/24940
+
+Subject: LU-1573 test: replay-ost-single test_9 issue extra write
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: a9a40f1130d2355443b0a08f77c21135f2ff7a66
+
+--- Comment (shadow, Fri, 26 Apr 2013 06:54:54 +0000) ---
+so my original patch looks fine. that is drop a reply for a no trasno mode, simulating to waiting a commit from journal and prevent a moving from sending to replay list.
+
+--- Comment (bzzz, Fri, 26 Apr 2013 05:51:29 +0000) ---
+as per discussion with Alexey at LUG: DIO should be waiting for IO completion on OST (otherwise it can get stuck awaiting for last transno to be transfered by ping), given so it makes sense to set transno to 0 in this case.
+
+--- Comment (bzzz, Wed, 27 Mar 2013 08:46:16 +0000) ---
+you're confusing last_committed (which we do not update when notransno flag is set) and per-rpc transno which we set always:
+
+void target_committed_to_req(struct ptlrpc_request *req)
+
+{
+
+        struct obd_export *exp = req->rq_export;
+
+        if (!exp->exp_obd->obd_no_transno && req->rq_repmsg != NULL)
+
+                lustre_msg_set_last_committed(req->rq_repmsg,
+
+                                              exp->exp_last_committed);
+
+--- Comment (shadow, Wed, 27 Mar 2013 08:40:15 +0000) ---
+when we have set a no_trasno - we have stop sending a transo updates to a clients (same way used to create recovery barrier in tests). after it - all requests put in recovery queue as rq_transno isn't less then last_transo from a clients. Ptlrpc don't have a differences between buffered write (where kernel have a copy of userspace data) and DIO - don't have a copy and have a direct pointer to userspace. both types of requests put in replay queue to able to replay after fail.
+
+that description enough? or that is fixes in 2.4 in different way? may you verify DIO requests don't put in recovery queue after recovery barrier?
+
+--- Comment (bzzz, Fri, 15 Mar 2013 07:08:27 +0000) ---
+sorry, I don't follow... it doesn't matter where the buffers are, imo. sync request means OST replies when the write is committed. in turn, this mean recovery/replay is not needed in the first place. then setting transno to 0 should be enough.
+
+--- Comment (shadow, Fri, 15 Mar 2013 07:02:33 +0000) ---
+Alex,
+
+that is not enough because DIO page have a pointer to user page, instead of buffered IO have a copy user data inside.
+
+if you set a transno to zero - you will leave that is from recovery so if we have uncommited data we will lost these changes.
+
+--- Comment (bzzz, Tue, 18 Dec 2012 03:15:08 +0000) ---
+not sure what's expected in this ticket.. as I said before, if RPC is not a subject to replay, then just do not set transno in reply.
+
+--- Comment (nrutman, Wed, 21 Nov 2012 18:50:10 +0000) ---
+Xyratex-bug-id: MRP-542
+
+--- Comment (bzzz, Thu, 5 Jul 2012 02:45:20 +0000) ---
+for sync request transno makes no sense, IMHO.
+
+--- Comment (shadow, Thu, 5 Jul 2012 02:43:43 +0000) ---
+Alex,
+
+for sync requests - we need always reply with request transno <= committed transno, or don't send reply at all.
+
+or provide more changes on client side to avoid moving that requests from sending to replay list.
+
+--- Comment (green, Thu, 5 Jul 2012 02:17:16 +0000) ---
+I personally think this is not really a "critical" issue.
+
+Sure the corruption is real, but the condition is not all that normal.
+
+It requires a lustre umount (a soft failover) that's hopefully a pretty rare operation. Typically a node just dies and that's it.
+
+Soft failovers are usually only done in testing for simplicity and speed, or for administrative reasons.
+
+I guess the only case not like this is the fail back once the primary node comes back online.
+
+--- Comment (bzzz, Thu, 5 Jul 2012 01:22:00 +0000) ---
+shouldn't we just always set transno to 0 on OSS side for sync requests?
+
+--- Comment (adilger, Wed, 4 Jul 2012 17:24:56 +0000) ---
+Alex, I was looking to see how this would apply to OFD/osd-ldiskfs/osd-zfs, but it is not at all obvious due to changes in this code.
+
+Could you (or Mike, as you see fit) please look into porting this patch for the updated OFD/OSD code.
+
+--- Comment (shadow, Wed, 27 Jun 2012 06:27:51 +0000) ---
+remote:   http://review.whamcloud.com/3197
+
+remote: 
+
+patch created as port of 2.1 code, so question about create same for osd_io.c and possible for osd-zfs.

@@ -1,0 +1,139 @@
+Key:        LU-2272
+Summary:    BUG: spinlock cpu recursion on CPU#2, ll_sa_30972/30992
+Link:       https://jira.whamcloud.com/browse/LU-2272
+Type:       Bug
+Priority:   Critical
+Status:     Resolved
+Resolution: Duplicate
+Assignee:   Lai Siyao
+Reporter:   Oleg Drokin
+Created:    Sat, 3 Nov 2012 20:28:48 +0000
+Updated:    Fri, 11 Dec 2015 15:49:07 +0000
+Resolved:   Sun, 22 Sep 2013 13:47:21 +0000
+
+--- Description ---
+Running racer with a debugging kernel on master I hit this condition:
+
+[ 8529.226634] BUG: spinlock cpu recursion on CPU#2, ll_sa_30972/30992 (Not tainted)
+[ 8529.227125]  lock: ffff88009cb38eb8, .magic: dead4ead, .owner: ptlrpcd_2/7457, .owner_cpu: 2
+[ 8529.227595] Pid: 30992, comm: ll_sa_30972 Not tainted 2.6.32-debug #6
+[ 8529.227874] Call Trace:
+[ 8529.228084]  [] ? spin_bug+0xaa/0x100
+[ 8529.228342]  [] ? _raw_spin_lock+0x121/0x180
+[ 8529.228610]  [] ? _spin_lock+0xe/0x10
+[ 8529.228892]  [] ? do_statahead_interpret+0x4c/0xdd0 [lustre]
+[ 8529.229426]  [] ? remove_wait_queue+0x3c/0x50
+[ 8529.229718]  [] ? ll_statahead_thread+0xcda/0xf40 [lustre]
+[ 8529.230008]  [] ? default_wake_function+0x0/0x20
+[ 8529.230293]  [] ? ll_statahead_thread+0x0/0xf40 [lustre]
+[ 8529.230577]  [] ? child_rip+0xa/0x20
+[ 8529.230844]  [] ? ll_statahead_thread+0x0/0xf40 [lustre]
+[ 8529.231142]  [] ? ll_statahead_thread+0x0/0xf40 [lustre]
+[ 8529.231429]  [] ? child_rip+0x0/0x20
+
+--- Comment (gerrit, Tue, 24 Feb 2015 08:41:38 +0000) ---
+Jian Yu (jian.yu@intel.com) uploaded a new patch: http://review.whamcloud.com/13846
+
+Subject: LU-2272 statahead: ll_intent_drop_lock() called in spinlock
+
+Project: fs/lustre-release
+
+Branch: b2_5
+
+Current Patch Set: 1
+
+Commit: 668bbb377ab45b9e863844406682c865de684b66
+
+--- Comment (pjones, Sun, 22 Sep 2013 13:47:21 +0000) ---
+ok thanks!
+
+--- Comment (laisiyao, Sun, 22 Sep 2013 13:42:45 +0000) ---
+Yes, Peter. LU-3270 fixed a number of statahead bugs which including this one.
+
+--- Comment (pjones, Sun, 22 Sep 2013 13:34:53 +0000) ---
+Lai
+
+So can we duplicate this ticket into LU-3270?
+
+Peter
+
+--- Comment (laisiyao, Tue, 10 Sep 2013 05:06:28 +0000) ---
+The above patch is abandoned, and the fix is included in http://review.whamcloud.com/#/c/6392/.
+
+--- Comment (laisiyao, Wed, 22 May 2013 08:11:19 +0000) ---
+The fix will modify the same code of patch for LU-3270, so I based this fix on LU-3270: http://review.whamcloud.com/#change,6413
+
+--- Comment (pjones, Tue, 21 May 2013 17:53:05 +0000) ---
+Lai
+
+Are you able to advise on this one?
+
+Thanks
+
+Peter
+
+--- Comment (green, Tue, 21 May 2013 15:49:36 +0000) ---
+Ok, I finally got to the root of it.
+
+The reason we got it is in ll_statahead_interpret we sleep under spinlock:
+
+crash> bt 21485
+PID: 21485  TASK: ffff8800b2906540  CPU: 7   COMMAND: "ptlrpcd_4"
+ #0 [ffff8800b098f930] schedule at ffffffff814fae3a
+ #1 [ffff8800b098f9f8] __cond_resched at ffffffff810644ea
+ #2 [ffff8800b098fa18] _cond_resched at ffffffff814fb840
+ #3 [ffff8800b098fa28] __kmalloc at ffffffff811686d0
+ #4 [ffff8800b098fa78] cfs_alloc at ffffffffa0b0cb90 [libcfs]
+ #5 [ffff8800b098faa8] ldlm_bl_to_thread at ffffffffa1268cc1 [ptlrpc]
+ #6 [ffff8800b098fbb8] ldlm_bl_to_thread_lock at ffffffffa1269219 [ptlrpc]
+ #7 [ffff8800b098fbc8] ldlm_lock_decref_internal at ffffffffa1246ccd [ptlrpc]
+ #8 [ffff8800b098fc28] ldlm_lock_decref at ffffffffa1247d69 [ptlrpc]
+ #9 [ffff8800b098fc58] ll_intent_drop_lock at ffffffffa07dac8d [lustre]
+#10 [ffff8800b098fc88] ll_statahead_interpret at ffffffffa0838e66 [lustre]
+#11 [ffff8800b098fce8] mdc_intent_getattr_async_interpret at ffffffffa0dea4a2 [mdc]
+#12 [ffff8800b098fd68] ptlrpc_check_set at ffffffffa12804e2 [ptlrpc]
+#13 [ffff8800b098fe08] ptlrpcd_check at ffffffffa12adc5b [ptlrpc]
+#14 [ffff8800b098fe68] ptlrpcd at ffffffffa12ae1a3 [ptlrpc]
+#15 [ffff8800b098ff48] kernel_thread at ffffffff8100c10a
+
+While I mostly hit the warnings like in this ticket, right now I got a deadlock, and that's how I finally found this issue.
+
+offending code:
+
+                        entry->se_minfo = minfo;
+                        entry->se_req = ptlrpc_request_addref(req);
+                        /* Release the async ibits lock ASAP to avoid deadlock
+                         * when statahead thread tries to enqueue lock on parent
+                         * for readpage and other tries to enqueue lock on child
+                         * with parent's lock held, for example: unlink. */
+                        entry->se_handle = it->d.lustre.it_lock_handle;
+can sleep!!! =>         ll_intent_drop_lock(it);
+                        wakeup = sa_received_empty(sai);
+                        cfs_list_add_tail(&entry->se_list,
+                                          &sai->sai_entries_received);
+                }
+                sai->sai_replied++;
+                spin_unlock(&lli->lli_sa_lock);
+
+--- Comment (green, Tue, 11 Dec 2012 15:24:15 +0000) ---
+I just had this hit again in my racer testing on veryfresh master:
+
+Dec 11 15:15:42 centos6-8 kernel: [226594.953228] BUG: spinlock cpu recursion on CPU#0, ll_sa_13669/13959 (Not tainted)
+Dec 11 15:15:42 centos6-8 kernel: [226594.953702]  lock: ffff880018c19eb8, .magic: dead4ead, .owner: ptlrpcd_2/26580, .owner_cpu: 0
+Dec 11 15:15:42 centos6-8 kernel: [226594.954248] Pid: 13959, comm: ll_sa_13669 Not tainted 2.6.32-debug #6
+Dec 11 15:15:42 centos6-8 kernel: [226594.954815] Call Trace:
+Dec 11 15:15:42 centos6-8 kernel: [226594.955034]  [] ? spin_bug+0xaa/0x100
+Dec 11 15:15:42 centos6-8 kernel: [226594.955285]  [] ? _raw_spin_lock+0x121/0x180
+Dec 11 15:15:42 centos6-8 kernel: [226594.955548]  [] ? _spin_lock+0xe/0x10
+Dec 11 15:15:42 centos6-8 kernel: [226594.955851]  [] ? do_statahead_interpret+0x4c/0xdd0 [lustre]
+Dec 11 15:15:42 centos6-8 kernel: [226594.957300]  [] ? remove_wait_queue+0x3c/0x50
+Dec 11 15:15:42 centos6-8 kernel: [226594.957612]  [] ? ll_statahead_thread+0xcda/0xf40 [lustre]
+Dec 11 15:15:42 centos6-8 kernel: [226594.957977]  [] ? default_wake_function+0x0/0x20
+Dec 11 15:15:42 centos6-8 kernel: [226594.958317]  [] ? ll_statahead_thread+0x0/0xf40 [lustre]
+Dec 11 15:15:42 centos6-8 kernel: [226594.959502]  [] ? child_rip+0x0/0x20
+
+--- Comment (yong.fan, Sun, 4 Nov 2012 00:40:14 +0000) ---
+OK, try to reproduce by myself and dump the log.
+
+--- Comment (green, Sat, 3 Nov 2012 20:29:55 +0000) ---
+Seems to be related to statahead, so FanYong, can you please take a look?

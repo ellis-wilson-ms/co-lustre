@@ -1,0 +1,68 @@
+Key:        LU-18908
+Summary:    hsm: Add support for a data mover separate from the copytool
+Link:       https://jira.whamcloud.com/browse/LU-18908
+Type:       New Feature
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Yang Sheng
+Reporter:   Yang Sheng
+Created:    Tue, 8 Apr 2025 16:26:30 +0000
+Updated:    Sat, 6 Dec 2025 02:29:07 +0000
+Links:      Related: is related to  LU-13384; Related: is related to  LU-18842
+
+--- Description ---
+We would like to be able to split the data mover process from the process that is receiving HSM actions from the coordinator.  The coordinator agent will forward the actions to the data mover process, and the data mover will be need to be able to use the llapi_hsm_action_begin api to be able to handle and complete the actions. 
+
+In the HSM api, the hsm_copytool_private structure serves two different roles. 
+
+	It receives message from the coordinator through the kuc connection.
+
+	Saves open file descriptors used by the hsm_copyaction_private functions to process actions.
+
+I propose adding a new interface for the data mover that will only initialize the parts of struct hsm_copytool_private that are needed for the second role above.  The struct should be identical to hsm_copytool_private (we don't need additional fields at this time), but only some of the fields will be used.  Also, the MAGIC number should be different in case a mover pointer is accidentally passed where a copytool should be used.
+
+ 
+
+typedef struct hsm_copytool_private hsm_mover_private
+
+int llapi_hsm_mover_register(hsm_mover_private **mover, char *mnt);
+int llapi_hsm_mover_unregister(hsm_mover_private *mover);l
+
+// A wrapper around llapi_hsm_action_begin(), just to make it clear
+// which functions the mover is used with. 
+int llapi_hsm_mover_action_begin(truct hsm_copyaction_private **phcp, 
+                        hsm_mover_private *mover, 
+                        const struct hsm_action_item *hai,
+			int restore_mdt_index, 
+                        int restore_open_flags,
+			bool is_error);
+
+--- Comment (rread, Tue, 29 Apr 2025 20:58:23 +0000) ---
+A different approach to fixing this API was created as part of LU-13384, and also includes support user space restore. I'm not sure if we really need lfs_hsm_open_files, but it might be helpful and doesn't have to be used. This patch also changes the ioctls to be on the file instead of the root:
+
+  https://review.whamcloud.com/c/fs/lustre-release/+/38041/3/lustre/utils/liblustreapi_hsm.c#1850
+
+Could we update the this patch to be compatible with coordinator as is?
+
+--- Comment (rread, Fri, 25 Apr 2025 19:27:32 +0000) ---
+After thinking about this some more, I'd like to see if we can take this a bit further. The HSM interface provided by lustreapi is quite heavy and IMHO includes a bit too much application logic. I'd like to see if it is possible to make a new version of these action functions that are stateless and allow the data mover to handle more of the logic being done in the api. Ideally, these functions should be little more than wrappers on an ioctl (or two).
+
+One thing that concerns me is hsm_copyaction_private contains reference to the hsm_copytool_private, but there is no reference counting or syncrhonization. In a parallel data mover the copytool struct will be shared, and there appears to be nothing to prevent hsm_copytool_unregister from being called while there still actions are still being processed. It's also possible there may be other race conditions present, though not sure.
+
+The original patch on this ticket could be used as a work around by allowing an application to create a new hsm_mover_private for each thread or request. However instead of relying the api open FIDs internally (which is the main purpose of hsm_mover_private), it's also possible for the application to handle FIDs itself, and provide whatever optimizations are necessary.
+
+Here is a proposal of what this might look like without out making any changes to the kernel interface. I think each of these is providing enough information need for each of the ioctls being used. The application will need to maintain the data version as well as create the volatile file for restores, but that seems reasonable.
+
+// begin returns data_version
+int llapi_hsm_mover_action_begin(hsm_action_item * hai, __u64 *data_version);
+int llapi_hsm_mover_action_progress(hsm_action_item *hai, 
+				hsm_extent *he, 
+				int flags);
+int llapi_hsm_mover_acton_progress(hsm_action_item *hai,
+				__u64 data_version,  
+				hsm_extent *he, 
+				int flags, 
+				int errval);
+
+If the new llapi_layout_file_open_volatile in LU-18842 isn't enough for an application to create its own recovery file, then we could add something like llapi_hsm_file_open_recovery_volatile that takes a layout and does what's needed.

@@ -1,0 +1,99 @@
+Key:        LU-11333
+Summary:    Using PCC to cache whole "virtual" directories
+Link:       https://jira.whamcloud.com/browse/LU-11333
+Type:       New Feature
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Li Xi
+Created:    Wed, 5 Sep 2018 08:42:10 +0000
+Updated:    Sat, 6 May 2023 22:35:05 +0000
+Labels:     PCC
+Links:      Related: is related to  LU-10092
+
+--- Description ---
+Original PCC is able to accelerate data read/write, but not able to cache and accelerate metadata operations. In order to improve that, we are going to implement a new mode of PCC which can cache both data and metadata access/modification. Let's call it "directory mode".
+
+Following is the design:
+
+	An image will used to store all metadata and data of a virtual directory tree. Possible options could be tarball/ext4 file system image/qemu image, but tarball might be the simple choice to start with.
+
+	The image will be saved in Lustre as a normal file.
+
+	When the image is being fetched into PCC in directory mode, the image, instead of being copied into PCC, will be untar-ed into a subtree on PCC.
+
+	A virtual directory inode will be created for the PCC attached image file. The directory name will have a special subfix, e.g. if the image file has a file name of "image", the virtual directory could have a name of "image.pcc_virtdir".
+
+	The virtual directory is only a virtual inode on Lustre client side, no inode will be created on MDT.
+
+	The image file on Lustre can not be modified any more on that Lustre client, since there is a cache of the image in PCC. Nobody is able to write/read directly from the image file, instead, they need to write/read from the virtual directory.
+
+	The virtual directory points to PCC directory of the image.
+
+	All access/modification under that virtual directory will be directed to PCC. All metadata or data operations will not go to Lustre servers.
+
+	For RW-PCC. whenever another client tries to modify the image file, or try to detach the image file from PCC, the restore action will be trigerred.
+
+	During restore action, a special kinds of copytool will be used. Instead of copying data between files, the copytool will tar the PCC directory of the image file and save the data into Lustre.
+
+Everything else should be very straightfoward, except of implementing a virtual directory. And what would be even better is, we do not create new virtual inode on Lustre client, instead, we change the type of the image file of the image into directory. This has some advanges:
+
+ 
+
+1) This prevents potential conflict beteen existing file that happens to have a subffix of ".pcc_virtdir", which is not likely to happen, but still possible.
+
+2) This simplify the interface and enables transparent virtual directory. If all clients have PCC and accessing it always triggers the prefetch of the image into PCC, users/applications do not need to be aware that this image is a regular file. The image will look like directory all the time for all applications/users.
+
+But of course, this increases implementation complexity and has higher possibility of causing other problems. So, we need to balance the pros and cons here.
+
+--- Comment (adilger, Sat, 6 May 2023 22:35:05 +0000) ---
+I think it definitely would be possible in the future to cache CCI files via PCC-RO to allow keeping the image access completely local to the client. The main impediment there is that PCC-RO is not completely landed to the master branch yet...
+
+For CCI, I'm beginning to think some kind of "directory access hook" would be the right thing to implement. That would be useful for both CCI automount at directory access time, and possibly incremental HSM attacht of objects from S3 into the current directory or similar, so that a whole S3 bucket does not need to be attached into the Lustre namespace at mount time.
+
+--- Comment (JIRAUSER18433, Fri, 5 May 2023 20:52:39 +0000) ---
+Thanks for the description. I saw your LUG23 slides too (link for anyone else reading this: https://na.eventscloud.com/file_uploads/0dcd58609d320679d8241c7b03004216_LUG2023-Lustre_2.16_and_Beyond-Dilger.pdf). Both are very helpful, especially some of the diagrams. Seems like an interesting feature. I haven't seen any CCI-related patches yet - I imagine no one has worked on this? If so, I might take a look at CCIv1 post-2.16 (next month or so). I think I have a good idea of what needs to be implemented to get this working.
+
+--- Comment (adilger, Wed, 26 Apr 2023 03:48:23 +0000) ---
+Tim, I don't think I've ever written down a detailed description of the CCI feature, but it would be good to move that feature forward.
+
+The underlying CCI functionality to loopback mount ext4 (or other) filesystem images on top of Lustre already exists for decades.  This has been used by some sites to distribute thousands/millions of small files to clients in a read-only manner, using job preamble scripts to do the mount/unmount for specific workloads.
+
+The automation of the client mount/unmount process is what would make CCI usable for regular users.  That is the first stage of the feature development, and should not require a lot of detailed Lustre knowledge.  I've been thinking that the image file would be stored inside the directory where it is mounted, and then after losetup it would be mounted onto the directory to "protect" the image file from further access on that client until it is unmounted (automatically after some idle time, or eventually under contention from other clients).  The file and directory would need a flag set (e.g. in the file layout) when it is "attached" so that the client knows to losetup+mount the file on access rather than just accessing the directory and file normally.  This would allow multi-client read-only mounting (maybe safest if the file is marked immutable at this point), or single-client read-write mounting of the CCI file (e.g. to format it initially and populate the data).  There would need to be some exclusion of other clients if a client has the image mounted read-write (e.g. group lock), so that other clients are not able to mount or modify it, otherwise the image would be corrupted by multiple writers, or the read-only clients would not see consistent blocks if the write-once client did not unmount or remount read-only.
+
+This would allow clients read-only shared mounting functionalty.  The next stage for shared read-write access to the CCI file would be to mount it internally on the MDS, similar to an MDT with DoM files, and then re-export it to clients.  This would only work for ldiskfs/ext4 filesystem images, and possibly some pre-processing would be needed in order to allow the re-export to work (e.g. run e2fsck and/or LFSCK over the image to fix errors, allocate a SEQ number for the image and add FIDs to the files and directory entries, add last_rcvd and other recovery logs, etc.)
+
+Any changes done to "Lustre-ify" the image shouldn't do anything to "permanently disfigure" it, since the image still needs to work directly on the client.  Likely all of the Lustre-specific information could be stored in a .lustre_cci hidden directory in the root of the image, or similar.  The MDS also needs to avoid bad actors trying to mount a malicious or  (intentionally or unintentionally) corrupted image.  The MDS would handle client requests (using a DoM-only non-DNE layout) so the files and directories remain in a normal tree local to the CCI file, until such a time that the CCI becomes idle and can be mounted directly on clients again.
+
+--- Comment (JIRAUSER18433, Tue, 25 Apr 2023 02:37:46 +0000) ---
+Is there an LU ticket tracking Client Container Image? I saw it mentioned on one of the mailing lists, but I had trouble finding anything besides some old slides: https://www.eofs.eu/_media/events/lad18/16_andreas_dilger_lad2018-lustre_2.12_and_beyond.pdf
+
+--- Comment (adilger, Tue, 25 Aug 2020 22:06:21 +0000) ---
+This seems very similar to Client Container Image.  Rather than using a tarball (which is not a very convenient container for random IO access), CCI proposes to use an ldiskfs filesystem image.  That allows random read/write within the container, and does not require full tar/untar before any of the contents can be used.  For Lustre CCI would be stored as a regular file, so it could be cached with PCC in the same way as any other file, with the main difference being that the client would directly automount the CCI via loopback to present the contents to userspace.  CCI also can be used both with or without PCC, and it could be exported directly from the MDS in shared access mode, if needed.
+
+--- Comment (lixi_wc, Tue, 25 Dec 2018 12:01:08 +0000) ---
+Some simple description of the raw design:
+
+When Run "lfs pcc_attach -dir $fpath" to attach the file $fpath to PCC directory, do the following:
+
+1. In HSM copytool, untar the $fpath image into PCC storage as a directory $pcc_dir
+
+2. Set a flag "pcc_mounted" to the inode of $fpath in Lustre
+
+3. create a virtual dir inode on Lustre with the same path of $fpath
+
+4. Add the dir inode of $fpath to a hash table (struct ll_inode_info->lli_pcc_children) of parent inode
+
+5. Bind mount $pcc_dir to dir inode of $fpath
+
+In Lustre, when accessing the $fpath, it will looks like a directory because:
+
+1. In ll_revalidate_nd(), check whether inode has "pcc_mounted" flag, if yes, return 0
+
+2. In ll_lookup_nd(), if the dentry name is in the hash table of parent inode, return the dir inode of $fpath rather than $fpath inode itself.
+
+--- Comment (lixi_wc, Thu, 6 Sep 2018 03:06:14 +0000) ---
+Another idea of Andreas is, not creating a virtual inode for the directory, instead, use the parent directory of the image to point to the PCC storage.
+
+For RW-PCC, we could extend this into some kind of subdirectory snapshoot. e.g. whenever a image is being restored from the PCC, instead overwrite the image, the original image will be saved as a another file. I think some kind of layout swap can be used for this, to avoid copying the data from the file. And the layout swapping might not happen during PCC detaching, it could happen druing PCC fetching.

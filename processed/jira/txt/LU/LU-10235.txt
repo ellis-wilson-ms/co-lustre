@@ -1,0 +1,285 @@
+Key:        LU-10235
+Summary:    mkdir should check for directory existence on client before taking write lock
+Link:       https://jira.whamcloud.com/browse/LU-10235
+Type:       Improvement
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Nathaniel Clark
+Reporter:   CEA
+Created:    Mon, 13 Nov 2017 15:59:51 +0000
+Updated:    Thu, 29 Feb 2024 18:27:34 +0000
+Resolved:   Thu, 20 Feb 2020 13:05:06 +0000
+Labels:     CEA
+Links:      Related: is related to LU-9193; Related: is related to LU-16405; Related: is related to LU-14017; Related: is related to LU-9133; Related: is related to LU-10262
+
+--- Description ---
+A "common" hang we have on our filesystems is when some clients experience temporary IB problems and other clients issue an occasional `mkdir -p` on a full tree.
+
+Taking an example `/mnt/lustre/path/to/dir`, basically all the active clients have a CR or PR lock on `/mnt/lustre`, but the client issuing `mkdir -p /mnt/lustre/path/to/dir` will try to get a CW lock on each intermediate directories, which makes the server recall all PR locks on very accessed base directories.
+
+Under bad weather, that recall can take time (as long as ldlm timeout), during which clients which did give the lock back will try to reestablish it and get blocked as well until that CW is granted and the no-op mkdir is done.. Which in turn can starve all the threads on the MDS in a situation with many clients and render the MDS unresponsive for a while even after resolving the IB issues.
+
+I think we would be much less likely to experience such hangs if mkdir() would, on the client side, first check with a read lock if the child directory exist before upgrading that to a write lock and sending the request to the server. If the directory already exists we can safely return EEXIST without sending mkdir to the server, in most other cases we will need to upgrade lock and send request as we currently do.
+
+This incurs a small overhead for the actual mkdir case but I believe it should be well worth it for large clusters, and in the common case a lock would already be held (if e.g. doing multiple operations on directory in a row)
+
+ 
+
+On last occurrence here we had 324 mdt0[0-3]_[0-9]* threads stuck on this trace:
+
+#0 schedule
+#1 schedule_timeout
+#2 ldlm_completion_ast
+#3 ldlm_cli_enqueue_local
+#4 mdt_object_lock0
+#5 mdt_object_lock
+#6 mdt_getattr_name_lock
+#7 mdt_intent_getattr
+#8 mdt_intent_policy
+#9 ldlm_lock_enqueue
+#10 ldlm_handle_enqueue0
+#11 tgt_enqueue
+#12 tgt_request_handle
+#3 ptlrpc_main
+#14 kthread
+#15 kernel_thread
+
+And 4 threads on this:
+
+#0 schedule
+#1 ldlm_completion_ast
+#2 ldlm_cli_enqueue_local
+#3 mdt_object_lock0
+#4 mdt_object_lock
+#5 mdt_object_find_lock
+#6 mdt_reint_create
+#7 mdt_reint_rec
+#8 mdt_reint_internal
+#9 mdt_reint
+#10 tgt_request_handle
+#11 ptlrpc_main
+#12 kthread
+#13 kernel_thread
+
+A finer examination lets us find a struct ldlm_resource in these threads, which point to a single directory (actually two in this case, we have a common directory to all users just below root here so it has just as much contention as the filesystem root itself).
+
+The ldlm_resource also has lists (lr_granted, lr_waiting) which show a few granted CR (not revoked) and a handful of PR that aren't giving lock back, and many waiting PR + a handful of CW waiting for the last granted PR to go away.
+
+ 
+
+I'm afraid I do not have exact traces of this anymore as it was on a live system and we didn't crash the MDT (+ it was on black site anyway), but if there are other things to look at I'm sure it will happen again eventually so please ask.
+
+ 
+
+Thanks,
+
+Dominique Martinet
+
+--- Comment (gerrit, Thu, 5 May 2022 06:10:41 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/41674/
+
+Subject: LU-10235 mdt: mdt_create: check EEXIST without lock
+
+Project: fs/lustre-release
+
+Branch: b2_12
+
+Current Patch Set: 
+
+Commit: 6c05c2135c4c4f0abd17cedc55f673cd28418c63
+
+--- Comment (gerrit, Mon, 15 Feb 2021 17:42:46 +0000) ---
+Etienne AUJAMES (eaujames@ddn.com) uploaded a new patch: https://review.whamcloud.com/41674
+
+Subject: LU-10235 mdt: mdt_create: check EEXIST without lock
+
+Project: fs/lustre-release
+
+Branch: b2_12
+
+Current Patch Set: 1
+
+Commit: 89e55274885d5d66712d40b173bac6b1805eaa0a
+
+--- Comment (pjones, Thu, 20 Feb 2020 13:05:06 +0000) ---
+Landed for 2.14
+
+--- Comment (gerrit, Thu, 20 Feb 2020 07:14:04 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/30880/
+
+Subject: LU-10235 mdt: mdt_create: check EEXIST without lock
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 79acb9a9e7d3c3185a047f5b067382a814c0e9e5
+
+--- Comment (tappro, Wed, 31 Jan 2018 15:39:50 +0000) ---
+Andreas, yes, these tests check just PDO lock correctness and previously -EEXIST check in code was done after the taking PDO lock so test ensures exactly that. Patch changes that to check EEXIST w/o lock, test doesn't expect that is the case and fails assuming that PDO lock does't work.
+
+The important case here about EEXIST checking is concurrent creates and it is OK with patch, because it checks EEXIST again after taking PW lock.
+
+As for rmdir vs mkdir case it doesn't work now and test is not valid with patch applied. I think that patch may disable these tests for now. I will create ticket to update tests with better conflict simulation.
+
+--- Comment (adilger, Tue, 30 Jan 2018 21:15:16 +0000) ---
+As mentioned in the patch review, there is a legitimate requirement that rmdir and mkdir operations submitted in chronological order should both succeed, even if run on different nodes.  However, the rmdir operation must have completed before the mkdir is started, rather than just submitted, or the outcome is racy and either success or -EEXIST are acceptable outcomes.  
+
+IMHO, the tests as they are written artificially block the rmdir completion, so it isn't clear that their failure indicates a bug.  The OBD_FAIL_MDS_PDO_LOCK check happens during locking, before the target file is unlinked, so it seems that these tests should be skipped for newer MDS versions that include the patch.
+
+--- Comment (martinetd, Thu, 18 Jan 2018 15:17:13 +0000) ---
+Patch makes two tests fail in sanityn (43a and 45a); basically tests expect unlink on one mount followed by mkdir on other mount to make mkdir wait until the unlink is completely done; the waiting must have been happening implicitly from the CW lock.
+
+I'm not sure where that expectation comes from? More to the point, I don't see how to work around it – waiting for other "directory write" operations finish is precisely what we do not want here.
+
+--- Comment (martinetd, Tue, 16 Jan 2018 16:36:24 +0000) ---
+mdtests results, with https://github.com/LLNL/mdtest , two 16-cores haswell VMs, llmount server mounted as tcp on both nodes.
+
+mdtest invoked on a single node with `mpirun -n 8 ./mdtest -D -i 8 -I 1000`
+
+action
+w/o patch, local mount
+w/ patch, local mount
+w/o patch, remote mount
+w/ patch, remote mount
+
+dir creation 
+ 5277/s 
+ 4266/s 
+ 3254/s 
+ 2910/s 
+
+tree creation
+ 2717/s 
+ 2554/s 
+ 1492/s 
+ 1473/s
+
+I'll have to say, I have no idea what mdtest calls "dir creation" vs "tree creation", looking with strace only seems to have one pattern of mkdir, if someone's more familiar with the tool I'd be happy to use other options.
+
+One thing to note is that the 8 parallel processes all do mkdirs in the same directory, so this is pretty much the worst case we can have with processes each waiting for each other and swapping the lock; how simple would it be to check if we already have write lock and skip the first step? (most "good" users pre-creating files do so from a single node, so it'd make sense to optimize this pattern)
+
+--- Comment (martinetd, Tue, 16 Jan 2018 15:04:36 +0000) ---
+I've tested the patch I submitted with my usual hanger:
+
+time clush -bw vm[1-131] 'seq 0 1000 | xargs -P 7 -I{} sh -c "(({}%%3==0)) && mkdir /mnt/lustre/testdir/foo 2>/dev/null || stat /mnt/lustre/testdir > /dev/null"'
+
+With 131 clients connecting to an @tcp llmount, this takes 54 seconds to run without patch and 9 seconds with patch so it's somewhat working.
+
+ I haven't tested the impact on actual useful mkdirs, in case of no contention I expect to not see much difference, but in case of a single client creating many sub-directories to a single directory we'd be getting/dropping write lock in a tight loop so there might be some non-negligible overhead. I'll report the result of an mdtest or something similar.
+
+I'm still not happy with the pathological case where clients all do check at same time and all try to get write lock afterwards - obviously this won't be much worse now than it was before, but I don't think we should be happy with that for LU-10262 as that feels like it is a common pattern for files with MPI/fortran... Would need some opinions I guess 
+
+Thanks,
+
+ – 
+
+ Dominique
+
+--- Comment (gerrit, Tue, 16 Jan 2018 14:55:31 +0000) ---
+Dominique Martinet (dominique.martinet@cea.fr) uploaded a new patch: https://review.whamcloud.com/30880
+
+Subject: LU-10235 mdt: mdt_create: check EEXIST with PR lock first
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: b7c062657e8e851d1482351872126dd54796726b
+
+--- Comment (martinetd, Fri, 22 Dec 2017 15:00:08 +0000) ---
+I've been a bit busy so didn't have as much time as I would have liked to work on this, but here's a few thoughts.
+
+ 
+
+I can confirm that the client approach works "a bit", I think the problem is that the client cache is not as populated as I thought it would be.
+
+For example, a client doing "mkdir -p /mnt/lustre/dir1/dir2/dir3" twice in a row after a fresh mount will send mkdirs the first time (obviously), but regardless of the result will also do mkdirs the second time as well - only after a proper readdir like `find /mnt/lustre` will the client recognize that the directories exist, despite having just created them/entered in them (`mkdir -p` does chdir() after each component); the inode must exist in vfs somehow just not in the right place.
+
+This behavior explains that even very commonly accessed directories right at the root of the filesystem are not considered "in cache" from this point of view, because these directories never change, they are hardcoded in user codes and it is very likely that a readdir never happened.
+
+I'm not sure if we could improve that somehow?
+
+ 
+
+Back to the actual patch, I'm a bit torn on the issue you point at with all clients getting read lock -> noticing the absence of dir -> all getting a write lock.
+
+As you say it is not such a big deal for mkdirs, but in general many opens will come after a MPI barrier() or similar and will thus be very, very synchronous. This can be problematic for LU-10262, but I guess asking users to make sure the files are first created in one rank is something we can do if we notice this kind of pattern, so instead of trying to come up with an impossible algorithm (we already have one thread per request blocked anyway so this is already a bad situation), could we realize we're in such a synchronous-real-create case and log a message to the console for admins/monitoring/whatever to pick up? Like peek at the waiting queues and maybe add a last warning timestamp in the ldlm_resource to not spam too much but have a clean warning?
+
+For now I'll stick to the simple solution without anything for mkdir but I think this needs a bit more thought in the long run.
+
+--- Comment (green, Mon, 20 Nov 2017 21:58:11 +0000) ---
+The lock upgrade is such a snakes nest that you absolutely do not want to go there. As such dropping the lock, then reobtaining it in write mode and then redoing your lookups is the way to go (also adding update bit in process - in fact there's no harm getting the update bit in read mode either).
+
+Of course this is kind of risky in that you might have a bunch of RPCs to arrive all of them see that there's no file and all of them try to get the write + update lock returning us to the same problem we have now though I guess not such a big deal for mkdirs
+
+The client approach should already mostly be there and handled by vfs - if you have a valid dentry for a directory, Lustre would not even be called and you'd get your EEXIST - did you check this?
+
+This is actually a more broad problem also appicable to open-creates - I filed LU-10262 for this.
+
+--- Comment (martinetd, Thu, 16 Nov 2017 15:46:08 +0000) ---
+Ok, so there are two ways to go about this that I can see.
+
+ - The first is fairly straight-forward, in mdt_create() (lustre/mdt/mdt_reint.c), right at the start after we found the parent but before getting the lock as MDS_INODELOCK_UPDATE; first try with mdt_object_lock_try(...MDS_INODELOCK_LOOKUP) and if ok do a first mdt_lookup_version_check(...) just as below and return EEXIST early if applicable. Then continue as currently (get lock with UPDATE, check again in case things changed and proceed).
+
+I'm not 100% sure how lock upgrade should work (should I willingly give back the lookup bit first, or will the update request do that?) but I should be able to submit a first version to discuss further details on gerrit reasonably quickly if that's the way to go.
+
+ - A second approach is directly on the client, and is way more complex, but would let the client utilize its cache if populated. I'm not as clear as the other one. Could probably check in ll_new_node() (lustre/llite/namei.c), but I can't find any way to check only in cache (d_lookup maybe, after picking a dentry from the inode? But how to tell if the cache is valid?). I've got to say I'm less confident there, so would need some help.
+
+ 
+
+The obvious pro and cons are that first one is simpler while the later would be cheaper if we restraint ourselves to already-in-cache-only lookups, which I am not actually sure we want to.
+
+Should I go ahead with what I first described?
+
+Thanks!
+
+--- Comment (jhammond, Wed, 15 Nov 2017 18:11:48 +0000) ---
+Well we would be happy to look at any patches that you send us.
+
+--- Comment (martinetd, Wed, 15 Nov 2017 08:28:24 +0000) ---
+Hi John,
+
+Answering in reverse order, I'm afraid we cannot do much about the uses of 'mkdir -p /mnt/lustre..' because they are not really in our control. If there is a job that does it in a tight loop or some overzealous user we might be able to spot it and tell them they should do something else, but users all have their own scripts and we can't really enforce anything like that.
+
+For example, on that last hang I've been referring to I've only bothered tracking one of the four CW lock that were pending and it was a user on an interactive login node manually creating his output directories. These use cases really should be fine, and are OK when all the clients are reactive and give the lock back; what I don't like is the ability for a single rogue/broken client to hang the whole filesystem because of another valid client request that is "fairly frequent". I'm not sure if we can get any statistics of syscalls on a specific directory but even if it's just once an hour it could be enough.
+
+Going back to your previous point, I believe we'd need to benchmark it but the overhead might be smaller than you think. I believe that in the general case the client is very likely to already have a read lock, so it will only be querying his cache. In the mkdir of existing directory case it will actually be much faster because it doesn't need to wait for the lock upgrade and other clients to give the lock back. I would be happy with checking if the directory exists only in the case we already have a read lock, because clients will really always have one for these directories I'm concerned about.
+
+I'll definitely agree it is more complex, though. I don't have much idea to help there. I actually have to admit I haven't spent enough time working out how the process currently works exactly, is the client actually sending two separate requests to upgrade the lock then for mkdir or is the lock upgrade done on the server on behalf of the client transparently? If it is the later I believe it's not too much added complexity and could actually be simple to just check before getting the write lock (no need to even bother about read lock on server side?).
+
+I'll be happy to spend some time figuring out the implementation details (DNEv2 might be tricky too), but need to agree it's something we want first.
+
+Thanks,
+
+Dominique
+
+--- Comment (jhammond, Tue, 14 Nov 2017 23:32:53 +0000) ---
+Hi Dominique,
+
+I agree that this may have some benefit in the case that you describe but I don't think it's the best policy in the general case. It violates the EAFP principle and increases complexity. We should assume that if the user calls mkdir() then the user really wants to create the directory. Also the small overhead you will be reported as a performance regression by other users.
+
+Could the uses of 'mkdir -p /mnt/lustre/path/to/dir' easily be switched to 'cd /mnt/lustre/path && mkdir -p to/dir'?
+
+--- Comment (martinetd, Mon, 13 Nov 2017 18:18:13 +0000) ---
+Sorry, forgot to specify. The specific traces I gave here were taken on lustre-fe 2.7.3 servers with some 2.5 client (2.5.3.90 but it's Bull's versioning, not sure what it relates to); I'm pretty sure we've had something similar with 2.7 clients+2.5 servers on another cluster, probably other mixes.
+
+I had a quick glance and did not see anything that would go in that direction on newer versions, and would need to spend some time trying to reproduce with a limited number of clients on VMs for more recent versions - was there improvements to the clients in that regards since 2.7? The original problem really is some IB troubles anyway so would happen regardless of version, but I think this would make lustre servers more tolerant to a few clients behaving badly.
+
+ 
+
+Thanks,
+
+Dominique
+
+--- Comment (pjones, Mon, 13 Nov 2017 17:56:02 +0000) ---
+Dominique
+
+Which Lustre version is in use on the affected system?
+
+Peter

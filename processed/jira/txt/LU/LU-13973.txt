@@ -1,0 +1,225 @@
+Key:        LU-13973
+Summary:    4K random write performance impacts on large sparse files
+Link:       https://jira.whamcloud.com/browse/LU-13973
+Type:       Bug
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   Qian Yingjin
+Reporter:   Shuichi Ihara
+Created:    Sun, 20 Sep 2020 07:57:49 +0000
+Updated:    Thu, 29 Oct 2020 11:49:47 +0000
+Links:      Related: is related to  LU-13765
+Attachments: 128g-4krandomwrite.svg, 1g-4krandomwrite.svg
+
+--- Environment ---
+master
+
+--- Description ---
+Here is a tested workload.
+
+4k, random write, FPP(File per process)
+
+[randwrite]
+ioengine=libaio
+rw=randwrite
+blocksize=4k
+iodepth=4
+direct=1
+size=${SIZE}
+runtime=60
+numjobs=16
+group_reporting
+directory=/ai400x/out
+create_serialize=0
+filename_format=f.$jobnum.$filenum
+
+The test case is that 2 clients have each 16 fio processes and each fio process does 4k random write to different files.
+
+ However, if file size is large (128GB in this case), it causes the huge performance impacts. Here is two test results.
+
+1GB file
+
+# SIZE=1g /work/ihara/fio.git/fio --client=hostfile randomwrite.fio
+
+write: IOPS=16.8k, BW=65.5MiB/s (68.7MB/s)(3930MiB/60004msec); 0 zone resets
+ 
+
+128GB file
+
+# SIZE=128g /work/ihara/fio.git/fio --client=hostfile randomwrite.fio
+
+write: IOPS=2894, BW=11.3MiB/s (11.9MB/s)(679MiB/60039msec)
+ 
+
+As far as I observed those two cases and collected cpu profiles on OSS, in 128GB file case, there were big spinlocks in ldiskfs_mb_new_block() and ldiskfs_mb_normalized_request() and it spent 89% time (14085/15823 samples) of total ost_io_xx() against 20% (1895/9296 samples) in 1GB file case. Please see attached framegraph.
+
+--- Comment (sihara, Mon, 21 Sep 2020 10:44:43 +0000) ---
+Hi Yingjin,
+
+ yup, I've also confirmed the latest patch (patchset 8 of https://review.whamcloud.com/39342) solved problem.
+
+ I was back to original problem of LU-13973 and re-tested again, it also solved problem. fallocate works with O_DIRECT well for now.
+
+# cat hostlist
+ec01
+ec02
+# SIZE=1g /work/ihara/fio.git/fio --client=hostlist randomwrite.fio
+  write: IOPS=37.4k, BW=146Mi (153M)(8761MiB/60004msec); 0 zone resets
+
+# SIZE=128g /work/ihara/fio.git/fio --client=hostlist randomwrite.fio
+  write: IOPS=38.1k, BW=149Mi (156M)(8921MiB/60007msec); 0 zone resets
+
+--- Comment (qian_wc, Mon, 21 Sep 2020 08:42:17 +0000) ---
+Just fixed the problem:
+
+With LDISKFS_GET_BLOCKS_CREATE:
+
+[root@qvm1 tests]# time fallocate -l 5G /mnt/lustre/test
+
+real	0m0.220s
+user	0m0.002s
+sys	0m0.003s
+[root@qvm1 tests]# stat /mnt/lustre/test
+  File: /mnt/lustre/test
+  Size: 5368709120	Blocks: 10485768   IO Block: 4194304 regular file
+[root@qvm1 tests]# time fallocate -l 1G /mnt/lustre/test
+
+real	0m0.175s
+user	0m0.002s
+sys	0m0.003s
+
+With LDISKFS_GET_BLOCKS_CREATE_UNWRIT_EXT:
+
+[root@qvm1 tests]# time fallocate -l 5G /mnt/lustre/test
+
+real	0m0.268s
+user	0m0.002s
+sys	0m0.005s
+[root@qvm1 tests]# stat /mnt/lustre/test
+  File: /mnt/lustre/test
+  Size: 5368709120	Blocks: 10485768   IO Block: 4194304 regular file
+Device: 2c54f966h/743766374d	Inode: 144115205272502273  Links: 1
+Access: (0644/-rw-r--r--)  Uid: (    0/    root)   Gid: (    0/    root)
+Context: unconfined_u:object_r:unlabeled_t:s0
+Access: 2020-09-21 16:36:57.000000000 +0800
+Modify: 2020-09-21 16:36:57.000000000 +0800
+Change: 2020-09-21 16:36:57.000000000 +0800
+ Birth: -
+
+Please try the updated patch again.
+
+BTW, could you please also try with large allocation by using EXT4 allocation flags:
+
+[root@qvm1 lustre-release]# git diff
+diff --git a/lustre/osd-ldiskfs/osd_io.c b/lustre/osd-ldiskfs/osd_io.c
+index 7897fd4082..233ea54c6f 100644
+--- a/lustre/osd-ldiskfs/osd_io.c
++++ b/lustre/osd-ldiskfs/osd_io.c
+@@ -1983,7 +1983,7 @@ static int osd_fallocate(const struct lu_env *env, struct dt_object *dt,
+        boff = start >> inode->i_blkbits;
+        blen = (ALIGN(end, 1 i_blkbits) >> inode->i_blkbits) - boff;
+ 
+-       flags = LDISKFS_GET_BLOCKS_CREATE;
++       flags = LDISKFS_GET_BLOCKS_CREATE_UNWRIT_EXT;
+        if (mode & FALLOC_FL_KEEP_SIZE)
+                flags |= LDISKFS_GET_BLOCKS_KEEP_SIZE;
+
+and measure the allocation time and the performance you did via fio again?
+
+Thanks,
+
+Qian
+
+--- Comment (sihara, Mon, 21 Sep 2020 06:09:30 +0000) ---
+In fact, it seems that fallocate is not working in both patch (patchset6 and patchet7) properly..
+
+patchset 6
+
+[root@ec01 ~]# time  fallocate -l 128g /ai400x/test1
+
+real	0m0.004s
+user	0m0.001s
+sys	0m0.000s
+[root@ec01 ~]# ls -l /ai400x/test1 
+-rw-r--r-- 1 root root 0 Sep 21 14:47 /ai400x/test1
+
+patchset 7
+
+[root@ec01 ~]# time  fallocate -l 128g /ai400x/test1
+
+real	0m0.003s
+user	0m0.001s
+sys	0m0.000s
+[root@ec01 ~]# ls -l /ai400x/test1 
+-rw-r--r-- 1 root root 0 Sep 21 15:06 /ai400x/test1
+
+--- Comment (qian_wc, Mon, 21 Sep 2020 02:20:33 +0000) ---
+Btw, could you please measure the fallocate performance with/without the updated patches?
+
+i.e.
+
+time fallocate -l 128G test1
+
+time fallocate -l 256G test2
+
+I just want to known whether it will affect the fallocate using time.
+
+thanks,
+
+Qian
+
+--- Comment (qian_wc, Mon, 21 Sep 2020 02:16:16 +0000) ---
+Please try the updated fallocate patch:
+
+ https://review.whamcloud.com/39342 LU-13765 osd-ldiskfs: Extend credit correctly for fallocate
+
+It jus modified one line:
+
+diff --git a/lustre/osd-ldiskfs/osd_io.c b/lustre/osd-ldiskfs/osd_io.c
+index 462a462cc9..689471e8a3 100644
+--- a/lustre/osd-ldiskfs/osd_io.c
++++ b/lustre/osd-ldiskfs/osd_io.c
+@@ -2009,7 +2009,7 @@ static int osd_fallocate(const struct lu_env *env, struct dt_object *dt,
+                        break;
+ 
+                rc = ldiskfs_map_blocks(handle, inode, &map,
+-                                       LDISKFS_GET_BLOCKS_CREATE_UNWRIT_EXT);
++                                       LDISKFS_GET_BLOCKS_CREATE);
+                if (rc "inode #%lu: block %u: len %u: "
+                               "ldiskfs_map_blocks returned %d\n",
+
+Regards,
+
+Qian
+
+--- Comment (qian_wc, Mon, 21 Sep 2020 02:09:57 +0000) ---
+Hi Ihara,
+
+I may find the reason, it should be a problem of fallocate for direct IO (not for buffered IO).
+
+Will make a revised patch soon.
+
+Regards,
+
+Qian
+
+--- Comment (sihara, Mon, 21 Sep 2020 00:47:31 +0000) ---
+Yingjin, I also thought fallocate might help and tried fallocate with fio (NOTE, fio use fallocate if filesystem supports it) after patch https://review.whamcloud.com/#/c/39342/ applied, but it was same problem and fallocate didn't help neither. btw, overwriting files helped. e.g. create 128GB files and allocate all blocks first then randomwrite on them.
+
+--- Comment (qian_wc, Sun, 20 Sep 2020 14:24:32 +0000) ---
+Hi Ihara, 
+
+Could you please first preallocate all space via fallocate?
+
+i.e
+
+fio with fallocate,
+
+or use the command 'fallocate -l ' to preallocate all needed space,
+
+and then do the fio testing?
+
+Thanks,
+
+Qian

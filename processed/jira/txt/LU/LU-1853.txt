@@ -1,0 +1,92 @@
+Key:        LU-1853
+Summary:    'out-of-bounds access' error in osd_scrub_setup()
+Link:       https://jira.whamcloud.com/browse/LU-1853
+Type:       Technical task
+Priority:   Major
+Status:     Resolved
+Resolution: Won't Fix
+Assignee:   nasf
+Reporter:   Sebastien Buisson
+Created:    Fri, 7 Sep 2012 04:07:49 +0000
+Updated:    Fri, 4 Oct 2013 19:59:11 +0000
+Resolved:   Fri, 19 Oct 2012 02:25:24 +0000
+Labels:     build, coverity
+
+--- Description ---
+In osd_scrub_setup(), id variable is of type 'struct osd_inode_id *' (size 8). But then this variable is passed to __osd_oi_lookup(), and in this function, it is passed to osd_oi_iam_lookup(), which casts it to a 'struct dt_rec *'. Then it is passed to osd_fid_unpack() by casting it to 'struct lu_fid *'. And at last, inside this function, a memcpy() is performed considering the variable is of type 'struct lu_fid *', which is of size 16.
+
+So we are accessing memory beyond what was allocated for that variable.
+
+I do not know how to fix this issue, as it is quite complex.
+
+--- Comment (yong.fan, Fri, 19 Oct 2012 02:25:24 +0000) ---
+It will not cause issues under current use mode.
+
+--- Comment (yong.fan, Thu, 11 Oct 2012 21:33:32 +0000) ---
+Yes, there are some dead codes in IAM, not only for this, but also for LVAR part. But nobody knows whether they will be re-used in the future or not, so these codes keep there since the beginning.
+
+--- Comment (sebastien.buisson, Thu, 11 Oct 2012 02:54:20 +0000) ---
+OK I understand.
+
+So maybe in that case, it would be better to remove this 'dead' branch, right?
+
+--- Comment (yong.fan, Wed, 10 Oct 2012 22:55:08 +0000) ---
+Originally, the IAM was designed not only for index file, such as OI files, and quota files, but also for storing directory under Lustre namespace. But the later use case is not valid since Lustre-2.0, that means the "if (S_ISDIR(oi->oi_inode->i_mode))" branch will not be trigger anymore in current 2.x code. So I think there will not be out-of-bounds" issues in IAM according to current use cases.
+
+--- Comment (sebastien.buisson, Wed, 10 Oct 2012 10:33:56 +0000) ---
+Hi Yong Fan,
+
+This issue was found by the static code analysis tool named Coverity.
+
+According to your analysis, osd_fid_unpack() will not be called because the condition above will evaluate to false. But maybe there is another call path leading to the issue described here?
+
+Sebastien.
+
+--- Comment (yong.fan, Mon, 8 Oct 2012 11:01:25 +0000) ---
+static int osd_oi_iam_lookup(struct osd_thread_info *oti,
+                             struct osd_oi *oi, struct dt_rec *rec,
+                             const struct dt_key *key)
+{
+...
+        rc = iam_it_get(it, (struct iam_key *)key);
+        if (rc >= 0) {
+                if (S_ISDIR(oi->oi_inode->i_mode))
+                        iam_rec = (struct iam_rec *)oti->oti_ldp;
+                else
+                        iam_rec = (struct iam_rec *)rec;
+                
+                iam_reccpy(&it->ii_path.ip_leaf, (struct iam_rec *)iam_rec);
+===>                if (S_ISDIR(oi->oi_inode->i_mode))
+                        osd_fid_unpack((struct lu_fid *)rec,
+                                       (struct osd_fid_pack *)iam_rec);
+        }               
+...
+}
+
+In this case, the IAM container is an OI index file, which is NOT directory, so the branch for "if (S_ISDIR(oi->oi_inode->i_mode))" in above code section will be skipped for the call trace: osd_scrub_setup() => __osd_oi_lookup() => osd_oi_iam_lookup(). So the OI scrub should not trigger "out-of-bounds access" error.
+
+Sebastien, have you hit such failure during any test? or thought there may be potential issues by analyzing code?
+
+--- Comment (adilger, Fri, 7 Sep 2012 16:44:34 +0000) ---
+Another potential issue is that even after the code to accept a proper struct dt_key, this code will need close examination to ensure that all existing callers actually pass a proper dt_key instead of the current practice of typecasting.  It probably makes sense to use a slightly different name for the structure, so that in-flight patches will get a compiler warning if they are still using the old practice of "(struct dt_key *)&key" instead of filling in the key properly:
+
+struct dt_keylen {
+        void   *dtk_key;
+        int     dtk_len;
+};
+
+or possibly a better name than "dt_keylen" could be found.
+
+--- Comment (adilger, Fri, 7 Sep 2012 16:39:24 +0000) ---
+This bug is in the OI Scrub code, but I think there is also a problem with the API itself that allows this kind of problem to be introduced.
+
+Firstly, the requirement to always cast to (struct dt_key *) means that any compiler type checking is disabled, and there is no way for the compiler or lower layers of the code to detect whether the caller is passing the correct pointer for the underlying index.  It would be much safer if struct dt_key were a real structure like:
+
+struct dt_key {
+        void   *dtk_key;
+        int     dtk_len;
+};
+
+so that the key size is passed up and down the whole stack.  This would also avoid the need to cast arguments everywhere (which in itself is evil) since that breaks the ability of the compiler to check the code correctness.  Instead, the caller would allocate a dt_key on the stack, assign the key pointer to dtk_key, and the length to dtk_len, and the parameter type to the function would be correct.
+
+It's 8 more bytes on the stack at the top-level calling function, but infinitely more robustness inside the code.  I don't know if there is some value to including an "int dtk_type" field as well, since the caller should know what type of index is being accessed, but it is an idea that crossed my mind and there are 4 free bytes in the struct that would otherwise go unused.

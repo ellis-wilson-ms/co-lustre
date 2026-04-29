@@ -1,0 +1,120 @@
+Key:        LU-3641
+Summary:    Dropping caches on SLES11SP2 hangs in shrink_slab()/ldlm_pools_cli_shrink() path
+Link:       https://jira.whamcloud.com/browse/LU-3641
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   WC Triage
+Reporter:   Ann Koehler
+Created:    Thu, 25 Jul 2013 20:52:17 +0000
+Updated:    Fri, 13 Sep 2013 04:01:50 +0000
+Resolved:   Wed, 31 Jul 2013 19:16:45 +0000
+Labels:     patch
+
+--- Description ---
+Dropping caches (echo 3 > /proc/vm/drop_caches) occasionally does not complete on a client running SLES11SP2 when a Lustre file system is mounted. The kernel shrink_slab() function gets stuck in an infinite loop calling ldlm_pools_cli_shrink() because Lustre does not initialize the new batch field of the shrinker struct when it registers shrinkers.
+
+cfs_set_shrinker() kmallocs a shrinker struct; it neither zero fills the struct nor explicitly sets the batch field. Occasionally the uninitialized batch value is negative. The kernel shrink_slab() function uses the batch value to control its loop around the calls to each shrinker. If the batch value is negative, the loop never terminates.
+
+The interesting code bits are:
+
+static inline
+struct cfs_shrinker *cfs_set_shrinker(int seek, cfs_shrinker_t func)
+{
+        struct shrinker *s; 
+
+        s = kmalloc(sizeof(*s), GFP_KERNEL);
+        if (s == NULL)
+                return (NULL);
+
+        s->shrink = func;
+        s->seeks = seek;
+
+        register_shrinker(s);
+
+        return s;
+}
+
+kernel/include/linux/mm.h
+struct shrinker {
+        int (*shrink)(struct shrinker *, struct shrink_control *sc);
+        int seeks;      /* seeks to recreate an obj */
+        long batch;     /* reclaim batch size, 0 = default */
+
+        /* These are for internal use */
+        struct list_head list;
+        long nr;        /* objs pending delete */
+};
+
+unsigned long shrink_slab(struct shrink_control *shrink,
+                          unsigned long nr_pages_scanned,
+                          unsigned long lru_pages)
+{
+[skip] 
+                long batch_size = shrinker->batch ? shrinker->batch
+                                                  : SHRINK_BATCH;
+[skip]
+                /* total_scan initialized to something positive */
+                while (total_scan >= batch_size) {
+[skip]
+                        shrink_ret = do_shrinker_shrink(shrinker, shrink,
+                                                        batch_size);
+[skip]
+                        total_scan -= batch_size;
+[skip] 
+                }
+
+When this problem occurs, stack traces of the hanging process look similar to the following, although the exact location along the ldlm_pools_cli_shrink() path varies.
+
+crash> bt 8994
+PID: 8994   TASK: ffff8808334747b0  CPU: 24  COMMAND: "apinit"
+ #0 [ffff8807f0a29c58] schedule at ffffffff81362e57
+ #1 [ffff8807f0a29ca0] ldlm_bl_to_thread_list at ffffffffa0470d40 [ptlrpc]
+ #2 [ffff8807f0a29cb0] ldlm_cancel_lru at ffffffffa046c385 [ptlrpc]
+ #3 [ffff8807f0a29d00] ldlm_cli_pool_shrink at ffffffffa047896d [ptlrpc]
+ #4 [ffff8807f0a29d40] ldlm_pool_shrink at ffffffffa0476568 [ptlrpc]
+ #5 [ffff8807f0a29d70] ldlm_pools_shrink at ffffffffa0477ebc [ptlrpc]
+ #6 [ffff8807f0a29dc0] ldlm_pools_cli_shrink at ffffffffa0477f5b [ptlrpc]
+ #7 [ffff8807f0a29dd0] shrink_slab at ffffffff810fec7a
+ #8 [ffff8807f0a29e70] drop_caches_sysctl_handler at ffffffff81164eb2
+ #9 [ffff8807f0a29ea0] proc_sys_call_handler at ffffffff811a08a0
+#10 [ffff8807f0a29f00] proc_sys_write at ffffffff811a08c4
+#11 [ffff8807f0a29f10] vfs_write at ffffffff8113cf1b
+#12 [ffff8807f0a29f40] sys_write at ffffffff8113d0c5
+#13 [ffff8807f0a29f80] system_call_fastpath at ffffffff8136cc2b
+
+> crash-7.0.0> shrinker 0xffff8803fb004340
+> struct shrinker {
+>   shrink = 0xffffffffa03c1130 , 
+>   seeks = 2, 
+>   batch = -4, 
+>   list = {
+>     next = 0xffffffff815a6e40 , 
+>     prev = 0xffff8803fb004398
+>   }, 
+>   nr = 0
+> }
+
+The Linux change that triggered this problem is:
+
+author	Dave Chinner 	2011-07-08 04:14:37 (GMT)
+
+committer	Al Viro 	2011-07-20 05:44:32 (GMT)
+
+commit	e9299f5058595a655c3b207cda9635e28b9197e6 (patch)
+
+tree	b31a4dc5cab98ee1701313f45e92e583c2d76f63
+
+parent	3567b59aa80ac4417002bf58e35dce5c777d4164 (diff)
+
+vmscan: add customisable shrinker batch size
+
+For shrinkers that have their own cond_resched* calls, having shrink_slab break the work down into small batches is not paticularly efficient. Add a custom batchsize field to the struct shrinker so that shrinkers can use a larger batch size if they desire. A value of zero (uninitialised) means "use the default", so behaviour is unchanged by this patch.
+
+Note: ldlm_pools_srv_shrink() does not exhibit this problem because it always returns -1, which causes shrink_slab to break out of its loop.
+
+--- Comment (amk, Thu, 25 Jul 2013 22:23:36 +0000) ---
+Submitted patch that zero fills the shrinker struct when cfs_set_shrinker allocates it. An alternative would be to explicitly set the batch field but this would require a conditional compilation since not all Linux kernels support the shrink batch size feature. Furthermore, just initializing the batch field is only part of the job. It may make sense to add full support in the future and allow each Lustre shrinker to specify its own batch size.
+
+Patch: http://review.whamcloud.com/7122

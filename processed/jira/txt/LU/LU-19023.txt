@@ -1,0 +1,160 @@
+Key:        LU-19023
+Summary:    slow fallocate on large ldiskfs devices
+Link:       https://jira.whamcloud.com/browse/LU-19023
+Type:       Bug
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   Alexander Zarochentsev
+Reporter:   Alexander Zarochentsev
+Created:    Thu, 15 May 2025 18:12:38 +0000
+Updated:    Thu, 17 Jul 2025 14:15:28 +0000
+
+--- Description ---
+An fallocate operation on large disk devices may be very slow.
+
+Here is an example, I created a 100T sparse file and formatted it as ldiskfs fs, then mounted as ldiskfs:
+
+[root@rocky9 wc-master]# df -h /mnt/ldiskfs/
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/vdb        100T  8.0T   87T   9% /mnt/ldiskfs
+[root@rocky9 wc-master]# 
+
+the fs was fragmented special way, i.e. each block group has about 8% used and 92% of free space:
+
+time for x in {0..819200}; do fallocate -o $((x * 10))M -l 10M /mnt/ldiskfs/filler.ldiskfs ; echo $x > /proc/fs/ldiskfs/vdb/mb_last_group ; (( $x % 10000 == 0 )) && { echo -n $x -- ; date; };   done
+
+ 
+
+after that, an attempt to fallocate a 100G file takes more than 1 min:
+
+[root@rocky9 wc-master]# rmmod ldiskfs
+[root@rocky9 wc-master]# insmod ldiskfs/ldiskfs.ko 
+[root@rocky9 wc-master]# mount -t ldiskfs /dev/vdb /mnt/ldiskfs/
+[root@rocky9 wc-master]# echo 1 > /sys/fs/ldiskfs/vdb/mb_stats 
+[root@rocky9 wc-master]# rm -f /mnt/ldiskfs/big 
+[root@rocky9 wc-master]# time fallocate -o 0  -l 100G /mnt/ldiskfs/big 
+
+real	1m24.296s
+user	0m0.001s
+sys	1m24.142s
+[root@rocky9 wc-master]# 
+
+here is the mb_stats for the operation:
+
+[root@rocky9 wc-master]# cat /proc/fs/ldiskfs/vdb/mb_stats 
+mballoc:
+	reqs: 875
+	success: 4
+	groups_scanned: 175074
+	cr0_stats:
+		hits: 0
+		groups_considered: 0
+		useless_loops: 0
+		bad_suggestions: 0
+	cr1_stats:
+		hits: 4
+		groups_considered: 713509254
+		useless_loops: 0
+		bad_suggestions: 0
+	cr2_stats:
+		hits: 0
+		groups_considered: 713523200
+		useless_loops: 871
+	cr3_stats:
+		hits: 871
+		groups_considered: 176811
+		useless_loops: 0
+	extents_scanned: 175096
+		goal_hits: 0
+		2^n_hits: 0
+		breaks: 871
+		lost: 0
+	buddies_generated: 820270/819200
+	buddies_time_used: 1904314776
+	preallocated: 0
+	discarded: 0
+[root@rocky9 wc-master]# 
+
+the mb alloc stats shows that c2 loop failed 800+ times, i.e. it failed for each allocation request. i.e. there were 800+ useless loops across all block groups in the fs.
+
+( 800+ is from max block allocation request which about 32k blocks (128MB) and the total fallocated space of 100GB ~= 128MB x 800 ).
+
+the statistics for cr1 is also not good:
+
+	cr1_stats:
+		hits: 4
+		groups_considered: 713509254
+		useless_loops: 0
+		bad_suggestions: 0
+
+"groups considered=713509254"  means the allocator also tried all block groups for each of 800+ requests, but just didn't count those attempts as "useless loops".
+
+My test fs has 819200, real systems may have ~5M+ groups, meaning the allocation requests would take 6-8 min or more.
+
+it is rather a generic problem with ldiskfs block allocator, fallocate just makes it clearly visible because unlike writes , fallocate requests are not limited by BRW size.
+
+the problem existed in RHEL8.x and the new improved block allocator from RHEL9.x / (linux-5.14) made it no better.
+
+--- Comment (bzzz, Fri, 23 May 2025 18:22:19 +0000) ---
+it would be useful to know what exact requests were coming to mballoc from fallocate. probably the requests were too big and I'd suggest to turn them into smaller ones and to be 2^n.
+
+given the filesystem was just mounted, mballoc had to re-initialize all those groups:
+
+	buddies_generated: 820270/819200
+	buddies_time_used: 1904314776
+
+another fallocate wouldn't take that long AFAIU.
+
+--- Comment (adilger, Wed, 21 May 2025 17:20:08 +0000) ---
+zam, have you tested this on a recent 6.x upstream kernel with the specially formatted filesystem to see if it reproduces there?  If yes, then it would be useful to submit a patch upstream to fix this, so that it can be fixed there instead of keeping a patch.
+
+--- Comment (zam, Fri, 16 May 2025 19:57:47 +0000) ---
+repeating the test with wc master and Rocky 9.5 with already landed LU-14438, it appears to be even slower slower:
+
+[root@rocky95 wc-master]# rm -f /mnt/fast/
+big             filler.ldiskfs  lost+found/     
+[root@rocky95 wc-master]# rm -f /mnt/fast/big 
+[root@rocky95 wc-master]# time fallocate -o 0  -l 100G /mnt//big 
+fast/ nfs/  
+[root@rocky95 wc-master]# time fallocate -o 0  -l 100G /mnt/fast/big 
+
+real	2m7.446s
+user	0m0.001s
+sys	2m7.270s
+[root@rocky95 wc-master]# 
+[root@rocky95 wc-master]# ls -l ldiskfs/linux-stage/series
+lrwxrwxrwx. 1 root root 63 May 16 18:40 ldiskfs/linux-stage/series -> ../../ldiskfs/kernel_patches/series/ldiskfs-5.14-rhel9.5.series
+[root@rocky95 wc-master]#
+
+--- Comment (zam, Thu, 15 May 2025 18:38:42 +0000) ---
+the same fallocate after applying the patch  (https://review.whamcloud.com/c/fs/lustre-release/+/59255) takes about 1 sec instead of more than 1 min:
+
+[root@rocky9 wc-master]# umount /mnt/ldiskfs/
+[root@rocky9 wc-master]# rmmod ldiskfs
+[root@rocky9 wc-master]# insmod ldiskfs/ldiskfs.ko 
+[root@rocky9 wc-master]# mount -t ldiskfs /dev/vdb /mnt/ldiskfs/
+[root@rocky9 wc-master]# rm -f /mnt/ldiskfs/big 
+[root@rocky9 wc-master]# echo 1 > /sys/fs/ldiskfs/vdb/mb_stats 
+[root@rocky9 wc-master]# time fallocate -o 0  -l 100G /mnt/ldiskfs/big 
+
+real	0m1.103s
+user	0m0.001s
+sys	0m1.007s
+[root@rocky9 wc-master]# 
+[root@rocky9 wc-master]# du -h /mnt/ldiskfs/big 
+101G	/mnt/ldiskfs/big
+[root@rocky9 wc-master]#
+
+--- Comment (gerrit, Thu, 15 May 2025 18:36:12 +0000) ---
+"Alexander Zarochentsev " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/59255
+
+Subject: LU-19023 ldiskfs: mballoc cr loops optmisation
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 58ad2f0025b76a2f2c2417382f7d0ee965dc2ce6

@@ -1,0 +1,362 @@
+Key:        LU-7266
+Summary:    Fix LDLM pool Server Lock Volume to make LRUR working properly
+Link:       https://jira.whamcloud.com/browse/LU-7266
+Type:       Bug
+Priority:   Critical
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Niu Yawei
+Created:    Thu, 8 Oct 2015 08:05:02 +0000
+Updated:    Sat, 28 Feb 2026 01:48:36 +0000
+Links:      Related: is related to  LU-1128; Related: is related to  LU-5152; Related: is related to  LU-6529; Related: is related to  LU-19264; Related: is related to  LU-11509; Related: is related to  LU-17428; Related: is related to LU-15712; Related: is related to LU-14221; Related: is related to LU-14517
+Attachments: lru-resize-dld.lyx, lru-resize-hld.lyx
+
+--- Description ---
+Current LDLM pool Server Lock Volume doesn't work as expected, it leads to server sometimes can be overburdened by too many cached LDLM locks (observed in LU-6529),  to fix the LDLM pool and make the LRUR working properly, I think following particular issues need be addressed:
+
+1. No hard limit for the server lock count;
+
+There are always exceptions (all locks are actively used on client, client failure, network lag, etc) can make the client unable to cancel lock in time, so a hard limit for the server lock count is crucial to make sure the server not being overburdened by LDLM lock at any time. When the server lock count exceeds the hard limit, server should reject any incoming lock enqueue request (Let client retry on -EINPROGRESS) until the lock count shrink back to a safe zone.
+
+This issue has been addressed by LU-6529.
+
+2. Lock load can't be balanced between the namespaces on same server;
+
+Current LDLM pool divide the memory quota equally for each namespace (MDTs, OSTs) on the same host, that could result in lots of memory is reserved by the idle namespaces but not used.
+
+I think we'd leverage the global lock counter introduced in LU-6529 to address this problem.
+
+3. Client needs to cancel lock more aggressively;
+
+According to the SLV/CLV formula, server lock count won't be decreased even if it has already exceeded the pool_limit (which is 25% total memory by default), a simulate program shows that server lock count only decreases after the lock consumed more than 32% of total memory, the number is calculated with the assumption that all locks on client are unused and client can always cancel lock instantly. I think the number will be larger in real world.
+
+As a workaround, I think this problem could be addressed by tweaking the LDLM pool parameters (such as pool_limit, lock_volume_factor, etc.).
+
+In a longer term solution, I think we'd get rid of the complexity of SLV recalculation, instead, just notify client directly with an estimated CLV when server is aware of memory pressure (or when server decide to reclaim some memory)
+
+4. Current server pool shrinker is barely functional;
+
+Current LDLM server pool shrinker decreases only a small amount of SLV , that's not enough to trigger lock cancel on client, to make it worse, the decreased SLV could be overwritten by SLV recalculation thread before it's carried back to client by some random RPC.
+
+As I mentioned in the long term solution of 3rd item, I think server pool shrinker should just notify client with an estimated CLV initiatively, that's simpler and more reliable.
+
+5. Improve LRU algorithm
+
+Using strict LRU to replace cached locks is sub-optimal due to cache thrashing and removal of valuable locks.  A better algorithm like LFRU or ARC would improve lock cache reuse and value.  (LU-11509)
+
+--- Comment (JIRAUSER19404, Sat, 28 Feb 2026 01:37:17 +0000) ---
+The current commit is a bit of complicated and abstract. As declared in the commit message,
+
+New SLV calculation formula:
+  slv = (lock_limit * pool_max_age * adjust_factor) / client_count
+
+Where adjust_factor = exp(4 * (available/granted - 1)), which:
+- Increases SLV when resources are abundant (available >> granted)
+- Decreases SLV under memory pressure (available 
+
+ 
+
+Now here's a more intuitive and straightforward approach. Hope everyone could figure it out. I'll switch to it later.
+
+NOTE: some figures here needs to be furture correction, just for explaination right now.
+
+Design Proposal: SLV (CPU-Centric Linear Model)
+1. Objectives
+
+	Smooth Reclamation: Predictable lock revocation without oscillation.
+
+	LRU Flexibility: Decouples pressure from time; allows much larger client-side LRU_MAX_AGE in the future.
+
+	Hardware-Aware: Lock quota scales naturally with CPU core count.
+
+	Zero-Dep: Removes unreliable client_count dependencies.
+
+2. Protocol & Logic
+
+The Server broadcasts SLV (64-bit), containing cpu_base and pressure (p).
+
+A. Server Side
+
+	p = granted / limit (sampled every 1s).
+
+	Apply EWMA to p for signal smoothing.
+
+	Broadcast cpu_base and p.
+
+Logic:
+
+	High Load: If p > 0.60 for T seconds => cpu_base = cpu_base * 0.95
+
+	Low Load: If p  cpu_base =  cpu_base * 1.05
+
+	Bounds: Result is always clamped between MIN and MAX.
+
+Intuition:
+
+	cpu_base: Long-term "Waterline" (Trends).
+
+	Scale(p): Short-term "Elasticity" (Bursts).
+
+SLV layout extension (backward compatible):
+
+Bits
+Field
+Description
+
+63..60
+Version Tag
+0xF. Old SLV not fill this part for compatibility
+
+59..24
+Reserved
+Reserved for future use
+
+23..16
+cpu_base
+Expected locks_per_core baseline
+
+15..0
+pressure
+Encoded system pressure p
+
+B. Client Side (Multi-Stage Linear)
+
+Clients calculate Scale (S) and Target based on p:
+
+1. Calculate Scale (S):
+
+	p                 S = 10 - 16 * p
+
+	50%  S = 2 - 6.4 * (p - 0.5)
+
+	p >= 75%:              S = 0.4 (Fixed floor)
+
+Pressure (p)
+Behavioral Zone
+Multiplier (S)
+Operational Intuition
+
+0%
+Idle
+10.0
+Max Caching (Performance Mode)
+
+25%
+Low Pressure
+6.0
+Incentive: Ample resources
+
+50%
+Transition Point
+2.0
+Pivot: Start rapid contraction
+
+60%
+Warning
+1.36
+Convergence: Moving toward base
+
+75%
+High Pressure
+0.4
+Hard Throttling (Safety Buffer)
+
+90%+
+Saturation
+0.4
+Protection: Minimal footprint
+
+ 
+
+2. Execute Reclamation:
+
+	Target = cpu_base * cores * S
+
+	Cancel = MAX(unused - Target, 0)
+
+3. Expected Results
+
+	Idle State: Clients can hold a large pool of locks for performance.
+
+	High Load: Automatic and rapid lock reclamation as pressure rises.
+
+	Scalability: Total locks scale naturally with the number of CPU cores.
+
+	Clean Logic: Zero dependency on client-side LRU timers or inaccurate client counts.
+
+--- Comment (gerrit, Wed, 12 Nov 2025 09:27:41 +0000) ---
+"kg.xu " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/62497
+
+Subject: LU-7266 ldlm: Fix LDLM pool Server Lock Volume
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: e65fbb863446354a224b3a8ba5cf22967cb71564
+
+--- Comment (adilger, Fri, 24 Oct 2025 06:29:51 +0000) ---
+Keguang, thank you for your analysis. 
+
+I cannot argue with your findings, since I have long thought the SLV mechanism is broken. 
+
+I do think that something like SLV can be used to convey lock cancellation pressure to the clients, so they can cancel locks from their LRU. However, I don't know if this can be fixed with only some tuning, or if more serious rework is needed. 
+
+I think if the SLV mechanism is working properly, then it should incrementally pressure the clients to shrink locks as server memory is growing.  If MDS memory pressure is high, then it does make sense to contact clients with large CLV more aggressively, but it doesn't make sense to cancel huge numbers of locks in all clients, just a fraction of the total.
+
+--- Comment (JIRAUSER19404, Fri, 24 Oct 2025 03:13:51 +0000) ---
+the LRU/frequency or age information about locks on the server lock namespaces may be not accurate and realtime. This lock reclaim dominated by the server may revoke the locks that may be still in use by clients or will be used in near future, and the data or attributes protected by locks will be invalidate and dropped, and reduce the overall performance.
+
+Thanks Yingjin, totally agree that we should let clients to decide which locks to be freed instead of server decides.
+
+And namespace part you mentioned that should be MDS vs Multiple MDT?
+
+ 
+
+The other alternative would be to discard the SLV implementation entirely (which has non-zero overhead to manage), and move to a simple mechanism where the server directly requests that each client cancels "N" locks (e.g. proportional to the number of locks they are holding) and the client shrinks its LRU accordingly. One suggestion for implementing this mechanism could be a blocking AST RPC on res 0:0:0:0 (normally invalid) with a count of locks.
+
+Andreas, Yingjin, per analysis in the previous comment, SLV do BROKEN (reflect too slowly to memory change, bugs, etc.) now. We may need to fix it, and I may prefer to keep SLV mech, with some modification to try resolving its BROKEN state,
+
+	Give SLV a simple meaning, just the current fraction of locks that consumed in by MDT.
+
+	Based on corresponding ns:SLV, clients could determine how many locks should be evicted as well. Clients should have their baseline, say, 100 locks per CPU as existing definition in ldlm. With some adjustment, like SLV  60%, then client should reduce to 60 locks per CPU, etc. Some tricky settings are necessary here.
+
+	Another consideration of lock eviction is lock age - I know how many (roughly) locks should be evicted, but which ones? Since we have LRU, we have a rough knowledge of the earlist and latest lock usage timestamp, we could just split it into 10 like buckets each responds 10% locks, and throw AGED ones in corresponding time frames. Long idle clients should have their locks been evicted due to LOCK_MAX_AGE; active user should have locks that distribute (roughly) evenly.
+
+	Return back to LDLM server, the shrinker would be called once kernel feels necessary. When this happens, newly updated SLV works for clients who recently have had interaction with server, but for others, server should actively send them the new SLV with high priority, request them to evict locks immediately.
+
+	A underlying risk is lock eviction storm when we are approaching memory limit and ask clients to free a huge amount of locks, can we handle those requests swiftly/smoothly? We need to tune clients' logic better to avoid such case. But if that do happened, just evict some large clients maybe acceptable? Not familiar with the lustre RECOVERY mech, their recovery process may introduce another round of lock require storm or not...
+
+	And the ldlm_reclaim logic, when we approach LDLM_WM_RATIO_HIGH_DEFAULT then return EINPROGRESS seems reasonable. But other logic... maybe some code simplification/reduction are needed.
+
+ Like to hear your feedback on this. Thanks.
+
+--- Comment (qian_wc, Thu, 23 Oct 2025 09:15:00 +0000) ---
+Hi KeGuang,
+
+Thanks for your analysis for this topic.
+
+ldlm_pool:
+
+50 ldlm locks for 1MB of RAM => 64GB means around 3.2M lock limit 
+
+ldlm_reclaim:
+
+ldlm_reclaim_threshold = ldlm_ratio2locknr(LDLM_WM_RATIO_LOW_DEFAULT):
+# and in ldlm_ratio2locknr():
+  locknr = ((__u64)NUM_CACHEPAGES 
+
+Assume sizeof(struct ldlm_lock) around 0.5KB => 13GB(i.e 64GB * 0.2 ratio) means 26M lock limit
+
+It means till 3.2M lock have been used up (OOM) however it's far less than 26M, so ldlm_reclaim would not even alarm/reaction here...
+
+From my understanding, ldlm_pool limit is per ldlm lock namespace based. 
+
+And ldlm_reclaim_threshold is per node based, it is a limit for all lock namespaces on a node and a node (server or client) may have multiple lock namespaces.
+
+ 
+
+And I go through the ldlm pool codes, found that it is using shrinker in Linux kernel to do lock shrinking (reclaim).  It seems that the original design using SLV and CLV to determine lock reclaim was broken.
+
+For an example, the system has already used about 20% memory for lock caching, but the linux kernel shrinker will not trigger for lock reclaim as 20% of memory does not reach the watermark to start memory reclaim for slab cache of locks.
+
+And in this case, the lock server will reach ldlm_reclaim_threshold, and trigger lock reclaim by LRU and age of locks in the lock namespaces on the server, but the LRU/frequency or age information about locks on the server lock namespaces may be not accurate and realtime. This lock reclaim dominated by the server may revoke the locks that may be still in use by clients or will be used in near future, and the data or attributes protected by locks will be invalidate and dropped, and reduce the overall performance.
+
+--- Comment (JIRAUSER19404, Thu, 23 Oct 2025 08:10:01 +0000) ---
+However, I think the tuning and/or Implementation of SLV is broken, and it does not do a good job of managing the total lock counts on the clients or servers.
+
+SLV & CLV mismatched in the calculation in my point of view which leads to SLV broken.
+
+Initial: Memory is relatively free
+
+Default SLV - ldlm_pool_slv_max():
+
+LDLM_POOL_HOST_L * LDLM_POOL_MAX_AGE
+  => /* 50 ldlm locks for 1MB of RAM */ host_total_ldlm_lock_counts * 600s
+  => (Millions of Locks one Server) * 600s
+
+Default CLV - ldlm_cancel_lrur_policy():
+
+lv = lvf * la * ns->ns_nr_unused
+  => 1.0 * lock_age_in_seconds * ns->ns_nr_unused
+  => (Thounsands of Locks per Client?) * lock_age_in_seconds(
+
+In this scenario eviction of lock from the client's LRU cache is extremely rare because SLV >> CLV.
+
+Is it possible that in the long run SLV will decrease to the same level of CLV? 
+
+ 
+
+Case 1: Lock consumption is steady
+
+ 
+
+ldlm_pool_recalc_slv():
+
+ 
+
+grant_usage = max_t(int, limit - (granted - grant_plan), 1);
+
+slv_factor = (grant_usage if (slv > ldlm_pool_slv_max(limit))
+    slv = ldlm_pool_slv_max(limit);
+
+ 
+
+If clients are gentlemen that steadily requires locks - requires less locks than grant_plan, then grant_usage increase => slv_factor > 1.0 => slv increase capped with slv_max => SLV far greater than CLV, until memory consumption reaches OS limit SLV is still that large, SLV >> CLV. We didn't release that till kernel told us, check THEN part.
+
+ 
+
+Case 2: Lock consumption with spikes
+
+Assume MDS has allocated 0.5M locks out of the total 1M, then spikes happened,  50K request in the next second, SLV is cut down by %5; then subsequent 50K requests, each with 5% cut... Note only 4~5 such requests in a row would push us to the memory limit, while SLV * (0.95)^4 is still that large, again we didn't realize it till kernel told us, check THEN part.{}
+
+Then: Memory is under pressure that shrinker is called
+
+ldlm_srv_pool_shrink():
+
+ 
+
+/*
+ * We want shrinker to possibly cause cancellation of @nr locks from
+ * clients or grant approximately @nr locks smaller next intervals.
+ * ...
+ */
+pl->pl_server_lock_volume = pl->pl_server_lock_volume - nr;
+
+ 
+
+Note @nr is number of locks, while SLV is (lock_counts * LDLM_POOL_MAX_AGE), and this substraction completely ignored the LDLM_POOL_MAX_AGE part, which means SLV stays relatively stable even under memory pressure. It's still that large. Even kernel cannot wake us up...
+
+ 
+
+And one more thing to notice, @nr of lock is not what us expect? @nr here is from ldlm_reclaim, not ldlm_pool.
+
+One more thing: unit mismatch between ldlm_pool with ldlm_reclaim?
+
+ldlm_pool:
+
+50 ldlm locks for 1MB of RAM => 64GB means around 3.2M lock limit 
+
+ldlm_reclaim:
+
+ldlm_reclaim_threshold = ldlm_ratio2locknr(LDLM_WM_RATIO_LOW_DEFAULT):
+# and in ldlm_ratio2locknr():
+  locknr = ((__u64)NUM_CACHEPAGES 
+
+Assume sizeof(struct ldlm_lock) around 0.5KB => 13GB(i.e 64GB * 0.2 ratio) means 26M lock limit
+
+It means till 3.2M lock have been used up (OOM) however it's far less than 26M, so ldlm_reclaim would not even alarm/reaction here...
+
+ 
+
+We should not have that many OOMs, so please correct which points above are wrong, thanks.
+
+--- Comment (adilger, Fri, 17 Oct 2025 11:17:43 +0000) ---
+There is a good discussion of the issues in LU-6529 and LU-19254, though I do not agree with the proposed solution in that ticket.  Instead of keeping the server well informed about the last usage of every lock on every client (which would be a huge overhead), it makes sense to have the server ask each client which locks should be cancelled. 
+
+The existing mechanism for this is the "Server Lock Volume" (SLV), which is a proxy for cumulative age of all locks held on the client(s), and if the server is under memory pressure, it notifies the clients to shrink their fraction of the SLV, and it is up to the client to decide which locks to cancel to shrink the SLV (either a few old+unused locks or many new+single-use locks, or a combination of the two). However, I think the tuning and/or Implementation of SLV is broken, and it does not do a good job of managing the total lock counts on the clients or servers. 
+
+The other alternative would be to discard the SLV implementation entirely (which has non-zero overhead to manage), and move to a simple mechanism where the server directly requests that each client cancels "N" locks (e.g. proportional to the number of locks they are holding) and the client shrinks its LRU accordingly. One suggestion for implementing this mechanism could be a blocking AST RPC on res 0:0:0:0 (normally invalid) with a count of locks.

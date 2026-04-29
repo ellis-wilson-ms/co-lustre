@@ -1,0 +1,99 @@
+Key:        LU-12434
+Summary:    use filesystem default dir layout for new directories
+Link:       https://jira.whamcloud.com/browse/LU-12434
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Duplicate
+Assignee:   Lai Siyao
+Reporter:   Lai Siyao
+Created:    Thu, 13 Jun 2019 03:43:11 +0000
+Updated:    Fri, 26 Nov 2021 21:49:21 +0000
+Resolved:   Fri, 26 Nov 2021 21:48:59 +0000
+Links:      Related: is related to  LU-12624; Related: is related to  LU-14792; Related: is related to  LU-11213
+
+--- Description ---
+Filesystem default dir layout stored in ROOT is not used in new directory creation, this is a technical debt of DNE code. It should follow the same semantic as filesystem default file layout:
+
+1. if user specified layout, use the input to create new directories.
+
+2. else if parent directory has default dir layout, check whether this default dir layout is sufficient (stripe_count is not 0 and hash_type is not 'none'), if so, use it to create.
+
+3. else if filesystem has default dir layout, and fill missing fields with it, then check whether it's sufficient, if so, use it to create.
+
+4. else fill missing fields with default values (stripe_count is "1", hash_type is "fnv16"), and create.
+
+--- Comment (adilger, Fri, 26 Nov 2021 21:48:37 +0000) ---
+This was largely implemented in patch https://review.whamcloud.com/44090 "LU-14792 llite: enable filesystem-wide default LMV" using "lum_stripe_offset = -1" and remote 1-stripe directories to do space balancing.
+
+LMV_HASH_TYPE_SPACE was renamed to LMV_HASH_FLAG_SPACE in patch https://review.whamcloud.com/35318 "LU-11213 uapi: change 'space' hash type to hash flag" and removed entirely in patch https://review.whamcloud.com/35825 "LU-12624 lod: alloc dir stripes by QoS"
+
+--- Comment (adilger, Thu, 20 Jun 2019 15:17:31 +0000) ---
+It looks like there is already a mask LMV_HASH_TYPE_MASK declared in lustre_idl.h along with several LMV_HASH_FLAG_* values, while the actual LMV_HASH_TYPE_* values are declared in lustre_user.h.
+
+To allow us to potentially allow inheriting different hash types from "space" hashed directories, we should consider moving LMV_HASH_TYPE_SPACE to be LMV_HASH_FLAG_SPACE and change the value to be in the high bits.  This could easily be done now, but will be much more difficult after 2.13 is released.  The LMV_HASH_FLAG_* values should also be moved into lustre_user.h so that they are together into enum lmv_hash_type , so we don't accidentally declare conflicting values.
+
+--- Comment (adilger, Mon, 17 Jun 2019 04:40:33 +0000) ---
+OK, good.  I was a bit concerned about that, but it seems OK if it falls back to plain directory type for lum_stripe_count .
+
+PS: it is confusing to me that the struct lmv_user_md fields are named "lum_*" the same as struct lov_user_md.  It would maybe be better to name them "luv_*" or something to make them different, though I understand that would also be a lot of lines changed...
+
+--- Comment (laisiyao, Mon, 17 Jun 2019 04:12:58 +0000) ---
+/*
+                 * "space" hash type can only be set in default LMV, child use
+                 * FNV_1A_64 in case it's striped.
+                 */
+                if (lo->ldo_dir_hash_type == LMV_HASH_TYPE_SPACE)
+                        lo->ldo_dir_hash_type = LMV_HASH_TYPE_FNV_1A_64;
+
+This code only changes hash type to default hash type, it doesn't mean subdirectories will be created as striped. This is just in case user set directory default layout hash to 'space' and stripe count > 1.
+
+I'll add a patch to implement inherit count first.
+
+--- Comment (adilger, Fri, 14 Jun 2019 07:54:24 +0000) ---
+I don't think it makes sense to wait for dir restripe, since that will be at least one release away, and will only balance large directories.  Being able to balance small directories on a regular basis is more important for regular usage.  I don't think it makes sense to limit space-hashed directories to only be used on ROOT, since they can be very useful for e.g. top-level user directories (to distribute their files across MDTs).
+
+I think the main issue is if new subdirectories below a space-hash directory are always created as striped:
+
+                /*
+                 * "space" hash type can only be set in default LMV, child use
+                 * FNV_1A_64 in case it's striped.
+                 */
+                if (lo->ldo_dir_hash_type == LMV_HASH_TYPE_SPACE)
+                        lo->ldo_dir_hash_type = LMV_HASH_TYPE_FNV_1A_64;
+
+I think it makes sense to move the lum_stripe_count check into lod_striping_from_default() so lum_stripe_count=0 or lum_stripe_count=1 would create a plain subdirectory, otherwise, the directory would be created with the specified parameters in lmv_user_md_v1., which makes the code more clear:
+
+        } else if (lds->lds_dir_def_striping_set && S_ISDIR(mode)) {
+                :
+                :
+                /* if stripe count is 1 or 0,  create normal directory */
+                if (lo->ldo_dir_stripe_count ldo_dir_hash_type = LMV_HASH_TYPE_NONE;
+                        lo->ldo_dir_stripe_count = 0;
+                }
+
+                /*
+                 * "space" hash type can only be set in default LMV, child use
+                 * FNV_1A_64 in case it's striped.
+                 */
+                if (lo->ldo_dir_hash_type == LMV_HASH_TYPE_SPACE)
+                        lo->ldo_dir_hash_type = LMV_HASH_TYPE_FNV_1A_64;
+
+However, this only allows setting the hash type to FNV_1A_64, which may be limiting in the future.
+
+One option would be to change lum_hash_type to be like LOV_PATTERN_* and have a 16-bit mask in the high bits and a 16-bit type, and put LMV_HASH_FLAG_SPACE in the mask part, and let the low bits store LMV_HASH_TYPE_FNV_1A_64 or LMV_HASH_TYPE_ALL_CHARS or LMV_HASH_TYPE_UNKNOWN (which should be renamed to LMV_HASH_TYPE_NONE) to indicate what type of subdirectory should be created.
+
+For the inherited layout, the lum_hash_type would be inherited if lum_inherit_count > 0 and cleared once lum_inherit_count == 0 to only create plain directories below that.
+
+--- Comment (laisiyao, Thu, 13 Jun 2019 08:13:16 +0000) ---
+There is a major difference between default dir layout and default file layout: ROOT default layout doesn't affect master MDT choosing for directories not under it, because it's chosen by lmv_locate_tgt() on client, and it's decided by its parent layout and default layout. This is why 'space' hash is not an issue for ROOT.
+
+--- Comment (laisiyao, Thu, 13 Jun 2019 07:38:09 +0000) ---
+This is not an issue for ROOT because its default layout is not inherited. And if its hash type is set to 'space', this value will only be used in its subdir creation (checked in LMV), and for other directories, the default value 'fnv16' will be used if a proper value is not provided.
+
+But it may become an issue for normal plain directories, we may add a inheritance count like you suggested before. Or we can leave it like this, and suggest user not to set this on normal plain directories, and let dir restripe (TDB) to balance MDT usage.
+
+--- Comment (adilger, Thu, 13 Jun 2019 07:10:00 +0000) ---
+A tricky problem here is that the new "hash=space" code is implemented using the default directory layout.  If this is set on the root directory, then suddenly every directory in the filesystem will use space-balanced mkdir() without any way to turn it off.
+
+If we want this to work, either the hash=space code needs to be implemented as a regular LMV layout (maybe just a flag in the layout type), or some other rule needs to be implemented for inheritance.

@@ -1,0 +1,94 @@
+Key:        LU-15202
+Summary:    lfs setstripe should check ost offset is valid for pool
+Link:       https://jira.whamcloud.com/browse/LU-15202
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Peter Jones
+Reporter:   Mahmoud Hanafi
+Created:    Tue, 9 Nov 2021 16:35:11 +0000
+Updated:    Wed, 10 Nov 2021 21:42:38 +0000
+
+--- Description ---
+When a directory has ost pool set and a change is made to the stripe offset lustre doesn't check to make sure ost offset is valid. Here for example:
+
+	mkdir creates a directory with PFL.
+
+	Striping is changed to offset of 0. ( This should error out, because offset of 0 (-i 0 ) is not valid for ssd-pool.
+
+> lfs getstripe -d stripe_test_dir
+  lcm_layout_gen:    0
+  lcm_mirror_count:  1
+  lcm_entry_count:   3
+    lcme_id:             N/A
+    lcme_mirror_id:      N/A
+    lcme_flags:          prefer
+    lcme_extent.e_start: 0
+    lcme_extent.e_end:   268435456
+      stripe_count:  1       stripe_size:   16777216       pattern:       raid0       stripe_offset: -1       pool:          ssd-pool
+
+    lcme_id:             N/A
+    lcme_mirror_id:      N/A
+    lcme_flags:          prefer
+    lcme_extent.e_start: 268435456
+    lcme_extent.e_end:   5368709120
+      stripe_count:  16       stripe_size:   16777216       pattern:       raid0       stripe_offset: -1       pool:          ssd-pool
+
+    lcme_id:             N/A
+    lcme_mirror_id:      N/A
+    lcme_flags:          0
+    lcme_extent.e_start: 5368709120
+    lcme_extent.e_end:   EOF
+      stripe_count:  16       stripe_size:   16777216       pattern:       raid0       stripe_offset: -1       pool:          hdd-pool
+
+> lfs setstripe -c 1 -i 0 stripe_test_dir
+mhanafi@pfe23:/nobackupp17/mhanafi> lfs getstripe -d stripe_test_dir
+stripe_count:  1 stripe_size:   1048576 pattern:       raid0 stripe_offset: 0 pool:          ssd-pool
+
+> touch stripe_test_dir/test
+touch: setting times of 'stripe_test_dir/test': No such file or directory
+
+lfs setstripe does check ost offset if the pool is passed.
+
+> lfs setstripe -c 1 -i 0 stripe_test_dir -p ssd-pool
+lfs setstripe: setstripe error for 'stripe_test_dir': Invalid argument
+
+> lfs setstripe -c 1 -i 100 stripe_test_dir -p ssd-pool
+
+> touch stripe_test_dir/test
+
+--- Comment (adilger, Wed, 10 Nov 2021 21:42:38 +0000) ---
+I was testing this on my local system, and it looks like the  problem is still present in 2.14.0.  The issue is that the MDS is checking if the OST index is valid for the pool, which is fine if the user specified it directly via setstripe and can do something about it, but should be ignored if the default layout is coming from a default layout on the parent/root directory where it would just confuse users and make them unhappy that they cannot create files.
+
+mdd_dir.c:2601:mdd_create()) Process entered
+mdd_object.c:557:mdd_declare_create_object_internal()) Process entered
+lod_object.c:5620:lod_declare_create()) Process entered
+lod_object.c:5512:lod_declare_striped_create()) Process entered
+lod_qos.c:2661:lod_prepare_create()) Process entered
+lod_qos.c:2697:lod_prepare_create()) comp[0] 0 [0x0, 0x0)
+lod_qos.c:2513:lod_qos_prep_create()) Process entered
+lod_qos.c:2564:lod_qos_prep_create()) tgt_count 5 stripe_count 1
+lod_qos.c:1266:lod_ost_alloc_specific()) Start index 0 not found in pool 'testpool'
+lod_qos.c:1267:lod_ost_alloc_specific()) Process leaving via out (rc=18446744073709551594 : -22 : 0xffffffffffffffea)
+lod_qos.c:2649:lod_qos_prep_create()) Process leaving (rc=18446744073709551594 : -22 : ffffffffffffffea)
+lod_qos.c:2705:lod_prepare_create()) Process leaving (rc=18446744073709551594 : -22 : ffffffffffffffea)
+lod_object.c:5521:lod_declare_striped_create()) Process leaving via out (rc=18446744073709551594 : -22 : 0xffffffffffffffea)
+lod_object.c:5702:lod_declare_create()) Process leaving (rc=18446744073709551594 : -22 : ffffffffffffffea)
+mdd_object.c:577:mdd_declare_create_object_internal()) Process leaving (rc=18446744073709551594 : -22 : ffffffffffffffea)
+mdd_dir.c:2161:mdd_declare_create_object()) Process leaving via out (rc=18446744073709551594 : -22 : 0xffffffffffffffea)
+mdd_dir.c:2261:mdd_declare_create()) Process leaving via out (rc=18446744073709551594 : -22 : 0xffffffffffffffea)
+mdd_dir.c:2678:mdd_create()) Process leaving via out_stop (rc=18446744073709551594 : -22 : 0xffffffffffffffea)
+
+This is in contrast to lod_verify_striping->lod_verify_v1v3() which checks is_from_disk to skip OST index validation when stripe_offset != LOV_OFFSET_DEFAULT.
+
+--- Comment (adilger, Wed, 10 Nov 2021 17:40:27 +0000) ---
+Mahmoud, it looks like there are two related issues here:
+
+	the default layout set on the directory contains a specific OST index that is not in the pool that is inherited for that directory
+
+	checking this OST index during file creation prevents the file from being created
+
+In general, because default layouts may be stored on arbitrary directories across the filesystem,  it is not possible for there to be a guaranteed coherence between the specified OST index in a default layout and a specified pool. The OSTs that make up a pool may change over time, or an OST may be offline or full at the time a file is created in a directory with a default layout. The file creation should ignore the invalid OST index at that time, so this is definitely a bug that should be fixed (though it may already be fixed in 2.14, I have to look).
+
+That said, it is not recommended to specify an explicit OST index for any layout, as this typically results in imbalanced OSTs and unhappy users. Most often "-i 0" is an error by the user when they really intended "-i -1", so it is best to not specify the "-i" argument at all in this case.

@@ -1,0 +1,198 @@
+Key:        LU-14694
+Summary:    racer timeouts with LU-10948
+Link:       https://jira.whamcloud.com/browse/LU-14694
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Alex Zhuravlev
+Reporter:   Alex Zhuravlev
+Created:    Thu, 20 May 2021 04:22:30 +0000
+Updated:    Tue, 10 Aug 2021 13:12:35 +0000
+Resolved:   Tue, 10 Aug 2021 13:12:35 +0000
+Links:      Related: is related to  LU-10948
+
+--- Description ---
+many racer runs timeout, bisected that to patch:
+
+https://review.whamcloud.com/32158/
+
+Subject: LU-10948 llite: Introduce inode open heat counter
+
+Project: fs/lustre-release
+
+Branch: master
+
+Commit: 41d99c4902836b7265db946dfa49cf99381f0db4
+
+--- Comment (pjones, Tue, 10 Aug 2021 13:12:35 +0000) ---
+Landed for 2.15
+
+--- Comment (gerrit, Tue, 10 Aug 2021 08:07:43 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/43783/
+
+Subject: LU-14694 mdt: do not remove orphans at umount
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 0b94a058fe6732907d7aa3f5de0cbd7888d28ce1
+
+--- Comment (gerrit, Tue, 25 May 2021 15:40:43 +0000) ---
+Alex Zhuravlev (bzzz@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/43783
+
+Subject: LU-14694 mdt: do not remove orphans at umount
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 9f9e98a5e94e021c68882db5ab3d03484048b810
+
+--- Comment (bzzz, Tue, 25 May 2021 09:30:31 +0000) ---
+I think we need something like above on its own as umount with just evicted client is a legal case.
+
+--- Comment (bzzz, Mon, 24 May 2021 15:15:18 +0000) ---
+probably a bit better option is to re-use existing infrastructure to skip orphan removal:
+
+--- a/lustre/mdt/mdt_handler.c
++++ b/lustre/mdt/mdt_handler.c
+@@ -6438,7 +6438,8 @@ static int mdt_export_cleanup(struct obd_export *exp)
+                                rc = mdt_ctxt_add_dirty_flag(&env, info, mfd);
+ 
+                        /* Don't unlink orphan on failover umount, LU-184 */
+-                       if (exp->exp_flags & OBD_OPT_FAILOVER) {
++                       if (exp->exp_flags & OBD_OPT_FAILOVER ||
++                               exp->exp_obd->obd_stopping) {
+                                ma->ma_valid = MA_FLAGS;
+                                ma->ma_attr_flags |= MDS_KEEP_ORPHAN;
+                        }
+
+--- Comment (bzzz, Mon, 24 May 2021 13:29:19 +0000) ---
+basically the problem is that:
+
+1) openlock is taken on directories
+
+2) the client doesn't cancel locks on umount:
+
+                /* obd_force == local only */
+                ldlm_cli_cancel_unused(obd->obd_namespace, NULL,
+                                       obd->obd_force ? LCF_LOCAL : 0, NULL);
+
+3) thus MDT has to clear those "lost" locks, so close the directories
+
+4) a close may result in directory removal
+
+5) directory can be striped, thus needs all involved MDTs to be healty
+
+6) MDTs are stopped one by one
+
+locally I "solved" the problem disabling opencache for directories:
+
+--- a/lustre/mdt/mdt_open.c
++++ b/lustre/mdt/mdt_open.c
+@@ -820,6 +820,9 @@ static int mdt_object_open_lock(struct mdt_thread_info *info,
+        if (req_is_replay(mdt_info_req(info)))
+                RETURN(0);
+ 
++       if (S_ISDIR(lu_object_attr(&obj->mot_obj)))
++               open_flags &= ~MDS_OPEN_LOCK;
++
+        if (S_ISREG(lu_object_attr(&obj->mot_obj))) {
+
+but it looks like we've got few real problems to solve here. the most serious one, IMO, is to handle such a close on MDT in a better manner, so that umount doesn't get stuck indefinitely.
+
+--- Comment (bzzz, Mon, 24 May 2021 07:25:57 +0000) ---
+--- a/lustre/tests/racer.sh
++++ b/lustre/tests/racer.sh
+@@ -180,6 +180,7 @@ test_1() {
+                lss_cleanup
+        fi
+ 
++       cancel_lru_locks mdc
+        return $rrc
+ }
+ run_test 1 "racer on clients: ${CLIENTS:-$(hostname)} DURATION=$DURATION"
+
+this helps.. it looks like openhandle locks are lost at umount, causing MDT to close them at export cleanup.
+
+--- Comment (bzzz, Fri, 21 May 2021 11:54:34 +0000) ---
+sanity/29 fails as well:
+
+== sanity test 29: IT_GETATTR regression  ============================================================ 11:52:13 (1621597933)
+Lustre: DEBUG MARKER: == sanity test 29: IT_GETATTR regression ============================================================ 11:52:13 (1621597933)
+striped dir -i1 -c2 -H all_char /mnt/lustre/d29
+first d29
+Lustre: DEBUG MARKER: first d29
+total 0
+-rw-r--r-- 1 root root 0 May 21 11:52 foo
+second d29
+Lustre: DEBUG MARKER: second d29
+total 0
+-rw-r--r-- 1 root root 0 May 21 11:52 foo
+done
+Lustre: DEBUG MARKER: done
+ sanity test_29: @@@@@@ FAIL: CURRENT: 10 > 9 
+Lustre: DEBUG MARKER: sanity test_29: @@@@@@ FAIL: CURRENT: 10 > 9
+  Trace dump:
+  = ./../tests/test-framework.sh:6280:error()
+  = sanity.sh:3398:test_29()
+  = ./../tests/test-framework.sh:6583:run_one()
+  = ./../tests/test-framework.sh:6630:run_one_logged()
+  = ./../tests/test-framework.sh:6457:run_test()
+  = sanity.sh:3410:main()
+Dumping lctl log to /tmp/ltest-logs/sanity.test_29.*.1621597935.log
+Dumping logs only on local client.
+Resetting fail_loc on all nodes...done.
+FAIL 29 (2s)
+
+--- Comment (bzzz, Thu, 20 May 2021 18:02:10 +0000) ---
+Also, is this with opencache enabled, or just with the patch applied?
+
+this is the latest clean master
+
+--- Comment (bzzz, Thu, 20 May 2021 17:12:46 +0000) ---
+basically it's MDSCOUNT=2 REFORMAT=yes bash racer.sh
+
+--- Comment (bzzz, Thu, 20 May 2021 17:12:22 +0000) ---
+...
+Resetting fail_loc on all nodes...done.
+PASS 1 (2720s)
+== racer test complete, duration 2768 sec ============================================================ 16:47:13 (1621529233)
+Stopping clients: tmp.xMEAXwSwZi /mnt/lustre (opts:-f)
+Stopping client tmp.xMEAXwSwZi /mnt/lustre opts:-f
+Stopping clients: tmp.xMEAXwSwZi /mnt/lustre2 (opts:-f)
+Stopping client tmp.xMEAXwSwZi /mnt/lustre2 opts:-f
+Stopping /mnt/lustre-mds1 (opts:-f) on tmp.xMEAXwSwZi
+modprobe: FATAL: Module dm-flakey not found.
+Stopping /mnt/lustre-mds2 (opts:-f) on tmp.xMEAXwSwZi
+
+then unique traces:
+
+schedule,do_select,trace_hardirqs_off_thunk
+	PIDs(1): "sshd":2287 
+
+schedule,do_select,_copy_to_user
+	PIDs(1): "sshd":2587 
+
+schedule,top_trans_stop,lod_trans_stop,mdd_trans_stop,mdt_mfd_close,mdt_obd_disconnect,class_fail_export,ping_evictor_main
+	PIDs(1): "ll_evictor":7754 
+
+schedule,ptlrpc_set_wait,ptlrpc_queue_wait,osp_send_update_req,osp_send_update_thread
+	PIDs(1): "osp_up0-1":7989 
+
+schedule,top_trans_stop,lod_trans_stop,mdd_trans_stop,mdt_mfd_close,mdt_obd_disconnect,class_disconnect_export_list,class_disconnect_exports,class_cleanup,class_process_config,class_manual_cleanup,server_put_super,generic_shutdown_super,kill_anon_super,deactivate_locked_super,cleanup_mnt,task_work_run,exit_to_usermode_loop
+	PIDs(1): "umount":535030
+
+--- Comment (adilger, Thu, 20 May 2021 05:05:21 +0000) ---
+Also, is this with opencache enabled, or just with the patch applied?
+
+--- Comment (adilger, Thu, 20 May 2021 05:04:55 +0000) ---
+Alex, what kind of timeout?  Stuck processes (with stack?), unable to unmount, oops, other?  Single client mountpoint or multiple?
+
+Previously Oleg and I had discussed whether opencache locks needed to time out sooner. Could you try running with ldlm.namespaces.*.lru_max_age=30 to see if that helps?

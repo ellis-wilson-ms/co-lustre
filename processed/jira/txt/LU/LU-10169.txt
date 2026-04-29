@@ -1,0 +1,122 @@
+Key:        LU-10169
+Summary:    Spillover space
+Link:       https://jira.whamcloud.com/browse/LU-10169
+Type:       New Feature
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Patrick Farrell
+Reporter:   Nathan Rutman
+Created:    Mon, 30 Oct 2017 20:13:04 +0000
+Updated:    Tue, 27 Aug 2019 17:49:30 +0000
+Resolved:   Tue, 27 Aug 2019 17:49:30 +0000
+Links:      Related: is related to  LU-10070
+
+--- Description ---
+I had an alternate but somewhat overlapping thought to LU-10070 - keep the last component going to EOF, but allow for the possibility of bounding it in the future by creating a new FLR replica, and marking the original one as stale.
+
+Spillover space (MRP-4598):
+
+I'm wondering if we can take the new enhanced file layouts feature plus OSC space grant info (or some other trigger) to eliminate ENOSPC caused by full OSTs. The idea would be something like:
+
+1.       Server decreases grants as space approaches 0
+
+2.       Client notes grant = 0 (or low)
+
+3.       Client takes layout lock, forcing flush of all dirty extents
+
+4.       Client adds a new FLR replica which chooses a different (emptier) set of OSTs for all further file extents of open-for-write files
+
+5.       Client sets this new layout as primary, and releases layout lock
+
+6.       Clients reqacquire locks and grants from new OSTs
+
+Example
+Initially:
+
+Layout v1: [0-inf) OST0-4
+
+Runs out of space when file is at 10GB; we add a 2nd replica with a PFL layout
+
+Layout v2: complex
+
+   Replica1: [0-inf) OST0-4
+
+   Replica2: component1 [0-10GB) OST0-4; component2 [10GB-inf) OST5-10
+
+Set Layer2 as the primary copy, mark Layer1 as stale.
+
+Benefits
+
+	Eliminate ENOSPC for single full OST
+
+	Allow for "tiering" spillover from flash pool to disk pool
+
+	Maybe use something like this also for changing layouts for failed OSTs...??
+
+Questions
+
+	Can layouts for open-for-write files be changed like this?
+
+	Can the PFL component layout match object-for-object the original simple RAID0 layout? (I.e. we don't want to copy the data, but instead just reference the original objects, now with an extent limit.)
+
+	Is grant the right trigger?
+
+	Do we need a policy for spillover selection? Pre-set spillover targets? Ask the MDS for new allocation?
+
+--- Comment (pfarrell, Tue, 27 Aug 2019 17:49:30 +0000) ---
+This was implemented in LU-10070.
+
+--- Comment (nrutman, Mon, 29 Jan 2018 19:45:13 +0000) ---
+Not handled as well by 10070:
+
+	Files must have a PFL layout already, primed for ENOSPC handling. 10169 could handle any layout type.
+
+	10070 grants a fixed amount of space to the next component. Too small, you will end up with too many components; too large, you may still run out of space as other files fill the OST. You're counting on bulk behavior, but one bad file could still cause ENOSPC for everyone else.
+
+	Layouts continue to grow with 10070, even though the system may have plenty of space, requiring more MDT space and network traffic for updating client layouts.
+
+Not handled as well by 10169:
+
+	Sparse writer case. Some writer way off at the end of the file may have an empty OST, and someone at the beginning hits a full OST. We can't change the extent of the existing layout to "short" without copying the data for potentially a large component. (If we can detect this, we could just give up and ENOSPC this one).
+
+--- Comment (nrutman, Tue, 31 Oct 2017 00:22:17 +0000) ---
+This could be simplified further if the layout was changed before an OST was totally full, which would essentially become a form of self-extending PFL layout in the end.
+
+yes - this is why I was suggesting something like watching grant to trigger the layout change before an actual ENOSPC. If all writers can't flush at this point, it's ENOSPC and give up. But we can avoid those cases just by more aggressively changing layout at say 95% full or something. We would truncate the layout at the furthest written extent, rounded up to something nice (say a full stripe size), again assuming we left ourselves plenty of spare room on each OST that hosts a stripe. That way we don't have to re-write or copy anything. Holes are perfectly fine – this will become one component of a PFL, and subsequent writes can fill in those holes if they want (since we left ourselves extra space). (Sure, you could come up with a sparse file scenario where this breaks down, but in those cases we just return ENOSPC as today.)
+
+ Of the two significant cases that this addresses
+
+	Eliminate ENOSPC for single full OST
+
+	Allow for "tiering" spillover from flash pool to disk pool
+
+neither can be addressed with a static layout determined at file create time. Eg. someone creates a tiered PFL on flash/disk OSTs with plenty of room, then someone else fills all the flash drives with a checkpoint. LU-10070 moves kind of halfway toward a dynamic component, but the alternative expressed in this ticket seems (to me) to provide broader advantages.
+
+--- Comment (adilger, Mon, 30 Oct 2017 22:40:17 +0000) ---
+I've thought about this issue and possible solutions in the past as well, and can share my ideas here (they may also be somewhere else). I agree that handling the single OST full issue is desirable, but my hope is that PFL will avoid this to a large extent, as would better OST space balancing as described in LU-9 and LU-9809. 
+
+While it IS possible to modify a layout while it is actively being written by a client, there are some caveats. There is not currently any way for a client to modify an existing component directly. This is done to prevent clients from introducing corruption into the layout (e.g. referencing objects owned by another file/user, or objects that do not exist). Also, until FLR is landed the components must be strictly non-overlapping. 
+
+Currently the methods to update composite layout are:
+
+	add a new component with a specified layout (instantialted or template)
+
+	remove an exiting component (by component number)
+
+	swap the layout from one file with the layout from another file
+
+I'm not against fixing this issue more directly, but at a minimum we would need a new layout operation to truncate the end of an existing component (@10GB in your example) before adding a new component to cover the rest of the file. That wouldn't be too hard, and would preserve the semantics that clients cannot manipulate layouts directly. 
+
+The next problem is where to truncate the original layout? There is no guarantee that the object on the full OST will have a nice size like 1GB, and currently there is a requirement that layouts must have sizes that are a multiple of 64KB. That implied we need to truncate the full object at the nearest multiple of 64KB, since we can't write more data to that OST, and write the remainder to the new component. Not a huge deal for The final issue is that the other OSTs the remaining stripes are on are presumably not full, so they may have continued being written before the client noticed one OST is full, and the file could be written from many other clients. That means potentially multiple GB of potentially sparse data that needs to be copied over to the new component atomically before the original layout is truncated and a new component is added. 
+
+Taking this to the extreme, even if we had a layout that had a "ragged" starting offset to handle the different-sized objects, there would still be the issue of holes in the original component that could not be filled, if the file was not being written linearly from start to end. While linear write is the most common case, there would definitely be times where that wasn't true, so even very complex solutions (which I would be against) wouldn't solve all cases.
+
+That said, if this could be fixed for the common single client linear writing case (i.e. truncate existing layout, add new component, copy a small amount of data that was truncated off), it would not be worse than what we have today.  This could be simplified further if the layout was changed before an OST was totally full, which would essentially become a form of self-extending PFL layout in the end. 
+
+An ounce of prevention in the form of PFL and not filling OSTs to 100% in the first place is worth a pound of cure.
+
+--- Comment (nrutman, Mon, 30 Oct 2017 20:58:36 +0000) ---
+> mark Layer1 as stale.
+
+Permanently stale. Or just delete it. Maybe this doesn't need FLR at all, if we can change Layout v1 into Layout v2 Replica2 directly under the layout lock.

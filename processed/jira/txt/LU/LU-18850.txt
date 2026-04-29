@@ -1,0 +1,121 @@
+Key:        LU-18850
+Summary:    sanity/900 Crash with cfs_hash_for_each_relax+0x17b/0x480 [obdclass]
+Link:       https://jira.whamcloud.com/browse/LU-18850
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Arshad Hussain
+Reporter:   Maloo
+Created:    Tue, 25 Mar 2025 16:59:24 +0000
+Updated:    Thu, 25 Dec 2025 12:22:39 +0000
+Links:      Related: is related to  LU-18593; Related: is related to LU-8792
+
+--- Description ---
+This issue was created by maloo for Arshad 
+
+This issue relates to the following test suite run: https://testing.whamcloud.com/test_sets/aec6b1c3-5f88-425a-8bf5-50415f59f012
+
+Test session details:
+
+clients: https://build.whamcloud.com/job/lustre-reviews/111944 - 4.18.0-553.44.1.el8_10.x86_64
+
+servers: https://build.whamcloud.com/job/lustre-reviews/111944 - 4.18.0-553.44.1.el8_lustre.x86_64
+
+Crashes executing sanity test 900 during umount:
+
+[17722.241646] LustreError: MGC10.240.28.46@tcp: Connection to MGS (at 10.240.28.46@tcp) was lost; in progress operations using this service will fail
+[17727.828813] Lustre: lustre-MDT0001: Not available for connect from 10.240.28.46@tcp (stopping)
+[17729.469790] Lustre: lustre-MDT0001: Not available for connect from 10.240.24.216@tcp (stopping)
+[17729.471698] Lustre: Skipped 7 previous similar messages
+:
+[17771.667290] watchdog: BUG: soft lockup - CPU#1 stuck for 22s! [umount:573821]
+[17772.371426] CPU: 1 PID: 573821 Comm: umount 4.18.0-553.44.1.el8_lustre.x86_64 #1
+[17772.522202] RIP: 0010:cfs_hash_for_each_relax+0x17b/0x480 [obdclass]
+[17773.230656] Call Trace:
+[17774.042684] ? cleanup_resource+0x350/0x350 [ptlrpc]
+[17774.044248] ? cfs_hash_for_each_relax+0x17b/0x480 [obdclass]
+[17774.045444] ? cfs_hash_for_each_relax+0x172/0x480 [obdclass]
+[17774.046634] ? cleanup_resource+0x350/0x350 [ptlrpc]
+[17774.047719] ? cleanup_resource+0x350/0x350 [ptlrpc]
+[17774.048817] cfs_hash_for_each_nolock+0x124/0x200 [obdclass]
+[17774.049984] ldlm_namespace_cleanup+0x2b/0xc0 [ptlrpc]
+[17774.262073] __ldlm_namespace_free+0x52/0x4e0 [ptlrpc]
+[17774.263285] ldlm_namespace_free_prior+0x5e/0x200 [ptlrpc]
+[17774.264623] mdt_device_fini+0x480/0xf80 [mdt]
+[17775.511739] obd_precleanup+0xf4/0x220 [obdclass]
+[17775.514029] class_cleanup+0x322/0x900 [obdclass]
+[17775.515047] class_process_config+0x3bb/0x20a0 [obdclass]
+[17775.517336] class_manual_cleanup+0x45b/0x780 [obdclass]
+[17775.518435] server_put_super+0xd62/0x11f0 [ptlrpc]
+[17775.578275] generic_shutdown_super+0x6c/0x110
+[17775.579220] kill_anon_super+0x14/0x30
+[17775.580050] deactivate_locked_super+0x34/0x70
+[17775.581003] cleanup_mnt+0x3b/0x70
+[17775.581767] task_work_run+0x8a/0xb0
+[17775.582579] exit_to_usermode_loop+0xef/0x100
+[17775.583529] do_syscall_64+0x195/0x1a0
+[17775.584330] entry_SYSCALL_64_after_hwframe+0x66/0xcb
+
+--- Comment (yujian, Thu, 25 Dec 2025 07:26:53 +0000) ---
+Lustre 2.17.0 RC4 conf-sanity hit the same crash:
+
+https://testing.whamcloud.com/test_sets/04b8ef43-b499-4add-a2c0-942af733c0c4
+
+--- Comment (adilger, Thu, 24 Apr 2025 23:16:02 +0000) ---
++1 on master (sanity-pfl cleanup): https://testing.whamcloud.com/test_sets/517409d7-cdf2-4f70-b165-ada076d5414c
+
+--- Comment (bzzz, Fri, 18 Apr 2025 13:46:55 +0000) ---
++1 on master (sanity-pfl cleanup) https://testing.whamcloud.com/test_sets/3c494888-4f9a-46af-9bba-128e91821cbe
+
+--- Comment (arshad512, Fri, 28 Mar 2025 04:13:58 +0000) ---
+Andreas, Thanks for the detail explaination. Let me own this.
+
+--- Comment (adilger, Thu, 27 Mar 2025 23:28:19 +0000) ---
+This looks like a cleanup bug on the MDS?  Either it is very busy cleaning up thousands of locks and/or the peer MDT where it has locks has already unmounted and the lock cancellation requests are timing out.
+
+It is calling __ldlm_namespace_free() with force=0 that uses cfs_hash_for_each_nolock() to iterate calling ldlm_resource_clean() for each lock, and that will try and cancel every DLM lock on the peer (with an RPC timeout for each), and only once all of the locks have been processed once will it try again with force=1:
+
+void ldlm_namespace_free_prior(struct ldlm_namespace *ns,
+                               struct obd_import *imp, int force)
+{
+:
+        /* Can fail with -EINTR when force == 0 in which case try harder. */
+        rc = __ldlm_namespace_free(ns, force);
+        if (rc != ELDLM_OK) {
+                if (imp) {
+                        ptlrpc_disconnect_import(imp, 0);
+                        ptlrpc_invalidate_import(imp);
+                }
+
+                /*
+                 * With all requests dropped and the import inactive
+                 * we are gaurenteed all reference will be dropped.
+                 */
+                rc = __ldlm_namespace_free(ns, 1);
+                LASSERT(rc == 0);
+        }
+        EXIT;
+}
+
+/*
+ * Only used when namespace goes away, like during an unmount.
+ */
+static int __ldlm_namespace_free(struct ldlm_namespace *ns, int force)
+{
+        /* At shutdown time, don't call the cancellation callback */
+        ldlm_namespace_cleanup(ns, force ? LDLM_FL_LOCAL_ONLY : 0); 
+        :
+
+It probably makes sense to have some "more efficient" way of handling this, like:
+
+	send all of the cancel RPCs once without waiting (maybe ": LDLM_FL_NDELAY" instead of ": 0" if not force, and then check this in ldlm_cli_cancel() to avoid waiting for the RPC reply?
+
+	wait only once for the RPCs to finish
+
+	cancel all of the locks with force=1 (as it does now)
+
+so that this doesn't block waiting for ages during shutdown (which is the only time that ldlm_namespace_free_prior() is called.
+
+--- Comment (arshad512, Tue, 25 Mar 2025 17:05:42 +0000) ---
+This might be duplicate of LU-18593. ( RIP: 0010:cfs_hash_for_each_relax+0x15d/0x480 [libcfs]). Both Failing under same function but both called from different context.

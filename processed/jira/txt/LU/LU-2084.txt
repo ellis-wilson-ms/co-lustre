@@ -1,0 +1,111 @@
+Key:        LU-2084
+Summary:    Kernel freeze allocating more memory than there is RAM
+Link:       https://jira.whamcloud.com/browse/LU-2084
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Andreas Dilger
+Reporter:   Doug Oucharek
+Created:    Wed, 3 Oct 2012 19:20:24 +0000
+Updated:    Wed, 27 Oct 2021 03:48:00 +0000
+Resolved:   Wed, 27 Oct 2021 03:48:00 +0000
+
+--- Description ---
+While working with router buffers, I set the number of large buffers to a number beyond the amount of memory I had assigned to the VM running Lustre.  Number of large buffer: 1024, amount of memory: 1G.  The VM froze with all 3 virtual cpu's running at 100%.
+
+Looking deeper into this, I found that the Linux memory allocation system will keep trying to free up memory to satisfy the request.  However, even after waiting 15 minutes, the VM did not "unfreeze".
+
+I changed the default flags we use for memory allocation to include __GFP_NORETRY to stop the memory allocator from looping.  When re-running the above test, I found the system no longer froze but returned -ENOMEM to the caller as expected.
+
+This bug is to track a discussion as to whether we should start using __GFP_NORETRY and if so, how widespread.
+
+--- Comment (pjones, Wed, 27 Oct 2021 03:48:00 +0000) ---
+Landed for 2.15
+
+--- Comment (gerrit, Wed, 27 Oct 2021 00:35:21 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/45174/
+
+Subject: LU-2084 lnet: don't retry allocating router buffers
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 3038917f12a53b059473db172f5126136e20abc0
+
+--- Comment (gerrit, Sat, 9 Oct 2021 01:22:19 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/45174
+
+Subject: LU-2084 lnet: don't retry allocating router buffers
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: ebd97d4585eea1aa7717f555a52dc24bcfa1885e
+
+--- Comment (adilger, Fri, 5 Oct 2012 00:06:18 +0000) ---
+As much as we could wish everyone using Lustre understood it as well as the developers, I don't think this is at all realistic.  Users need to be told that something they are trying to do is unrealistic, rather than causing failures or hanging/crashing the node.  Having a check like the following seems reasonable:
+
+        if (router_buffer_pages > cfs_num_physpages * 7 / 8) {
+                CERROR("too much router memory requested: max %u\n",
+                       cfs_num_physpages * 7 / 8);
+                RETURN(-EINVAL);
+        fi
+
+with allowances for printing messages with proper units, etc.  We still need to keep some memory for other things as well, which we may not get with a simple -ENOMEM case.
+
+--- Comment (doug, Thu, 4 Oct 2012 23:43:00 +0000) ---
+Good point.
+
+Ok, I can add CFS_ALLOC_NORETRY to our own set of memory allocation flags and map this to __GFP_NORETRY when present.  This way it can be added on a case by case basis.  I will only add this flag when allocating router buffers.
+
+--- Comment (isaac, Thu, 4 Oct 2012 22:36:43 +0000) ---
+I tend to think __GFP_NORETRY is sufficient. On dedicated routers, where could the VM free much memory from?
+
+--- Comment (doug, Thu, 4 Oct 2012 17:48:58 +0000) ---
+This becomes more complicated when looking forward to the Dynamic LNet Config project which will be making the router buffer pools changeable.  With the code as is today, if a user tells a running router to increase the size of a pool beyond available memory, we will see the router lock up for potentially hours.  That is unacceptable.
+
+If we use __GFP_NORETRY, it may return ENOMEM in cases where memory could have been freed to satisfy the request.  However, I would rather see this than a live router lockup.
+
+Checking ahead of time to see if there is RAM available does not sound easy given how the Linux memory manager works.  Also, I feel this would be doing the OS's job for it.
+
+I heard somewhere that work was done to the memory manager in the Linux 3 streams to address these sort of issues.  None of that was back-ported to 2.6.
+
+--- Comment (isaac, Thu, 4 Oct 2012 15:49:09 +0000) ---
+1. I think __GFP_NORETRY is reasonable for router buffers. Routers should be dedicated nodes, where there's nothing else running - i.e. there's nothing like dirty pages to be flushed or idle process pages to be swapped out, so it makes little sense to make the VM retry.
+
+2. I don't think we should make it fool proof by limiting large_router_buffers. System administrators should understand what large_router_buffers does, if they ask for too much, they are asking for trouble and should end up with troubles. Such failures happen only once at router startup, and such routers would be avoided by clients and servers by router pingers, so the consequence should not be catastrophic. Then the admin should notice it and learn his lesson.
+
+--- Comment (adilger, Thu, 4 Oct 2012 04:01:02 +0000) ---
+Doug, wouldn't it make sense to limit the number of router buffers to some amount less than the total amount of RAM?  Using __GFP_NORETRY in a blanket fashion seems like it could cause gratuitous system failures for cases where there is low memory, but the allocation is not absurd like in your case.
+
+--- Comment (keith, Wed, 3 Oct 2012 20:29:50 +0000) ---
+Yes working to keep the system out of OOM is a much better user experience.
+
+cfs_alloc_flags_to_gfp seems to be pretty low. I would think that is a huge amount of code affected. 
+
+Are you using cfs_alloc(size_t nr_bytes, u_int32_t flags)?  You can passdown  __GFP_NORETRY to your specific allocation. 
+
+What are you seeing as your -ENOMEM indication?
+
+--- Comment (doug, Wed, 3 Oct 2012 20:03:59 +0000) ---
+Given how there are many layers of "abstraction" in libcfs for OS portability, I ended up just hardcoding the addition of __GFP_NORETRY in routine cfs_alloc_flags_to_gfp() in linux-mem.c.
+
+Since we don't preallocate everything and do have some level of dynamic allocation, the possibility will exist that a happy running server could all of a sudden appear to freeze.  I myself thought I had crashed the kernel since the terminal was no longer responsive.  Only by seeing the CPU meter on the host system did I notice that the VM is still running at 100%.
+
+From a user's perspective, I would rather have an error message saying "task X could not be done because of a lack of memory" rather than a freeze.
+
+--- Comment (keith, Wed, 3 Oct 2012 19:49:38 +0000) ---
+In general:
+
+I have seen near OOM situations take hours (think overnight to days) to work themselves out if it is possible, over committal of kernel size code fairs badly. 15min is just getting started with these things.  In your "frozen" state your kernel was likely not broken in any way just busy trying to accomplish what you asked it to do. 
+
+There are going to be some critical sections of code that cannot fail and should block until fulfilled. It is definitely a per-allocation-class question of weather it should block or not. If you are allocating a whole systems amount of memory it should use __GFP_NORETRY and check for -ENOMEM, also I would hope that resources users this large would carefully grow as needed.
+
+Where did you add the  __GFP_NORETRY flag?

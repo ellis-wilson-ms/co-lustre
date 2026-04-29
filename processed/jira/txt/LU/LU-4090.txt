@@ -1,0 +1,312 @@
+Key:        LU-4090
+Summary:    OST unavailable due to possible deadlock
+Link:       https://jira.whamcloud.com/browse/LU-4090
+Type:       Bug
+Priority:   Major
+Status:     Reopened
+Resolution: Unresolved
+Assignee:   Zhenyu Xu
+Reporter:   Li Xi
+Created:    Fri, 11 Oct 2013 07:25:26 +0000
+Updated:    Tue, 7 Jun 2016 15:38:31 +0000
+Attachments: 0001-LU-4090-fsfilt-don-t-wait-forever-for-stale-tid.patch, ALPL202.messages_20150518.txt, messages.ALPL401.txt, messages.ALPL402.txt
+
+--- Description ---
+One OST became unavailable ane kept on dumping stack traces until its service is taken over by another OSS. This issue occured a couple of time on different servers.
+
+After some inverstigation, we found that a lot of service theads hang at different places. Here is a list of where they stuck.
+
+ll_ost_01:10226,-ll_ost_07:10232,-ll_ost_09:10234,-ll_ost_11:10236,-ll_ost_13:10238,-ll_ost_15:10240,-ll_ost_18:10243
+
+filter_lvbo_init
+
+--filter_fid2dentry
+
+----filter_parent_lock
+
+------filter_lock_dentry
+
+-------LOCK_INODE_MUTEX(dparent>d_inode);
+
+ll_ost_06:10231,-ll_ost_16:10241,-ll_ost_484,-ll_ost_io_129,-ll_ost_io_123,-ll_ost_383
+
+fsfilt_ext3_start
+
+--ext3_journal_start
+
+----journal_start
+
+------start_this_handle
+
+----------__jbd2_log_wait_for_space
+
+-----------mutex_lock(&journal>j_checkpoint_mutex);
+
+ll_ost_17:10242
+
+filter_lvbo_init
+
+--filter_fid2dentry
+
+----filter_parent_lock
+
+----lookup_one_len
+
+------__lookup_hash
+
+-------inode>i_op->lookup-=-ext4_lookup
+
+----------ext4_iget
+
+------------iget_locked
+
+--------------ifind_fast
+
+----------------find_inode_fast
+
+------------------__wait_on_freeing_inode
+
+-------------------?ldiskfs_bread...-Child-dentry's-inode__I_LOCK
+
+ll_ost_io_15
+
+ost_brw_write
+
+--filter_commitrw_write
+
+----fsfilt_ext3_commit_wait
+
+------autoremove_wake_function
+
+-------fsfilt_log_wait_commit=-jbd2_log_wait_commit
+
+We think that is not neccessarily the problem of Lustre codes. And we found a nearly merged patch which fixes a similar deadlock problem in __jbd2_log_wait_for_space(). Maybe it is the root cause?
+
+https://git.kernel.org/cgit/linux/kernel/git/stable/linux-stable.git/commit/fs/jbd2/checkpoint.c?id=0ef54180e0187117062939202b96faf04c8673bc
+
+--- Comment (bobijam, Wed, 20 May 2015 08:00:58 +0000) ---
+I deleted the old patch and updated it.
+
+--- Comment (bobijam, Wed, 20 May 2015 07:58:48 +0000) ---
+found such backtrace in ALPL202.messages_20150518.txt
+
+May 17 11:57:05 ALPL202 kernel: INFO: task ll_ost_io_144:20839 blocked for more than 120 seconds.
+May 17 11:57:05 ALPL202 kernel: "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+May 17 11:57:05 ALPL202 kernel: ll_ost_io_144 D ffff810c3e08f7a0     0 20839      1         20840 20838 (L-TLB)
+May 17 11:57:05 ALPL202 kernel:  ffff810911f63800 0000000000000046 ffff81034d1e1460 ffff8105ee5276c0
+May 17 11:57:05 ALPL202 kernel:  ffff8105ee5276c0 000000000000000a ffff8108d1fee7e0 ffff810c3e08f7a0
+May 17 11:57:05 ALPL202 kernel:  00129c413d2f65fb 000000000071882c ffff8108d1fee9c8 000000035a5a5a5a
+May 17 11:57:05 ALPL202 kernel: Call Trace:
+May 17 11:57:05 ALPL202 kernel:  [] __wake_up+0x38/0x4f
+May 17 11:57:05 ALPL202 kernel:  [] :jbd2:jbd2_log_wait_commit+0xa3/0xf5
+...
+
+and I checked Linux kernel patch, this patch commit 3469a32a1e948c54204b5dd6f7476a7d11349e9e fits to the symptom
+
+    jbd2: don't hold j_state_lock while calling wake_up()
+    
+    The j_state_lock is one of the hottest locks in the jbd2 layer and
+    thus one of its scalability bottlenecks.
+    
+    We don't need to be holding the j_state_lock while we are calling
+    wake_up(&journal->j_wait_commit), so release the lock a little bit
+    earlier.
+
+so I include it in this patch, would you mind give it a try?
+
+--- Comment (wangshilong, Mon, 18 May 2015 11:17:16 +0000) ---
+Hi, 
+
+It is Rhel5 and kernel version is 2.6.18-348.3.1-xxx
+
+Regards,
+
+--- Comment (bobijam, Mon, 18 May 2015 09:02:03 +0000) ---
+What linux distro does the OST use?
+
+--- Comment (wangshilong, Mon, 18 May 2015 04:26:47 +0000) ---
+Hi,
+
+After applying following patch:
+
+https://jira.hpdd.intel.com/secure/attachment/17458/0001-LU-4090-fsfilt-don-t-wait-forever-for-stale-tid.patch
+
+We still hit this issue, please check latest uploaded logs(xxx20150518.txt). And i am wondering whether following thread is
+
+related to this bug?
+
+https://lkml.org/lkml/2012/7/11/255
+
+--- Comment (bobijam, Wed, 8 Apr 2015 15:27:49 +0000) ---
+I think what you described could be the reason some processes hang waiting for transaction commit, and would you give this patch a try? It changes fsfilt_ext3_commit_async() to avoid call jbd2_log_start_commit() with a stale tid.
+
+--- Comment (lixi, Wed, 8 Apr 2015 15:11:55 +0000) ---
+Zhengyu, yes, it is.
+
+--- Comment (bobijam, Wed, 8 Apr 2015 15:08:15 +0000) ---
+So the system still uses 1.8 version?
+
+--- Comment (lixi, Wed, 8 Apr 2015 13:55:25 +0000) ---
+I am not sure, maybe following patch fixes a bug similar with our problem?
+
+ext4/jbd2: don't wait (forever) for stale tid caused by wraparound
+
+Tid wraparound is possible to happen on Lustre. And we saw it happened for multiple times in some systems before.
+
+--- Comment (bobijam, Thu, 2 Apr 2015 04:11:26 +0000) ---
+Hi Ihara,
+
+From the messages.ALPL402.txt, I saw majorly two backtrace places, __jbd2_log_wait_for_space+0x5d and jbd2_log_wait_commit+0xa3, can you figure out what the code would be? As I've done the lookup on my test system
+
+[12:04 PM]root@test1:~/work/kernel/linux-2.6.32-431.29.2.el6-master/
+# gdb fs/jbd2/jbd2.ko
+GNU gdb (GDB) Red Hat Enterprise Linux (7.2-75.el6)
+Copyright (C) 2010 Free Software Foundation, Inc.
+License GPLv3+: GNU GPL version 3 or later 
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.  Type "show copying"
+and "show warranty" for details.
+This GDB was configured as "x86_64-redhat-linux-gnu".
+For bug reporting instructions, please see:
+...
+Reading symbols from /root/work/kernel/linux-2.6.32-431.29.2.el6-master/fs/jbd2/jbd2.ko...done.
+(gdb) l *jbd2_log_wait_commit+0xa3
+0x85c3 is in jbd2_log_wait_commit (fs/jbd2/journal.c:641).
+636		while (tid_gt(tid, journal->j_commit_sequence)) {
+637			jbd_debug(1, "JBD: want %d, j_commit_sequence=%d\n",
+638					  tid, journal->j_commit_sequence);
+639			wake_up(&journal->j_wait_commit);
+640			spin_unlock(&journal->j_state_lock);
+641			wait_event(journal->j_wait_done_commit,
+642					!tid_gt(tid, journal->j_commit_sequence));
+643			spin_lock(&journal->j_state_lock);
+644		}
+645		spin_unlock(&journal->j_state_lock);
+
+(gdb) l *__jbd2_log_wait_for_space+0x5d
+0x548d is in __jbd2_log_wait_for_space (fs/jbd2/checkpoint.c:172).
+167					continue;
+168				} else {
+169					printk(KERN_ERR "%s: needed %d blocks and "
+170					       "only had %d space available\n",
+171					       __func__, nblocks, space_left);
+172					printk(KERN_ERR "%s: no way to get more "
+173					       "journal space in %s\n", __func__,
+174					       journal->j_devname);
+175					WARN_ON(1);
+176					jbd2_journal_abort(journal, 0);
+(gdb) 
+
+The jbd2_log_wait_commit+0xa3 makes sense to, and it is waiting for the commit to finish. While other most processes hang in __jbd2_log_wait_for_space+0x5d does not look right, I want to know what code line would appear on your system.
+
+--- Comment (ihara, Fri, 27 Mar 2015 08:53:06 +0000) ---
+Bobijam, we confirmed kernel includes the follwoing codes, but hit same issue. pleaes check https://jira.hpdd.intel.com/secure/attachment/17384/messages.ALPL402.txt again, please.
+
+Index: linux-2.6.18-348.3.1.el5-b18/fs/jbd2/checkpoint.c
+===================================================================
+--- linux-2.6.18-348.3.1.el5-b18.orig/fs/jbd2/checkpoint.c
++++ linux-2.6.18-348.3.1.el5-b18/fs/jbd2/checkpoint.c
+@@ -155,7 +155,15 @@ void __jbd2_log_wait_for_space(journal_t
+ 				/* We were able to recover space; yay! */
+ 				;
+ 			} else if (tid) {
++				/*
++				 * jbd2_journal_commit_transaction() may want
++				 * to take the checkpoint_mutex if JBD2_FLUSHED
++				 * is set.  So we need to temporarily drop it.
++				 */
++				mutex_unlock(&journal->j_checkpoint_mutex);
+ 				jbd2_log_wait_commit(journal, tid);
++				spin_lock(&journal->j_state_lock);
++				continue;
+ 			} else {
+ 				printk(KERN_ERR "%s: needed %d blocks and "
+ 				       "only had %d space available\n",
+
+--- Comment (pjones, Thu, 26 Mar 2015 23:33:10 +0000) ---
+Bobijam
+
+Ihara confirms that this patch has been in place and the issue has still hit
+
+Peter
+
+--- Comment (bobijam, Thu, 26 Mar 2015 09:57:30 +0000) ---
+You need to make sure that your server build does use lustre/kernel_patches/series/2.6-rhel6.series to patch the server kernel code to make the patch effect (since it's a kernel patch).
+
+You can check the patched server code fs/jbd2/checkpoint.c, find whether following code is there
+
+@@ -156,7 +156,15 @@ void __jbd2_log_wait_for_space(journal_t
+
+ 				/* We were able to recover space; yay! */
+
+ 				;
+
+ 			} else if (tid) {
+
++				/*
+
++				 * jbd2_journal_commit_transaction() may want
+
++				 * to take the checkpoint_mutex if JBD2_FLUSHED
+
++				 * is set.  So we need to temporarily drop it.
+
++				 */
+
++				mutex_unlock(&journal->j_checkpoint_mutex);
+
+ 				jbd2_log_wait_commit(journal, tid);
+
++				spin_lock(&journal->j_state_lock);
+
++				continue;
+
+--- Comment (wangshilong, Thu, 26 Mar 2015 08:07:58 +0000) ---
+We still hit the issue, with LU-4020 patch applied, see attachment.
+
+--- Comment (yujian, Mon, 18 Aug 2014 17:00:24 +0000) ---
+Here is the back-ported patch for Lustre b2_5 branch: http://review.whamcloud.com/11492
+
+--- Comment (pjones, Mon, 18 Aug 2014 13:15:15 +0000) ---
+Landed for 2.7
+
+--- Comment (bogl, Wed, 13 Aug 2014 15:56:40 +0000) ---
+I think http://review.whamcloud.com/#/c/11041 is the better mod as it covers both el6 and sles.
+
+--- Comment (simmonsja, Thu, 10 Jul 2014 23:07:42 +0000) ---
+Another patch seems to be floating around - http://review.whamcloud.com/#/c/8059. We need to pick one of them.
+
+--- Comment (ihara, Thu, 10 Jul 2014 09:18:25 +0000) ---
+This is really repeatable problem.
+
+New patches for included SLES11 and SP3 as well as RHEL6. http://review.whamcloud.com/#/c/11041/
+
+--- Comment (lixi, Fri, 13 Jun 2014 00:44:51 +0000) ---
+We've seen this problem in three different systems. And there is no way to recover from it without rebooting the system. So it is a critical problem...
+
+--- Comment (bobijam, Thu, 24 Oct 2013 04:45:31 +0000) ---
+master patch http://review.whamcloud.com/8059
+
+b1_8 patch http://review.whamcloud.com/8060
+
+--- Comment (lixi, Thu, 24 Oct 2013 04:02:53 +0000) ---
+Zhenyu,
+
+Thank you very much for the help!
+
+--- Comment (bobijam, Thu, 24 Oct 2013 03:53:42 +0000) ---
+yes, it is most likely the cause. I'll try to get a patch for it.
+
+--- Comment (pjones, Fri, 11 Oct 2013 13:17:47 +0000) ---
+Bobijam
+
+Could you please comment on this one?
+
+Thanks
+
+Peter
+
+--- Comment (lixi, Fri, 11 Oct 2013 07:28:41 +0000) ---
+The debug messages are uploaded here.
+
+ftp://ftp.whamcloud.com/uploads/LU-4090/

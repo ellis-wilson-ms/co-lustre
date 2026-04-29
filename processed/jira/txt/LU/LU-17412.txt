@@ -1,0 +1,114 @@
+Key:        LU-17412
+Summary:    lustre snapshot: write barrier stuck at "failed" state
+Link:       https://jira.whamcloud.com/browse/LU-17412
+Type:       Bug
+Priority:   Major
+Status:     In Progress
+Resolution: Unresolved
+Assignee:   Akash B
+Reporter:   Akash B
+Created:    Wed, 10 Jan 2024 16:05:02 +0000
+Updated:    Wed, 11 Sep 2024 16:53:21 +0000
+Labels:     ZFS, snapshots
+Links:      Related: is related to  LU-17142
+Attachments: reproducer.sh
+
+--- Description ---
+When we create a lustre snapshot (lctl snapshot_create) a global write barrier is used internally to avoid an inconsistent snapshot of the filesystem.
+
+Creating a snapshot after mounting another snapshot causes the barrier to get into a "failed" state. This state cannot be cleared until an MGS remount an actual filesystem. Any operations involving barrier fails due to this, etc.
+
+# lctl barrier_stat testfs
+state: failed
+timeout: 0 seconds
+
+# lctl barrier_rescan testfs
+Fail to rescan barrier bitmap for testfs: Invalid argument
+# lctl barrier_thaw testfs
+Fail to thaw barrier for testfs: Invalid argument
+
+Bisecting through master branch recent commits. The below commit was causing the issue and I'm not able to reproduce this issue without this commit.
+
+    LU-17142 mgc: reconnection without pinger
+
+Overall looks like the issue is due to LU-17142.
+
+I'm able to consistently reproduce this using this script(reproducer.sh).
+
+--- Comment (JIRAUSER18017, Wed, 11 Sep 2024 16:53:21 +0000) ---
+test_801a log:
+
+oleg241-server: Fail to freeze barrier for lustre: Timer expired
+pdsh@oleg241-client: oleg241-server: ssh exited with exit code 62
+sanity test_801a: @@@@@@ FAIL: (8) unexpected barrier status 'expired' 
+
+The current failure in test_801a occurs because the barrier is expected to be in a "failed" state when OBD_FAIL_BARRIER_FAILURE is set.
+
+        #define OBD_FAIL_BARRIER_FAILURE        0x2203
+        do_facet $SINGLEMDS $LCTL set_param fail_loc=0x2203
+        do_facet mgs $LCTL barrier_freeze $FSNAME
+
+        b_status=$(barrier_stat)
+        [ "$b_status" = "'failed'" ] ||
+                error "(8) unexpected barrier status $b_status"
+
+The purpose of this patch is to retry the operation (barrier_freeze) until the barrier time expires and then fail. Given the test snippet for OBD_FAIL_BARRIER_FAILURE, we expect the barrier state to be "failed" and retry until timer expiry. 
+
+Should we also consider the "expired" state as valid failed state in this testcase? Any thoughts?
+
+Let me know if any other modifications are necessary.
+
+--- Comment (gerrit, Wed, 11 Sep 2024 05:14:07 +0000) ---
+"Akash B " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/56326
+
+Subject: LU-17412 mgs: Fix write barrier failed state
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: f444a121a3c2fe04c2c61d3410f7b5b11b1058f1
+
+--- Comment (JIRAUSER18017, Tue, 10 Sep 2024 17:47:04 +0000) ---
+Creating a snapshot after mounting another snapshot fails and causes the barrier to enter a 'failed' state. The following error is observed:
+
+-> lctl snapshot_create -F testfs -n snap2
+Fail to freeze barrier for testfs: Object is remote
+Can't create the snapshot snap2
+
+Upon further analysis, it was found that mgs_barrier_glimpse_lock() returns 0, but the barrier operation was incomplete, causing the barrier to enter a failed state. 
+
+As a result, subsequent operations on Lustre snapshots fail unless the barrier failed state is cleared. This occurs because the current implementation assumes that mgs_barrier_glimpse_lock() returning 0 means the barrier is complete. However, this is not always the case, as mgs_barrier_done() can still return 0. 
+
+Adding a test case to the existing sanity-lsnapshot.sh (test_1c) to consistently reproduce the above issue. The fix I've planned is to ensure the operation retries/waits until the barrier is actually complete.
+
+Will update with fix shortly once the test (test_1c) fails in the test suite.
+
+--- Comment (gerrit, Tue, 10 Sep 2024 17:28:51 +0000) ---
+"Akash B " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/56320
+
+Subject: LU-17412 tests: snapshot_create with mounted snapshot FS
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 70603e41f1f72ac446ed88ea32b88c06e3d74b9a
+
+--- Comment (aboyko, Thu, 11 Jan 2024 09:06:09 +0000) ---
+The situation is next
+
+lctl snapshot_mount xxx - starts the MGC reconnection, this leads to a dropping locks for MGS.
+
+lctl snapshot_create xxx -> lctl barrier_freeze -> MGS sends glimpse AST to MGCs, no locks, considers as error.
+
+Clients need some time to enqueue MGS locks.
+
+The simple 3-5 seconds timeout between snapshot_mount and snapshot_create helps.
+
+--- Comment (adilger, Wed, 10 Jan 2024 16:48:36 +0000) ---
+aboyko, any ideas here?

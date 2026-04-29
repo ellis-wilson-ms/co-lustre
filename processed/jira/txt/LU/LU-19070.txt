@@ -1,0 +1,109 @@
+Key:        LU-19070
+Summary:    dir migrate leaves the migrated dir in "migrating" form.
+Link:       https://jira.whamcloud.com/browse/LU-19070
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Alexander Zarochentsev
+Reporter:   Alexander Zarochentsev
+Created:    Wed, 28 May 2025 17:20:29 +0000
+Updated:    Thu, 12 Jun 2025 06:51:40 +0000
+Resolved:   Thu, 12 Jun 2025 06:51:40 +0000
+
+--- Description ---
+if lfs migrate -m is allowed for ordinary users, it completes w/o errors but leaves the dir
+
+in "migrating" form:
+
+[zam@rocky94 tests]$ ../utils/lfs  getdirstripe /mnt/lustre/testdir/foodir/
+lmv_stripe_count: 0 lmv_stripe_offset: 1 lmv_hash_type: none
+mdtidx		 FID[seq:oid:ver]
+[zam@rocky94 tests]$ ../utils/lfs  migrate -m 0 /mnt/lustre/testdir/foodir/
+[zam@rocky94 tests]$ ../utils/lfs  getdirstripe /mnt/lustre/testdir/foodir/
+lmv_stripe_count: 2 lmv_stripe_offset: 0 lmv_hash_type: crush,migrating,fixed
+mdtidx		 FID[seq:oid:ver]
+     0		 [0x200000400:0x2:0x0]		
+     1		 [0x240000402:0x6:0x0]		
+[zam@rocky94 tests]$
+
+--- Comment (pjones, Thu, 12 Jun 2025 06:51:40 +0000) ---
+Merged for 2.17
+
+--- Comment (gerrit, Thu, 12 Jun 2025 06:33:35 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/59474/
+
+Subject: LU-19070 dne: dir migrate allowed only for root
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 07963781a918ada7911e11c02e5e4f1a096e4bbb
+
+--- Comment (gerrit, Thu, 5 Jun 2025 16:27:48 +0000) ---
+.
+
+--- Comment (gerrit, Wed, 28 May 2025 17:44:10 +0000) ---
+"Alexander Zarochentsev " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/59474
+
+Subject: LU-19070 dne: dir migrate allowed only for root
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: c70324fb1f64f1e3bc04803764835762ef48e96f
+
+--- Comment (zam, Wed, 28 May 2025 17:27:34 +0000) ---
+The root cause is that lfs migrate tries to convert the dir in cb_migrate_mdt_fini():
+
+/* dir migration finished, shrink its stripes */
+static int cb_migrate_mdt_fini(char *path, int p, int *dp, void *data,
+                               struct dirent64 *de)
+{
+        struct find_param *param = data;
+        struct lmv_user_md *lmu = param->fp_lmv_md;
+        int lmulen = lmv_user_md_size(lmu->lum_stripe_count, lmu->lum_magic);
+        int ret = 0;
+
+        if (de && de->d_type != DT_DIR)
+                goto out;
+
+        if (*dp != -1) {
+                /*
+                 * close it before setxattr because the latter may destroy the
+                 * original object, and cause close fail.
+                 */
+                ret = close(*dp);
+                *dp = -1;
+                if (ret)
+                        goto out;
+        }
+
+        ret = setxattr(path, XATTR_NAME_LMV, lmu, lmulen, 0);
+        if (ret == -EALREADY)
+                ret = 0;
+...
+
+by invoking setxattr() syscall for a xattr in "trusted" namespace.  The syscall fails because Linux doesn't allow a non-root user (user w/o CAP_SYS_ADMIN) to access any xattr from the "trusted" namespace:
+
+static int
+xattr_permission(struct inode *inode, const char *name, int mask)
+{
+   ...
+        /*
+         * The trusted.* namespace can only be accessed by privileged users.
+         */
+        if (!strncmp(name, XATTR_TRUSTED_PREFIX, XATTR_TRUSTED_PREFIX_LEN)) {
+                if (!capable(CAP_SYS_ADMIN))
+                        return (mask & MAY_WRITE) ? -EPERM : -ENODATA;
+                return 0;
+        }
+...
+
+moreover, it fails silently, as the error from the setxattr() call is ignored.

@@ -1,0 +1,49 @@
+Key:        LU-19830
+Summary:    client is able to do buffered IO after unmount despite -EDQUOT
+Link:       https://jira.whamcloud.com/browse/LU-19830
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Sergey Cheremencev
+Created:    Tue, 27 Jan 2026 22:32:35 +0000
+Updated:    Tue, 27 Jan 2026 22:32:35 +0000
+
+--- Description ---
+Andreas comment from https://review.whamcloud.com/c/fs/lustre-release/+/63541 :
+
+(suggestion) This makes me wonder if the client could repeatedly do buffered writes to exceed quota by unmounting and remounting the client? Is the EDQUOT (once hit) tracked on the client per OST, or is it per UID/GID/PROJID on each filesystem? How is EDQUOT tracked if it is OST pool quota that is hit, or LQA?
+
+I'm wondering if it would be prudent for the first write for any ID/pool on a mountpoint to do an internal GETQUOTA RPC to see if the ID is already over quota? That should complete quickly, and avoid a lot of quota overflow (potentially GB for each new client mount could go into cache, OSTCOUNT * max_dirty_mb). The cached "did mountpoint check EDQUOT status" could expire periodically, maybe 10 minutes after the last use, so that idle clients that checked hours or days ago would check again. Since there is already a mechanism to clear the EDQUOT status (sync write), nothing new is needed to clear the cached "over quota" state.
+
+Obviously this is something that would be done in a separate patch, but we get enough complaints about "over quota" that a simple check could potentially solve.
+
+Indeed, the client may do buffered IO each time after remounting. Here is the reproducer:
+
+#!/bin/bash
+bash llmount.sh
+mount -t lustre 192.168.1.83@tcp:/lustre /mnt/lustre2
+
+lctl set_param osd*.*.quota_slave.enabled=ugp
+lctl set_param debug=+quota
+lctl set_param debug=+trace
+lctl set_param debug_mb=300
+
+lfs setquota -u quota_usr -B30M /mnt/lustre
+mkdir /mnt/lustre/dir1
+chmod 777 /mnt/lustre/dir1
+./runas -u quota_usr dd if=/dev/urandom of=/mnt/lustre/dir1/f1 bs=1M count=40 oflag=direct && echo "ERROR: should fail"
+./runas -u quota_usr dd if=/dev/urandom of=/mnt/lustre2/dir1/f2 bs=1M count=1 || echo "ERROR: expect succeed"
+echo 3 > /proc/sys/vm/drop_caches
+
+fsize=$(stat -c %s /mnt/lustre2/dir1/f2)
+(( fsize == 1048576 )) || error "async write data lost: expected 1048576 got $fsize"
+
+umount /mnt/lustre2
+mount -t lustre 192.168.1.83@tcp:/lustre /mnt/lustre2
+./runas -u quota_usr dd if=/dev/urandom of=/mnt/lustre2/dir1/f2 bs=1M count=1 && echo "ERROR: should fail after remount 1"
+
+umount /mnt/lustre2
+mount -t lustre 192.168.1.83@tcp:/lustre /mnt/lustre2
+./runas -u quota_usr dd if=/dev/urandom of=/mnt/lustre2/dir1/f2 bs=1M count=1 && echo "ERROR: should fail after remount 2"

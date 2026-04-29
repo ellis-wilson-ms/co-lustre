@@ -1,0 +1,164 @@
+Key:        LU-9266
+Summary:    Mount hung due to double HSM RESTORE records
+Link:       https://jira.whamcloud.com/browse/LU-9266
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Hongchao Zhang
+Reporter:   Sergey Cheremencev
+Created:    Mon, 27 Mar 2017 20:57:48 +0000
+Updated:    Wed, 16 Aug 2017 21:49:59 +0000
+Resolved:   Wed, 9 Aug 2017 04:52:05 +0000
+
+--- Description ---
+Usually when agent sends several RESTORE requests to the same fid MDT processes only the first.
+
+ When the 2nd arrives MDT doesn't add new action because see the first in llog.
+
+ But there is a chance that the 1st RESTORE action is not written into llog when the 2nd comes to MDT:
+
+ 
+int mdt_hsm_add_actions(struct mdt_thread_info *mti, 
+                        struct hsm_action_list *hal, __u64 *compound_id) 
+{
+...
+       rc = hsm_find_compatible(mti->mti_env, mdt, hal);
+...
+
+                /* test result of hsm_find_compatible()
+                 * if request redundant or cancel of nothing
+                 * do not record
+                 */
+                /* redundant case */
+                if (hai->hai_action != HSMA_CANCEL && hai->hai_cookie != 0)
+                        continue;
+...
+                        /* take LAYOUT lock so that accessing the layout will
+                         * be blocked until the restore is finished */
+                        mdt_lock_reg_init(&crh->crh_lh, LCK_EX);
+                        rc = mdt_object_lock(mti, obj, &crh->crh_lh,
+...
+                /* record request */
+                rc = mdt_agent_record_add(mti->mti_env, mdt, *compound_id,
+                                          archive_id, flags, hai);
+
+Even If MDT doesn't find compatible request in llog it tries to take LAYOUT lock. This lock is already taken by the 1st RESTORE request.
+
+ Normally 2nd RESTORE request may take LAYOUT lock only AFTER the end of 1st RESOTRE action. In such case 2nd request finds that object is already RESTORED and does nothing.
+
+ But ldlm_resource_clean called from umount brakes this order and 2nd request may add the same action to the llog:
+
+lrh=[type=10680000 len=136 idx=1/1] fid=[0x200000402:0x1:0x0] dfid=[0x200000402:0x1:0x0] compound/cookie=0x58d95f65/0x58d95f65 action=ARCHIVE archive#=2 flags=0x0 extent=0x0-0xffffffffffffffff gid=0x0 datalen=0 status=SUCCEED data=[]
+lrh=[type=10680000 len=136 idx=1/2] fid=[0x200000402:0x1:0x0] dfid=[0x200000402:0x1:0x0] compound/cookie=0x58d95f66/0x58d95f66 action=RESTORE archive#=2 flags=0x0 extent=0x0-0xffffffffffffffff gid=0x0 datalen=0 status=WAITING data=[]
+lrh=[type=10680000 len=136 idx=1/3] fid=[0x200000402:0x1:0x0] dfid=[0x200000402:0x1:0x0] compound/cookie=0x58d95f67/0x58d95f67 action=RESTORE archive#=2 flags=0x0 extent=0x0-0xffffffffffffffff gid=0x0 datalen=0 status=WAITING data=[]
+
+Such records causes mount to hung when
+
+ starting hsm:
+
+ D: 15524 TASK: ffff880068b5b540 CPU: 4 COMMAND: "lctl"
+ #0 [ffff8800bacd9728] schedule at ffffffff81525d30
+ #1 [ffff8800bacd97f0] ldlm_completion_ast at ffffffffa08527f5 [ptlrpc]
+ #2 [ffff8800bacd9890] ldlm_cli_enqueue_local at ffffffffa0851b8e [ptlrpc]
+ #3 [ffff8800bacd9910] mdt_object_lock0 at ffffffffa0e4ec4c [mdt]
+ #4 [ffff8800bacd99c0] mdt_object_lock at ffffffffa0e4f694 [mdt]
+ #5 [ffff8800bacd99d0] mdt_object_find_lock at ffffffffa0e4f9c1 [mdt]
+ #6 [ffff8800bacd9a00] hsm_restore_cb at ffffffffa0e9b533 [mdt]
+ #7 [ffff8800bacd9a50] llog_process_thread at ffffffffa05fd699 [obdclass]
+ #8 [ffff8800bacd9b10] llog_process_or_fork at ffffffffa05fdbaf [obdclass]
+ #9 [ffff8800bacd9b60] llog_cat_process_cb at ffffffffa0601250 [obdclass]
+
+--- Comment (gerrit, Wed, 16 Aug 2017 20:43:12 +0000) ---
+John L. Hammond (john.hammond@intel.com) merged in patch https://review.whamcloud.com/28441/
+
+Subject: LU-9266 hsm: don't add request when cdt is stopped
+
+Project: fs/lustre-release
+
+Branch: b2_10
+
+Current Patch Set: 
+
+Commit: d488337c04b52392e11a784617d902e1f12c7cba
+
+--- Comment (gerrit, Wed, 9 Aug 2017 16:24:32 +0000) ---
+Minh Diep (minh.diep@intel.com) uploaded a new patch: https://review.whamcloud.com/28441
+
+Subject: LU-9266 hsm: don't add request when cdt is stopped
+
+Project: fs/lustre-release
+
+Branch: b2_10
+
+Current Patch Set: 1
+
+Commit: 04269245ce43e879869326c8ae5950b300fb318e
+
+--- Comment (pjones, Wed, 9 Aug 2017 04:52:05 +0000) ---
+Landed for 2.11
+
+--- Comment (gerrit, Wed, 9 Aug 2017 04:18:23 +0000) ---
+Oleg Drokin (oleg.drokin@intel.com) merged in patch https://review.whamcloud.com/26215/
+
+Subject: LU-9266 hsm: don't add request when cdt is stopped
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 37a5157b84bce367e31743cb8648a15618492531
+
+--- Comment (sergey, Wed, 26 Apr 2017 22:23:52 +0000) ---
+Thanks for feedback.
+
+Do I correctly understand that the conditions required to fall into this situation are very unlikely and racy?
+
+Yes at first look it is very unlikely. But on the other hand seagate's customer faced this problem.
+
+ So I guess it is not so unlikely on the systems with high hsm activity.
+
+I mean, 2 MDT request handler threads handling 2 restore requests for the same FID/file, and a concurrent MDT umount/stop, leading to 1st restore request to have granted layout-lock and recorded a 1st restore action to llog, but this lock has been canceled as part of umount process allowing the 2nd restore request to grant it and thus be able to add a 2nd restore action to llog, finally leading to a hang during next MDT mount/start when replaying all the layout-locks for all recorded restores.
+
+ Am I right?
+
+Correct.
+
+And if yes, why don't you fix this very specific case in hsm_restore_cb() by finding/discarding (EALREADY ?) any duplicates ?
+
+Because easier to don't add new requests when cdt is stopped then parsing llog later during the mount. Furthermore mdt_hsm_add_actions has the same condition(cdt->cdt_state == CDT_STOPPED) at the beginning - so ideally we shouldn't serve any requests when coordinator is stopped.
+
+--- Comment (bfaccini, Fri, 21 Apr 2017 14:15:34 +0000) ---
+Sergei, Hongchao,
+
+Do I correctly understand that the conditions required to fall into this situation are very unlikely and racy?
+
+I mean, 2 MDT request handler threads handling 2 restore requests for the same FID/file, and a concurrent MDT umount/stop, leading to 1st restore request to have granted layout-lock and recorded a 1st restore action to llog, but this lock has been canceled as part of umount process allowing the 2nd restore request to grant it and thus be able to add a 2nd restore action to llog, finally leading to a hang during next MDT mount/start when replaying all the layout-locks for all recorded restores.
+
+Am I right?
+
+And if yes, why don't you fix this very specific case in hsm_restore_cb() by finding/discarding (EALREADY ?) any duplicates ? We may want to add a hashing mechanism for the cdt_restore_handle structs and not require to browse crh_list,  in case we will need to handle huge number of restores.
+
+--- Comment (pjones, Fri, 31 Mar 2017 23:00:41 +0000) ---
+Hongchao
+
+Could you please review this proposed change
+
+Thanks
+
+Peter
+
+--- Comment (gerrit, Mon, 27 Mar 2017 21:04:51 +0000) ---
+Sergey Cheremencev (sergey.cheremencev@seagate.com) uploaded a new patch: https://review.whamcloud.com/26215
+
+Subject: LU-9266 hsm: don't add request when cdt is stopped
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 0587c27ddf9ed41cb57b6959370656696295f954

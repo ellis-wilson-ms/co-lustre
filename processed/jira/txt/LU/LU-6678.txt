@@ -1,0 +1,105 @@
+Key:        LU-6678
+Summary:    calling ldlm_revoke_export_locks repeatedly while running racer seems to cause deadlock
+Link:       https://jira.whamcloud.com/browse/LU-6678
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Cannot Reproduce
+Assignee:   WC Triage
+Reporter:   Kit Westneat
+Created:    Wed, 3 Jun 2015 03:08:27 +0000
+Updated:    Sun, 10 Oct 2021 21:22:35 +0000
+Resolved:   Sun, 10 Oct 2021 21:22:35 +0000
+Attachments: dk_locks
+
+--- Description ---
+John Hammond and Nathan Lavender recently reported an issue where making nodemap configuration changes while running racer can run into a deadlock situation. After reproducing it on my machine, the code seems to get stuck in ldlm_revoke_export_locks.
+
+Looking at the trace debug, it never leaves cfs_hash_for_each_empty:
+
+...
+00000001:00000040:2.0:1433251090.069004:0:24913:0:(hash.c:1704:cfs_hash_for_each_empty()) Try to empty hash: a9afca12-80f8-a, loop: 4390396
+00000001:00000001:2.0:1433251090.069004:0:24913:0:(hash.c:1600:cfs_hash_for_each_relax()) Process entered
+00010000:00000001:2.0:1433251090.069006:0:24913:0:(ldlm_lock.c:189:ldlm_lock_put()) Process entered
+00010000:00000001:2.0:1433251090.069006:0:24913:0:(ldlm_lock.c:222:ldlm_lock_put()) Process leaving
+00000001:00000040:2.0:1433251090.069007:0:24913:0:(hash.c:1704:cfs_hash_for_each_empty()) Try to empty hash: a9afca12-80f8-a, loop: 4390397
+00000001:00000001:2.0:1433251090.069008:0:24913:0:(hash.c:1600:cfs_hash_for_each_relax()) Process entered
+00010000:00000001:2.0:1433251090.069010:0:24913:0:(ldlm_lock.c:189:ldlm_lock_put()) Process entered
+00010000:00000001:2.0:1433251090.069010:0:24913:0:(ldlm_lock.c:222:ldlm_lock_put()) Process leaving
+00000001:00000040:2.0:1433251090.069011:0:24913:0:(hash.c:1704:cfs_hash_for_each_empty()) Try to empty hash: a9afca12-80f8-a, loop: 4390398
+...
+
+It looks like some locks eventually timeout:
+
+00010000:00000001:0.0:1433298387.132153:0:2831:0:(ldlm_request.c:97:ldlm_expired_completion_wait()) Process entered
+00010000:02000400:0.0:1433298387.132154:0:2831:0:(ldlm_request.c:105:ldlm_expired_completion_wait()) lock timed out (enqueued at 1433298087, 300s ago)
+00010000:00010000:0.0:1433298387.132162:0:2831:0:(ldlm_request.c:111:ldlm_expired_completion_wait()) ### lock timed out (enqueued at 1433298087, 300s ago); not entering recovery in server code, just going back to sleep ns: mdt-test-MDT00
+00_UUID lock: ffff880061a31540/0xf4d215ae26653a36 lrc: 3/1,0 mode: --/PR res: [0x20000e690:0x1:0x0].0 bits 0x13 rrc: 25 type: IBT flags: 0x40210000000000 nid: local remote: 0x0 expref: -99 pid: 2831 timeout: 0 lvb_type: 0
+00010000:00000001:0.0:1433298387.132167:0:2831:0:(ldlm_request.c:120:ldlm_expired_completion_wait()) Process leaving (rc=0 : 0 : 0)
+
+On one test run, I crashed the system and took backtraces of the processes to see what was up. Here are some bits I found interesting:
+
+	A lot of racer commands are stuck in do_lookup, like:
+
+ #2 [ffff880061c53be0] mutex_lock at ffffffff8152a2ab
+ #3 [ffff880061c53c00] do_lookup at ffffffff811988eb
+
+	4 or 5 mdt threads look similar to these two:
+
+ #2 [ffff88007bf1b8c8] ldlm_completion_ast at ffffffffa1259459 [ptlrpc]
+ #3 [ffff88007bf1b978] ldlm_cli_enqueue_local at ffffffffa125885e [ptlrpc]
+ #4 [ffff88007bf1b9f8] mdt_object_local_lock at ffffffffa07f9b2c [mdt]
+ #5 [ffff88007bf1baa8] mdt_object_lock_internal at ffffffffa07fa775 [mdt]
+ #6 [ffff88007bf1baf8] mdt_object_lock at ffffffffa07fab34 [mdt]
+ #7 [ffff88007bf1bb08] mdt_getattr_name_lock at ffffffffa080930c [mdt]
+
+ #2 [ffff88006c0c19c8] ldlm_completion_ast at ffffffffa1259459 [ptlrpc]
+ #3 [ffff88006c0c1a78] ldlm_cli_enqueue_local at ffffffffa125885e [ptlrpc]
+ #4 [ffff88006c0c1af8] mdt_object_local_lock at ffffffffa07f9b2c [mdt]
+ #5 [ffff88006c0c1ba8] mdt_object_lock_internal at ffffffffa07fa775 [mdt]
+ #6 [ffff88006c0c1bf8] mdt_object_lock at ffffffffa07fab34 [mdt]
+ #7 [ffff88006c0c1c08] mdt_reint_link at ffffffffa0815876 [mdt]
+
+	a couple "ln" commands look like:
+
+ #2 [ffff880061e21ba0] ptlrpc_set_wait at ffffffffa1279979 [ptlrpc]
+ #3 [ffff880061e21c60] ptlrpc_queue_wait at ffffffffa1279fe1 [ptlrpc]
+ #4 [ffff880061e21c80] mdc_reint at ffffffffa038c4b1 [mdc]
+ #5 [ffff880061e21cb0] mdc_link at ffffffffa038d2a3 [mdc]
+
+	a couple lfs calls look like:
+
+ #2 [ffff880063b17660] ptlrpc_set_wait at ffffffffa1279979 [ptlrpc]
+ #3 [ffff880063b17720] ptlrpc_queue_wait at ffffffffa1279fe1 [ptlrpc]
+ #4 [ffff880063b17740] ldlm_cli_enqueue at ffffffffa1253dae [ptlrpc]
+ #5 [ffff880063b177f0] mdc_enqueue at ffffffffa039380d [mdc]
+
+I'm not sure what information is most useful to figure this out. Is it a matter of doing dlmtrace and then dumping the namespaces when it hangs? It's relatively easy to cause the crash:
+
+i=0; lctl nodemap_add nm0; while true; do echo $i; lctl nodemap_add_range --name nm0 --range 0@lo; lctl nodemap_del_range --name nm0 --range 0@lo; ((i++)); done
+
+I've attached a namespace dump in case that's enough to figure it out. I'll keep digging, but I thought I'd post this in case anyone had any ideas, or in case I am way off track.
+
+--- Comment (green, Thu, 4 Jun 2015 05:02:56 +0000) ---
+actually no, the 2831 is the thread that's hung, what needs to be done is we need to see what lock is blocking of granting of this lcok then and hunt that down.
+
+Usually it's printed somewhere nearby.
+
+--- Comment (green, Thu, 4 Jun 2015 05:00:40 +0000) ---
+00000001:00000040:2.0:1433251090.069011:0:24913:0:(hash.c:1704:cfs_hash_for_each_empty()) Try to empty hash: a9afca12-80f8-a, loop: 4390398
+
+This looks pretty much like a nodemap bug to me.
+
+This may or may not be related to the hang at hand, of course.
+
+Basically the ldlm hang you see is (in your example) due to a thread that holds this lock is stuck on theserver while holding that lock. It's pid is 2831 and you need to hunt it down and see what is it it is doing.
+
+--- Comment (kit.westneat, Wed, 3 Jun 2015 18:59:45 +0000) ---
+I think this is a different bug, it looks like it's related to LDLM locks instead of mutex/spinlock problems. It also doesn't seem to be related to nodemap per se, just triggered by it. But I might be misreading the debug logs. 
+
+I did, I'm working on a fix for the new issues in LU-6409, but I'm not sure how to trigger the error that you are seeing. Is your kernel compiled with CONFIG_DEBUG_SPINLOCK_SLEEP or something like that?
+
+--- Comment (green, Wed, 3 Jun 2015 18:18:47 +0000) ---
+Is this with LU-6409 patches too?
+
+Have you seen my additional comment in there?

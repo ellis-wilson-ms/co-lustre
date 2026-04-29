@@ -1,0 +1,192 @@
+Key:        LU-16651
+Summary:    hold invalidate_lock when invalidating page cache under kernel 5.15+
+Link:       https://jira.whamcloud.com/browse/LU-16651
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Qian Yingjin
+Reporter:   Qian Yingjin
+Created:    Tue, 21 Mar 2023 08:42:08 +0000
+Updated:    Thu, 15 Jan 2026 17:08:09 +0000
+Resolved:   Sun, 9 Jul 2023 14:22:12 +0000
+Links:      Related: is related to  LU-16030; Related: is related to LU-19427
+
+--- Description ---
+When three processes are keeping doing I/O on a same file on a client:
+
+	A: buffered write
+
+	B: buffered read
+
+	C: direct I/O read
+
+Process B will return -EIO on the newer kernel such as Ubuntu 2204.
+
+After investigate the bug, the problem should be that:
+
+The client has two overlapped PR DLM extent locks:
+
+	L1 = [1M, 4M - 1]>
+
+	L2 = [3M, 5M - 1]>
+
+A reader process holds L1 and read data in range [3M, 4M -1].
+
+L2 is being revoking due to the conflict access.
+
+Then in the ->readpage() call:
+
+It will unlock the page after the page is in Uptodate state.
+
+And lock blocking callback for L2 will clear the Uptodate state and delete the page from cache.
+
+Then in the old kernel, it will:
+
+/* Start the actual read. The read will unlock the page. */
+		error = mapping->a_ops->readpage(filp, page);
+
+		if (unlikely(error)) {
+			if (error == AOP_TRUNCATED_PAGE) {
+				put_page(page);
+				error = 0;
+				goto find_page;
+			}
+			goto readpage_error;
+		}
+
+		if (!PageUptodate(page)) {
+			error = lock_page_killable(page);
+			if (unlikely(error))
+				goto readpage_error;
+			if (!PageUptodate(page)) {
+				if (page->mapping == NULL) { =====>
+					/*
+					 * invalidate_mapping_pages got it
+					 */
+					unlock_page(page);
+					put_page(page);
+					goto find_page;
+				}
+				unlock_page(page);
+				shrink_readahead_size_eio(filp, ra);
+				error = -EIO;
+				goto readpage_error;
+			}
+			unlock_page(page);
+		}
+
+		goto page_ok;
+
+It will check whether the page was truncated and deleted from page cache via page->mapping, if so, it will retry the page read.
+
+But in the newer kernel, it deletes this check and retry.
+
+It seems there is no any simple solution for this bug.
+
+static int filemap_read_page(struct file *file, struct address_space *mapping,
+		struct page *page)
+{
+	int error;
+
+	/*
+	 * A previous I/O error may have been due to temporary failures,
+	 * eg. multipath errors.  PG_error will be set again if readpage
+	 * fails.
+	 */
+	ClearPageError(page);
+	/* Start the actual read. The read will unlock the page. */
+	error = mapping->a_ops->readpage(file, page);
+	if (error)
+		return error;
+
+	error = wait_on_page_locked_killable(page);
+	if (error)
+		return error;
+	if (PageUptodate(page))
+		return 0;
+
+	shrink_readahead_size_eio(&file->f_ra);
+	return -EIO;
+}
+
+ According to the Linux Documents: Documentations/filkesystems/locking.rst:
+
+Locking rules:
+	All except set_page_dirty and freepage may block
+
+======================	======================== =========	===============
+ops			PageLocked(page)	 i_rwsem	invalidate_lock
+======================	======================== =========	===============
+writepage:		yes, unlocks (see below)
+readpage:		yes, unlocks				shared
+writepages:
+set_page_dirty		no
+readahead:		yes, unlocks				shared
+readpages:		no					shared
+write_begin:		locks the page		 exclusive
+write_end:		yes, unlocks		 exclusive
+bmap:
+invalidatepage:		yes					exclusive
+releasepage:		yes
+freepage:		yes
+direct_IO:
+isolate_page:		yes
+migratepage:		yes (both)
+putback_page:		yes
+launder_page:		yes
+is_partially_uptodate:	yes
+error_remove_page:	yes
+swap_activate:		no
+swap_deactivate:	no
+======================	======================== =========	===============
+The filesystem must exclusively acquire invalidate_lock before invalidating page cache in truncate / hole punch path (and thus calling into ->invalidatepage) to block races between page cache invalidation and page cache filling functions (fault, read, ...).
+
+The solution  should be that:
+
+we must hold exclusive invalidate_lock (mapping->invalidate_lock) (in the newer kernel) when remove pages from page cache caused by the revoking of the DLM extent lock protecting them.
+
+--- Comment (pjones, Sun, 9 Jul 2023 14:22:13 +0000) ---
+Landed for 2.16
+
+--- Comment (gerrit, Sat, 8 Jul 2023 22:34:46 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/50371/
+
+Subject: LU-16651 llite: hold invalidate_lock when invalidate cache pages
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: bba59b1287c9cd8c30a85fafb4fd5788452bd05c
+
+--- Comment (qian_wc, Wed, 22 Mar 2023 08:59:11 +0000) ---
+There are four place that will delete a page from Lustre:
+
+	truncate
+
+	punch hole
+
+	extent lock blocking AST callback
+
+	layout change will prune the pages
+
+All these places we need to hold invalidate_lock.
+
+--- Comment (gerrit, Wed, 22 Mar 2023 08:42:17 +0000) ---
+"Qian Yingjin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/50371
+
+Subject: LU-16651 llite: hold invalidate_lock when invalidate cache pages
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 504cb9b2db177a695f05b95c79797516b99098c1
+
+--- Comment (qian_wc, Tue, 21 Mar 2023 12:42:07 +0000) ---
+We may still need to patch Lustre to hold invalidate_lock for truncate and punch hole operations.

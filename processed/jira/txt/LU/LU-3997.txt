@@ -1,0 +1,464 @@
+Key:        LU-3997
+Summary:    Excessive slab usage causes large mem & core count clients to hang
+Link:       https://jira.whamcloud.com/browse/LU-3997
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Not a Bug
+Assignee:   Bruno Faccini
+Reporter:   Kit Westneat
+Created:    Mon, 23 Sep 2013 20:07:04 +0000
+Updated:    Thu, 24 Oct 2013 15:17:04 +0000
+Resolved:   Thu, 24 Oct 2013 15:17:04 +0000
+Links:      Related: is related to  LU-4053
+
+--- Description ---
+Client version: 2.3.0, SLES kernel 3.0.13_0.27_default
+
+Server version: 2.1.2
+
+We are running into an issue at SCBI that appears to be similar to LU-3771. Under certain workloads, the slab memory usage gets to the point where it causes the kernel to hang. Apparently it is not a problem under the SLUB allocator, but Novell is not prepared to support a SLES kernel with the SLUB allocator enabled.
+
+Are there any tunables that can help shrink the slab usage? 
+
+HP Summary:
+
+The main factor triggering the problem is reading from /proc/slabinfo. SLAB does this while holding l3->list_lock and when a slab is huge, this leads to big delays so that other subsystems are impacted and if NMI Watchdog is enabled, this leads t soft/hards lockups and panics.
+
+Novell analysis:
+
+Have you actually tried to put pcc governor out of way? I can still see many
+
+cpus looping on the same pcc internal lock:
+
+crash> struct spinlock_t ffffffffa047c610
+
+struct spinlock_t {
+
+{
+
+rlock = {
+
+raw_lock = {
+
+slock = 862335805
+
+}
+
+}
+
+}
+
+}
+
+crash> p /x 862335805
+
+$1 = 0x3366333d
+
+crash> p 0x3366-0x333d
+
+$2 = 41
+
+So there are 40 CPUs waiting for the lock. This sounds really insane! Who is
+
+holding the lock?
+
+PID: 79454 TASK: ffff882fd6a224c0 CPU: 0 COMMAND: "kworker/0:1"
+
+#0 [ffff88407f807eb0] crash_nmi_callback at ffffffff8101eaef
+
+#1 [ffff88407f807ec0] notifier_call_chain at ffffffff81445617
+
+#2 [ffff88407f807ef0] notify_die at ffffffff814456ad
+
+#3 [ffff88407f807f20] default_do_nmi at ffffffff814429d7
+
+#4 [ffff88407f807f40] do_nmi at ffffffff81442c08
+
+#5 [ffff88407f807f50] nmi at ffffffff81442320
+
+[exception RIP: _raw_spin_lock+24]
+
+RIP: ffffffff81441998 RSP: ffff883f02147d28 RFLAGS: 00000293
+
+RAX: 000000000000333d RBX: ffff8b3e85c4e680 RCX: 0000000000000028
+
+RDX: 0000000000003335 RSI: 0000000000249f00 RDI: ffffffffa047c610
+
+RBP: ffff88407f80eb80 R8: 0000000000000020 R9: 0000000000000000
+
+R10: 0000000000000064 R11: ffffffffa047a4e0 R12: 0000000000249f00
+
+R13: 0000000000004fd4 R14: 00000000000000a0 R15: 0000000000000000
+
+ORIG_RAX: ffffffffffffffff CS: 0010 SS: 0018
+
+—  —
+
+#6 [ffff883f02147d28] _raw_spin_lock at ffffffff81441998
+
+#7 [ffff883f02147d28] pcc_cpufreq_target at ffffffffa047a4fe [pcc_cpufreq]
+
+[...]
+
+OK this one requested 0x333d ticket but it still sees very old spinlock state.
+
+And what more interesting is that it just refetched the global state:
+
+0xffffffff81441995 : movzwl (%rdi),%edx
+
+0xffffffff81441998 : jmp 0xffffffff8144198f
+
+The lock is not IRQ safe so an interrupt might have triggered after movzwl and before jmp. OK, let's pretend that this is not a problem, althought I wouldn't be happy about CPU governor which doesn't scale on such a machine that badly.
+
+The lockup has been detected:
+
+crash> dmesg | grep -i lockup
+
+[385474.330482] BUG: soft lockup - CPU#0 stuck for 22s! [sort:130201]
+
+[507912.743427] Kernel panic - not syncing: Watchdog detected hard LOCKUP on
+
+cpu 44
+
+The first one (soft lockup) was obviously recoverable. The second is more
+
+interesting:
+
+PID: 100927 TASK: ffff8b3e857c2580 CPU: 44 COMMAND: "collectl"
+
+#0 [ffff8a3fff907b20] machine_kexec at ffffffff810265ce
+
+#1 [ffff8a3fff907b70] crash_kexec at ffffffff810a3b5a
+
+#2 [ffff8a3fff907c40] panic at ffffffff8143eadf
+
+#3 [ffff8a3fff907cc0] watchdog_overflow_callback at ffffffff810be194
+
+#4 [ffff8a3fff907cd0] __perf_event_overflow at ffffffff810e9aba
+
+#5 [ffff8a3fff907d70] intel_pmu_handle_irq at ffffffff810159d9
+
+#6 [ffff8a3fff907eb0] perf_event_nmi_handler at ffffffff814433b1
+
+#7 [ffff8a3fff907ec0] notifier_call_chain at ffffffff81445617
+
+#8 [ffff8a3fff907ef0] notify_die at ffffffff814456ad
+
+#9 [ffff8a3fff907f20] default_do_nmi at ffffffff814429d7
+
+#10 [ffff8a3fff907f40] do_nmi at ffffffff81442c08
+
+#11 [ffff8a3fff907f50] nmi at ffffffff81442320
+
+[exception RIP: s_show+211]
+
+RIP: ffffffff8113a4c3 RSP: ffff8b3e70d2fde8 RFLAGS: 00000046
+
+RAX: ffff89367c870000 RBX: 0000000000000000 RCX: 0000000000000025
+
+RDX: 0000000000000025 RSI: ffff893fff42e150 RDI: ffff893fff42e180
+
+RBP: ffff893fff42e140 R8: 0000000000000400 R9: ffffffff81be18a0
+
+R10: 0000ffff00066c0a R11: 0000000000000000 R12: 0000000004ec9217
+
+R13: 00000000002270bc R14: 0000000000000000 R15: 0000000000000002
+
+ORIG_RAX: ffffffffffffffff CS: 0010 SS: 0018
+
+—  —
+
+#12 [ffff8b3e70d2fde8] s_show at ffffffff8113a4c3
+
+#13 [ffff8b3e70d2fe60] seq_read at ffffffff81171991
+
+#14 [ffff8b3e70d2fed0] proc_reg_read at ffffffff811ad847
+
+#15 [ffff8b3e70d2ff10] vfs_read at ffffffff81151687
+
+#16 [ffff8b3e70d2ff40] sys_read at ffffffff811517f3
+
+#17 [ffff8b3e70d2ff80] system_call_fastpath at ffffffff81449692
+
+RIP: 00007d570dc8e750 RSP: 00007fff43f31af0 RFLAGS: 00010206
+
+RAX: 0000000000000000 RBX: ffffffff81449692 RCX: 0000000000004618
+
+RDX: 0000000000001000 RSI: 0000000001bc7ee8 RDI: 0000000000000007
+
+RBP: 000000000078e010 R8: 0000000000000000 R9: 0000000000000000
+
+R10: 0000000000000000 R11: 0000000000000246 R12: 0000000001bc7ee8
+
+R13: 0000000000000007 R14: 0000000000000000 R15: 000000000000f001
+
+ORIG_RAX: 0000000000000000 CS: 0033 SS: 002b
+
+This is /proc/slabinfo interface. rbp contains kmem_list.
+
+crash> struct kmem_list3 ffff893fff42e140
+
+struct kmem_list3 {
+
+slabs_partial = {
+
+next = 0xffff893fff42e140,
+
+prev = 0xffff893fff42e140
+
+},
+
+slabs_full = {
+
+next = 0xffff892a92857000,
+
+prev = 0xffff893e86cb0000
+
+},
+
+slabs_free = {
+
+next = 0xffff893fff42e160,
+
+prev = 0xffff893fff42e160
+
+},
+
+free_objects = 0,
+
+free_limit = 637,
+
+colour_next = 0,
+
+list_lock = {
+
+{
+
+rlock = {
+
+raw_lock = {
+
+slock = 2008643510
+
+}
+
+}
+
+}
+
+},
+
+shared = 0xffff893fff42f000,
+
+alien = 0xffff893fff41d640,
+
+next_reap = 4422089447,
+
+free_touched = 1
+
+}
+
+There are no free nor partially filled slabs so we have only full_slabs and
+
+quite some of them:
+
+crash> list -s slab 0xffff892a92857000 | grep "^ffff" > full_slabs
+
+[wait for a loooooooooooooooooooooooong time until you loose your patience and
+
+ctrl+c]
+
+$ wc -l full_slabs
+
+55898 full_slabs
+
+So yes, this is indeed dangerous if some subsystem allocates too many objects.
+
+Especially when:
+
+ll /proc/slabinfo
+
+rw-rr- 1 root root 0 Sep 19 11:50 /proc/slabinfo
+
+So anybody might read and interfere. Upstream is no better in that aspect as
+
+get_slabinfo does the same thing. SLUB would be better as it is using atomic
+
+counters for the same purposes.
+
+We can silent the watchdog and stuff touch_nmi_watchdog into the loops but that only papers over the real issue. The right thing to do would be having
+
+something similar as SLUB and collect statistics per kmem_cachel3. I am not
+
+sure whether this is doable considering kABI restrictions and potential
+
+performance regressions. I would have to dive into this more but unfortunatelly I am leaving for a long vacation. Let's CC Mel here. Also I haven't seen this as a problem with our regular kernel because nothing seems to be allocating so manny kmalloc objects so it is questionable how much of a problem this really is for the supported kernel configurations.
+
+Whether using so many objects is healthy is another question for which I do not have a good answer. SLAB tries to batch operations internally so it should scale with the number of objects quite well but I am not familiar with all the internals enough to tell that with 100% certainity.
+
+--- Comment (kitwestneat, Thu, 24 Oct 2013 15:14:09 +0000) ---
+Sure
+
+--- Comment (bfaccini, Thu, 24 Oct 2013 14:58:43 +0000) ---
+Thanks for the update Kit. Do you agree if I close it with the "Not a Bug" reason ??
+
+--- Comment (kitwestneat, Thu, 24 Oct 2013 14:37:29 +0000) ---
+Hi Bruno,
+
+The customer has decided to disable collectl on the client and this seems to have cleared up the issue. Thank you for  your investigation into the issue. I think we can close the ticket.
+
+Thanks,
+
+Kit
+
+--- Comment (bfaccini, Wed, 23 Oct 2013 22:59:03 +0000) ---
+And no surprise that the current kmem_cache being walked-thru, as part of "/proc/slabinfo" access and at the time of the problem, is cl_page_kmem and its huge number of Slabs/Objects.
+
+There are 80 cores divided in 8 Numa-nodes, and this is Node #4 kmem_list3 that is being processed. It is made of 782369 slabs_full and 190921 slabs_partial and no slabs_free to be parsed in this order by s_show() routine with disabled IRQs (ie, causing no HPET timer updates in-between). And the current Slab being used at the time of the crash is one of the partial ones (the 173600th out of 190921) so seems that the watchdog just did not allow to complete parsing of Node-4 cl_page_kmem consumption !!
+
+So, according to the concerned Slabs and their current usage, this does not look like LU-2613 nor LU-4053 scenarios but seem to be only the consequence of a huge-memory Lustre Client page-cache memory foot-print.
+
+And yes, SLUBs are definitely a future option when supported by distro providers.
+
+And sure, disable HPET/NMI-watchdog could be a "ugly" work-around but an other possible one could be to regularly drain Lustre page-cache (using "lctl set_param ldlm_namespaces.*.lru_size=clear" and/or "echo 3 > /proc/sys/vm/drop_caches") and/or also reduce lustre-page-cache size (max_cached_mb) in order to reduce the number of *_page_kmem objects to be kept in Slabs. Last, simply avoid /proc/slabinfo usage is also one !!
+
+What else can be done about this???
+
+--- Comment (bfaccini, Tue, 22 Oct 2013 23:16:00 +0000) ---
+Top Slabs consumers in crash-dump provided are :
+
+CACHE            NAME                 OBJSIZE  ALLOCATED     TOTAL  SLABS  SSIZE
+ffff883ef7a61080 cl_page_kmem             192  110784616  117426440 5871322     4k
+ffff883ef5f011c0 osc_page_kmem            216   55392308  59188842 3288269     4k
+ffff883ef5ee17c0 vvp_page_kmem             80   55392308  59744976 1244687     4k
+ffff883ef5e913c0 lov_page_kmem             48   55392308  59936492 778396     4k
+ffff883ef5a01540 lovsub_page_kmem          40   55392308  60008840 652270     4k
+ffff88407f690980 radix_tree_node          560    2812010   3063060 437580     4k
+ffff883ef59d16c0 lustre_inode_cache      1152    1077902   1078294 154042     8k
+
+others are of a much lower order of magnitude.
+
+The KMem footprint is more than 50GB but it is only 2.5% of the 2048GB of memory. The corresponding number of objects (360446944) can be the problem here, causing collectl thread to spend too long time in s_show() routine loops, and thus trigger the hard-lockup ??
+
+--- Comment (bfaccini, Tue, 22 Oct 2013 10:12:22 +0000) ---
+Humm the crash-output you already attached are not from the uploaded crash-dump but fortunately it shows the same situation!! 
+
+Concerning the pcc_lock contention, there are about 28 threads spinning on it and on the node's 80 cores, when it is likely to be owned by this thread :
+
+PID: 5758   TASK: ffff883369b12480  CPU: 0   COMMAND: "kworker/0:1"
+ #0 [ffff88407f807eb0] crash_nmi_callback at ffffffff8101eaef
+ #1 [ffff88407f807ec0] notifier_call_chain at ffffffff81445617
+ #2 [ffff88407f807ef0] notify_die at ffffffff814456ad
+ #3 [ffff88407f807f20] default_do_nmi at ffffffff814429d7
+ #4 [ffff88407f807f40] do_nmi at ffffffff81442c08
+ #5 [ffff88407f807f50] nmi at ffffffff81442320
+    [exception RIP: _raw_spin_lock+21]
+    RIP: ffffffff81441995  RSP: ffff8834d4d7dd28  RFLAGS: 00000283
+    RAX: 000000000000c430  RBX: ffff8b3e8532d7c0  RCX: 0000000000000028
+    RDX: 000000000000c42e  RSI: 0000000000249f00  RDI: ffffffffa02b7610
+    RBP: ffff88407f80eb80   R8: 0000000000000020   R9: 0000000000000000
+    R10: 0000000000000064  R11: ffffffffa02b54e0  R12: 0000000000249f00
+    R13: 0000000000005ef0  R14: 00000000000000a0  R15: 0000000000000000
+    ORIG_RAX: ffffffffffffffff  CS: 0010  SS: 0018
+---  ---
+ #6 [ffff8834d4d7dd28] _raw_spin_lock at ffffffff81441995
+ #7 [ffff8834d4d7dd28] pcc_cpufreq_target at ffffffffa02b54fe [pcc_cpufreq]
+ #8 [ffff8834d4d7dd78] dbs_check_cpu at ffffffff8135feb3
+ #9 [ffff8834d4d7ddf8] do_dbs_timer at ffffffff813601c8
+#10 [ffff8834d4d7de28] process_one_work at ffffffff810747bc
+#11 [ffff8834d4d7de78] worker_thread at ffffffff8107734a
+#12 [ffff8834d4d7dee8] kthread at ffffffff8107b676
+#13 [ffff8834d4d7df48] kernel_thread_helper at ffffffff8144a7c4
+
+again, it is running on CPU/Core 0 and also shows an old spin-lock/ticket value which should only be a side-effect of the NMI handling.
+
+But finally, I don't think this pcc_lock contention is an issue since it only occurs on Idle cores (ie, where the only thread waiting in RU-nning state is the Idle-loop), during power/frequency recalibration.
+
+Now I will investigate the Soft-lockup+NMI/watchdog issue caused by collectl computing the Slabs consumption.
+
+--- Comment (bfaccini, Mon, 21 Oct 2013 12:48:09 +0000) ---
+Yes I got it and I am working on the crash-dump now that crash tool is happy.
+
+--- Comment (kitwestneat, Wed, 16 Oct 2013 14:50:24 +0000) ---
+Hi Bruno,
+
+Were you able to get the debuginfo?
+
+Thanks,
+
+Kit
+
+--- Comment (kitwestneat, Thu, 3 Oct 2013 14:38:26 +0000) ---
+Hi Bruno,
+
+The customer has uploaded the debuginfo rpm.
+
+Thanks,
+
+Kit
+
+--- Comment (bfaccini, Wed, 2 Oct 2013 09:07:31 +0000) ---
+Kit, I am sorry but crash tool complains "no debugging data available" against the "localscratch/dump/2013-08-20-14:05/vmlinux-3.0.13-0.27-default" kernel you provided ...
+
+Do you know where to find and/or can you also upload the corresponding kernel-debuginfo* RPMs ??
+
+Thanks again and in advance for your help!
+
+--- Comment (kitwestneat, Fri, 27 Sep 2013 19:32:33 +0000) ---
+The NREL bug is due to LU-2613. Reading in a file on the filesystem caused it to unblock.
+
+--- Comment (kitwestneat, Fri, 27 Sep 2013 19:15:12 +0000) ---
+I've just run into a similar issue at NREL while doing robinhood testing, where the slab unreclaim goes to 90% of memory. I ran 'echo 3 > /proc/sys/vm/drop_caches', but it is hanging and the bash process is at 100% CPU, as is the kswapd process. Lustre is mounted read-only.
+
+Here is slabtop sorted by cache size:
+
+2080183 2080182  99%    8.00K 2080183        1  16641464K size-8192
+
+6185372 6185242  99%    1.00K 1546343        4   6185372K size-1024
+
+2062676 2062631  99%    2.00K 1031338        2   4125352K size-2048
+
+2064096 2063826  99%    0.50K 258012        8   1032048K size-512
+
+3054480 305107   9%    0.12K 101816       30    407264K size-128
+
+4803485 4754884  98%    0.06K  81415       59    325660K size-64 
+
+4096288 2116344  51%    0.03K  36574      112    146296K size-32   
+
+You can see that the 8k slab cache is using 16G. The other slabs are also using a lot. 
+
+memused=28486658060
+
+memused_max=28535237092
+
+The kernel is 2.6.32-279.el6.x86_64, client is 2.1.6. Any more information we can get?
+
+--- Comment (kitwestneat, Thu, 26 Sep 2013 22:50:01 +0000) ---
+Hi Bruno,
+
+They should be uploaded, let me know if you need anything else.
+
+Thanks.
+
+--- Comment (bfaccini, Tue, 24 Sep 2013 21:32:25 +0000) ---
+Just sent you upload instructions by email.
+
+Thanks for your help.
+
+--- Comment (kitwestneat, Tue, 24 Sep 2013 17:19:16 +0000) ---
+Hi Bruno, 
+
+Where should we upload the core to?
+
+Thanks,
+
+Kit
+
+--- Comment (bfaccini, Tue, 24 Sep 2013 13:16:55 +0000) ---
+Hello Kit,
+
+Even if I easily understand that the /proc/slabinfo walk-thru by "collectl" thread can take ages due to huge Slabs, I don't see where it can interfere with the pcc_lock spin-lock use by others threads here.
+
+Could it be possible for you to provide the crash-dump (along with vmlinux/kernel-debuginfo[-common] RPMs, and the lustre-[modules,debuginfo] RPMs) or at least attach the log/dmesg, foreach bt, kmem -s, crash sub-commands output ??

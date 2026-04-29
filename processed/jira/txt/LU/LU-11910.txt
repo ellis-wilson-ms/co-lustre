@@ -1,0 +1,56 @@
+Key:        LU-11910
+Summary:    Improve repbuf/easize/mdsize handling on client
+Link:       https://jira.whamcloud.com/browse/LU-11910
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Patrick Farrell
+Created:    Thu, 31 Jan 2019 21:54:20 +0000
+Updated:    Mon, 9 Sep 2019 16:53:38 +0000
+Links:      Related: is related to LU-11868
+
+--- Description ---
+This is work spun out of https://review.whamcloud.com/#/c/34058/ / LU-11868.
+
+The sizing used for the various RPC fields in the MDC code is a bit chaotic.
+
+Some of them use cl_max_mds_easize, some use cl_default_mds_easize, and some use ocd_max_easize, which is the raw easize from the server, and without LU-11868, can be as much as 1 MiB.
+
+We need to look over the code setting up the repbuf for the various operations and decide on:
+
+	Reasonable defaults (the ACL buffer is currently set to max_easize, which is much too large for a default for ACLs)
+
+	Good behavior for handling large layouts or other eas - The current code is inconsistent, but the intended behavior of default_mds_easize is that it expands with the sizes seen up to a limit of 4K...  But it never drops. 
+
+ 
+
+The current behavior is workable and LU-11868 improves it, but there is definitely some technical debt here.
+
+--- Comment (pfarrell, Mon, 9 Sep 2019 16:53:38 +0000) ---
+Still more to do - That patch was low hanging fruit, limiting a few buffers that only hold certain xattrs to the max size for those xattrs.  We've still got the simplistic "just use the biggest size you've seen" behavior.  But it is less serious because we now limit xattr sizes to 64 KiB, whereas before we were at 1 MiB for ldiskfs, which was obviously super bad.
+
+--- Comment (adilger, Fri, 28 Jun 2019 10:12:49 +0000) ---
+Patrick, was this issue fixed with your patch that was recently landed, or is there still more to do?
+
+Patrick Farrell (pfarrell@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/34059
+Subject: LU-11868 mdc: Improve xattr buffer allocations
+Project: fs/lustre-release
+Branch: master
+Current Patch Set: 1
+Commit: 055702a13537c99d7f09364a350d8027359c694e
+
+--- Comment (pfarrell, Thu, 28 Feb 2019 20:16:10 +0000) ---
+Not planning to work on this atm, so putting it back in the general bucket.
+
+--- Comment (adilger, Fri, 1 Feb 2019 01:02:20 +0000) ---
+Allocating the maximum reply buffer size was previously a significant issue, as LNet would drop any too-large replies on the floor and the client would never see them.  Now, with RPC resending this is less of a concern that we always allocate the maximum reply buffer size, and instead find a balance between "too large" (expensive allocations and high RAM usage) and "too small" (too many resends).  Definitely ACLs are in the "too large" territory today, many files never even have an ACL, and those that do store only a few extra groups.
+
+Having some kind of common and relatively light-weight helper routine for each these buffers that behaves like a decaying average, but works like a "median" instead of a "mean" would be ideal.  That keeps each buffer component large enough to receive a full-sized reply if that is commonly seen, while not averaging to "slightly smaller than the useful size" which will otherwise happen if there are some cases where the full-sized buffer is not needed.  It should check the buffer sizes after receiving each reply to ensure decisions are based on the actually-needed buffer sizes rather than the clients estimate of what the sizes should be.
+
+Since we may not need the maximum-sized buffer for each component on each file (e.g. maximum ACL size + maximum layout size + maximum xattr size), and there is room for rounding up to the actual allocation size, there is some room for aggregation of these buffers at allocation time.  We don't want to just pin them at the maximum size ever seen, since this may vary dramatically by user or workload over time as well.
+
+One possibility for implementation is to have a regular decaying average to find the mean buffer size, and additionally store the buffer sizes that exceed this value within a few recent time windows in an array and the count of entries that are within some threshold of this maximum.  As long as the count or large replies is above some threshold (e.g. more than 5% of all replies in this window) then the maximum value is used, otherwise the decaying average (which excludes these large replies) is used.  That avoids the false "benefit" of having a larger average buffer size, when e.g. 4% of replies are a bit larger than the decaying average but still need a resend, yet 96% of replies are much smaller and do not benefit from the larger allocation.
+
+We already have code that does most of this on a per-target basis in struct imp_at using struct adaptive_timeout and at_measured.  This could get a slightly better name like averaging_table, and the usage routines encapsulated a bit better.  It would make sense to avoid direct access to the parameters at_history, at_min, and at_max in the main code (e.g. add pointers to them to the data structures) so that we can use different values for the adaptive buffer sizes.

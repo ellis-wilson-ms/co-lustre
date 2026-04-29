@@ -1,0 +1,121 @@
+Key:        LU-9133
+Summary:    Use only MDS-local time when determining if directory is active
+Link:       https://jira.whamcloud.com/browse/LU-9133
+Type:       Improvement
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   Mikhail Pershin
+Reporter:   Steve Guminski
+Created:    Thu, 16 Feb 2017 19:17:34 +0000
+Updated:    Tue, 28 Oct 2025 15:22:20 +0000
+Links:      Blocker: is blocked by LU-11435; Related: is related to  LU-10235
+
+--- Description ---
+When determining if a directory has recently been active, the client-provided timestamp in la_ctime is compared against the current time on the MDS. If the clocks are not synchronized on the client and the MDS, an incorrect elapsed time can be calculated. The comparison should instead be performed against the lr_contention_time in the resource, which is set by the MDS.
+
+Andreas Dilger provided detailed information about the required changes:
+
+                if (!(child_bits & MDS_INODELOCK_UPDATE) &&
+                      mdt_object_exists(child) && !mdt_object_remote(child)) {
+                        struct md_attr *ma = &info->mti_attr;
+
+                        ma->ma_valid = 0;
+                        ma->ma_need = MA_INODE;
+                        rc = mdt_attr_get_complex(info, child, ma);
+                        if (unlikely(rc != 0))
+                                GOTO(out_child, rc);
+
+                        /* If the file has not been changed for some time, we
+                         * return not only a LOOKUP lock, but also an UPDATE
+                         * lock and this might save us RPC on later STAT. For
+                         * directories, it also let negative dentry cache start
+                         * working for this dir. */
+                        if (ma->ma_valid & MA_INODE &&
+                            ma->ma_attr.la_valid & LA_CTIME &&
+                            info->mti_mdt->mdt_namespace->ns_ctime_age_limit +
+                                ma->ma_attr.la_ctime 
+
+I think instead of looking up the inode and checking the client-supplied la_ctime on the directory against the MDS-local clock, this check should look up the resource and compare res->lr_contention_time via ldlm_check_contention() which uses only the clock on the server. That would remove similar, but different code, and unify lock contention behaviour between the OST and MDT somewhat.
+
+--- Comment (pjones, Wed, 29 May 2024 18:45:38 +0000) ---
+ok. Then let's move it to 2.17 for now
+
+--- Comment (adilger, Wed, 29 May 2024 18:26:09 +0000) ---
+I don't think it is a blocker for 2.16.  It is an issue that crops up intermittently and causes some customer and support headaches because it can cause fairly significant performance impact (i.e. individual metadata operations taking seconds to complete) without any visible sign of problems with the system.
+
+Having it on the release list at lease gives some chance that someone will eventually fix it.
+
+--- Comment (pjones, Wed, 29 May 2024 15:00:14 +0000) ---
+Is this really something that we need to fix for 2.16? It seems to be a very long-standing issue...
+
+--- Comment (adilger, Fri, 1 Mar 2024 01:39:57 +0000) ---
+With trybits lock enqueue, it should be possible to change this code to use:
+
+diff --git a/lustre/mdt/mdt_handler.c b/lustre/mdt/mdt_handler.c
+index 19e05d0671..913a84a593 100644
+--- a/lustre/mdt/mdt_handler.c
++++ b/lustre/mdt/mdt_handler.c
+@@ -2349,7 +2349,7 @@ static int mdt_getattr_name_lock(struct mdt_thread_info *info,
+                            ma->ma_attr.la_valid & LA_CTIME &&
+                            info->mti_mdt->mdt_namespace->ns_ctime_age_limit +
+                            ma->ma_attr.la_ctime 
+
+but it would need a proper test case to determine if this is actually helping or not...
+
+--- Comment (adilger, Mon, 15 Oct 2018 15:19:49 +0000) ---
+Sorry, I meant Dominique's work in patch https://review.whamcloud.com/30880 "LU-10235 mdt: mdt_create: check EEXIST without lock"
+
+--- Comment (bougetq, Mon, 15 Oct 2018 07:57:05 +0000) ---
+@Andreas, I am pretty sure you meant someone else... Maybe Patrick Farell?
+
+--- Comment (adilger, Fri, 12 Oct 2018 23:43:18 +0000) ---
+Quentin, is there a chance you could look into this issue?  It is somewhat related to your work on LU-11199 "mdt: Attempt lookup lock on open"
+
+--- Comment (adilger, Fri, 28 Sep 2018 22:13:27 +0000) ---
+Hmm. I thought it was updated on the most recent conflict, but I haven't looked at it recently. If there is some other way to determine if the directory has been idle recently, I'd be fine with a different solution. Using timestamps from the MDS is best, since client and MDS clocks may be out of sync. Also, clocks between clients may be different, so using the MDS clock is best.
+
+--- Comment (tappro, Fri, 28 Sep 2018 12:52:48 +0000) ---
+Andreas, I am not sure that lr_contention_time can replace ctime check in that code, lr_contention_time is updated when amount of contended locks are bigger than ns_contended_locks variable which is 32, therefore this time is updated much rarely than ctime. Is that what we need?
+
+--- Comment (adilger, Tue, 28 Aug 2018 21:08:01 +0000) ---
+Mike, I think that is exactly what lr_contention_time is for - to track how recently the resource was contended by multiple clients, so that the server can make better decisions than just ping-pong of the lock.  This should apply to conflicting IBITS locks as well, if it doesn't yet.
+
+--- Comment (tappro, Thu, 23 Aug 2018 06:38:50 +0000) ---
+Andreas, I see that contention mechanism is not being used with IBITS locks. This must be done first to update lr_contention_time regularly. The simplest way would be to count each conflicting lock as contended one, maybe you have an better idea about contention for IBITS locks?
+
+--- Comment (adilger, Wed, 22 Aug 2018 21:28:30 +0000) ---
+Mike, is there some chance that this could be fixed for 2.12 still?  We still get occasional complaints about slow operations when the system clocks are not in sync.
+
+--- Comment (tappro, Thu, 9 Mar 2017 19:25:27 +0000) ---
+I see, so for this particular ticket LU-9133 the only patch for selective lock bits is needed, not whole DoM work.
+
+--- Comment (adilger, Wed, 8 Mar 2017 20:29:06 +0000) ---
+I guess I meant the patch https://review.whamcloud.com/25262 ("LU-9184 ldlm: selective IBITS lock trying").  The issue here is that we can't check the contention time on the DLM resource before getting the lock, but we don't know if we want the UPDATE bit until after checking the lock contention...
+
+My thought to fix this properly is that the caller will always speculatively try to get the UPDATE bit, but the DLM code (or MDS callback?) can drop the UPDATE bit if the lock is recently contended.  That keeps the info about lock contention internal to the DLM instead of the caller, and avoids the chicken-and-egg problem.
+
+--- Comment (tappro, Tue, 7 Mar 2017 18:07:27 +0000) ---
+Andreas, do you mean that 'try_bits' patch: https://review.whamcloud.com/#/c/25262/ ? Or whole combination with lock convert? The first one os ready for landing, just review is required.
+
+--- Comment (adilger, Sat, 4 Mar 2017 04:41:38 +0000) ---
+I also tried to find the ldlm_resource to directly compare the res->lr_contention_time.  I tried to get the ldlm_res_id from the child_fid using fid_build_reg_res_name(), and then called ldlm_resource_get() to find the resource.  However, the latter function returned NULL.  Is this approach incorrect?
+
+That would have been my next choice.  It is possible the LDLM namespace (info->mti_mdt->mdt_namespace) or resource type (LDLM_IBITS) was not correct?  Looking down the callpath, it looks like mdt_object_local_lock() is doing the same. I do agree there is a chicken-and-egg problem here, so this may not be as easy as I thought.
+
+On the plus side, there is work being done by tappro for Data-on-MDT in https://review.whamcloud.com/23010 to allow speculatively adding/removing lock bits to a lock, which may allow us to do the lookup of the child lock/resource with the UPDATE bit optional, and then not grant that bit in the DLM if there is resource contention.  With that said, I think it makes sense to shelve this change until Mike's work lands.
+
+--- Comment (adilger, Sat, 4 Mar 2017 04:36:39 +0000) ---
+From an email discussion between Steve and I:
+
+It appears that lhc is an mdt_lock_handle() for the child directory entry, and lhp is a lock handle for the parent directory. You can turn these into DLM locks via lock = ldlm_handle2lock(&lhc->mlh_reg_lh);
+
+Thanks for the info, Andreas. I've been trying to follow the instructions you provided, but ldlm_handle2lock(&lhc->mlh_reg_lh) seems to always be returning NULL. Shortly before the code that I'm replacing, there is a call to mdt_lock_handle_init(lhc). This function zeroes out the lhc->mlh_reg_lh.cookie, which seems to be needed by ldlm_handle2lock() to actually locate the lock.
+
+I see that a few lines later, mdt_object_lock() is called for the child. Is this where the handle's cookie gets set? If so, then there's a conflict: I need to know the child_bits before calling mdt_object_lock(), but I can't get the child_bits until I've called mdt_object_lock() to get the lock and retrieve the contention time.
+
+According to the existing code, which is using child and the timestamps thereon, it makes sense to check the lhc data rather than lhp.
+
+If I instead try to locate the lock for the parent (lhp), I get a successful result from ldlm_handle2lock(). I'm not sure if the parent lock is actually useful, however.
+
+I also tried to find the ldlm_resource to directly compare the res->lr_contention_time.  I tried to get the ldlm_res_id from the child_fid using fid_build_reg_res_name(), and then called ldlm_resource_get() to find the resource.  However, the latter function returned NULL.  Is this approach incorrect?

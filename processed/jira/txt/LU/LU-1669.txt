@@ -1,0 +1,415 @@
+Key:        LU-1669
+Summary:    lli->lli_write_mutex (single shared file performance)
+Link:       https://jira.whamcloud.com/browse/LU-1669
+Type:       Bug
+Priority:   Critical
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Lai Siyao
+Reporter:   Brian Behlendorf
+Created:    Tue, 24 Jul 2012 18:31:11 +0000
+Updated:    Sat, 23 Jan 2021 12:31:38 +0000
+Resolved:   Fri, 14 Nov 2014 18:46:25 +0000
+Labels:     client, llnl, performance
+Links:      Blocker: is blocked by LU-3261; Related: is related to  LU-11085; Related: is related to LU-5700; Related: is related to LU-8025; Related: is related to LU-5360
+Attachments: Range Lock for Write.docx, ext4-dd-1M-ftrace.log.bz2, lustre-dd-1M-ftrace.log.bz2
+
+--- Environment ---
+Chaos 5, single client
+
+--- Description ---
+Shared file writes on a single client from many threads performs significantly worse with the CLIO code.
+
+However, unlike issue coh_page_guard contention (single shared file performance)" class="issue-link" data-issue-key="LU-1666">LU-1666 the root cause for this appears to be the lli->lli_write_mutex which is taken in the common write path (see ll_file_io_generic).  This lock effectively serializes all writes to the file and drastically limits the rate at which we can dirty pages.  It's so bad that according to /proc/meminfo we're unable to dirty pages in the cache faster than they are written to the server.  That is the total number of dirty pages on the client rarely exceeds a few megabytes.
+
+Once again this issue can be easily reproduced with the following fio script run on a single client.
+
+fio ssf.fio
+
+; ssf.fio, single shared file
+[global]
+directory=/p/lstest/behlendo/fio/
+filename=ssf
+size=256g
+blocksize=1m
+direct=0
+ioengine=sync
+numjobs=128
+group_reporting=1
+fallocate=none
+runtime=60
+stonewall
+
+[write]
+rw=randwrite:256
+rw_sequencer=sequential
+fsync_on_close=1
+
+[read]
+rw=randread:256
+rw_sequencer=sequential
+
+The following are a sampling of stacks from the system showing all the IO threads contending for this mutex.  In addition, we can clearly see process 33296 holding the mutex while potentially blocking briefly in osc_enter_cache().  It's still unclear to me if we can simply drastically speed up cl_io_loop() to improve this, or if we must reintroduce some range locking as was done in 1.8.
+
+fio           S 0000000000000008     0 33296  33207 0x00000000
+ ffff880522555548 0000000000000082 ffff880522555510 ffff88052255550c
+ ffff8807ff75a8c8 ffff88083fe82000 ffff880044635fc0 00000000000007ff
+ ffff8807c6633af8 ffff880522555fd8 000000000000f4e8 ffff8807c6633af8
+Call Trace:
+ [] cfs_waitq_wait+0xe/0x10 [libcfs]
+ [] osc_enter_cache+0x676/0x9c0 [osc]
+ [] ? lov_merge_lvb_kms+0x113/0x260 [lov]
+ [] ? default_wake_function+0x0/0x20
+ [] ? lov_attr_get+0x1e/0x60 [lov]
+ [] osc_queue_async_io+0xe53/0x1430 [osc]
+ [] ? put_dec+0x10c/0x110
+ [] ? number+0x2ee/0x320
+ [] ? osc_page_init+0x29e/0x5b0 [osc]
+ [] ? vsnprintf+0x2b6/0x5f0
+ [] osc_page_cache_add+0x94/0x1a0 [osc]
+ [] cl_page_cache_add+0x7f/0x1e0 [obdclass]
+ [] lov_page_cache_add+0x8f/0x190 [lov]
+ [] cl_page_cache_add+0x7f/0x1e0 [obdclass]
+ [] ? __set_page_dirty_nobuffers+0xdd/0x160
+ [] vvp_io_commit_write+0x313/0x4e0 [lustre]
+ [] cl_io_commit_write+0xbd/0x1b0 [obdclass]
+ [] ll_commit_write+0xfb/0x320 [lustre]
+ [] ll_write_end+0x30/0x60 [lustre]
+ [] generic_file_buffered_write+0x174/0x2a0
+ [] ? current_fs_time+0x27/0x30
+ [] __generic_file_aio_write+0x250/0x480
+ [] ? cl_env_info+0x15/0x20 [obdclass]
+ [] generic_file_aio_write+0x6f/0xe0
+ [] vvp_io_write_start+0xb0/0x1e0 [lustre]
+ [] cl_io_start+0x72/0xf0 [obdclass]
+ [] cl_io_loop+0xb4/0x160 [obdclass]
+ [] ll_file_io_generic+0x3be/0x4f0 [lustre]
+ [] ll_file_aio_write+0x14c/0x290 [lustre]
+ [] ll_file_write+0x173/0x270 [lustre]
+ [] vfs_write+0xb8/0x1a0
+ [] sys_write+0x51/0x90
+ [] ? do_device_not_available+0xe/0x10
+ [] system_call_fastpath+0x16/0x1b
+
+fio           S 0000000000000001     0 33297  33207 0x00000000
+ ffff8807d4b91d18 0000000000000086 ffff8807d4b91c98 ffffffffa0aba783
+ ffff880c5cca92f0 ffff880f9a8c7428 ffffffff8100bc0e ffff8807d4b91d18
+ ffff8807c6633098 ffff8807d4b91fd8 000000000000f4e8 ffff8807c6633098
+Call Trace:
+ [] ? lov_io_init_raid0+0x383/0x780 [lov]
+ [] ? apic_timer_interrupt+0xe/0x20
+ [] ? mutex_spin_on_owner+0x9b/0xc0
+ [] __mutex_lock_interruptible_slowpath+0x14b/0x1b0
+ [] mutex_lock_interruptible+0x48/0x50
+ [] ll_file_io_generic+0x3af/0x4f0 [lustre]
+ [] ll_file_aio_write+0x14c/0x290 [lustre]
+ [] ll_file_write+0x173/0x270 [lustre]
+ [] vfs_write+0xb8/0x1a0
+ [] sys_write+0x51/0x90
+ [] ? do_device_not_available+0xe/0x10
+ [] system_call_fastpath+0x16/0x1b
+...many threads like 33297...
+
+Finally, it's my understanding that this lock is solely here to enforce atomicity between threads on the client.  If that is in fact the case we may do a little experimenting with the group lock to see if that's a reasonable short term workaround for some of our codes.
+
+--- Comment (jlevi, Fri, 14 Nov 2014 18:46:25 +0000) ---
+Patch landed to Master.
+
+--- Comment (jay, Fri, 22 Aug 2014 17:39:09 +0000) ---
+I believe the patches are ready - the only effort is to wait for permission and follow our internal quality process to land.
+
+--- Comment (pjones, Fri, 22 Aug 2014 17:30:07 +0000) ---
+Lai
+
+Could you please have a look at these existing patches and see what further effort is required to complete this work?
+
+Thanks
+
+Peter
+
+--- Comment (jlevi, Tue, 3 Sep 2013 16:27:53 +0000) ---
+Moving this to 2.6 Release version as we have passed feature freeze for 2.5
+
+--- Comment (jay, Sat, 15 Jun 2013 00:00:02 +0000) ---
+Thank you, Prakash, I will take a look.
+
+--- Comment (prakash, Fri, 14 Jun 2013 23:15:22 +0000) ---
+I've pushed a new version of http://review.whamcloud.com/6320 which attempts to add a range lock implementation using Lustre's interval tree implementation. It's still a work in progress, but I wanted to push it for review to get some feedback. Specifically, I seem to be using the waitq interface incorrectly, so any help fixing that would be appreciated.
+
+--- Comment (jay, Wed, 12 Jun 2013 23:55:34 +0000) ---
+One tricky thing about inode mutex is to check all references of it in the client code to see if our change will affect it.
+
+--- Comment (jay, Wed, 12 Jun 2013 21:38:42 +0000) ---
+Yes, exactly.
+
+--- Comment (prakash, Wed, 12 Jun 2013 19:51:18 +0000) ---
+Jinshan, thanks for the HLD. Just to assure myself, you want to ignore the inode mutex completely by using the lockless __generic_file_aio_write function, right? It seems like a simple first patch can be made to make that change, and atomicity will still be maintained using the current lli_write_lock and the lli_trunc_sem as you described in the HLD. Of course this won't garner any performance benefits, but a follow up patch to break the lli_write_mutex into a range lock would.
+
+--- Comment (jay, Mon, 10 Jun 2013 22:25:52 +0000) ---
+Hi Prakash, Please check the attachment for design of range lock.
+
+--- Comment (prakash, Fri, 7 Jun 2013 21:42:41 +0000) ---
+Yes, please do!
+
+--- Comment (jay, Fri, 7 Jun 2013 21:19:40 +0000) ---
+Hi Prakash,
+
+Sorry for delay response. Is it possible for me to write an HLD so that you can work out a patch to solve this problem?
+
+Jinshan
+
+--- Comment (prakash, Tue, 4 Jun 2013 16:49:39 +0000) ---
+Sure, here's how I gathered the results:
+
+# trace-cmd record -p function_graph -g generic_file_aio_write dd if=/dev/urandom of=/p/lustre/dd-test bs=1M count=1
+# trace-cmd report > lustre-dd-1M-ftrace.log
+
+The results I posted above were taken in a VM, so you might see slightly different results on real hardware, but I'd expect the overall trend to be the same.
+
+--- Comment (jay, Tue, 4 Jun 2013 03:55:01 +0000) ---
+Hi Prakash,
+
+Can you please share me the options you used for ftrace? I'd like to reproduce the result and tune the performance.
+
+Jinshan
+
+--- Comment (prakash, Mon, 3 Jun 2013 21:38:05 +0000) ---
+I spent some time looking into what occurs under the inode mutex, in the context of the generic_file_aio_write call, specifically looking for ways to speed things up; but nothing obvious is jumping out at me. Nothing in particular is jumping out as a blatant time sink, and instead it seems like we just do "too much" in this call path and every little thing adds up to a lot of time. I ran a simple test using dd with ftrace enabled to try and better understand where the time is spent, and have attached the results of that to this ticket in the file "lustre-dd-1M-ftrace.log.bz2".
+
+I've also attached the ftrace results of the same test but writing to a ext4 file system for comparison in "ext4-dd-1M-ftrace.log.bz2". It's clear looking at the ftrace output and the ext4 sources that it is significantly simpler and faster as a result, which is to be expected. It also somewhat explains why ext4 sees much better single shared file performance (~1.1 GB/s)*, despite using the same generic_file_aio_write call path (i.e. serializing on the same inode mutex). 
+
+Some timing information gathered from the ftrace log shows most of the time being spent on per page operations, ll_write_begin and ll_write_end specifically. Within ll_write_begin, ll_cl_init appeared to take up much of the time, and within ll_write_end, vvp_io_commit_write appeared to take up much of the time. I copied the timing information of these functions, for the first several pages in the transfer, into the following table:
+
+                                                                      
++---------------------------------------------------------------------------------------------+
+| ftrace - function timings - dd if=/dev/urandom of=/mnt/lustre/dd-test bs=1M count=1         |   
++---------------------------------------------------------------------------------------------+
+| Page | ll_write_begin | ll_cl_init | ll_write_end | vvp_io_commit_write | cl_page_cache_add |
++------+----------------+------------+--------------+---------------------+-------------------+
+|   1  |     69.769 us  |  36.993 us |   92.987 us  |       59.436 us     |      39.116 us    |   
+|   2  |     66.168 us  |  35.470 us |   65.158 us  |       32.857 us     |      14.910 us    |   
+|   3  |     67.560 us  |  34.630 us |   64.155 us  |       31.757 us     |      13.909 us    |   
+|   4  |     64.997 us  |  34.800 us |   63.694 us  |       31.747 us     |      13.952 us    |   
+|   5  |    101.143 us  |  34.898 us |   65.215 us  |       32.658 us     |      14.203 us    |   
+|   6  |    115.112 us  |  36.210 us |   66.911 us  |       33.839 us     |      14.850 us    |   
+|   7  |     66.310 us  |  35.354 us |   96.414 us  |       31.787 us     |      13.970 us    |   
+|   8  |     68.359 us  |  36.688 us |   65.467 us  |       33.124 us     |      14.438 us    |   
+|   9  |     73.147 us  |  42.840 us |   68.209 us  |       35.116 us     |      13.796 us    |   
+|  10  |     68.107 us  |  36.319 us |   67.216 us  |       33.343 us     |      14.714 us    |   
+|  11  |     76.030 us  |  44.170 us |   68.870 us  |       35.738 us     |      17.667 us    |   
+|  12  |     65.502 us  |  35.035 us |  130.747 us  |       98.017 us     |      13.348 us    |   
+|  13  |     67.758 us  |  36.636 us |   65.490 us  |       32.750 us     |      14.242 us    |   
+|  ... |       ...      |    ...     |     ...      |         ...         |        ...        |   
++------+----------------+------------+--------------+---------------------+-------------------+
+
+                                                                      
+
+If we intend to continue using the generic_file_aio_write call, we must speed up the execution time of ll_write_begin and ll_write_end if we are to see better single shared file performance out of a single client. Based on the ftrace data I collected, I'm not sure there is an easy way to do this, and it might take a significant overhaul to the client infrastructure.
+
+With that said, there is talk upstream about removing the inode mutex with a range lock (http://lwn.net/Articles/535843/). I believe this would completely remove our source of contention, but doesn't help us in the short term (or even long term if it doesn't get merged).
+
+	The ext4 test was FIO using a single shared file with 16 threads each writing 1G. A single thread writing 16G test was also run and saw ~1.5 GB/s. The "disk" used for the ext4 FS was a 16 GB ramdisk.
+
+--- Comment (prakash, Sat, 11 May 2013 00:22:24 +0000) ---
+I tried my hand at manipulating the kernel's range locking implementation to do what we need to satisfy (1) from my comment above, but no longer think that's feasible. I've pushed a where I tried to do that here: http://review.whamcloud.com/6320 but I don't think it's fit for landing. We'll probably have to create own range lock implementation and add it into libcfs.
+
+--- Comment (prakash, Thu, 9 May 2013 00:00:56 +0000) ---
+jay, Do you have any ideas as to how we can address the i_mutex bottle neck we're seeing from the generic_file_aio_write call? and/or why that is such an issue for us compared to local filesystems?
+
+--- Comment (prakash, Tue, 7 May 2013 16:43:20 +0000) ---
+We can clearly see that without those locks the single shared file performance is even better than file-per-process performance.
+
+Keep in mind the small sample size of each iteration. Although the raw numbers show Test 5 greater than Test 2, I wouldn't put much emphasis on that fact with only a single sample for each iteration. I'm more focused on the trend in better performance up to the point where it resembles that of the file per process test.
+
+The small write RPC would be due to dirty limit or lack of grant.
+
+Agreed, and it sounds like you are aware of this. I had not been exposed to this affect, so I was surprised at first. In my case, even when increasing the dirty limit to 1G per OSC I still hit the dirty limit. This had the side effect of causing server performance to be much much worse because read-modify-writes were occurring when rewriting files. Simply using brand new files removed the server side performance artifact, but the small RPC sizes maintained.
+
+As you know, the reason we need inode mutex and write_sem is to make lustre client be posix compliant; but maybe we can investigate the necessity of lli_size_sem.
+
+Right. Without looking into the details, my initial thoughts are this:
+
+ 1. lli_write_sem - This can be converted into a range lock. This will allow multiple threads to simultaneously write to a single file, as long as they are writing to unique offset ranges in the file. All while maintaining posix compatibility. If multiple threads overlap their writes, then we degerate to the point we're at now (but there's not much we can do about that case). I'm hoping I can make use of the kernel fcntrl/flock functions and implementation, rather than rolling our own custom range locking implementation.
+
+ 2. inode mutex - I'm unsure if we can simply drop this as I did in my test. I need to look at the kernel sources more closely and determine exactly why they take the lock, and see if there is something clever we can do to get around this. I'm curious how local filesystems perform running the same FIO test, because I would assume they'll run into the same inode mutex bottle neck.
+
+ 3. lli_size_sem - I think this can be converted into a reader-writer semaphore. Currently a mutex is taken for each write in order to check and potentially update the inode size. What I think we can do, is first take a read lock to check the inode size, if it needs updating then promote to a write lock. In the normal case, I would imagine most threads would only takea read lock, thus allowing most threads to proceed without blocking here.
+
+--- Comment (jay, Tue, 7 May 2013 04:56:20 +0000) ---
+Prakash, thank you very much for this great work. We can clearly see that without those locks the single shared file performance is even better than file-per-process performance.
+
+The small write RPC would be due to dirty limit or lack of grant. This can be simply verified by increasing dirty limit to a bigger number. Actually after IO engine work is done, the OSC tend to put all pages from an IO into one extent so that they can be written out in one RPC, however, the extent has to be split if there is no enough grant or reach dirty limit.
+
+As you know, the reason we need inode mutex and write_sem is to make lustre client be posix compliant; but maybe we can investigate the necessity of lli_size_sem.
+
+--- Comment (prakash, Tue, 7 May 2013 02:39:44 +0000) ---
+Before I lose track of this, I wanted to report on some single shared file testing I did last week.
+
+Specifically, I ran 5 different tests. Two of which were using a client built from an unmodified version of master to serve as a baseline, and then 3 other tests were run with slight modifications to the lustre client. The point of the testing was to try and scope out what changes might be needed for the single shared file performance to match that of the file per process performance, using a single client.
+
+                                                                      
+Test 1: single shared file FIO, using unmodified client git commit: 77aa3f2     
+Test 2: file per process FIO, using unmodified client git commit: 77aa3f2       
+Test 3: single shared file FIO, using modified client based off: 77aa3f2        
+        The modification in this test removed the usage of lli_write_sem        
+        from ll_file_io_generic                                                 
+Test 4: single shared file FIO, using modified client based off: 77aa3f2        
+        This test included the modification from Test 3, but also               
+        changed the usage of generic_file_aio_write inside                      
+        lustre_generic_file_write to use the lockless version,                  
+        __generic_file_aio_write                                                
+Test 5: single shared file FIO, using modified client based off: 77aa3f2        
+        This test included modifications from both Test 3 and 4, but            
+        also removed the usage of ll_inode_size_lock and                        
+        ll_inode_size_unlock from within vvp_io_commit_write.                   
+
+                                                                      
+
+For each test described above, 7 FIO iterations were run, with each iteration varying the number of tasks. To keep the total amount of data transfered over the network constant as the number of tasks increased, the amount of data each task wrote decreased proportionally.
+
+My take away from this testing was – In order to improve the single shared file write performance of a single lustre client, we need to address these 3 areas of contention:
+
+                                                                      
+1. The lli_write_sem usage in ll_file_io_generic                                
+2. The inode mutex usage in generic_file_aio_write                                 
+3. The lli_size_sem usage in vvp_io_commit_write                                
+
+                                                                      
+
+Below are the results of each iteration of FIO for each Test. It shows the number of tasks used, amount of data each task wrote, and the total aggregate bandwidth (as reported by FIO) for each iteration:                   
+
+                                                                      
++---------+------------------+------------+------------+------------+------------+------------+
+| fio 2.0.13, Lustre: 2.3.64 |   Test 1   |   Test 2   |   Test 3   |   Test 4   |   Test 5   |
++---------+------------------+------------+------------+------------+------------+------------+
+| # Tasks | Data (GB) / Task | SSF (KB/s) | FPP (KB/s) | SSF (KB/s) | SSF (KB/s) | SSF (KB/s) |
+|---------+------------------+------------+------------+------------+------------+------------+
+|     1   |        64        |   355835   |   322299   |   345435   |   301829   | Not Tested |
+|     2   |        32        |   341790   |   555017   |   368117   |   513292   | Not Tested |
+|     4   |        16        |   359387   |   721717   |   383781   |   661158   |   935719   |
+|     8   |         8        |   347649   |   853378   |   377629   |   729364   |  1086976   |
+|    16   |         4        |   348633   |   782729   |   357952   |   718879   |   974428   |
+|    32   |         2        |   353254   |   974343   |   378361   |   652594   |   993219   |
+|    64   |         1        |   359861   |   922839   |   424023   |   560735   |   921382   |
++---------+------------------+------------+------------+------------+------------+------------+
+
+                                                                      
+
+SIDE NOTE:                                                                      
+
+As an aside, I ran into what appeared to be poor RPC formation when writing to a single shared file from many different threads, and simultaneously hitting the per OSC dirty page limit. During "Test 5" (and to a lesser extent, "Test 2" as well) I began to see many non 1M RPCs being sent to the OSS nodes, whereas with the other tests, nearly all of the RPCs were 1M in size. This affect got worse as the number of tasks increased.
+
+What I think was happening is this                                              
+
+                                                                      
+ - As the client pushes data fast enough to the server, it bumps up             
+   against the per OSC dirty limit, thus RPCs are forcefully flushed out        
+                                                                                
+ - As this is happening, threads are continuously trying to write data          
+   to there specific region of the file. Some tasks are able to fill a          
+   full 1M buffer before the dirty limit forces a flush, but some tasks         
+   are not.                                                                     
+                                                                                
+ - Buffers to non-contiguous regions of a file are not joined together,         
+   so the smaller non-1M buffers are forced out in non-optimal small            
+   RPCs.                                                                        
+
+                                                                      
+
+I believe this affect was only apparent in Test 2 and Test 5, because the other tests just weren't able to push data to the server fast enough to bump up against the dirty limit.
+
+It would be nice if the RPC formation engine would keep these small buffers around, waiting for them to reach a full 1M, before flushing them out to the server. This is especially harmful on ZFS backends because it can force read-modify-write operations, as opposed to only performing writes when the RPC is properly aligned at 1M.
+
+--- Comment (prakash, Thu, 25 Apr 2013 17:24:58 +0000) ---
+As far as I know, there hasn't been any real work done to improve this issue yet. I'm hoping to get a chance to work on this soon since it is a priority for us at LLNL, but that wont definitely won't happen in time for 2.4.0. I can't comment on where this falls on Intel's list of priority's though.
+
+--- Comment (spitzcor, Thu, 25 Apr 2013 04:24:02 +0000) ---
+What's the status of this performance issue at this point (for 2.4.0)?
+
+--- Comment (behlendorf, Mon, 30 Jul 2012 15:38:05 +0000) ---
+Good thought, I hadn't noticed that __generic_file_aio_write() was also exported.  I made this quick change and ran the test to see what this would buy us, the results are interesting.
+
+The single shared file write performance does increase from ~550MB/s to over 1,300MB/s (over 2x) as observed by the client.  But after about 30 seconds of run time it collapses back down to ~550MB/s.  Observing the servers during this process shows that they never exceed ~550MB/s.  My assumption was this was simply getting cached on the client but /proc/meminfo doesn't show a large build up of dirty pages so there's a mystery there.  The servers are easily capable of handling the increase load since the shared file is striped 8 wide.
+
+More profiling is clearly needed.  However, a quick dump of the client stack traces show the current contention point is now ll_inode_size_lock().  There are a few callers blocked in osc_enter_cache() still which probably should also be explained since it appears we're rarely out of grant or dirty more than a meta byte or so per osc.
+
+--- Comment (jay, Fri, 27 Jul 2012 19:35:56 +0000) ---
+I checked kernel source just now and I think we can do a quick test by calling __generic_file_aio_write() instead of generic_file_aio_write() to skip inode mutex. In this case, we can work out a range lock patch in lustre really easy.
+
+--- Comment (behlendorf, Fri, 27 Jul 2012 18:45:42 +0000) ---
+> However, I'm not quite sure I follow why using a range lock would force us to change the VFS interface we use.
+
+Now I think I understand what your getting at.
+
+I took the opportunity to drop the lli_write_sem entirely just to see what that would do to the single shared file write performance.  It turns out it barely helps.  The contention just shifts as you expected to the i_mutex in generic_file_aio_write().  Presumably this is what you meant about us no longer being able use certain VFS interfaces.
+
+fio           D 0000000000000009     0  7511   7406 0x00000000
+ ffff880d6db73c28 0000000000000086 ffff880d6db73bf0 ffff880d6db73bec
+ ffff880f00000000 ffff88083fe82200 ffff880044675fc0 0000000000000400
+ ffff880f3b76dab8 ffff880d6db73fd8 000000000000f4e8 ffff880f3b76dab8
+Call Trace:
+ [] ? mutex_spin_on_owner+0x9b/0xc0
+ [] __mutex_lock_slowpath+0x13e/0x180
+ [] ? cl_env_info+0x15/0x20 [obdclass]
+ [] mutex_lock+0x2b/0x50
+ [] generic_file_aio_write+0x59/0xe0
+ [] vvp_io_write_start+0xb0/0x1e0 [lustre]
+ [] cl_io_start+0x72/0xf0 [obdclass]
+ [] cl_io_loop+0xb4/0x160 [obdclass]
+ [] ll_file_io_generic+0x25b/0x450 [lustre]
+ [] ll_file_aio_write+0x14c/0x290 [lustre]
+ [] ll_file_write+0x173/0x270 [lustre]
+ [] vfs_write+0xb8/0x1a0
+ [] sys_write+0x51/0x90
+ [] ? do_device_not_available+0xe/0x10
+ [] system_call_fastpath+0x16/0x1b
+
+--- Comment (behlendorf, Fri, 27 Jul 2012 16:20:44 +0000) ---
+I can easily believe that if lli_write_sem was converted in to a range lock then we'd see the inode mutex become the hottest lock.  However, that lock is taken much less broadly so I'd expect we'd still see significant performance improvements.  Perhaps enough to improve things to an acceptable level.  We'd have to run the benchmarks to see.
+
+However, I'm not quite sure I follow why using a range lock would force us to change the VFS interface we use.
+
+--- Comment (jay, Thu, 26 Jul 2012 20:34:46 +0000) ---
+The difficult thing is we have to talk to kernel for VM support so it's hard to skip inode mutex. I would say if we removed lli_write_sem, inode mutex would definitely be the hotest lock as what've seen for lli_write_sem.
+
+To apply range lock, we can't call vfs interfaces any more, so this will need a lot of work as lustre will have to talk to VM itself. However, this is not a totally bad thing because we can do better IO optimization.
+
+--- Comment (behlendorf, Thu, 26 Jul 2012 14:29:22 +0000) ---
+> 1. llite_write_mutex (and inode mutex) serializes the write processes, this seems unavoidable if you want posix compatibility;
+
+Not exactly, a mutex is just the simplest way to achieve it.  There are other methods, for example doing range locking would be one way to allow far greater parallelism.
+
+> 2. per OSC maximum dirty pages, this can be adjusted by lproc of osc.max_dirty_mb;
+
+> 3. system maximum dirty pages, this can be set by max_dirty_mb under /proc/sys/lustre
+
+Yes I had the same thought when running these tests originally.  I checked both the dirty limits and the available grant and neither were being regularly exhausted.  We even increased the stripe width of the shared file to rule this out as a significant cause, it didn't help.  So while the above stack does show us blocked in osc_enter_cache().  I suspect this is more the cumulative amount of time spent with the write mutex held in cl_io_loop().
+
+Speeding up cl_io_loop() will of course help, but only up to a point.  Since we're serialized by a single mutex shared file performance will be limited to:
+
+  (syscall write size) * (nr of context switches/second) = (maximum shared file write performance)
+
+--- Comment (jay, Thu, 26 Jul 2012 10:25:22 +0000) ---
+From the backtrace, the process was blocking at osc_enter_cache() for more grants or budget of dirty_page. lli_write_mutex is used to keep write atomicity for lustre.
+
+There may be several causes to limit the speed of generating dirty pages:
+
+1. llite_write_mutex (and inode mutex) serializes the write processes, this seems unavoidable if you want posix compatibility;
+
+2. per OSC maximum dirty pages, this can be adjusted by lproc of osc.max_dirty_mb;
+
+3. system maximum dirty pages, this can be set by max_dirty_mb under /proc/sys/lustre
+
+Can you please try to adjust the above parameters to see if it helps? It'll be really bad if it turns out that lli_write_mutex or inode mutex limits the write speed because it would be hard to improve it.
+
+--- Comment (pjones, Wed, 25 Jul 2012 12:35:27 +0000) ---
+Jinshan
+
+Please can you comment on this one?
+
+Thanks
+
+Peter
+
+--- Comment (behlendorf, Wed, 25 Jul 2012 12:28:24 +0000) ---
+I was just thinking the best way to pursue this is to probably get some ftrace/systemtap profiling data for the cl_io_loop() function.  This would allow us to easily identify any call paths which are blocked for a long time with this write mutex held.  At a minimum those places should be made asynchronous.

@@ -1,0 +1,155 @@
+Key:        LU-12970
+Summary:    improve mballoc for huge filesystems
+Link:       https://jira.whamcloud.com/browse/LU-12970
+Type:       Improvement
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Alex Zhuravlev
+Created:    Thu, 14 Nov 2019 16:56:49 +0000
+Updated:    Tue, 18 Mar 2025 06:46:08 +0000
+Labels:     ldiskfs, performance, scalability
+Links:      Related: is related to  LU-12103; Related: is related to  LU-14438; Related: is related to  LU-10946; Related: is related to LU-8365; Related: is related to LU-15319; Related: is related to LU-12976; Related: is related to LU-16155; Related: is related to LU-12988; Related: is related to LU-16691
+Attachments: ext4-loadbitmaps.patch
+
+--- Description ---
+there are number of reports demonstrating a poor behaviour of mballoc on huge filesystems. in one report it was  688TB filesystem with 5.3M groups.
+
+mballoc tries to allocate large chunks of space, for small allocations it tries to preallocate and share large chunks. while this is good in terms of fragmentation and streaming IO allocation itself may need to scan many groups to find a good candidate.
+
+mballoc maintains internal in-memory structures (buddy cache) to speed up searching, but that cache is built from regular on-disk bitmaps, meaning IO. and if cache is cold, populating it may take a lot of time.
+
+there are few ideas how to improve that:
+
+	skip more groups using less information when possible
+
+	stop scanning if too many groups have been scanned (loaded) and use best found
+
+	prefetch bitmaps (use lazy init thread? prefetch at scanning)
+
+another option for prefetching would be to skip non-initialized groups, but start an async read for the corresponding bitmap.
+
+also, when mballoc marks the blocks used (allocation has been just made) it could make sense to check/prefetch the subsequent group(s) which is likely a goal for subsequent allocation - while the caller are writting IO to just allocated blocks, the next group(s) will be prefetchted and ready to use.
+
+--- Comment (adilger, Tue, 11 May 2021 06:16:39 +0000) ---
+Link to backport of upstream mballoc patches in LU-14438, which may be enough to resolve this issue.
+
+--- Comment (adilger, Fri, 6 Dec 2019 20:04:28 +0000) ---
+I have thought in the past about something similar to what you describe.  However, it is difficult to know in advance what the size requirements are.
+
+One though was whether it makes sense to have a higher-level buddy bitmap for groups that is generated at the default preallocation unit size (based on the s_mb_large_req size) that allows quickly finding groups that have available 8MB or 16MB chunks, up to the maximum possible allocation size (probably 64MB is enough).  At 8-64MB chunks this would mean 15MB of bitmap for a 512TiB filesystem (could use kvmalloc()).  This would be essentially a filesystem-wide replacement for the bb_counters array that is tracked on a per-group basis, so would likely reduce overall memory usage, and would essentially replace "group scanning" with "bitmap scanning".  It could be optimized to save the first set bit to avoid repeatedly scanning the blocks of beginning of the filesystem, assuming they would be preferentially allocated.
+
+This could also be implemented as an array of linked lists (at power-of-two granularity up to 64MB), with groups being put in the list with their largest aligned free chunk (separate lists for unaligned chunks?).  Allocations would first walk the list for the smallest chunk that they need, then move up to lists with progressively larger chunks if no groups are available at the smaller size.  Once the allocation is done, the group may be demote to to a lower list if the allocation results in a smaller chunk being available.  To add a list_head to each of 4M groups in a 512TiB filesystem would consume 64MB of memory, but it would be split across all of the ext4_group_info allocations.
+
+Note that using a bigalloc size of e.g. 32KB would reduce the number of groups by a factor of 8 (e.g. 4M -> 512K) so we should also consider fixing the issues with bigalloc so that it is usable.
+
+--- Comment (bzzz, Fri, 6 Dec 2019 15:04:35 +0000) ---
+given in all the case we do forward scan, I think it would be relatively simple to add few lists of groups to be scanned at each criterion.
+
+each time a group gets/loses free blocks we would move it from one to another list at cost of few CPU cycles.
+
+I'm not sure what are crossing points for each list yet (in terms of free blocks/fragments/etc), but the inital implementation
+
+could start with empty/non-empty lists.
+
+--- Comment (bzzz, Fri, 22 Nov 2019 15:25:30 +0000) ---
+with 32-groups-at-once prefetching, the same cat:
+
+real	0m14.150s
+user	0m0.000s
+sys	0m0.309s
+
+with 64-groups-at-once prefetching:
+
+real	0m13.200s
+user	0m0.000s
+sys	0m0.277s
+
+but this is a single spindle, for any regular site that would be multiple spindles I guess and a larger prefetch window would help more.
+
+--- Comment (bzzz, Fri, 22 Nov 2019 14:29:52 +0000) ---
+partly for curiosity attached old SATA 7200 500GB drive to my testing box..:
+
+[root@rz /]# time cat /proc/fs/ext4/sda/mb_groups >/dev/null
+
+real	0m24.081s
+user	0m0.000s
+sys	0m0.274s
+
+this is 3726 groups, initialized by mke2fs so all to read during that cat.
+
+--- Comment (bzzz, Thu, 21 Nov 2019 06:52:52 +0000) ---
+hmm, why you think this is not likely? few growing files would fill the filesystem group by group.
+
+"just find" - this is exactly the issue. the allocator is supposed to be generic enough to work with small and big files, right?
+
+thus we want to keep some locality, if file A has last extent in the group N, then we should try to write next extent in the same N or nearby, not just any empty group?
+
+and then searching for the group is what is happening in DDN -923, but the groups weren't considered "best" and that got worse due to cold cache.
+
+so that approach I'm trying is to limit coverage of searching.
+
+I think that coverage can be expressed in number of groups to search in and/or number of uninitialized groups causing IO.
+
+on the first try we can search for exactly requested chunk in N groups, if failed relax requirement and search for best in N*m groups, then just anything..
+
+--- Comment (adilger, Thu, 21 Nov 2019 06:17:14 +0000) ---
+While it is possible to have the 1/2 full and 1/2 empty groups case you propose, I don't think that this is a likely condition.  Even so, in this case, wouldn't the allocator just find the first empty group and allocate linearly from there?
+
+--- Comment (bzzz, Wed, 20 Nov 2019 19:10:38 +0000) ---
+I think it's a bit different approach. overall fullness doesn't mean we can't find good chunks, IMO.
+
+say, few files have been written very dense so that 1/2 of groups are full, but another 1/2 is nearly empty.
+
+why should we change the algorithm?
+
+--- Comment (adilger, Wed, 20 Nov 2019 18:52:04 +0000) ---
+Alex, is this complementary with the LU-12103 patch that is already landed?
+
+--- Comment (bzzz, Wed, 20 Nov 2019 15:03:01 +0000) ---
+https://review.whamcloud.com/#/c/36793/ - this patch limits scanning for a good goup and adds basic prefetching.
+
+currently it's more like an RFC, though I tested it manually
+
+--- Comment (bzzz, Mon, 18 Nov 2019 08:07:23 +0000) ---
+sure, will try to make the script useful for the outter world.
+
+--- Comment (adilger, Fri, 15 Nov 2019 22:04:31 +0000) ---
+Shilong, could you please post your patch to WC Gerrit so that it can be reviewed.  Once the block bitmap is loaded, it makes sense to call mb_regenerate_buddy() to create the buddy bitmap and ext4_group_info as part of the ext4_end_bitmap_read() callback rather than waiting in ext4_wait_block_bitmap() for the bitmaps.  That allows submitting IO in batches and letting it complete asyncrhonously (keep an atomic counter of how many blocks need to be processed and submit more IO when it gets large enough), rather than doing read then wait for all blocks to finish, read/wait, ...
+
+I've got a script to prepare a fragmented filesystem using debugfs's setb and freeb commands which basically takes few seconds.
+
+Alex, it would be very useful to submit this upstream to e2fsprogs, since testing fragmented filesystems is always a problem.
+
+It also makes sense for you to see if Shilong's current patch helps your test case, and then we can work on optimizing it further.
+
+--- Comment (adilger, Fri, 15 Nov 2019 21:46:12 +0000) ---
+Alex, I think that setting "RAID stripe size" (sbi->s_stripe) in the superblock may also be a contribute to the problem.  For large RAID systems this is typically 512 blocks (2MB), up to 2048 blocks (8MB) or more in order to get allocations sized an aligned with the underlying RAID geometry.  That in itself is good for large writes, but for small writes at mount time it can be problematic.
+
+--- Comment (bzzz, Fri, 15 Nov 2019 18:01:13 +0000) ---
+I've got a script to prepare a fragemnted filesystem using debugfs's setb and freeb commands which basically takes few seconds.
+
+so now I can reproduce this issue easily - I see one by one bitmap load of few hundred non-empty groups initiated by a single-block allocation.
+
+the next step is to add some instrumentation..
+
+--- Comment (wshilong, Fri, 15 Nov 2019 11:06:49 +0000) ---
+ext4-loadbitmaps.patch
+
+--- Comment (wshilong, Fri, 15 Nov 2019 11:03:05 +0000) ---
+I cooked a new patch before to load block bitmaps async using workqueue:
+
+http://gerrit.datadirectnet.jp:8082/#/c/2965/2/ldiskfs/kernel_patches/patches/rhel7.6/ext4-loadbitmaps.patch
+
+And there was interface to control how much blocks could be prefetched each time, but havne't got some benchmark numbers for it yet.
+
+--- Comment (adilger, Fri, 15 Nov 2019 08:56:35 +0000) ---
+Reducing size expectations for allocations during mount, and/or limiting scanning should also help. I think for small writes, we should avoid trying to do group preallocation until after the bitmaps have been loaded. That can be handled entirely inside the ldiskfs code and avoids the need to understand what is happening at the Lustre level.
+
+The bitmap scanning code can also advance the allocation hints itself until it finds some groups that have suitable free space, instead of waiting for an incoming write to do this.
+
+--- Comment (adilger, Fri, 15 Nov 2019 08:49:23 +0000) ---
+I think that prefetching the block bitmaps in large chunks should be relatively easily implemented using the lazy_init thread. There is already patch https://review.whamcloud.com/32347 "LU-10946 ldiskfs: add an interface to load ldiskfs block bitmaps" but I suspect that this is happening only after the mount, which is too late to be useful, and it is loading the bitmaps one-at-a-time, which causes a lot of extra overhead. Also, there was objection upstream to the extra data structure used to reference the bitmaps.
+
+Instead, the block bitmap prefetch should be done a whole flex_bg at a time (256 blocks), asynchronously during mount and the buddy and group info calculated in the end_io completion handler. It would make sense to keep the same sysfs interface to allow pinning the bitmaps as 32347 to maintain compatibility.

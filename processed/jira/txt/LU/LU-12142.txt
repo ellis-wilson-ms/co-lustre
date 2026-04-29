@@ -1,0 +1,185 @@
+Key:        LU-12142
+Summary:    Hang in OSC on eviction - threads stuck in read() and ldlm_bl_NN
+Link:       https://jira.whamcloud.com/browse/LU-12142
+Type:       Improvement
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Wang Shilong
+Reporter:   Patrick Farrell
+Created:    Mon, 1 Apr 2019 16:57:10 +0000
+Updated:    Fri, 5 Nov 2021 15:30:14 +0000
+Resolved:   Tue, 6 Apr 2021 03:39:44 +0000
+Links:      Related: is related to  LU-6271
+
+--- Description ---
+This appears to be related to cp_type == CPT_CACHEABLE) || (!PageDirty(cl_page_vmpage(page)))) ) failed:" class="issue-link" data-issue-key="LU-6271">LU-6271.
+
+A private customer ticket reported a hang on a client which was suffering repeated evictions.
+
+The client threads all seem to be waiting in two connected places.
+
+First, the eviction:
+
+[] osc_object_invalidate+0x115/0x290 [osc]
+[] osc_ldlm_resource_invalidate+0xaf/0x190 [osc]
+[] cfs_hash_for_each_relax+0x250/0x450 [libcfs]
+[] cfs_hash_for_each_nolock+0x75/0x1c0 [libcfs]
+[] osc_import_event+0x497/0x1370 [osc]
+[] ptlrpc_invalidate_import+0x220/0x8f0 [ptlrpc]
+[] ptlrpc_invalidate_import_thread+0x48/0x2b0 [ptlrpc]
+[] kthread+0xd1/0xe0
+[] ret_from_fork_nospec_begin+0x7/0x21
+[] 0xffffffffffffffff 
+
+And then the other side:
+
+[] osc_lru_alloc+0x265/0x390 [osc]
+[] osc_page_init+0x132/0x1d0 [osc]
+[] lov_page_init_composite+0x26f/0x4c0 [lov]
+[] lov_page_init+0x21/0x60 [lov]
+[] cl_page_alloc+0x10d/0x280 [obdclass]
+[] cl_page_find+0x74/0x280 [obdclass]
+[] ll_readpage+0x83/0x6e0 [lustre]
+[] generic_file_aio_read+0x3f0/0x790
+[] vvp_io_read_start+0x4b7/0x600 [lustre]
+[] cl_io_start+0x68/0x130 [obdclass]
+[] cl_io_loop+0x12e/0xc90 [obdclass]
+[] ll_file_io_generic+0x498/0xc80 [lustre]
+[] ll_file_aio_read+0x34a/0x3e0 [lustre]
+[] ll_file_read+0xce/0x1e0 [lustre]
+[] vfs_read+0x9f/0x170
+[] SyS_read+0x7f/0xf0
+[] system_call_fastpath+0x22/0x27
+[] 0xffffffffffffffff
+
+The eviction side is waiting for:
+
+l_wait_event(osc->oo_io_waitq, atomic_read(&osc->oo_nr_ios) == 0, &lwi);
+
+This is the first action in osc_object_invalidate.
+
+ 
+
+And the other side, in osc_lru_alloc, sleeps with no timeout on the osc_lru_waitq:
+
+        struct l_wait_info lwi = LWI_INTR(LWI_ON_SIGNAL_NOOP, NULL);
+[.....]
+                rc = l_wait_event(osc_lru_waitq,
+                                atomic_long_read(cli->cl_lru_left) > 0,
+                                &lwi); 
+
+osc_lru_alloc is called after osc_io_iter_init, which increases oo_nr_ios, so it's sleeping here with oo_nr_ios elevated.
+
+ 
+
+The OSC eviction path does not tickle osc_lru_waitq directly, it does so by freeing pages from objects, so if the first object to be invalidated has threads waiting for pages, I think it will get stuck here.  (We would also expect that the failure of whatever is holding these LRU pages would free them up - We may have an ordering issue here.)
+
+Additionally, the osc_lru_alloc code does not appear to have any method to fail if the import is being evicted.  It looks like we have to successfully get a page in here before we'll spool out in to the larger i/o, which will eventually catch the eviction and fail.
+
+--- Comment (bzzz, Mon, 23 Aug 2021 08:16:06 +0000) ---
+hitting the following deadlock in racer quite often:
+
+schedule,vvp_io_setattr_start,cl_io_start,cl_io_loop,cl_setattr_ost,ll_setattr_raw,do_truncate,path_openat,do_filp_open,do_sys_open
+	PIDs(2): "dir_create.sh":9061 "dir_create.sh":9134 
+
+schedule,wait_for_common,osc_io_setattr_end,cl_io_end,lov_io_end_wrapper,lov_io_call,lov_io_end,cl_io_end,cl_io_loop,cl_setattr_ost,ll_setattr_raw,do_truncate,path_openat,do_filp_open,do_sys_open
+	PIDs(1): "dir_create.sh":9363 
+
+schedule,ldlm_completion_ast,ldlm_cli_enqueue_local,ofd_destroy_by_fid,ofd_destroy_hdl,tgt_request_handle,ptlrpc_main
+	PIDs(1): "ll_ost00_007":12274 
+
+schedule,osc_object_invalidate,osc_ldlm_resource_invalidate,cfs_hash_for_each_relax,cfs_hash_for_each_nolock,osc_import_event,ptlrpc_invalidate_import,ptlrpc_invalidate_import_thread
+	PIDs(1): "ll_imp_inval":553105
+
+--- Comment (pjones, Tue, 6 Apr 2021 03:39:44 +0000) ---
+Landed for 2.15
+
+--- Comment (gerrit, Tue, 6 Apr 2021 03:01:53 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/40237/
+
+Subject: LU-12142 clio: fix hang on urgent cached pages
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 2a34dc95bd100c181573e231047ff8976e296a36
+
+--- Comment (gerrit, Tue, 6 Apr 2021 03:01:49 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/42060/
+
+Subject: LU-12142 readahead: limit over reservation
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 1058867c004bf19774218945631a691e8210b502
+
+--- Comment (gerrit, Wed, 17 Mar 2021 10:09:28 +0000) ---
+Wang Shilong (wshilong@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/42060
+
+Subject: LU-12142 readahead: limit over reservation
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 470d677b2eb05961067034afeb78b58302d65323
+
+--- Comment (gerrit, Wed, 14 Oct 2020 02:58:47 +0000) ---
+Wang Shilong (wshilong@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/40237
+
+Subject: LU-12142 clio: fix hang on urgent cached pages
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: a0c85f030166234f732628c38fffe573f841fec2
+
+--- Comment (wshilong, Thu, 3 Sep 2020 07:13:11 +0000) ---
+adilger I am not sure for that, this might need some debugging and testing, for example even max_cached_mb is bigger, it might still possibly run out,
+
+and if we blindly send smaller rpc for this case, it might hurt performances, so we might only do that if max_cached_mb is small.
+
+--- Comment (adilger, Thu, 3 Sep 2020 06:42:32 +0000) ---
+Another alternative may be to send a smaller RPC if there are not enough pages to form a full-sized RPC?
+
+--- Comment (wshilong, Thu, 3 Sep 2020 00:57:15 +0000) ---
+We definitely try to reserve LRU pages before that, see cl_io_iter_init->osc_io_rw_iter_init->osc_lru_reserve() but this doesn't give gurantee, it just try reserve LRU pages in batch in advance if there are plenty of free pages, and it try to tigger async reclaim if there are not enough free pages.
+
+Maybe we should modify osc_lru_reserve() logic to be blocked if there are not enough free LRU to trigger
+
+at least one RPC page(or npages), so that other threads could go further to send RPC out, and at the same time we might modify readahead to be aware of lru pages, and don't trigger too much pages exceed it.
+
+--- Comment (adilger, Wed, 2 Sep 2020 22:46:15 +0000) ---
+I think there are a couple of ways to get out of this kind of deadlock situation:
+
+	after some (semi-random?) number of loops without making progress, the osc_lru_alloc() returns an -EAGAIN (or similar) error and unwinds the stack, freeing the pages it had previously reserved, and then trying again.  The freeing of the previous pages would allow some other thread to make progress.  Having a semi-random number of loops (e.g. N + (pid%M)) would avoid threads being stuck in a loop still contending with each other.  This has the drawback that the cl_loop->osc_lru_alloc() callchain is deep and probably hard to unwind, and would cause a lot of work to be re-done, but it is still better than the thread being stuck for hours doing nothing.
+
+	have readahead threads fail the allocation outright after some number of tries, since they shouldn't be forcing reads under memory pressure.  This has the advantage of being relatively simple to implement, but may hurt readahead performance, and may not solve all problems if normal threads are doing large reads
+
+	have the page cache reservation be done at a higher level, all at once for a given read request, rather than one page at a time at the low level.  This has the advantage that it is very efficient, but may lead to starvation if one thread can never get the pages it needs.  It may also require some significant code restructuring to move the max_cached_mb handling up to a higher level, but at the same time since this is a llite parameter instead of an osc parameter it might simplify the code also?
+
+--- Comment (adilger, Wed, 2 Sep 2020 22:21:52 +0000) ---
+It looks like the root of this problem is caused by llite.*.max_cached_mb being too small (=128 on the /home filesystem and =2048 on the /scratch filesystem) for multiple threads reading from the same filesystem to reserve enough pages for the RDMA reads at one time. This results in all of the threads being stuck holding some number of pages, but waiting for additional pages before it has enough to send the read RPC.  The clients have osc.*.max_pages_per_rpc=16M, so it would only need 9+ threads preparing concurrent 16MB read RPCs from the /home filesystem before the livelock could be hit.  With clients having 20-30 or more cores and the max_pages_per_rpc increasing, this is increasingly likely to be hit, as seen when the unused_mb is stuck at 0, as below:
+
+$ lctl get_param llite.home*.max_cached_mb
+llite.home-ffff880c1c30ec00.max_cached_mb=
+users: 8
+max_cached_mb: 128
+used_mb: 128
+unused_mb: 0
+reclaim_count: 0
+
+Increasing the llite.*.max_cached_mb values for both filesystems allowed the read threads to get the pages they needed and get unstuck. The llite.*.max_cached_mb value was reduced during debugging another issue related to a memory problem.

@@ -1,0 +1,230 @@
+Key:        LU-12335
+Summary:    mb_prealloc_table  table read/write code is racy
+Link:       https://jira.whamcloud.com/browse/LU-12335
+Type:       Bug
+Priority:   Critical
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Artem Blagodarenko
+Reporter:   Artem Blagodarenko
+Created:    Fri, 24 May 2019 07:25:18 +0000
+Updated:    Tue, 10 Sep 2019 14:00:42 +0000
+Resolved:   Tue, 10 Sep 2019 13:45:39 +0000
+Links:      Related: is related to  LU-12103; Related: is related to LU-12511
+
+--- Description ---
+Preallocation table read/write code is racy. There is a  possibility of accessing memory outside of allocated table.
+
+This issue can be easy reproduced. I am not sure, I have to upload test that lead to test system to be crashed. So I put it here.
+
+ 
+
+dd if=/dev/zero of= bs=1048576 count=1024 conv=fsync
+
+cat "32 64 128 256" > /proc/fs/ldiskfs//prealloc_table
+
+--- Comment (artem_blagodarenko, Tue, 10 Sep 2019 14:00:42 +0000) ---
+No need send this patch to ext4 upstream because no such bug there. Bug was introduced in our ldiskfs patches.
+
+--- Comment (simmonsja, Tue, 10 Sep 2019 13:58:26 +0000) ---
+Please make sure this is push to the ext4 maintainers.
+
+--- Comment (pjones, Tue, 10 Sep 2019 13:45:39 +0000) ---
+As per recent LWG discussion this ticket should be marked as RESOLVED and anyone wanting to keep SLES/Ubuntu servers in sync should do that under a separate ticket
+
+--- Comment (simmonsja, Sun, 16 Jun 2019 14:44:35 +0000) ---
+This fix was only every applied to RHEL platforms. SLES and Ubuntu lack this fix.
+
+--- Comment (pjones, Wed, 29 May 2019 12:58:31 +0000) ---
+Landed for 2.13
+
+--- Comment (gerrit, Wed, 29 May 2019 04:24:31 +0000) ---
+Oleg Drokin (green@whamcloud.com) merged in patch https://review.whamcloud.com/34950/
+
+Subject: LU-12335 ldiskfs: fixed size preallocation table
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: f15995b8e52bafabe55506ad2e12c8a64a373948
+
+--- Comment (artem_blagodarenko, Sat, 25 May 2019 05:31:10 +0000) ---
+The algorithm is not difficult, as you can see in script. So, can be added to kernel. The most difficult diction - moment then we need to reconfigure preallocation table. With script, administrator decide, then change configuration.
+
+ 
+
+> (hard for most users to configure, can die if there are problems (e.g. OOM),
+
+My suggestion, add to cluster scripts and adjust automatically.
+
+>become CPU starved if the server is busy
+
+Preallocation table changing is quite fast operation, and with patch https://review.whamcloud.com/34950, safe and lockless.
+
+>needs extra scanning to learn current filesystem state and may become out of sync with the kernel).
+
+Scanning is made by kernel. Script use "/proc/fs/ldiskfs/loop1/mb_groups" output. This statistic is perfect data for such decision. Anyway, even in kernel we need use this statistic.
+
+--- Comment (adilger, Fri, 24 May 2019 20:38:59 +0000) ---
+A novel script has been developed to dynamically adjust the block device pre-allocation table. This controls the number of pre-allocated blocks that are created for the request size in logarithmic increments starting at 4. As file systems fragment and become filled, some free block groups will simply not be available. Because of this, the block allocator should be tuned to address this on a regular basis. 
+
+How hard would it be to include this into the mballoc code in the kernel directly?  Having a userspace tool is OK, but suffers from a number of limitations (hard for most users to configure, can die if there are problems (e.g. OOM), become CPU starved if the server is busy, needs extra scanning to learn current filesystem state and may become out of sync with the kernel).
+
+--- Comment (artem_blagodarenko, Fri, 24 May 2019 09:06:07 +0000) ---
+I used preallocation table to solve allocator problems on aged systems(LU-12103). There are two (and 3rd is bigalloc) solutions: 
+
+	A new block allocator algorithm has been developed (LU-12103, send to upstream) by Cray to strategically skip low probability-of-match block groups while attempting to locate contiguous block groups when they likely won’t exist.  
+
+	A novel script has been developed to dynamically adjust the block device pre-allocation table. This controls the number of pre-allocated blocks that are created for the request size in logarithmic increments starting at 4. As file systems fragment and become filled, some free block groups will simply not be available. Because of this, the block allocator should be tuned to address this on a regular basis.  
+
+Do you have a real test system where you could measure performance under load to see if removing ext4-prealloc.patch improves or hurts performance or allocation behaviour?
+
+We have test results for third solution. 140TB ldiskfs partition. Will share results to LU-12103. For second solution I have some synthetic test results:
+
+Here is bash script that build prealloc table based on mb_groups output: 
+
+[root@localhost cray-lustre]# cat build_prealloc.sh 
+
+#!/bin/bash 
+INPUT_FILE=$1 
+
+#columes from 9 to 21 shows how free fragments available 
+for index in {9..21} 
+do 
+   PARAMS="'NR>1 {if (\$$index > 0) { print }}'" 
+   REGS=`eval awk "$PARAMS" $INPUT_FILE | wc -l` 
+   VAL=$((2 ** ($index-8))) 
+     [ $REGS -gt 0 ] && PREALLOC_TABLE="$PREALLOC_TABLE $VAL" 
+done 
+echo "prealloc table: $PREALLOC_TABLE" 
+
+Example how to use it: 
+
+cat /proc/fs/ldiskfs/loop1/mb_groups > table.dat 
+sh build_prealloc.sh table.dat > prealloc.txt 
+cat prealloc.txt > /proc/fs/ldiskfs/loop1/prealloc_table 
+
+ 
+
+ Here is test output of my local testing on shared fsxfs-n24.img. I have extracted and make two copies of this image for clear testing. 
+
+tar -xf fsxfs-n24.img.tgz 
+
+cp fsxfs-n24.img fsxfs-n24-2.img 
+
+And run test that 1) make large preallocation table 2) start dd 3) adjust preallocation table using script above 4) start dd 
+
+start_mb_stats() 
+{ 
+        echo "1" > /sys/fs/ldiskfs/loop1/mb_stats 
+        echo "0" > /sys/fs/ldiskfs/loop1/mb_c1_threshold 
+        echo "0" > /sys/fs/ldiskfs/loop1/mb_c2_threshold 
+        echo "0" > /sys/fs/ldiskfs/loop1/mb_c3_threshold 
+} 
+
+mount_image() 
+{ 
+        local IMAGE=$1 
+
+        mount -t xfs -o loop $IMAGE /mnt/fs2xfs/ 
+        mount -t ldiskfs -o loop /mnt/fs2xfs/n24.raw /mnt/fs2ost/ 
+} 
+
+umount_image() 
+{ 
+        umount /mnt/fs2ost/ 
+        umount /mnt/fs2xfs/ 
+} 
+
+1. Set too large preallocation table and estimate write speed 
+
+LOAD=yes lustre/tests/llmount.sh 
+mount_image /lustre/mnt/staff/CAST-19722/fsxfs-n24.img 
+echo "256 512 1024 2048 4096 8192 16384" > /proc/fs/ldiskfs/loop1/prealloc_table 
+start_mb_stats 
+dd if=/dev/zero of=/mnt/fs2ost/O/foofile bs=1048576  count=1024  conv=fsync 
+cat /proc/fs/ldiskfs/loop1/mb_alloc 
+echo "clear" > /proc/fs/ldiskfs/loop1/mb_alloc 
+umount_image 
+mount_image /lustre/mnt/staff/CAST-19722/fsxfs-n24-2.img 
+
+2. Adjast preallocation table based on mb_groups output 
+
+cat /proc/fs/ldiskfs/loop1/mb_groups > $TMP/table.dat 
+sh build_prealloc.sh $TMP/table.dat > $TMP/prealloc.txt 
+cat $TMP/prealloc.txt > /proc/fs/ldiskfs/loop1/prealloc_table 
+
+3. Estimate preformance again 
+
+dd if=/dev/zero of=/mnt/fs2ost/O/foofile bs=1048576  count=1024  conv=fsync 
+cat /proc/fs/ldiskfs/loop1/mb_alloc 
+echo "clear" > /proc/fs/ldiskfs/loop1/mb_alloc 
+umount_image 
+
+[root@localhost cray-lustre]# sh start.sh  
+Loading modules from /lustre/mnt/orig/cray-lustre/lustre/tests/.. 
+detected 8 online CPUs by sysfs 
+libcfs will create CPU partition based on online CPUs 
+1024+0 records in 
+1024+0 records out 
+1073741824 bytes (1.1 GB) copied, 11.2427 s, 95.5 MB/s 
+mballoc: 262144 blocks 153 reqs (137 success) 
+mballoc: 2046 extents scanned, 127 goal hits, 1 2^N hits, 10 breaks, 0 lost 
+mballoc: (0, 0, 0) useless c(0,1,2) loops 
+mballoc: (0, 0, 0) skipped c(0,1,2) loops 
+1024+0 records in 
+1024+0 records out 
+1073741824 bytes (1.1 GB) copied, 9.22825 s, 116 MB/s 
+
+mballoc: 262143 blocks 243 reqs (240 success) 
+mballoc: 141 extents scanned, 113 goal hits, 129 2^N hits, 0 breaks, 0 lost 
+mballoc: (0, 0, 0) useless c(0,1,2) loops 
+mballoc: (0, 0, 0) skipped c(0,1,2) loops 
+[root@localhost cray-lustre]# 
+
+test passed and shows ~18% speed improvement 
+
+[root@localhost cray-lustre]# sh start.sh 
+Loading modules from /lustre/mnt/orig/cray-lustre/lustre/tests/.. 
+detected 8 online CPUs by sysfs 
+libcfs will create CPU partition based on online CPUs 
+1024+0 records in 
+1024+0 records out 
+1073741824 bytes (1.1 GB) copied, 11.2427 s, 95.5 MB/s 
+
+mballoc: 262144 blocks 153 reqs (137 success) 
+mballoc: 2046 extents scanned, 127 goal hits, 1 2^N hits, 10 breaks, 0 lost 
+mballoc: (0, 0, 0) useless c(0,1,2) loops 
+mballoc: (0, 0, 0) skipped c(0,1,2) loops 
+1024+0 records in 
+1024+0 records out 
+1073741824 bytes (1.1 GB) copied, 9.22825 s, 116 MB/s 
+
+mballoc: 262143 blocks 243 reqs (240 success) 
+mballoc: 141 extents scanned, 113 goal hits, 129 2^N hits, 0 breaks, 0 lost 
+mballoc: (0, 0, 0) useless c(0,1,2) loops 
+mballoc: (0, 0, 0) skipped c(0,1,2) loops 
+[root@localhost cray-lustre]# 
+
+I am going test this approach on 140TB ldiskfs OST soon.
+
+--- Comment (adilger, Fri, 24 May 2019 08:37:45 +0000) ---
+I guess the first question is whether the preallocation table settings are even useful?  We've been carrying that patch for many years without submitting it upstream, because I'm not sure whether it actually improves performance or functionality or is just overhead for patch maintenance?  Do you have a real test system where you could measure performance under load to see if removing ext4-prealloc.patch improves or hurts performance or allocation behaviour?  
+
+If there is data that shows the patch improves performance noticeably under at least some non-Lustre workloads, and doesn't hurt performance, then it would make sense to push the patch upstream finally.
+
+--- Comment (gerrit, Fri, 24 May 2019 07:27:03 +0000) ---
+Artem Blagodarenko (c17828@cray.com) uploaded a new patch: https://review.whamcloud.com/34950
+
+Subject: LU-12335 ldiskfs: fixed size preallocation table
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 411f62650ddb2ef569fbcd38891e0610ce44b0d3

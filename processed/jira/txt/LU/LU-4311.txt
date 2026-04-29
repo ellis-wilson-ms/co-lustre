@@ -1,0 +1,161 @@
+Key:        LU-4311
+Summary:    Mount sometimes fails with EIO on OSS with several mounts in parallel
+Link:       https://jira.whamcloud.com/browse/LU-4311
+Type:       Bug
+Priority:   Major
+Status:     Closed
+Resolution: Duplicate
+Assignee:   Bruno Faccini
+Reporter:   Patrick Valentin
+Created:    Tue, 26 Nov 2013 13:49:54 +0000
+Updated:    Wed, 27 Nov 2013 19:13:40 +0000
+Resolved:   Wed, 27 Nov 2013 19:13:40 +0000
+Links:      Duplicate: is duplicated by LU-1279
+Attachments: reproduce.tarces.tar
+
+--- Environment ---
+Lustre 2.4.1
+
+--- Description ---
+On one of our test cluster installed with Lustre 2.4.1, we somtimes saw the following error message in the "shine" command line tool output, when starting a lustre file system, and the corresponding OST is not mounted:
+
+mount.lustre: mount /dev/mapper/mpathj at /mnt/fs1/ost/6 failed: Input/output error
+Is the MGS running?
+
+The test file system is composed of 6 servers: one MDS (one MDT), 4 OSS (3 with 2 OSTs and one with 1 OST) and a separate MGS.
+
+Configuration (see attached config_parameters file for details):
+
+    MGS: lama5 (failover lama6)
+
+    MDS: lama6 (failover lama5)
+
+    OSS: lama7 (failover lama8, lama9 and lama10) to lama10 (failover lama7, lama8 and lama9)
+
+When the error occurs, we have the following lustre kernel traces on MGS:
+
+MGS: Client  seen on new nid  when existing nid  is already connected
+...
+@@@ MGS fail to handle opc = 250: rc = -114
+...
+
+and on OSS:
+
+InitRecov MGC10.3.0.10@o2ib 1/d0:i0:r0:or0:NEW
+...
+InitRecov MGC10.3.0.10@o2ib 1/d0:i0:r1:or0:CONNECTING
+...
+recovery of MGS on MGC10.3.0.10@o2ib_0 failed (-5)
+...
+MGS: recovery started, waiting 100000 seconds
+...
+MGC10.3.0.10@o2ib: Communicating with 10.4.0.10@o2ib1, operation mgs_connect failed with -114
+...
+recovery of MGS on MGC10.3.0.10@o2ib_0 failed (-114)
+MGS: recovery finished
+...
+fs1-OST0005: cannot register this server with the MGS: rc = -5. Is the MGS running?
+...
+Unable to start targets: -5
+...
+Unable to mount  (-5)
+
+I was able to reproduce the error without shine and with only one OSS, with the script below.
+
+The MGS (lama5) and MDS (lama6) are started/mounted, and the script is started on lama10.
+
+If the tunefs.lustre or the lustre_rmmod is removed, or the first mount is started in foreground, the error does not occur.
+
+N=1
+rm -f error stop
+while true; do
+        tunefs.lustre --erase-params --quiet "--mgsnode=lama5-ic1@o2ib0,lama5-ic2@o2ib1" \
+             "--mgsnode=lama6-ic1@o2ib0,lama6-ic2@o2ib1" "--failnode=lama7-ic1@o2ib0" \
+             "--failnode=lama8-ic1@o2ib0" "--failnode=lama9-ic1@o2ib0" \
+              --network=o2ib0 --writeconf /dev/ldn.cook.ost3 > /dev/null
+
+        tunefs.lustre --erase-params --quiet "--mgsnode=lama5-ic1@o2ib0,lama5-ic2@o2ib1" \
+             "--mgsnode=lama6-ic1@o2ib0,lama6-ic2@o2ib1" "--failnode=lama7-ic2@o2ib1" \
+             "--failnode=lama8-ic2@o2ib1" "--failnode=lama9-ic2@o2ib1" \
+             --network=o2ib1 --writeconf /dev/ldn.cook.ost6 > /dev/null
+
+        modprobe fsfilt_ldiskfs
+        modprobe lustre
+        ssh lama5 lctl clear
+        dmesg -c > /dev/null
+        ssh lama5 dmesg -c > /dev/null
+        (/bin/mount -t lustre -o errors=panic /dev/ldn.cook.ost3 /mnt/fs1/ost/5 || touch error) &
+        /bin/mount -t lustre -o errors=panic /dev/ldn.cook.ost6 /mnt/fs1/ost/6 || touch error
+        wait
+        if [ -f error ]; then
+                lctl dk > oss.lustre.dk.bad
+                ssh lama5 lctl dk > mgs.lustre.dk.bad
+                dmesg > oss.dmesg.bad
+                ssh lama5 dmesg > mgs.dmesg.bad
+        else
+                lctl dk > oss.lustre.dk.good
+                ssh lama5 lctl dk > mgs.lustre.dk.good
+                dmesg > oss.dmesg.good
+                ssh lama5 dmesg > mgs.dmesg.good
+        fi
+        umount /mnt/fs1/ost/5
+        umount /mnt/fs1/ost/6
+        lustre_rmmod
+        [ -f stop -o -f error ] && break
+        [ $N -ge 25 ] && break
+        echo "============================> loop $N"
+        N=$((N+1))
+done
+
+I have attached a tarball containing the config parameters, the reproducer, and the files produced by the reproducer:
+
+    reproducer
+
+    config_parameters
+
+    mgs.dmesg.good, mgs.lustre.dk.good, oss.dmesg.good, oss.lustre.dk.good
+
+    mgs.dmesg.bad,  mgs.lustre.dk.bad,  oss.dmesg.bad,  oss.lustre.dk.bad
+
+I have tried the following patch, which skips the connection at INIT_RECOV_BACKUP if one already exists.
+
+With this patch the "mount" no longer fails, but it's only a workaround and it does not solve the problem of double connection on MGS. Probably there is a missing serialisation/synchronisation.
+
+--- a/lustre/mgc/mgc_request.c
++++ b/lustre/mgc/mgc_request.c
+@@ -1029,6 +1029,7 @@ int mgc_set_info_async(const struct lu_e
+                        ptlrpc_import_state_name(imp->imp_state));
+                 /* Resurrect if we previously died */
+                 if ((imp->imp_state != LUSTRE_IMP_FULL &&
++                     imp->imp_state != LUSTRE_IMP_CONNECTING &&
+                      imp->imp_state != LUSTRE_IMP_NEW) || value > 1)
+                         ptlrpc_reconnect_import(imp);
+                 RETURN(0);
+
+--- Comment (patrick.valentin, Tue, 26 Nov 2013 16:11:17 +0000) ---
+> 
+
+> Hello Patrick, is it me or we also got this kind of issues in the past and already related to the // operations launched by Shine during Lustre start/mount ??
+
+>
+
+Hi Bruno,
+
+I discussed with Sébastien and he confirms such problem was already seen on "tera100" with shine. So it's not a new issue introduced by lustre 2.4.1, but is more a problem of commands which run in parallel.
+
+>
+
+> Also, did you really mean that "the error does not occur" also when "the first mount is started in foreground" or when it is not ?
+
+>
+
+As far as I remember, the issue only occurs when the two mount commands are executing in parallel (the fisrt one started in background). If the first one is started in the foreground (sequentiel execution) there is no mount error. And if there is only one mount command in the script, there is no error either.
+
+I make a new try to confirm this.
+
+As suggested by Sébastien, I will also try to reduce the number of "mgsnode" and "failnode" in the "tunefs", to see if this has any effect.
+
+--- Comment (bfaccini, Tue, 26 Nov 2013 14:46:09 +0000) ---
+Hello Patrick, is it me or we also got this kind of issues in the past and already related to the // operations launched by Shine during Lustre start/mount ??
+
+Also, did you really mean that "the error does not occur" also when "the first mount is started in foreground" or when it is not ?

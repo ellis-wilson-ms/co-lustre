@@ -1,0 +1,143 @@
+Key:        LU-9479
+Summary:    sanity test 184d 244: don't instantiate PFL component when taking group lock
+Link:       https://jira.whamcloud.com/browse/LU-9479
+Type:       Bug
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   Zhenyu Xu
+Reporter:   Andreas Dilger
+Created:    Tue, 9 May 2017 20:40:37 +0000
+Updated:    Thu, 18 Dec 2025 08:22:27 +0000
+Labels:     pfl
+Links:      Related: is related to  LU-13645; Related: is related to  LU-9341; Related: is related to  LU-8998; Related: is related to  LU-9344; Related: is related to  LU-9349; Related: is related to LU-9429; Related: is related to LU-17403; Related: is related to LU-9756; Related: is related to LU-17694; Related: is related to LU-9793; Related: is related to LU-10070; Related: is related to LU-19722; Related: is related to LU-12738
+
+--- Description ---
+This issue was created by maloo for bobijam 
+
+This issue relates to the following test suite run: https://testing.hpdd.intel.com/test_sets/67af86be-2027-11e7-9073-5254006e85c2.
+
+The sub-test test_244 failed with the following error:
+
+test failed to respond and timed out
+
+Info required for matching: sanity 244
+
+sendfile_grouplock.c calls sendfile_copy(sourfile, 0, destfile, 98765)
+
+and sendfile_copy()->llapi_group_lock(fd_out, dest_gid);
+
+which will call into lov_io_init() and atomic_inc(&lov->lo_active_ios)
+
+and sendfile_copy() tries to write to the file, which will check to get layout, and ll_layout_refresh() finds there is an active ios (marked by ll_get_grouplock()), so the write hung there
+
+sendfile_grou S 0000000000000000     0  7394   7321 0x00000080
+ ffff88000eb3f618 0000000000000082 ffff88000eb3f5e0 ffff88000eb3f5dc
+ 00001ce200000000 ffff88003f828400 0000005dce083b5f ffff880003436ac0
+ 00000000000005ff 0000000100017a1d ffff88002b57fad0 ffff88000eb3ffd8
+Call Trace:
+ [] lov_layout_wait+0x11b/0x220 [lov]
+ [] ? default_wake_function+0x0/0x20
+ [] lov_conf_set+0x37e/0xa30 [lov]
+ [] ? libcfs_debug_msg+0x41/0x50 [libcfs]
+ [] cl_conf_set+0x58/0x100 [obdclass]
+ [] ll_layout_conf+0x84/0x3f0 [lustre]
+ [] ? libcfs_debug_msg+0x41/0x50 [libcfs]
+ [] ll_layout_refresh+0x96d/0x1710 [lustre]
+ [] ? libcfs_debug_msg+0x41/0x50 [libcfs]
+ [] vvp_io_init+0x32f/0x450 [lustre]
+ [] ? libcfs_debug_msg+0x41/0x50 [libcfs]
+ [] cl_io_init0+0x88/0x150 [obdclass]
+ [] cl_io_init+0x4a/0xa0 [obdclass]
+ [] cl_io_rw_init+0xbc/0x200 [obdclass]
+ [] ll_file_io_generic+0x203/0xaf0 [lustre]
+ [] ll_file_aio_write+0x13d/0x280 [lustre]
+ [] ll_file_write+0x13a/0x270 [lustre]
+ [] vfs_write+0xb8/0x1a0
+ [] kernel_write+0x3d/0x50
+ [] write_pipe_buf+0x5a/0x90
+ [] splice_from_pipe_feed+0x72/0x120
+ [] ? write_pipe_buf+0x0/0x90
+ [] ? write_pipe_buf+0x0/0x90
+ [] __splice_from_pipe+0x6e/0x80
+ [] ? write_pipe_buf+0x0/0x90
+ [] splice_from_pipe+0x51/0x70
+ [] default_file_splice_write+0x1d/0x30
+ [] do_splice_from+0xba/0xf0
+ [] direct_splice_actor+0x20/0x30
+ [] splice_direct_to_actor+0xc6/0x1c0
+ [] ? direct_splice_actor+0x0/0x30
+ [] do_splice_direct+0x4d/0x60
+ [] do_sendfile+0x184/0x1e0
+ [] sys_sendfile64+0x34/0xb0
+ [] ? __audit_syscall_exit+0x25e/0x290
+ [] system_call_fastpath+0x16/0x1b
+
+--- Comment (adilger, Fri, 22 Oct 2021 01:24:34 +0000) ---
+It is worthwhile to note that the "MDS holds IBITS group lock" issue is (partly) solved already via patch https://review.whamcloud.com/39406 "LU-13645 ldlm: group locks for DOM IBIT lock", which was commit v2_13_56-61-g0674044036 and as such is included in 2.14.0.
+
+That would potentially allow group locks to always lock on the MDT first, and then lock only initialized components.  Older clients that don't understand the MDT group lock would (unfortunately) keep their current behavior of always instantiating and locking all components.
+
+The new MDS could potentially revoke the layout lock (and keep it) from older clients that do not have this functionality, to prevent non-group locks from instantiating uninitialized components, but there is unfortunately no OBD_CONNECT_* flag for this.  It might be enough in 2.15 for a group lock to hold the MDS_INODEBITS_LAYOUT lock exclusively, if there are uninitialized components to block older clients, but this wouldn't be needed if all components are already initialized, or all clients are new and understand MDS group locking (a new OBD_CONNECT_* flag could be added for this).
+
+--- Comment (paf, Fri, 18 May 2018 18:45:53 +0000) ---
+No intention to work on this right now, but I wanted to write this down here so it doesn't get forgotten:
+
+As Andreas said, the issue is that group locks are handled by the OSS, but object instantiation is handled by the MDS.  As Oleg noted at LUG, given that, it seems like we need to move group locks to being layout locks.
+
+A few thoughts on this.
+
+	There is no provision (now) for group lock IDs in IBITS locks.  There is enough room in the ldlm_wire_policy_data union to fit a gid in the IBITS case.  And I'm not sure how much of the rest of the mdc/mdt/IBITS LDLM code will need to be modified to support them correctly.
+
+	We still need data locks to cover the data i/o.  So a group lock could start with locking the layout exclusively, then getting locks on all of the existing data components (ie just lock from 0 to EOF and not worry about uninstantiated components).  Unlocking one would go in reverse order - unlock data, unlock layout.
+
+There may also be some ... interesting ... interoperability issues with clients that do not request/expect group locks on the layout.  That might be challenging to get right.
+
+--- Comment (paf, Thu, 22 Feb 2018 19:42:36 +0000) ---
+Yup...  No straightforward suggestions from me.
+
+--- Comment (adilger, Thu, 22 Feb 2018 19:32:11 +0000) ---
+The issue is that group locks are handled by the OSS, but object instantiation is done by the MDS, so there is no way for the MDS to even know that there is a group lock on the file...
+
+--- Comment (paf, Thu, 22 Feb 2018 18:29:13 +0000) ---
+Right, I understand - Note "instantiation of further components by those not holding a group lock".  I think that's necessary because otherwise that problem you note occurs - The new segment doesn't get the old group lock applied to it.  I don't see a way to solve that, so instead holding a group lock should prevent instantiation of a new component by those not holding the group lock, because otherwise they could get around the group lock and write to that new component.
+
+Those holding the group lock can do it, which gives them a chance to apply the group lock to the new component.
+
+This is still potentially problematic though, if the client who instantiated the new layout releases its group lock, other clients holding a group lock will not have that portion locked and so it could become unlocked.
+
+This is not fun.
+
+--- Comment (adilger, Thu, 22 Feb 2018 17:46:47 +0000) ---
+Patrick, the problem here is that we don't want to prevent instantistion new component instantistion, but if new objects are instantisted they do not have a group lock on them (since that is handled between each OST and client separately for each object).
+
+--- Comment (paf, Tue, 20 Feb 2018 21:05:41 +0000) ---
+Is it not possible for a group lock to prevent instantiation of further components by those not holding a group lock?  It would imply a group lock also had to take a layout lock, though.
+
+--- Comment (adilger, Thu, 31 Aug 2017 17:37:18 +0000) ---
+Bobijam, can you discuss with Oleg some way we could get group locks for newly-instantiated components that is not racy.  It seems that the workaround is not working properly, since there are now multiple problems with grouplocks being seen.
+
+--- Comment (bobijam, Tue, 23 May 2017 09:58:50 +0000) ---
+well, even lo_active_ios is resolved with my last comment, there still exists problem that the later instantiated component does not protected by the prior given group lock.
+
+--- Comment (bobijam, Tue, 23 May 2017 09:31:10 +0000) ---
+Jinshan,
+
+from commit d25892863a30a385cdae2b1991ab0a9ca76fcd7d, the lov->lo_active_ios was created, and get grouplock also increases it.
+
+    LU-1876 hsm: account for active IOs correctly
+    
+    We used to use refcount of lsm to account for active IOs but this
+    turns out wrong because empty layout files don't have a lsm.
+    
+    In this patch, lov_object::lo_active_ios is invented to account for
+    active IOs for both raid0 and empty layout;
+
+I'm think of not accounting get_grouplock as a active IOs so that process with the grouplock won't hung itself in the first place, do you think it's plausible?
+
+--- Comment (adilger, Tue, 9 May 2017 20:48:15 +0000) ---
+This problem was worked around in patch https://review.whamcloud.com/26646 "LU-9344  test: hung with sendfile_grouplock test12()" by instantiating all of the file's components before taking the group lock.  However, for operations like lfs swap_layouts in sanity.sh test_184d or lfs migrate since this will instantiate all of the components even if the file is empty.  
+
+This is inefficient for the source file since it is about to be deleted, and for the destination file since it doesn't need all of those objects.
+
+Per comments in LU-9344 and https://review.whamcloud.com/26646 it makes sense to not instantiate the components of the source file, since it is not being modified.  It is also known what the file size is for writes during migration/swap_layouts, so it is possible to instantiate the required components in advance and leave any later ones alone.
