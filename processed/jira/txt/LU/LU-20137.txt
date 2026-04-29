@@ -1,0 +1,78 @@
+Key:        LU-20137
+Summary:    EC read silently returns zero-filled pages when err_nr > pcount in lov_io_ec_rd_start
+Link:       https://jira.whamcloud.com/browse/LU-20137
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Patrick Farrell
+Created:    Tue, 14 Apr 2026 21:47:15 +0000
+Updated:    Tue, 14 Apr 2026 21:47:15 +0000
+
+--- Description ---
+When more data stripes fail than parity stripes can recover (err_nr > pcount), the per-RG handling in lov_io_ec_rd_start() silently falls through the reconstruction loop, marks the unreconstructed EC_DPG_ERROR pages Uptodate, and returns 0.  Userspace reads get zero-filled data instead of EIO.
+
+Reproducer (after LU-12669 ec: recover data from parity / gerrit 62757 is applied):
+
+  $LFS setstripe -E -1 -S 1M -c 4 --ec 4+2 $tf
+
+  dd if=/dev/urandom of=$tf bs=1M count=8 conv=fsync
+
+  $LFS mirror resync $tf
+
+  lctl set_param osc.*.resend_count=1 fail_loc=0x20f fail_val=0   # fail all OST reads persistently
+
+  cancel_lru_locks osc
+
+  dd if=$tf of=/dev/null bs=1M     # should return EIO, returns 0 (zeros)
+
+Root cause in lustre/lov/lov_io.c:lov_io_ec_rd_start() around lines 2798-2870:
+
+	err_nr is recomputed from EC_DPG_ERROR states per RG
+
+	The block 'if (err_nr > 0 && err_nr ' is
+
+    only entered when recovery is possible
+
+	When err_nr > pcount, par_vmpages stays NULL, so the reconstruction
+
+    at line 2900 'if (d_j > 0 && d_j But the unconditional 'SetPageUptodate' sweep at line 2953 still runs
+
+    over io->u.ci_ec.ec_page_list, marking the unreconstructed pages valid
+
+	Result: dd reads zeros, never sees EIO
+
+Naive fix (add 'if (err_nr > pcount) rc = -EIO; goto rg_cleanup;' right
+
+after err_nr is recomputed) makes the EC code crash the kernel with
+
+multiple LBUGs:
+
+  1. cl_io.c:946:cl_page_list_add()) ASSERTION(list_empty(&cp_batch)) failed
+
+     (because ec_page_list pages aren't cleaned up before EIO returns)
+
+  2. After adding cl_page_list_disown+fini on ec_page_list: a different
+
+     LBUG in ldlm_lock_decref_internal_nolock: ASSERTION(l_readers > 0)
+
+     failed (during cl_io_unlock of the outer IO – either double-decref
+
+     or list/lock corruption from the partial cleanup)
+
+Proper fix needs coordinated unwind: the outer IO's cl_lock reader ref,
+
+the per-stripe lov_sub IO state, and the ec_page_list pages all need
+
+to be cleaned up in an order that matches what vvp_io_ec_rd_end expects
+
+when cio_start returns an error.
+
+Tests sanity-ec:test_43c, test_44a, test_44c exercise this case and
+
+currently FAIL (correctly – they observe that dd succeeds and the
+
+grep for 'Input/output error' finds nothing).  They are marked in
+
+ALWAYS_EXCEPT pending this bug's fix.

@@ -1,0 +1,115 @@
+Key:        LU-20157
+Summary:    deadlock between recovery and IO
+Link:       https://jira.whamcloud.com/browse/LU-20157
+Type:       Bug
+Priority:   Critical
+Status:     Open
+Resolution: Unresolved
+Assignee:   Qian Yingjin
+Reporter:   Alexander Boyko
+Created:    Fri, 17 Apr 2026 11:35:22 +0000
+Updated:    Fri, 17 Apr 2026 15:04:51 +0000
+
+--- Environment ---
+Vms is enough for reproducer
+
+--- Description ---
+The situation at vmcore  looks next.
+
+ The client recovery thread trying to cancel local locks and wait at vvp_io_init()>filemap_invalidate_lock(inode>i_mapping). Another  IO read thread hold this mutex and waits IO, but IO is on pause since a recovery process. So this is a some kind of deadlock between recovery and IO thread.
+
+PID: 2092611  TASK: ffff911a97f90000  CPU: 19   COMMAND: "ldlm_lock_repla"
+ #0 [ffffb6d520cbbad0] __schedule at ffffffffb9b32879
+ #1 [ffffb6d520cbbb38] schedule at ffffffffb9b32b2e
+ #2 [ffffb6d520cbbb50] schedule_preempt_disabled at ffffffffb9b32dc1
+ #3 [ffffb6d520cbbb58] rwsem_down_write_slowpath at ffffffffb9b35fcd
+ #4 [ffffb6d520cbbbf8] down_write at ffffffffb9b362f8
+ #5 [ffffb6d520cbbc08] vvp_io_init at ffffffffc2a762a1 [lustre]
+ #6 [ffffb6d520cbbc70] __cl_io_init at ffffffffc21a8598 [obdclass]
+ #7 [ffffb6d520cbbca0] osc_lock_discard_pages at ffffffffc2808940 [osc]
+ #8 [ffffb6d520cbbce8] osc_lock_flush at ffffffffc27ec043 [osc]
+ #9 [ffffb6d520cbbd38] osc_dlm_blocking_ast0.constprop.0 at ffffffffc27ec312 [osc]
+#10 [ffffb6d520cbbd70] osc_ldlm_blocking_ast at ffffffffc27ec5bf [osc]
+#11 [ffffb6d520cbbda0] ldlm_cancel_callback at ffffffffc254d5fd [ptlrpc]
+#12 [ffffb6d520cbbdf8] ldlm_lock_cancel at ffffffffc254d875 [ptlrpc]
+#13 [ffffb6d520cbbe10] ldlm_cli_cancel_list_local at ffffffffc256c520 [ptlrpc]
+#14 [ffffb6d520cbbe80] __ldlm_replay_locks at ffffffffc256d0bc [ptlrpc]
+#15 [ffffb6d520cbbf08] ldlm_lock_replay_thread at ffffffffc256d286 [ptlrpc]
+#16 [ffffb6d520cbbf18] kthread at ffffffffb8f3eb30
+#17 [ffffb6d520cbbf50] ret_from_fork at ffffffffb8e0854c 
+
+PID: 2086457  TASK: ffff911d62623980  CPU: 22   COMMAND: "fio"                   
+ #0 [ffffb6d534f0f360] __schedule at ffffffffb9b32879                            
+ #1 [ffffb6d534f0f3c8] schedule at ffffffffb9b32b2e                              
+ #2 [ffffb6d534f0f3e0] cl_sync_io_wait at ffffffffc21aa2ba [obdclass]            
+ #3 [ffffb6d534f0f438] ll_io_read_page at ffffffffc2a4023e [lustre]              
+ #4 [ffffb6d534f0f498] ll_readpage at ffffffffc2a40bac [lustre]                  
+ #5 [ffffb6d534f0f528] filemap_read_folio at ffffffffb915af44                    
+ #6 [ffffb6d534f0f5c8] filemap_update_page at ffffffffb915be39                   
+ #7 [ffffb6d534f0f680] filemap_get_pages at ffffffffb915c2f7                     
+ #8 [ffffb6d534f0f748] filemap_read at ffffffffb915c515                          
+ #9 [ffffb6d534f0f848] vvp_io_read_start at ffffffffc2a73bf7 [lustre]            
+#10 [ffffb6d534f0f8e0] cl_io_start at ffffffffc21a81e1 [obdclass]                
+#11 [ffffb6d534f0f910] cl_io_loop at ffffffffc21ac999 [obdclass]                 
+#12 [ffffb6d534f0f948] ll_file_io_generic at ffffffffc2a11b01 [lustre]           
+#13 [ffffb6d534f0fa58] do_file_read_iter at ffffffffc2a1337d [lustre]            
+#14 [ffffb6d534f0fab8] aio_read at ffffffffb92d22d1                              
+#15 [ffffb6d534f0fbd8] io_submit_one at ffffffffb92d5cde                         
+#16 [ffffb6d534f0fc50] __x64_sys_io_submit at ffffffffb92d6330                   
+#17 [ffffb6d534f0fcc0] do_syscall_64 at ffffffffb9b228df           
+
+This new locking mechanism, which caused the deadlock, was added to support new kernel versions and has existed since version 2.16.
+
+commit bba59b1287c9cd8c30a85fafb4fd5788452bd05c
+Author: Qian Yingjin 
+Date:   Tue Mar 21 04:53:00 2023 -0400
+
+    LU-16651 llite: hold invalidate_lock when invalidate cache pages
+    
+    The newer kernel (such as Ubuntu 2204) introduces a new member:
+    invalidate_lock in the structure @address_space.
+    The filesystem must exclusively acquire invalidate_lock before
+    invalidating page cache in truncate / hole punch (and thus calling
+    into ->invalidatepage) to block races between page cache
+    invalidation and page cache filling functions (fault, read, ...)
+    
+    However, current Lustre client does not hold this lock when remove
+    pages from page cache caused by the revocation of the extent DLM
+    lock protecting them.
+    If a client has two overlapped PR DLM extent locks, i.e:
+    - L1 = 
+    Reviewed-on: https://review.whamcloud.com/c/fs/lustre-release/+/50371
+    Tested-by: jenkins 
+    Tested-by: Maloo 
+    Reviewed-by: Shaun Tancheff 
+    Reviewed-by: Oleg Drokin 
+    Reviewed-by: Patrick Farrell 
+
+The possible quick workaround would be disabling lock cancel during recovery.
+
+lctl set_param ldlm.cancel_unused_locks_before_replay=0
+
+ But for a thick clients with thousands cached locks recovery would be a disaster at server.
+
+--- Comment (qian_wc, Fri, 17 Apr 2026 15:04:51 +0000) ---
+There is no good solution for this problem right now...
+
+The only suggestion  is that set 
+
+ldlm_cancel_unused_locks_before_replay=0
+
+--- Comment (sebastien, Fri, 17 Apr 2026 13:41:31 +0000) ---
+qian_wc As you are the author of the patch that is suspected to have introduced the behavior change, could you please see if you agree with Alexander's analysis? Also, do you see a way to address the problem?
+
+--- Comment (gerrit, Fri, 17 Apr 2026 11:37:12 +0000) ---
+"Alexander Boyko " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/65395
+
+Subject: LU-20157 tests: recovery vs IO deadlock
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 559b4c90193572893afceeb6d0763f23abf63b4f

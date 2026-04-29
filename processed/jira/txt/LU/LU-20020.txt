@@ -1,0 +1,195 @@
+Key:        LU-20020
+Summary:    llite：Opening an existing file can easily lead to security context memory leaks
+Link:       https://jira.whamcloud.com/browse/LU-20020
+Type:       Bug
+Priority:   Critical
+Status:     Open
+Resolution: Unresolved
+Assignee:   Siyao Zhang
+Reporter:   Siyao Zhang
+Created:    Thu, 19 Mar 2026 10:09:49 +0000
+Updated:    Mon, 23 Mar 2026 06:10:55 +0000
+Labels:     client, leak, memory
+Attachments: code-1.png, code.png, free.png, slabtop.png
+
+--- Environment ---
+Lustre server 2.15.6 RoCE
+
+Lustre MGS 2.15.6 RoCE
+
+Lustre client 2.15.6 RoCE
+
+--- Description ---
+Lustre server are deployed within the VM, The VM uses the network card PF pass-through mode.
+
+【Lustre Server OS】
+
+VM Version: qemu-kvm-7.0.0
+
+OS Verion: openEuler2203sp4
+
+Kernel Verion: 5.10.0-216.0.0.115.oe2203sp4.x86_64
+
+【Lustre Client OS】
+
+OS Version：CCLinux OS
+
+Kernel Verion: 5.15.131-17.cl9.x86_64
+
+【Network Card】
+
+Client：
+
+MLX CX6 1*100G RoCE v2
+
+MLNX_OFED_LINUX-23.10-2.1.3.1-rhel9.2-x86_64
+
+Server:
+
+MLX CX6 2*100G RoCE v2 ** 
+
+MLNX_OFED_LINUX-23.10-3.2.2.0-rhel8.10-x86_64
+
+ 
+
+【BUG Info】
+
+Here is the following reproducer:
+
+	Mount lustre on a RoCE network. Mount point is /mnt/lustre
+
+	write a simple open test。
+
+ 
+
+/*
+ * simple_open_test.c
+ */
+#include 
+#include 
+#include int main(int argc, char *argv[])
+{
+    int fd;
+    if (argc "Usage: %s \n", argv[0]);
+        return 1;
+    }
+  
+    fd = open(argv[1], O_CREAT | O_WRONLY, 0644);
+    if (fd "open failed");
+        return 1;
+    }
+    
+    printf("Opened: %s (fd=%d)\n", argv[1], fd);
+    close(fd);
+    return 0;
+}
+
+         Compile: gcc -o simple_open simple_open_test.c 
+
+         Test Command:
+
+             Client：for i in {1..10000000}; do     echo 3 > /proc/sys/vm/drop_caches     ./simple_open /mnt/lustre/file1.txt >/dev/null 2>&1 done 
+
+	Use slabtop to observe the growth of kmalloc-32 and kmalloc-64
+
+ 
+
+【Problem manifestation】
+
+If you use high concurrency for stress testing, the memory will be completely consumed.You can observe through slabtop that kmalloc-32 or kmalloc-64 keeps growing.
+
+--- Comment (JIRAUSER19601, Mon, 23 Mar 2026 06:10:55 +0000) ---
+Hi Oleg
+
+The current master no longer has this bug.
+
+These two patches indirectly fixed it: https://review.whamcloud.com/c/fs/lustre-release/+/56233, https://review.whamcloud.com/c/fs/lustre-release/+/56353.
+
+However, these two patches cannot be directly cherry-picked because the codebases of current master and 2.15.6 are quite different — nearly a thousand lines of code may need to be merged before cherry-picking is possible.
+
+Now, in my patch，only one line of code needs to be merged to fix this bug, so I'm unsure whether cherry-picking the above two patches is necessary, as it may introduce risks.
+
+--- Comment (green, Mon, 23 Mar 2026 05:48:16 +0000) ---
+Thank you for reporting the problem.
+
+I wonder if you could check for the same leak in the current master? The code is noticeably different with no security context exposed in the ll_lookup_it 
+
+The move was done as part of this patch: https://review.whamcloud.com/c/fs/lustre-release/+/56353
+
+if this patch also fixes the problem, might be better off porting it from master? If it does not then we'd need to fix master as well.
+
+--- Comment (JIRAUSER19601, Mon, 23 Mar 2026 02:18:40 +0000) ---
+Hi Patric
+
+I have pushed the patch to Gerrit, the link is https://review.whamcloud.com/c/fs/lustre-release/+/64769
+
+Who should I contact next for a review?
+
+--- Comment (paf0186, Fri, 20 Mar 2026 13:50:47 +0000) ---
+OK, it's not that - it's just a busy project and we don't always respond to public reports promptly.
+
+In this case, you have a good suggestion for a fix - I'll assign it to you and you can push the patch to gerrit.  If you need help with that process, you can ask here.
+
+--- Comment (JIRAUSER19601, Fri, 20 Mar 2026 01:45:19 +0000) ---
+Hi Patric
+
+ The reason for assigning this issue to Alex is that for a previous issue, he replied to us and gave a lot of useful suggestions.
+
+ I don't know who this issue should be assigned to, and I'm not sure who is more familiar with the llite module. We have raised a few issues before, but nobody replied, possibly because they couldn't find the person responsible for the relevant module.
+
+--- Comment (paf0186, Thu, 19 Mar 2026 14:24:39 +0000) ---
+Zhang,
+
+Is there a reason you assigned this ticket to Alex?  You have a suggested fix, usually we'd ask you to contribute it in Gerrit
+
+--- Comment (JIRAUSER19601, Thu, 19 Mar 2026 10:33:12 +0000) ---
+I have already found the location of the problematic code in version 2.15.6, the problematic code file is lustre/llite/namei.c
+
+static int ll_atomic_open(struct inode *dir, struct dentry *dentry,              
+                          struct file *file, unsigned open_flags,              
+                          umode_t mode ll_last_arg)
+{    
+    struct lookup_intent *it;    
+    struct dentry *de;    
+    long long lookup_flags = LOOKUP_OPEN;    
+    void *secctx = NULL;    
+    __u32 secctxlen = 0;    
+    void *encctx = NULL;    
+    __u32 encctxlen = 0;    
+    ......
+   if (!rc) {        
+      if (it_disposition(it, DISP_OPEN_CREATE)) {            
+         /* Dentry instantiated in ll_create_it. */            
+         rc = ll_create_it(dir, dentry, it, secctx, secctxlen, 
+                  encrypt, encctx, encctxlen,
+                  open_flags);            
+         ll_security_release_secctx(secctx, secctxlen);            
+         llcrypt_free_ctx(encctx, encctxlen);
+         ......            
+      } else {            
+        /* Open the file with O_CREAT, but the file already             
+         * existed on MDT. This may happend in the case that             
+         * the LOOKUP ibits lock is revoked and the             
+         * corresponding dentry cache is deleted.             
+         * i.e. In the current Lustre, the truncate operation             
+         * will revoke the LOOKUP ibits lock, and the file             
+         * dentry cache will be invalidated. The following open             
+         * with O_CREAT flag will call into ->atomic_open, the             
+         * file was wrongly though as newly created file and             
+         * try to auto cache the file. So after client knows it             
+         * is not a DISP_OPEN_CREATE, it should cleanup the             
+         * already created PCC copy.             */            
+         pcc_create_attach_cleanup(dir->i_sb, &pca);
+       if (open_flags & O_CREAT && encrypt &&                
+             dentry->d_inode) {                
+             rc = ll_set_encflags(dentry->d_inode, encctx,                             
+                           encctxlen, true);                
+             llcrypt_free_ctx(encctx, encctxlen);                
+             if (rc)                    
+               GOTO(out_release, rc);             
+          }        
+       }
+......
+}
+
+When it_disposition(it, DISP_OPEN_CREATE) is false, the memory of secctx is not released. Here, a line of code is needed to release secctx.

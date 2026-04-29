@@ -1,0 +1,118 @@
+Key:        LU-19977
+Summary:    osc: osc_init_grant ignores cl_lost_grant on reconnect, causing grant inflation
+Link:       https://jira.whamcloud.com/browse/LU-19977
+Type:       Bug
+Priority:   Medium
+Status:     Closed
+Resolution: Duplicate
+Assignee:   WC Triage
+Reporter:   Patrick Farrell
+Created:    Fri, 13 Mar 2026 02:20:03 +0000
+Updated:    Fri, 13 Mar 2026 14:36:59 +0000
+Resolved:   Fri, 13 Mar 2026 14:36:53 +0000
+Links:      Duplicate: duplicates LU-19976
+
+--- Description ---
+Summary
+
+A race between truncation/writeback drain and reconnect grant initialization leaves cl_lost_grant unzeroed in osc_init_grant(), causing client-side grant total to exceed the server-authorized amount.
+
+Background
+
+The Lustre OSC maintains a split grant accounting model:
+
+	cl_avail_grant – grants available for new I/O
+
+	cl_dirty_grant – grants held by in-flight dirty pages
+
+	cl_reserved_grant – grants reserved but not yet dirtied
+
+	cl_lost_grant – grants freed from dirty pages (pending announcement to server via o_dropped)
+
+On disconnect/eviction (IMP_EVENT_DISCON), osc_import_event() zeroes cl_avail_grant and cl_lost_grant. On reconnect, osc_reconnect() also zeroes cl_lost_grant and reports ocd_grant = avail + reserved + dirty to the server. IMP_EVENT_OCD then fires osc_init_grant() to reinitialize cl_avail_grant.
+
+The Race
+
+There is a window between osc_reconnect() (which zeroes cl_lost_grant) and osc_init_grant() (called from IMP_EVENT_OCD) during which truncate/writeback can drain dirty pages, accumulating cl_lost_grant > 0 via osc_free_grant() (dirty -> lost path in osc_cache.c:~1580).
+
+osc_init_grant() at osc_request.c:998 sets:
+
+  cli->cl_avail_grant = ocd->ocd_grant;
+
+  // (non-EVICTED branch):
+
+  consumed = cli->cl_reserved_grant + cli->cl_dirty_grant;
+
+  cli->cl_avail_grant -= consumed;
+
+  // cl_lost_grant is NOT zeroed here
+
+After osc_init_grant, the client-side total is:
+
+  avail + dirty + reserved + lost
+
+  = (ocd_grant - dirty - reserved) + dirty + reserved + lost
+
+  = ocd_grant + lost
+
+  > TOTAL_GRANT   (if lost > 0)
+
+Discovery: Formal Model (TLA+)
+
+This bug was discovered by the osc_grant_eviction_race.tla TLA+ model in the lustre-design-docs formal verification project (bead lustre-design-docs-at9.6).
+
+TLC model checker found a 23-state counterexample with:
+
+  TOTAL_GRANT = 2, MAX_ITER = 2, EnableReconnect = TRUE, InjectBugReconnectLostLeak = TRUE
+
+The InjectBugReconnectLostLeak flag models osc_init_grant NOT zeroing cl_lost_grant, which is exactly the current code behavior. TLC violated GrantConservation: avail + reserved + dirty + returned + lost + wire_dropped != TOTAL_GRANT after reconnect.
+
+Counterexample trace summary (23 states):
+
+  1. Writer reserves and dirties 1 grant (avail=1, dirty=1)
+
+  2. Eviction fires (IMP_EVENT_DISCON): avail=0, lost=0, dirty=1
+
+  3. Truncate drains: dirty=0, lost=1 (post-eviction dirty drain)
+
+  4. Reconnect (osc_init_grant): avail=TOTAL_GRANT-0-0=2, lost=1 (NOT zeroed)
+
+  5. VIOLATION: avail+dirty+reserved+lost = 2+0+0+1 = 3 > TOTAL_GRANT=2
+
+Impact
+
+Client can make I/O reservations beyond server-authorized grant budget, causing:
+
+	Potential dirty page overcommit on the server
+
+	Grant accounting drift that compounds across repeated eviction/reconnect cycles
+
+Affected Code
+
+  lustre/osc/osc_request.c: osc_init_grant() (~line 998)
+
+  lustre/osc/osc_request.c: osc_reconnect() (~line 3796)
+
+  lustre/osc/osc_cache.c: osc_free_grant() (~line 1580)
+
+Proposed Fix
+
+In osc_init_grant(), under cl_loi_list_lock, add:
+
+  cli->cl_lost_grant = 0;
+
+This mirrors what IMP_EVENT_DISCON and osc_reconnect already do. On reconnect the server authorizes a fresh total; any cl_lost_grant accumulated during the drain window represents in-flight truncations whose returned grants should not inflate the new grant budget.
+
+References
+
+	osc_grant_eviction_race.tla – TLA+ formal model that discovered this (PR #7, lustre-design-docs)
+
+	Config: osc_grant_eviction_race__reconnect_lost_leak_bug.cfg
+
+	Bead: lustre-design-docs-cx7 (source verification task)
+
+--- Comment (paf0186, Fri, 13 Mar 2026 14:36:53 +0000) ---
+See LU-19976
+
+--- Comment (paf0186, Fri, 13 Mar 2026 02:22:29 +0000) ---
+Duplicate of LU-19976, which was independently filed by another agent for the same osc_init_grant / cl_lost_grant reconnect bug. This issue should be closed as a duplicate.

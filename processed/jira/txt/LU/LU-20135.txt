@@ -1,0 +1,94 @@
+Key:        LU-20135
+Summary:    Client reconnection extending recovery causes unnecessary delays and can lead to extra evictions
+Link:       https://jira.whamcloud.com/browse/LU-20135
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Duncan Vogel
+Reporter:   Duncan Vogel
+Created:    Tue, 14 Apr 2026 16:29:54 +0000
+Updated:    Wed, 22 Apr 2026 16:30:15 +0000
+Links:      Related: is related to  LU-19199; Related: is related to  LU-18681
+
+--- Description ---
+There are two timeouts related to recovery - the soft timeout (default 5min) and the hard timeout (default 15min). The recovery timeout begins at the soft timeout, but can be extended in five places:
+
+In check_and_start_recovery_timer: The connect request includes an estimate of the server’s service timeout before recovery, which the server uses to update the recovery timeout. 
+
+In check_for_recovery_ready: Recovery always waits for the lod_sub_recovery_thread to prepare the llog and get updates from the MDTs before it starts replays, so it just extends the timer as necessary here.
+
+In replay_request_or_update: Makes sure it has at least obd_timeout (100s) each time the server handles an update request during this stage.
+
+In handle_recovery_req: While replaying requests/locks or sending the final ping, it extends the timer to allow enough time for the next replay request.
+
+In target_recovery_overseer: When the timer does expire and times out, the overseer (a thread which manages state change and error handling during recovery) resets the timer after evicting stale exports. This gives some time to see if recovery can resume with the problematic exports gone.
+
+The goal of all of these extensions is to make sure we don't time out recovery which is actually making progress. However, the first extension is problematic for several reasons:
+
+1. The service_timeout as measured before recovery (reboot or failover) has absolutely nothing to do with how long things will take on the recovering server. Often, recovery is entered expressly because a server was having problems (many of which can be resolved by reboot or failover), so if service_timeout is reported as very high by clients, we will extend past the soft timeout for no good reason.
+
+2. The service_timeout really doesn't have anything to do with the actual replays in the reconnection phase. Perhaps it will influence how long it takes to actually commit new transactions or grant new locks, but there are dedicated additional extend_recovery_timer calls in those stages. The reconnection phase simply involves reconstructing the already granted lock state and ptlrpc queues via ptlrpc_replay_next and ldlm_replay_locks, which is very fast. The long part of this stage is the clients actually realizing the server is ready for replay/failover is needed and joining recovery.
+
+3. The client is allowed to extend the timeout all the way up to the hard timeout. In this case, if any clients fail to reconnect, we will hard timeout rather than soft timeout.
+
+This is problematic if any of the clients do not join recovery (very common in many workloads with containers where hosts are scaled up and down frequently). In these cases, if we have let clients extend the soft timeout, we will wait (sometimes several extra minutes) for no reason before evicting the missing clients, leading to additional downtime.
+
+The worst case is if a client extends recovery to the hard timeout. In this case, we will go to the hard timeout behavior without even attempting a soft timeout. Because we never reached a VBR-enabled recovery attempt, any client that has a later transaction in the replay queue will be evicted even if it reconnected and was perfectly fine. If you get unlucky, you can end up getting nearly your entire healthy fleet evicted for no reason.
+
+We have observed all of these behaviors, and by removing the extend_recovery_timer call in check_and_start_recovery_timer, they are resolved.
+
+I think it would be worth re-evaluating all of this timer extension logic, as it feels potentially overengineered and error-prone. Other network filesytems use fixed timeouts for replay, which is much easier to reason about.
+
+The main concern here would be failover - if the client MUST wait for service_timeout before failing over, then we do need to give them at least that long. We should find a way to resolve this in a way that handles both cases. On servers without failover, this extension is a large liability.
+
+--- Comment (adilger, Wed, 22 Apr 2026 16:30:15 +0000) ---
+fvogdunc, if you have an opportunity, implementing LU-18681 to provide information about client reconnection times, and ideally also some histograms for each phase of recovery to see where it is spending its time. 
+
+If this is mostly about not waiting for dead clients to reconnect (eg. Kubernetes containers which were already unmounting when the server went down), then making a better decision about how long to wait for recovery (eg. 95% reconnected clients plus 10% of the time that took) then that is something which would speed up all recovery. 
+
+I suspect there is also other low-hanging fruit like allowing parallel and out-of-order replay for transno that match the VBR dependencies, that would help speed up replay when there is just a large volume of RPCs outstanding at the time of recovery.
+
+--- Comment (JIRAUSER19589, Wed, 22 Apr 2026 13:52:21 +0000) ---
+The original VBR design actually seems to have been intended to include some version of your suggestion - where clients reconnecting after recovery is complete would be able to replay. It's possible there's existing work that we can refresh if we wanted to implement that route (not for this ticket, but for recovery improvements overall)
+
+--- Comment (JIRAUSER19589, Mon, 20 Apr 2026 23:14:00 +0000) ---
+That's a fair point - I had been thinking in terms of checking if the server itself was the one that had failed over, but yes it makes more sense just to check if failover is enabled at all
+
+--- Comment (adilger, Mon, 20 Apr 2026 22:20:56 +0000) ---
+Shouldn't it be possible to check the configuration to see if there are multiple failover NIDs configured?  Or check if the configured NIDs for the restarted service are all present in the local NIDs of the server or not?  No need to store any new information.
+
+--- Comment (JIRAUSER19589, Mon, 20 Apr 2026 20:50:39 +0000) ---
+Okay, my current thinking is thus:
+
+1. Reduce the overhead that the extend adds to the adaptive timeout to reduce the change it extends all the way to hard timeout
+
+2. If this is a single-node recovery rather than a failover recovery, don't extend at all
+
+On single-node recovery, LNet will be retrying the send and so within the bounds of backoff we will reconnect pretty quickly once the server is online, even if AT has gone high. On failover, we have to time out the RPC before we try to fail over, so it make more sense to extend to (closer to) the client AT to give clients time to fail over if IR is not available. If IR is available, we probably shouldn't extend at all, since we know the clients don't need to wait for an AT timeout.
+
+As of now, I don't think there is any way to detect which kind of recovery the server is in. I can see two ways to do this with some cursory analysis:
+
+	Store the server NID in last_rcvd and compare to current NID to determine if the new server is failing over from a different host (will involve some special conversion due to endianness mismatch)
+
+	Add a flag to the registration to the MGS, since the MGS already knows whether the new target is a failover node, and then store the result in a new field in obd_device for check during recovery
+
+Lustre currently is extremely agnostic to whether or not it is failing over a different server or just rebooting. However, the benefits of this change seem good enough to warrant it here, unless anyone else has ideas for something smarter we could do in the failover case.
+
+--- Comment (JIRAUSER19589, Wed, 15 Apr 2026 02:05:17 +0000) ---
+Yes, I am planning to submit a patch. We do not use failover so we simply removed the call to extend, but I understand that the extension is designed to handle the failover case. For us, removing the extend was very helpful.
+
+I need to revise my patch to do something smarter in the failover case. 
+
+The final thought in your comment is interesting. Are you proposing we allow outliers to reconnect after recovery is complete and implement some replay method outside of the existing target_recovery_overseer loop that checks object versions and performs the replay if it hasn't changed?
+
+--- Comment (adilger, Tue, 14 Apr 2026 23:42:34 +0000) ---
+Hi fvogdunc, thank you for your posting.  We were coincidentally discussing recovery time reductions this morning and this topic of static timeouts came up.
+
+I previously filed LU-18681 as a small improvement to improve visibility into the client recovery process.  Knowing the distribution of how quickly clients connect can help make better decisions than just have a static timeout.  I suspect in many cases that some high percentile of clients can reconnect to the server quickly, and slow/misbehaving clients may take multiple times that long to reconnect, if they ever do, so there may not be any value in waiting longer than e.g. 90% of clients reconneced + 10s, or 75% of clients + 1/3 longer (or similar) would minimize the unnecessary wait time without unduly impacting recovery behavior.
+
+Are you planning to submit a patch with your changes for review?
+
+Allowing VBR to run would be a big improvement in reliable recovery, since clients can progress independently if they are not modifying common files or directories in the filesystem.  That allows "most" clients to recover and only evict the unresponsive clients, and potentially start using the filesystem immediately without waiting for all clients to finish recovery.
+
+One potential option for determining whether clients are "related" to each other is to use VBR and JobID information before the server restarts to annotate groups of clients that are interacting.  This could be stored persistently on the server in last_rcvd or replay_data so that it is available after restart to determine if "outliers" need to be recovered to allow responsive clients to complete recovery.  If it is known that "outliers" are loners (i.e. not interacting with other clients) then it might be possible to avoid evicting them for a much longer time, while allowing responsive clients to continue operation.  The main reasons for evicting unresponsive clients are to ensure that they have dropped their cache to avoid later inconsistencies, and to evict any other clients that (may) depend on state that was lost when the unresponsive client was evicted.  If the server knows that the clients are not interacting, then the scope of the eviction could be significantly reduced.

@@ -1,0 +1,489 @@
+Key:        LU-20057
+Summary:    frequent crashes for "kernel BUG at kernel/cred.c:400!"
+Link:       https://jira.whamcloud.com/browse/LU-20057
+Type:       Bug
+Priority:   Medium
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Bruno Faccini
+Reporter:   Bruno Faccini
+Created:    Mon, 30 Mar 2026 15:00:23 +0000
+Updated:    Wed, 15 Apr 2026 13:55:29 +0000
+Resolved:   Fri, 10 Apr 2026 17:05:25 +0000
+
+--- Description ---
+We trigger this crash almost once a week on our cluster.
+
+The Panic stack always looks like following (with added inlines, identified using raw-stack content analysis and associated source code browsing) :
+
+PID: 45208    TASK: ff2ce73ad597b0c0  CPU: 30   COMMAND: "ptlrpcd_00_102"
+ #0 [ff786ce6403976a0] machine_kexec at ffffffff8f73cd55
+ #1 [ff786ce6403976e0] __crash_kexec at ffffffff8f8d6681
+ #2 [ff786ce6403977a8] crash_kexec at ffffffff8f8d6854
+ #3 [ff786ce6403977b8] oops_end at ffffffff8f6db88f
+ #4 [ff786ce6403977e0] die at ffffffff8f6dc2ae
+ #5 [ff786ce640397810] do_trap at ffffffff8f6d5eea
+ #6 [ff786ce640397850] do_error_trap at ffffffff8f6d62b1
+ #7 [ff786ce640397898] exc_invalid_op at ffffffff908d8802
+ #8 [ff786ce6403978c0] asm_exc_invalid_op at ffffffff8f400b4b
+    [exception RIP: commit_creds+653]
+    RIP: ffffffff8f7c8b5d  RSP: ff786ce640397970  RFLAGS: 00010287
+    RAX: 0000000000000000  RBX: 0000000000000007  RCX: 0000000000000000
+    RDX: 0000000000000000  RSI: 0000000000000000  RDI: ff2ce7394b9e5ec0
+    RBP: ff786ce640397988   R8: 0000000000000000   R9: 0000000000000000
+    R10: 0000000000000000  R11: 0000000000000000  R12: ff2ce73a5bc0b200
+    R13: ff2ce73ad597b0c0  R14: 00000000fffffffd  R15: ff2ce73915090900
+    ORIG_RAX: ffffffffffffffff  CS: 0010  SS: 0018 
+
+Inlined :
+install_session_keyring()
+
+ #9 [ff786ce640397990] lookup_user_key at ffffffff8fdb81d4
+
+!!! ff786ce6403979a8:  ff2ce73915090900 !!! struct key *user_session in lookup_user_key()
+
+!!! ff786ce6403979d8:  ff2ce7394b9e52c0 !!!!   ctx.cmp 
+
+  [ff786ce6403979e0] lookup_user_key_possessed at ffffffff8fdb7070 !!! Start address so likely in “struct keyring_search_context ctx” on stack for lookup_user_key() !!!
+
+Inlineds :
+_user_key(KEY_SPEC_SESSION_KEYRING)
+get_session_keyring(current->cred) 
+construct_get_dest_keyring()
+
+!!! ff786ce640397a50:  ff2ce7394b9e52c0 !!! R15 save from request_key_unlink() which is new_cred in fact !!!
+
+#10 [ff786ce640397a60] request_key_unlink at ffffffffc36eaf4a [ptlrpc_gss]
+#11 [ff786ce640397ab0] gss_sec_lookup_ctx_kr at ffffffffc36ed492 [ptlrpc_gss]
+#12 [ff786ce640397b28] get_my_ctx at ffffffffc33d88dc [ptlrpc]
+#13 [ff786ce640397b58] sptlrpc_req_get_ctx at ffffffffc33dd32c [ptlrpc]
+#14 [ff786ce640397b90] sptlrpc_req_replace_dead_ctx at ffffffffc33de91f [ptlrpc]
+#15 [ff786ce640397be8] sptlrpc_req_refresh_ctx at ffffffffc33df80a [ptlrpc]
+#16 [ff786ce640397c88] ptlrpc_send_new_req at ffffffffc3397ace [ptlrpc]
+#17 [ff786ce640397cf0] ptlrpc_check_set at ffffffffc3399e37 [ptlrpc]
+#18 [ff786ce640397d90] ptlrpcd_check at ffffffffc33cd731 [ptlrpc]
+#19 [ff786ce640397de0] ptlrpcd at ffffffffc33cddf9 [ptlrpc]
+#20 [ff786ce640397ec8] kthread at ffffffff8f7bdf1b
+#21 [ff786ce640397f18] ret_from_fork at ffffffff8f6e9cd4
+#22 [ff786ce640397f40] ret_from_fork_asm at ffffffff8f682c3a
+
+which can be resolved as the following path in the source code :
+
+/**     
+ * Helper function to send request \a req over the network for the first time
+ * Also adjusts request phase.
+ * Returns 0 on success or error code.
+ */     
+static int ptlrpc_send_new_req(struct ptlrpc_request *req)
+{
+        struct obd_import *imp = req->rq_import;
+        __u64 min_xid = 0;
+        int rc;
+………………………………..
+        /* If the request to be sent is an LDLM callback, do not try to
+         * refresh context.
+         * An LDLM callback is sent by a server to a client in order to make
+         * it release a lock, on a communication channel that uses a reverse
+         * context. It cannot be refreshed on its own, as it is the 'reverse'
+         * (server-side) representation of a client context.
+         * We do not care if the reverse context is expired, and want to send
+         * the LDLM callback anyway. Once the client receives the AST, it is
+         * its job to refresh its own context if it has expired, hence
+         * refreshing the associated reverse context on server side, before
+         * being able to send the LDLM_CANCEL requested by the server.
+         */
+        if (lustre_msg_get_opc(req->rq_reqmsg) != LDLM_BL_CALLBACK &&
+            lustre_msg_get_opc(req->rq_reqmsg) != LDLM_CP_CALLBACK &&
+            lustre_msg_get_opc(req->rq_reqmsg) != LDLM_GL_CALLBACK)
+                rc = sptlrpc_req_refresh_ctx(req, 0); "lustre/ptlrpc/client.c" 3817 lines --46%--     1792,4-18     47%
+
+ 
+
+/**
+ * To refresh the context of \req, if it's not up-to-date.
+ * \param timeout
+ * - == 0: do not wait
+ * - == MAX_SCHEDULE_TIMEOUT: wait indefinitely
+ * - > 0: not supported
+ *
+ * The status of the context could be subject to be changed by other threads
+ * at any time. We allow this race, but once we return with 0, the caller will
+ * suppose it's uptodated and keep using it until the owning rpc is done.
+ *
+ * \retval 0 only if the context is uptodated.
+ * \retval -ev error number.
+ */
+int sptlrpc_req_refresh_ctx(struct ptlrpc_request *req, long timeout)
+{
+        struct ptlrpc_cli_ctx *ctx = req->rq_cli_ctx;
+        struct ptlrpc_sec *sec;
+        int rc;
+………………………………..
+        if (unlikely(test_bit(PTLRPC_CTX_DEAD_BIT, &ctx->cc_flags))) {
+                req_off_ctx_list(req, ctx);
+                /*
+                 * don't switch ctx if import was deactivated
+                 */
+                if (req->rq_import->imp_deactive) {
+                        spin_lock(&req->rq_lock);
+                        req->rq_err = 1;
+                        spin_unlock(&req->rq_lock);
+                        RETURN(-EINTR);
+                }
+
+                rc = sptlrpc_req_replace_dead_ctx(req, NULL); "lustre/ptlrpc/sec.c" 2938 lines --28%--     826,3-17      27%
+
+ 
+
+/**
+ * If current context of \a req is dead somehow, e.g. we just switched flavor
+ * thus marked original contexts dead, we'll find a new context for it. if
+ * no switch is needed, \a req will end up with the same context.
+ *
+ * \note a request must have a context, to keep other parts of code happy.
+ * In any case of failure during the switching, we must restore the old one.
+ */
+int sptlrpc_req_replace_dead_ctx(struct ptlrpc_request *req,
+                                 struct ptlrpc_sec *sec)
+{
+        struct ptlrpc_cli_ctx *oldctx = req->rq_cli_ctx;
+        struct ptlrpc_cli_ctx *newctx;
+        int rc;
+
+        ENTRY;
+
+        LASSERT(oldctx);
+
+        sptlrpc_cli_ctx_get(oldctx);
+        sptlrpc_req_put_ctx(req, 0);
+
+        /* If sec is provided, we must use the existing context for root that
+         * it references. If not root, or no existing context, or same context,
+         * just fail replacing the dead context.
+         */
+        if (sec) {
+                newctx = get_my_ctx(sec, true);
+                if (!newctx)
+                        GOTO(restore, rc = -EINVAL);
+                if (IS_ERR(newctx))
+                        GOTO(restore, rc = PTR_ERR(newctx));
+                if (newctx == oldctx) {
+                        sptlrpc_cli_ctx_put(newctx, 0);
+                        GOTO(restore, rc = -ENODATA);
+                }
+                /* Because we are replacing an erroneous ctx, new sec ctx is
+                 * expected to have higher imp generation or same imp generation
+                 * but higher imp connection count.
+                 */
+                if (newctx->cc_impgen cc_impgen ||
+                    (newctx->cc_impgen == oldctx->cc_impgen &&
+                     newctx->cc_impconncnt cc_impconncnt))
+                        CERROR("ctx (%p, fl %lx) will switch, but does not look more recent than old ctx: imp gen %d vs %d, imp conn cnt %d vs %d\n",
+                               newctx, newctx->cc_flags,
+                               newctx->cc_impgen, oldctx->cc_impgen,
+                               newctx->cc_impconncnt, oldctx->cc_impconncnt);
+                req->rq_cli_ctx = newctx;
+        } else {
+                rc = sptlrpc_req_get_ctx(req);  "lustre/ptlrpc/sec.c" 2938 lines --21%--      617,1-8       19%
+
+/**
+ * Given a \a req, find or allocate an appropriate context for it.
+ * \pre req->rq_cli_ctx == NULL.
+ *
+ * \retval 0 succeed, and req->rq_cli_ctx is set.
+ * \retval -ev error number, and req->rq_cli_ctx == NULL.
+ */
+int sptlrpc_req_get_ctx(struct ptlrpc_request *req)
+{
+        struct obd_import *imp = req->rq_import;
+        struct ptlrpc_sec *sec;
+        int rc;
+
+        ENTRY;
+
+        LASSERT(!req->rq_cli_ctx);
+        LASSERT(imp);
+
+        rc = import_sec_validate_get(imp, &sec);
+        if (rc) 
+                RETURN(rc);
+
+        req->rq_cli_ctx = get_my_ctx(sec, false); "lustre/ptlrpc/sec.c" 2938 lines --15%--       459,1-8       14%
+
+/* existingroot to tell we only want to fetch an already existing root ctx */
+static
+struct ptlrpc_cli_ctx *get_my_ctx(struct ptlrpc_sec *sec, bool existingroot)
+{
+        struct vfs_cred vcred;
+        int create = 1, remove_dead = 1;
+
+        LASSERT(sec);
+        LASSERT(sec->ps_policy->sp_cops->lookup_ctx);
+
+        if (existingroot) {
+                vcred.vc_uid = from_kuid(&init_user_ns, current_uid());
+                vcred.vc_gid = from_kgid(&init_user_ns, current_gid());
+                create = 0;
+                remove_dead = 0;
+
+                if (!(sec->ps_flvr.sf_flags & PTLRPC_SEC_FL_ROOTONLY) &&
+                    vcred.vc_uid != 0)
+                        return ERR_PTR(-EINVAL);
+        } else if (sec->ps_flvr.sf_flags & (PTLRPC_SEC_FL_REVERSE |
+                                            PTLRPC_SEC_FL_ROOTONLY)) {
+                vcred.vc_uid = 0;
+                vcred.vc_gid = 0;
+                if (sec->ps_flvr.sf_flags & PTLRPC_SEC_FL_REVERSE) {
+                        create = 0;
+                        remove_dead = 0;
+                }
+        } else {
+                vcred.vc_uid = from_kuid(&init_user_ns, current_uid());
+                vcred.vc_gid = from_kgid(&init_user_ns, current_gid());
+        }
+
+        return sec->ps_policy->sp_cops->lookup_ctx(sec, &vcred, create,
+                                                   remove_dead); "lustre/ptlrpc/sec.c" 2938 lines --10%--       311,1-8        8%
+
+0 gss/gss_keyring.c   1831 .lookup_ctx = gss_sec_lookup_ctx_kr, 
+
+/**
+ * \retval a valid context on success
+ * \retval -ev error number or NULL on error
+ */
+static
+struct ptlrpc_cli_ctx * gss_sec_lookup_ctx_kr(struct ptlrpc_sec *sec,
+                                              struct vfs_cred *vcred,
+                                              int create, int remove_dead)
+{
+..........................
+        /* We want user keys to be linked to the user keyring (see call to
+         * keyctl_instantiate() from prepare_and_instantiate() in userspace).
+         * But internally request_key() links the key to the session or
+         * user session keyring, depending on jit_keyring value. Avoid that by
+         * unlinking the key from this keyring. It will spare
+         * us pain when we need to remove the key later on.
+         */
+        if (!is_root || create_new)
+                request_key_unlink(key, true); "lustre/ptlrpc/gss/gss_keyring.c" 1889 lines --58%--   1099,2-16     57%
+
+/*
+ * Unlink key from its keyring, which was linked during request_key().
+ */
+static void request_key_unlink(struct key *key, bool fullsearch)
+{
+        kuid_t kuid_orig = current_cred()->user->uid;
+#ifdef HAVE_USER_UID_KEYRING
+        struct key *root_uid_keyring = NULL;
+#endif 
+        const struct cred *old_cred = NULL;
+        struct cred *new_cred = NULL;
+        struct key *ring = NULL;
+        uid_t uid, key_uid;
+        int res;
+
+        uid = from_kuid(current_user_ns(), kuid_orig);
+        key_uid = from_kuid(&init_user_ns, key->uid);
+        /* unlink key with user's creds if it's a user key */
+        if (key_uid != uid) {
+                new_cred = prepare_creds();
+                if (new_cred == NULL)
+                        goto search;
+
+                new_cred->uid = key->uid;
+                new_cred->user->uid = key->uid;
+                if (new_cred->user_ns != &init_user_ns) {
+                        put_user_ns(new_cred->user_ns);
+                        new_cred->user_ns = get_user_ns(&init_user_ns);
+                }
+#ifdef HAVE_USER_UID_KEYRING
+                root_uid_keyring = current_cred()->user->uid_keyring;
+                new_cred->user->uid_keyring = NULL;
+#endif
+                old_cred = override_creds(new_cred); /* User keys are linked to the user keyring. So get it now. */
+        if (key_uid && !fullsearch) {
+                /* Getting a key(ring) normally increases its refcount by 1.
+                 * But if we overrode creds above, calling get_user_keyring()
+                 * will add one more ref, because of the user switch.
+                 */
+                ring = get_user_keyring(current_cred());
+        } else {
+search:
+                if (construct_get_dest_keyring(&ring)) "lustre/ptlrpc/gss/gss_keyring.c" 1889 lines --44%--         832,1-8       42%
+
+/*
+ * Get the appropriate destination keyring for the request.
+ *
+ * The keyring selected is returned with an extra reference upon it which the
+ * caller must release.
+ */
+/*
+ * Function inspired from the kernel's one, unfortunately not exported.
+ */
+static int construct_get_dest_keyring(struct key **_dest_keyring)
+{
+        struct key *dest_keyring = *_dest_keyring;
+        const struct cred *cred = current_cred();
+
+        if (dest_keyring) {
+                /* the caller supplied one */
+                key_get(dest_keyring);
+                return 0;
+        }
+
+        switch (cred->jit_keyring) {
+        case KEY_REQKEY_DEFL_DEFAULT:
+        case KEY_REQKEY_DEFL_REQUESTOR_KEYRING:
+#ifdef HAVE_GET_REQUEST_KEY_AUTH
+                if (cred->request_key_auth) {
+                        struct request_key_auth *rka;
+                        struct key *authkey = cred->request_key_auth;
+
+                        down_read(&authkey->sem);
+                        rka = get_request_key_auth(authkey);
+                        if (!test_bit(KEY_FLAG_REVOKED, &authkey->flags))
+                                dest_keyring = key_get(rka->dest_keyring);
+                        up_read(&authkey->sem);
+                        if (dest_keyring)
+                                break;
+                }
+#endif
+                fallthrough;
+        case KEY_REQKEY_DEFL_THREAD_KEYRING:
+                dest_keyring = key_get(cred->thread_keyring);
+                if (dest_keyring)
+                        break;
+                fallthrough;
+        case KEY_REQKEY_DEFL_PROCESS_KEYRING:
+                dest_keyring = key_get(cred->process_keyring);
+                if (dest_keyring)
+                        break;
+                fallthrough;
+        case KEY_REQKEY_DEFL_SESSION_KEYRING:
+                dest_keyring = get_session_keyring(cred); if (dest_keyring) {
+                        if (!test_bit(KEY_FLAG_REVOKED, &dest_keyring->flags))
+                                break;
+                        key_put(dest_keyring);
+                }
+                fallthrough;
+"lustre/ptlrpc/gss/gss_keyring.c" 1889 lines --40%--        769,1-8       39%
+
+static inline struct key *get_session_keyring(const struct cred *cred)
+{
+        return _user_key(KEY_SPEC_SESSION_KEYRING); "lustre/ptlrpc/gss/gss_keyring.c" 1889 lines --36%--       696,1         36%
+
+static struct key *_user_key(key_serial_t id)
+{
+        key_ref_t ref;
+
+        might_sleep();
+        ref = lookup_user_key(id, KEY_LOOKUP_PARTIAL, KEY_NEED_UNLINK); if (IS_ERR(ref))
+                return NULL;
+        return key_ref_to_ptr(ref);
+}
+"lustre/ptlrpc/gss/gss_keyring.c" 1889 lines --36%--        681,1         36%
+
+/*
+ * Look up a key ID given us by userspace with a given permissions mask to get
+ * the key it refers to.
+ *
+ * Flags can be passed to request that special keyrings be created if referred
+ * to directly, to permit partially constructed keys to be found and to skip
+ * validity and permission checks on the found key.
+ *
+ * Returns a pointer to the key with an incremented usage count if successful;
+ * -EINVAL if the key ID is invalid; -ENOKEY if the key ID does not correspond
+ * to a key or the best found key was a negative key; -EKEYREVOKED or
+ * -EKEYEXPIRED if the best found key was revoked or expired; -EACCES if the
+ * found key doesn't grant the requested permit or the LSM denied access to it;
+ * or -ENOMEM if a special keyring couldn't be created.
+ *
+ * In the case of a successful return, the possession attribute is set on the
+ * returned key reference.
+ */
+key_ref_t lookup_user_key(key_serial_t id, unsigned long lflags,
+                          enum key_need_perm need_perm)
+{
+........................
+      case KEY_SPEC_SESSION_KEYRING:                 if (!ctx.cred->session_keyring) {                         /* always install a session keyring upon access if one                          * doesn't exist yet */                         ret = look_up_user_keyrings(NULL, &user_session);                         if (ret goto error;                         if (lflags & KEY_LOOKUP_CREATE)                                 ret = join_session_keyring(NULL);                         else                                 ret = install_session_keyring(user_session); "security/keys/process_keys.c" [readonly] 965 lines --70%--     676,3-24   70%
+
+ 
+
+/*
+ * Install the given keyring as the session keyring of the current task,
+ * replacing the existing one if any.  If the given keyring is NULL, then
+ * install a new anonymous session keyring.
+ *
+ * Return: 0 on success; -errno on failure.
+ */
+static int install_session_keyring(struct key *keyring)
+{
+        struct cred *new;
+        int ret;
+
+        new = prepare_creds();
+        if (!new)
+                return -ENOMEM;
+
+        ret = install_session_keyring_to_cred(new, keyring);
+        if (ret new);
+                return ret;
+        }
+
+        return commit_creds(new); "security/keys/process_keys.c" [readonly] 965 lines --37%--     365,1-8   38%
+
+/**
+ * commit_creds - Install new credentials upon the current task
+ * @new: The credentials to be assigned
+ *
+ * Install a new set of credentials to the current task, using RCU to replace
+ * the old set.  Both the objective and the subjective credentials pointers are
+ * updated.  This function may not be called if the subjective credentials are
+ * in an overridden state.
+ *
+ * This function eats the caller's reference to the new credentials.
+ *
+ * Always returns 0 thus allowing this function to be tail-called at the end
+ * of, say, sys_setgid().
+ */
+int commit_creds(struct cred *new)
+{
+        struct task_struct *task = current;
+        const struct cred *old = task->real_cred;
+
+        kdebug("commit_creds(%p{%ld})", new,
+               atomic_long_read(&new->usage));
+
+        BUG_ON(task->cred != old); "kernel/cred.c" [readonly] 684 lines --58%--      400,1-8       58%
+
+and the two main reasons, to have followed this code path and to crash that have been found in the crash-dump, are that current->cred and current->real_cred point to different credentials due to ongoing override_creds() but both credentials have their session_keyring set to NULL causing install_session_keyring() to be called to populate it.
+
+And a possible other reason to follow this code-path, is that we play with namespaces during our Slurm jobs.
+
+Doing some more investigations/testing we have found that credentials of ptlrpcd_0 threads do have their *session_keyring initialized upon first need, so may be a possible solution could be to do it during the thread start-up ?!
+
+--- Comment (pjo, Fri, 10 Apr 2026 17:05:25 +0000) ---
+Merged for 2.18
+
+--- Comment (gerrit, Fri, 10 Apr 2026 05:26:36 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/64923/
+
+Subject: LU-20057 gss: do not use lookup_user_key() if cred overrided
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 37927f832bbe7e26ef46f616ebb9d009f13c428c
+
+--- Comment (JIRAUSER18717, Tue, 31 Mar 2026 08:06:42 +0000) ---
+Sibling public ticket LU-20057 has been created to pursue about this issue and allow to push https://review.whamcloud.com/c/fs/lustre-release/+/64923 against master !!
+
+--- Comment (JIRAUSER18717, Mon, 30 Mar 2026 15:04:55 +0000) ---
+After joint brainstorming with Aurelien, because both still unhappy with current/first fix direction (populate the session_keyring of each ptlrpcd threads at init) that we both consider more as a work-around than a real fix, we have found that in construct_get_dest_keyring() Lustre version, lookup_user_key() should not be called because if current thread has no session_keyring set, then an attempt to populate it will cause commit_creds() to be called which will trigger this BUG() because we are already running with overrided cred. 
+
+So I have pushed https://review.whamcloud.com/c/fs/lustre-release/+/64923 where we call key_get() instead which is conform to what is being done in Kernel's version of construct_get_dest_keyring() and which was already done before e2156e69cc ("LU-18145 gss: fix key unlink for regular user") has landed.
+
+This reverts a part of "e2156e69cc LU-18145 gss: fix key unlink for regular user" (https://review.whamcloud.com/c/fs/lustre-release/+/56053) that do not seem to be intended to fix the original problem there ...

@@ -1,0 +1,196 @@
+Key:        LU-20199
+Summary:    A large RPC is queued as numerous bios
+Link:       https://jira.whamcloud.com/browse/LU-20199
+Type:       Bug
+Priority:   Medium
+Status:     In Progress
+Resolution: Unresolved
+Assignee:   Aleksandr Dyadyushkin
+Reporter:   Aleksandr Dyadyushkin
+Created:    Tue, 28 Apr 2026 15:37:31 +0000
+Updated:    Tue, 28 Apr 2026 15:49:27 +0000
+
+--- Environment ---
+# cat /etc/os-release 
+
+NAME="Rocky Linux"
+
+VERSION="9.7 (Blue Onyx)"
+
+ID="rocky"
+
+ID_LIKE="rhel centos fedora"
+
+VERSION_ID="9.7"
+
+PLATFORM_ID="platform:el9"
+
+PRETTY_NAME="Rocky Linux 9.7 (Blue Onyx)"
+
+ANSI_COLOR="0;32"
+
+LOGO="fedora-logo-icon"
+
+CPE_NAME="cpe:/o:rocky:rocky:9::baseos"
+
+HOME_URL="https://rockylinux.org/"
+
+VENDOR_NAME="RESF"
+
+VENDOR_URL="https://resf.org/"
+
+BUG_REPORT_URL="https://bugs.rockylinux.org/"
+
+SUPPORT_END="2032-05-31"
+
+ROCKY_SUPPORT_PRODUCT="Rocky-Linux-9"
+
+ROCKY_SUPPORT_PRODUCT_VERSION="9.7"
+
+REDHAT_SUPPORT_PRODUCT="Rocky Linux"
+
+REDHAT_SUPPORT_PRODUCT_VERSION="9.7"
+
+# rpm -qa | grep lustre
+
+kernel-modules-core-5.14.0-611.13.1_lustre.el9.x86_64
+
+kernel-core-5.14.0-611.13.1_lustre.el9.x86_64
+
+kernel-modules-5.14.0-611.13.1_lustre.el9.x86_64
+
+python3-perf-5.14.0-611.13.1_lustre.el9.x86_64
+
+kernel-5.14.0-611.13.1_lustre.el9.x86_64
+
+kernel-headers-5.14.0-611.13.1_lustre.el9.x86_64
+
+kernel-devel-5.14.0-611.13.1_lustre.el9.x86_64
+
+kernel-debuginfo-common-x86_64-5.14.0-611.13.1_lustre.el9.x86_64
+
+kernel-debuginfo-5.14.0-611.13.1_lustre.el9.x86_64
+
+kernel-devel-matched-5.14.0-611.13.1_lustre.el9.x86_64
+
+lustre-all-dkms-2.17.0-1.el9.noarch
+
+lustre-osd-ldiskfs-mount-2.17.0-1.el9.x86_64
+
+lustre-2.17.0-1.el9.x86_64
+
+perf-5.14.0-611.13.1_lustre.el9.x86_64
+
+lustre-iokit-2.17.0-1.el9.x86_64
+
+# uname -a
+
+Linux localhost.localdomain 5.14.0-611.13.1_lustre.el9.x86_64 #1 SMP PREEMPT_DYNAMIC Tue Dec 30 01:49:33 UTC 2025 x86_64 x86_64 x86_64 GNU/Linux
+
+--- Description ---
+Starting with LU-11526 (https://github.com/lustre/lustre-release/commit/1a9be0046b1f1772d3f934c2146dc5233c391377  , commit 1a9be0046b1f1772d3f934c2146dc5233c391377 ), Lustre has technical capability to serve RPCs as large as 64 MiB, while Lustre manual at the time of writing still only advertises 16 MiB. Large RPC come very handy in the era of Big Data and expanding use of transparent huge pages(usually 2 MiB for x86_64 architecture). It is also pretty helpful to submit as much sequential data as possible for slower storage mediums, like HDD.
+
+ 
+
+To illustrate the observed issue, the example is given using virtio for ease of reproduction but it is technically relevant for any architecture with 4 KiB page size and RPCs larger than 1 MiB when the underlying block device for Lustre OST is capable of handling requests equal to or larger than the set RPC size. The illustration utilizes ldiskfs but the underlying caveat might affect ZFS-based server storage too. Given the following parameters:
+
+[root@localhost t]# mount -t lustre | awk '{ print $1; }' | xargs -I{} bash -c 'strings -f -n1 /sys/class/block/$(basename {})/queue/max*' | sort
+/sys/class/block/vdb/queue/max_discard_segments: 1
+/sys/class/block/vdb/queue/max_hw_sectors_kb: 2147483647
+/sys/class/block/vdb/queue/max_integrity_segments: 0
+/sys/class/block/vdb/queue/max_sectors_kb: 2147483647
+/sys/class/block/vdb/queue/max_segments: 254
+/sys/class/block/vdb/queue/max_segment_size: 4294967295
+/sys/class/block/vdc/queue/max_discard_segments: 1
+/sys/class/block/vdc/queue/max_hw_sectors_kb: 2147483647
+/sys/class/block/vdc/queue/max_integrity_segments: 0
+/sys/class/block/vdc/queue/max_sectors_kb: 2147483647
+/sys/class/block/vdc/queue/max_segments: 254
+/sys/class/block/vdc/queue/max_segment_size: 4294967295
+
+it is clear that we can submit pretty much any imaginable request, as long as the memory pages storing the data are arranged within it sequentially enough to fit queue/max_segment_size with the total number of segments no larger than queue/max_segments. The overall request size can be bound by admin, varying queue/max_sectors_kb value up to queue/max_hw_sectors_kb. Depending on the block device driver implementation, especially virtual ones, many of these parameters can be ignored by it in the end but that is overall contract/expectations.
+
+Starting with kernel 5.0.x release and consequent introduction of multi-page bvec, it became easier than ever to compose requests to block device as large as one needs to, varying from megabytes to gigabytes, as long as one has enough physically continuous memory. For Lustre server edition kernel 4.18.x the largest bio possible is still 2 MiB, unlike the typical holy grail of 1 MiB, due the number of pages in a single bvec being increased from typical 256 to 512 to accommodate transparent 2 MiB huge-page swap capabilities.
+
+Unfortunately, it appears that while Lustre RPC capable of transferring up to 64 MiB per request, the bio requests chaotically vary in size, even when on the filesystem level the space allocation is favorable and can fit the RPC whole sequentially. To simplify the illustration and to gain some performance in production environments, we’ve disabled the page cache use on the server side and increased the RPC size to the maximum:
+
+lctl set_param 'obdfilter.*-OST*.brw_size=64'
+lctl set_param osd-ldiskfs.*.read_cache_enable=0
+lctl set_param osd-ldiskfs.*.writethrough_cache_enable=0
+
+Then we used obdfilter-survey script to illustrate the behavior without a client:
+
+cd $(dirname $(which obdfilter-survey))
+export nobjhi=1
+export thrhi=1
+export size=$((1 * 1024))
+export rszlo=$((64 * 1024))
+export rszhi=$((64 * 1024))
+export rszmax=$((64 * 1024))
+export case=disk
+export targets=bigreq-OST0000
+export tests_str='write'
+exec sh obdfilter-survey 
+
+along with logging relevant debug information:
+
+# cat reproduce.sh 
+lctl debug_daemon start ./lustre-dbg.txt
+lctl set_param debug=+inode
+perf record -e 'block:block_bio_queue' -- bash ~/alx/survey.sh
+lctl debug_daemon stop
+lctl set_param debug=-inode
+lctl debug_file ./lustre-dbg.txt > lustre-dbg-plain.txt 
+
+Then one can observe something like:
+
+[root@localhost t]# mount -t lustre | awk '{ print $1; }' | xargs -I{} bash -c 'echo $((0x$(stat -c %t {}))),$((0x$(stat -c %T {})))'
+253,16
+253,32
+
+# grep osd_submit_bio lustre-dbg-plain.txt | head 00080000:00000002:3.0:1777377656.939748:0:3370:0:(osd_io.c:326:osd_submit_bio()) bio++ sz 3592192 vcnt 256(256) sectors 7016(2560) psg 877(254) 00080000:00000002:3.0:1777377656.940427:0:3370:0:(osd_io.c:326:osd_submit_bio()) bio++ sz 63516672 vcnt 241(256) sectors 124056(2560) psg 15507(254) 00080000:00000002:3.0:1777377656.950661:0:3370:0:(osd_io.c:326:osd_submit_bio()) bio++ sz 3592192 vcnt 256(256) sectors 7016(2560) psg 877(254) 00080000:00000002:3.0:1777377656.951319:0:3370:0:(osd_io.c:326:osd_submit_bio()) bio++ sz 63516672 vcnt 241(256) sectors 124056(2560) psg 15507(254) 00080000:00000002:3.0:1777377656.961277:0:3370:0:(osd_io.c:326:osd_submit_bio()) bio++ sz 3592192 vcnt 256(256) sectors 7016(2560) psg 877(254) 00080000:00000002:3.0:1777377656.961935:0:3370:0:(osd_io.c:326:osd_submit_bio()) bio++ sz 63516672 vcnt 241(256) sectors 124056(2560) psg 15507(254) 00080000:00000002:3.0F:1777377656.971789:0:3370:0:(osd_io.c:326:osd_submit_bio()) bio++ sz 3592192 vcnt 256(256) sectors 7016(2560) psg 877(254) 00080000:00000002:3.0:1777377656.972433:0:3370:0:(osd_io.c:326:osd_submit_bio()) bio++ sz 63516672 vcnt 241(256) sectors 124056(2560) psg 15507(254) 00080000:00000002:3.0:1777377656.982480:0:3370:0:(osd_io.c:326:osd_submit_bio()) bio++ sz 3592192 vcnt 256(256) sectors 7016(2560) psg 877(254) 00080000:00000002:3.0:1777377656.983150:0:3370:0:(osd_io.c:326:osd_submit_bio()) bio++ sz 63516672 vcnt 241(256) sectors 124056(2560) psg 15507(254)
+
+grep -f majmin.txt perf-script.txt | head
+             lctl    3358 [000] 70943.896093: block:block_bio_queue: 253,32 RM 1532656 + 8 [lctl]
+             lctl    3358 [000] 70943.896709: block:block_bio_queue: 253,32 RM 1536032 + 8 [lctl]
+             lctl    3358 [000] 70943.896864: block:block_bio_queue: 253,32 RM 1527848 + 8 [lctl]
+             lctl    3362 [003] 70943.905005: block:block_bio_queue: 253,16 FWS 0 + 0 [lctl]
+             lctl    3362 [003] 70943.905147: block:block_bio_queue: 253,32 FWS 0 + 0 [lctl]
+             lctl    3370 [003] 70943.922705: block:block_bio_queue: 253,32 W 20709376 + 7016 [lctl]
+             lctl    3370 [003] 70943.923379: block:block_bio_queue: 253,32 W 20716392 + 124056 [lctl]
+             lctl    3370 [003] 70943.933613: block:block_bio_queue: 253,32 W 20840448 + 7016 [lctl]
+             lctl    3370 [003] 70943.934270: block:block_bio_queue: 253,32 W 20847464 + 124056 [lctl]             lctl    3370 [003] 70943.944229: block:block_bio_queue: 253,32 W 20447232 + 7016 [lctl]
+
+So even after cranking up the RPC size to the max, the BIOs that are queued in are 3508 KiB and 62028 KiB respectively in this run, and given that the smaller request has 256 out of 256 possible bvec entries, it is clear that the issue is related to how the pages for the bio are allocated. The pattern can vary from boot to boot and even between RPCs, as there are numerous OSS threads(and IIRC at least 2).
+
+For kernel’s prior to 5.0 the issue is less direct, as one needs to rely on the luck that multiple 1-2 MiB bios(depending on which kernel the server uses) happen to merge together in, for example, blk-mq stack and thus handled by the driver as one larger request. Thus, the I/O pattern will still vary significantly between client’s RPC size and the completed bios, even when filesystem parameters, be it cluster ones(like RPC) or architectural(like ldiskfs/ext4 bigalloc options and such) are favorable.
+
+The issue can be reproduced from a client but requires extra steps, like using fio or other hugepage-capable I/O source and preallocating large(preferably 1 GiB) pages, along with setting client-side RPC size limit to the max:
+
+# depends on your architecture's PAGE_SIZE
+lctl set_param osc.*.max_pages_per_rpc=$((64 * 1024 / 4096))
+
+--- Comment (JIRAUSER21800, Tue, 28 Apr 2026 15:43:39 +0000) ---
+Example of a fio config equivalent for `obdfilter-survey` pattern(1 process / 64 MiB request / 1 GiB sequential write):
+
+[global]
+ioengine=libaio
+direct=1
+group_reporting=0
+numjobs=1
+iodepth=1
+bs=64m
+filesize=1g
+rw=write
+create_on_open=1
+iomem_align=4M
+iomem=mmaphuge
+
+[ost_debug]
+# mounted at /mnt/clt
+filename=/mnt/clt/bigreq.raw
+
+--- Comment (JIRAUSER21800, Tue, 28 Apr 2026 15:40:10 +0000) ---
+Apologies in advance for slightly messy description, I've struggled a bit with putting all the relevant details in a coherent manner.
+
+I'm planning to publish the improvement regarding this issue to Gerrit in the following weeks, at least for the case w/o cache and for `ldiskfs`. I'm currently testing/polishing it beforehand for the master.

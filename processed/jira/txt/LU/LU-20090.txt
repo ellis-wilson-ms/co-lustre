@@ -1,0 +1,203 @@
+Key:        LU-20090
+Summary:    Per‑Rule Scheduling Class type for NRS TBF
+Link:       https://jira.whamcloud.com/browse/LU-20090
+Type:       Improvement
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Qian Yingjin
+Reporter:   Qian Yingjin
+Created:    Tue, 7 Apr 2026 08:41:17 +0000
+Updated:    Thu, 23 Apr 2026 19:56:31 +0000
+Links:      Related: is related to  LU-16007; Related: is related to  LU-17296; Related: is related to  LU-17902
+
+--- Description ---
+NRS TBF: Support per-rule scheduling classes for heterogeneous rate limiting
+Background and Current Behavior
+
+The Lustre NRS TBF (Token Bucket Filter) scheduler provides rate limiting for incoming PTLRPC requests on the server side. Currently, administrators define rules (e.g., NID/JobID or nodemap) to group requests into "classes" and attach a token bucket to each class to enforce bandwidth or request-rate limits.
+
+In the current implementation:
+
+A TBF scheduler instance is configured with one global classification type (e.g., NID-based TBF or Nodemap-based TBF).
+
+This classification type applies to all rules within that TBF scheduler instance.
+
+Constraints of this approach:
+
+	Administrators cannot mix per-NID and per-nodemap rules in the same scheduler.
+
+	It is impossible to choose different grouping granularities for different traffic classes on the same service.
+
+	Different traffic types often require different scopes (e.g., some need per-client limits, others need per-tenant/nodemap limits).
+
+Design Goal
+
+Introduce per-rule scheduling classes (classification types) for NRS TBF to achieve the following:
+
+Allow each TBF rule to independently choose how its matching requests are grouped into token buckets (e.g., per-NID, per-nodemap, or various combination of NID/Nodemap/Opcode/JobID/UID/GID, et, al).
+
+Enable a single TBF scheduler instance to contain a heterogeneous mix of rule types.
+
+Increase the expressiveness of the configuration model while preserving existing global defaults.
+
+Maintain full backwards compatibility with current NID-only or nodemap-only setups.
+
+Requirements
+Functional Requirements
+
+Per-rule scheduling class
+
+	Every TBF rule must have a configurable scheduling class (classification type).
+
+	Supported types should include nid, nodemap, JobID, UID, GID, ProjID, Opcode and their combinations.
+
+Rule–to–bucket mapping
+
+	The TBF scheduler must identify the matching rule for a given incoming request.
+
+	The bucket key must be computed according to that specific rule’s scheduling class.
+
+	Token accounting must be applied against the selected bucket.
+
+Rule heterogeneity
+
+	Multiple rules with different scheduling classes (TBF types) must coexist within one TBF scheduler instance (e.g., Rule A is per-NID, Rule B is per-nodemap, Rule C is the combination of NID+Opcode).
+
+Scheduler-level default
+
+ **The existing scheduler-level type shall remain as a default scheduling class for rules that do not explicitly specify one.
+
+Non-Functional Requirements
+
+Backward compatibility
+
+	Existing configurations specifying only "NID TBF" or "Nodemap TBF" at the scheduler level must continue to behave exactly as before.
+
+Low overhead
+
+	Request classification and bucket lookup must remain O(1) or near-O(1) per request (using rhashtable).
+
+	Additional logic for per-rule classes must be minimal to avoid performance degradation.
+
+Operational clarity
+
+	The configuration interface must clearly express rule match conditions, the scheduling class, and the effective rate limit scope.
+
+High-Level Design
+Rule-Level Scheduling Class
+
+Each TBF rule is extended to carry a scheduling class type attribute. If a rule omits this field, the rule type defaults to the scheduler-level default class type.
+
+Example syntax:
+
+Per-NID rule
+ost.OSS.ost_io.nrs_tbf_rule="start rule1 nid={192.168.23.10} rate=100 type=nid"
+Per-Nodemap rule
+ost.OSS.ost_io.nrs_tbf_rule="start rule2 nodemap={storage_group} rate=50 type=nodemap"
+Combined NID and Opcode rule
+ost.OSS.ost_io.nrs_tbf_rule="start rule3 nid={192.168.23.19}&opcode={ost_read} rate=30 type=nid+opcode"
+
+Or the class type of a rule can be detected automatically from the matching conditions if the detect one is not same with the default global one of the NRS TBF scheduler:
+
+i.e.
+
+ 
+
+nrs_tbf_rule="start ruleauto nid={10.0.0.1}&opcode={ost_write}&uid={100} rate=10"
+
+it can automatically detect that the rule class type is the combination of nid+opcode+uid.
+
+Backwards Compatibility
+
+To avoid breaking existing deployments:
+
+Scheduler-level type preservation
+
+	Legacy settings (NID TBF / Nodemap TBF / JobID TBF) remain and serve as the default scheduling class for all rules in that scheduler.
+
+Legacy Rule Behavior
+
+	Rules installed without specifying a scheduling class rypw will yield identical behavior to current versions (same grouping and rate semantics).
+
+Opt-in Mixed Mode
+
+	Heterogeneous scheduling classes are only utilized when the operator explicitly specifies the type parameter in new or updated rules.
+
+--- Comment (adilger, Thu, 23 Apr 2026 19:37:37 +0000) ---
+qian_wc, I think a very critical problem with NRS TBF is that there are a growing number of options for configuring rules, but it keeps on becoming more complex and harder to use.  It isn't clear to me if anyone other than yourself actually understands how to use TBF effectively.  It isn't only that there is a lack of documentation on how to use NRS TBF (though that is itself a big problem), but also that the number of different ways to configure TBF rates still do not lead to a clear way to specify limits that users/administrators could do themselves.
+
+One set of users (HPC/University) want to specify a simple rule like "users should be able to use the full bandwidth/IOPS when there is no contention, but under contention fair share bandwidth and IOPS across (PROJID if non-zero, otherwise UID), and short-running JobIDs should have higher priority than long running JobIDs".  That allows computations to finish as quickly as possible, but avoids "noisy neighbor" issues where one job/user is overloading the storage, or "ls -l" taking 5 minutes to run instead of 5 seconds because of a big HPC/AI batch job that is doing IO continually for 10h. 
+
+Another set of users (cloud/MTFL) want to specify simple rules like "all nodes using nodemap NNNN have an upper limit of X GB/s and Y IOPS", or ideally have a default like "all nodes of any single nodemap have a limit of X GB/s and Y IOPS, unless a specific rule is added for a nodemap", and  then within the nodemap limits use the HPC/Universit rule to "fair share" bandwidth/IOPS across PROJID/UID/JobID.
+
+Ideally a single rate could be specified across all OSS nodes, but even for per-OSS rates I don't think that there is a simple way to implement such limits.
+
+I don't think adding even more complex ways to specify a large number of rules is what any users want, but rather a way to specify simple rules that achieve their goals.  Ideally it should be possible to specify a single default rule for every filesystem (the "fair share" one) that works well for 90% of sites.  I think if a user needs to specify so many TBF rules that O(n^2) issues start to become a performance problem, then there is something fundamentally wrong with how TBF rules are specified and not with the efficiency of rule matching.
+
+It may be that the right answer is to use the "fairshare" NRS for the first use case, and then stack TBF to provide a rate limit on top of this for the second use case.  TBF seems fundamentally better for limiting rates (given that it was originally for real-time voice traffic management), but poor at distributing or balancing usage for real users.  If the NRS stacking/chaining of rules was known to be working well, then I think most of the complexity being added to TBF could be avoided.
+
+--- Comment (gerrit, Tue, 21 Apr 2026 08:36:06 +0000) ---
+"Qian Yingjin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/65433
+
+Subject: LU-20090 nrs: use allowed classification types for bucket lookup
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 2153f597c426293e27f143196a1c31d2256a7f9c
+
+--- Comment (gerrit, Mon, 20 Apr 2026 03:24:22 +0000) ---
+"Qian Yingjin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/65412
+
+Subject: LU-20090 nrs: add allowed dynamic classification types for TBF
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: f3eedc71d7668e60a1008d5c8f81f8d5241609e7
+
+--- Comment (gerrit, Sun, 19 Apr 2026 02:25:52 +0000) ---
+"Qian Yingjin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/65407
+
+Subject: LU-20090 nrs: add dynamic granularity classifier for TBF
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 97535ab62cc06e88eabbc3700d9d445ddb76307a
+
+--- Comment (gerrit, Fri, 17 Apr 2026 08:30:43 +0000) ---
+"Qian Yingjin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/65391
+
+Subject: LU-20090 nrs: add static and dynamic classify conf for TBF policy
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 5c12ed3f2cc354d075678e18bfe75650d7a559a1
+
+--- Comment (gerrit, Thu, 16 Apr 2026 06:39:42 +0000) ---
+"Qian Yingjin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/65369
+
+Subject: LU-20090 nrs: use fixed size key for NRS TBF class bucket
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: e933b5e512fffa08829fee79b99898aba74c3c32

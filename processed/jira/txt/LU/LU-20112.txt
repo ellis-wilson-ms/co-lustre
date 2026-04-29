@@ -1,0 +1,73 @@
+Key:        LU-20112
+Summary:    sanity test_101k: verify drop_caches evicts non-pinned Lustre client pages
+Link:       https://jira.whamcloud.com/browse/LU-20112
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Patrick Farrell
+Created:    Thu, 9 Apr 2026 23:34:01 +0000
+Updated:    Fri, 10 Apr 2026 22:58:47 +0000
+
+--- Description ---
+Add a sanity test (test_101k) that verifies drop_caches actually evicts Lustre client page cache pages.
+
+Original investigation reframed: Lustre's drop_caches behavior is correct as designed. The kernel-level reclaim path (mapping_evict_folio in mm/truncate.c) checks the folio refcount against (nr_pages + has_private + 1) before calling release_folio. With Lustre's normal page state, this means a folio in the page cache with no in-flight RPC has refcount 3 (page cache + vvp_page_init's get_page + find_lock_entries elevation), which passes the threshold and gets evicted via ll_release_folio -> do_release_page.
+
+What was confusing: write pages stay pinned for replay until the OST commits the write, because osc_brw_prep_request uses ptlrpc_bulk_kiov_pin_ops, which holds an extra get_page on every page in the bulk descriptor until ptlrpc_release_bulk_page_pin runs. This is intentional and required for write replay during recovery – the window between completion and commit can be arbitrarily long.
+
+That means:
+
+	Pages from a read-only or already-committed file: drop_caches works.
+
+	Pages from a freshly-written file (commit not yet received): drop_caches DOES NOT evict them, by design.
+
+There is no bug. test_101k validates the working behavior:
+
+  1. Write 4 MiB + conv=fsync (forces server commit -> bulk pin released)
+
+  2. drop_caches=1
+
+  3. Re-read and confirm at least one ost_read happened (cache miss)
+
+  4. Same flow without writing: cancel_lru_locks osc, read, drop, re-read, confirm cache miss
+
+Side note (worth a separate ticket if anyone cares): global sync(2) does NOT drain Lustre's bulk pins. Only fsync(fd) (or per-file conv=fsync) does, because only fsync goes through ll_fsync -> OST_SYNC. Making sync(2) wait for OST commit would be expensive on every call, so leaving it as-is.
+
+The original symptom report was investigated under https://review.whamcloud.com/65222 (now abandoned – the proposed fix was a no-op in dead code, see review for details).
+
+--- Comment (gerrit, Fri, 10 Apr 2026 22:54:24 +0000) ---
+"Patrick Farrell " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/65227
+
+Subject: LU-20112 tests: verify drop_caches evicts client cache pages
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 63d458577a785ddc2b7e2fcc158584fde1552515
+
+--- Comment (paf0186, Fri, 10 Apr 2026 22:50:38 +0000) ---
+Reframing this ticket. Original investigation reported drop_caches failing on Lustre, but a closer look (with mincore() and bpftrace) shows drop_caches works correctly – pages from a read-only or already-committed file are evicted as expected. The cases that 'failed' were pages still bulk-pinned for write replay (osc_brw_prep_request uses ptlrpc_bulk_kiov_pin_ops, which holds an extra get_page until the OST commit reaps the request). That is intentional and required for recovery.
+
+Specifically, the kernel's mapping_evict_folio refcount check (>nr_pages+has_private+1, i.e. >3) passes for ordinary cached pages and rejects pages still bulk-pinned. With the bulk pin held the refcount is 4, without it 3. So the 'fix' in https://review.whamcloud.com/65222 was solving a non-problem – the put_page it added in do_release_page was in dead code, because release_folio is never called when the bulk pin is still held.
+
+Action: abandon https://review.whamcloud.com/65222 (done) and add sanity test_101k that verifies drop_caches actually evicts both read pages and write+fsync pages.
+
+Side note: global sync(2) does NOT drain Lustre's bulk pins. Only fsync(fd) goes through ll_fsync -> OST_SYNC and forces commit. Documenting in case it surprises anyone else; not fixing because making sync(2) wait for OST commit would be expensive on every call.
+
+--- Comment (gerrit, Fri, 10 Apr 2026 16:28:39 +0000) ---
+"Patrick Farrell " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/65222
+
+Subject: LU-20112 llite: drop vmpage ref in do_release_page
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 2c5c6c6dc00c221ca9d4cc75e5dfffbcffce864f

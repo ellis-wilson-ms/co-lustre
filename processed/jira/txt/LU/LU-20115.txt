@@ -1,0 +1,424 @@
+Key:        LU-20115
+Summary:    ll_readpage() leaks internal -ENODATA to external a_ops->read_folio callers, breaking EROFS file-backed mode
+Link:       https://jira.whamcloud.com/browse/LU-20115
+Type:       Bug
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Hui Chen
+Created:    Fri, 10 Apr 2026 06:27:17 +0000
+Updated:    Tue, 14 Apr 2026 02:00:58 +0000
+Labels:     erofs, file-backed-mode, llite, readpage
+
+--- Environment ---
+Kernel: 6.14.0 (Ubuntu linux-hwe-6.14, also reproducible on mainline 6.14+)
+
+Lustre: master branch (lustre/llite/rw.c, ll_readpage function)
+
+Backing filesystem: EROFS image file stored on Lustre mount
+
+EROFS mount method: file-backed mode (new in kernel 6.14, via fsconfig() syscalls)
+
+Test node OS: Ubuntu 24.04 with HWE kernel 6.14
+
+--- Description ---
+```
+
+Summary
+
+Lustre's ll_readpage() (the a_ops->read_folio implementation) returns -ENODATA when called without a pre-established cl_io context and the requested page is not already in the page cache. This -ENODATA is an internal signal used by Lustre's "fast read" mechanism, intended to be caught by ll_do_fast_read() and converted to a fallback to the slow I/O path.
+
+However, when external kernel subsystems call a_ops->read_folio directly (bypassing Lustre's f_op->read_iter), this internal error leaks out and causes failures. The most prominent affected use case is EROFS file-backed mode (introduced in Linux 6.14), which calls read_mapping_folio() → a_ops->read_folio to read metadata from the backing file.
+
+This bug exists in the current Lustre master branch — the io == NULL branch in ll_readpage() has identical logic.
+
+Steps to Reproduce
+
+	Store an EROFS image file on a Lustre filesystem (e.g., /mnt/lustre/images/layer.img)
+
+	Attempt to mount it using EROFS file-backed mode:
+
+int ctx_fd = fsopen("erofs", 0);
+fsconfig(ctx_fd, FSCONFIG_SET_STRING, "source", "/mnt/lustre/images/layer.img", 0);
+fsconfig(ctx_fd, FSCONFIG_CMD_CREATE, NULL, NULL, 0);  // ← fails with ENODATA
+
+	Observe that fsconfig(CMD_CREATE) returns -ENODATA (errno 61).
+
+Interesting observation: If you first run md5sum /mnt/lustre/images/layer.img (which populates the page cache via the normal read() path), then the EROFS mount succeeds. After echo 3 > /proc/sys/vm/drop_caches, it fails again. This confirms the issue is related to page cache state.
+
+Root Cause Analysis
+
+The call chain that fails
+
+EROFS file-backed mode reads metadata via read_mapping_folio(), which directly invokes a_ops->read_folio:
+
+erofs_fc_fill_super()                          // fs/erofs/super.c
+  → erofs_read_superblock()
+    → erofs_read_metabuf()
+      → erofs_bread()                          // fs/erofs/data.c
+        → read_mapping_folio(mapping, index, file)
+          → read_cache_folio()                 // include/linux/pagemap.h
+            → filemap_read_folio()             // mm/filemap.c
+              → a_ops->read_folio(file, folio)
+                → ll_readpage(file, vmpage)    // lustre/llite/rw.c
+
+The problematic code in ll_readpage()
+
+In lustre/llite/rw.c, the ll_readpage() function:
+
+int ll_readpage(struct file *file, struct page *vmpage)
+{
+    // ...
+    lcc = ll_cl_find(inode);   // Search for cl_io context on current task
+    if (lcc != NULL) {
+        env = lcc->lcc_env;
+        io  = lcc->lcc_io;
+    }
+
+    if (io == NULL) { /* fast read */
+        result = -ENODATA;
+
+        page = cl_vmpage_page(vmpage, clob);
+        if (page == NULL) {
+            unlock_page(vmpage);
+            // *** BUG: returns -ENODATA to ANY caller, including external ones ***
+            RETURN(result);
+        }
+        // ... only handles pages already in cl_page cache (fast read hit) ...
+    }
+
+    // io != NULL: full slow read path with cl_io context
+    // ...
+}
+
+The cl_io context is established by ll_cl_add() inside ll_file_io_generic(), which is called from ll_file_read_iter() (i.e., f_op->read_iter). When a_ops->read_folio is called directly by an external consumer (like EROFS's read_mapping_folio()), no cl_io context exists, so ll_cl_find() returns NULL, io is NULL, and if the page is not already cached, -ENODATA is returned.
+
+Why -ENODATA is an internal signal, not a proper error
+
+In Lustre's normal read path, -ENODATA from ll_readpage() is caught by ll_do_fast_read() in lustre/llite/file.c:
+
+static ssize_t ll_do_fast_read(struct kiocb *iocb, struct iov_iter *iter)
+{
+    result = generic_file_read_iter(iocb, iter);
+    if (result == -ENODATA)
+        result = 0;  // Convert to 0, causing fallback to ll_file_io_generic()
+    return result;
+}
+
+This works for Lustre's own read path because ll_do_fast_read() acts as a sentinel. But external callers like EROFS have no knowledge of this convention and propagate -ENODATA as a real error.
+
+The architectural issue
+
+Lustre's address_space_operations are not self-contained. They depend on a cl_io context that is established at the file_operations level:
+
+┌─────────────────────────────────────────────────────────────────┐
+│  file_operations (ll_file_read_iter)                            │
+│    → ll_file_io_generic()                                       │
+│      → ll_cl_add()          ← establishes cl_io context        │
+│      → cl_io_loop()                                             │
+│        → vvp_io_read_start()                                    │
+│          → generic_file_read_iter()                             │
+│            ↓                                                    │
+│  address_space_operations (ll_readpage)                          │
+│    → ll_cl_find()           ← requires pre-established context  │
+│    → if no context: return -ENODATA (fast read signal)          │
+└─────────────────────────────────────────────────────────────────┘
+
+Any caller that invokes a_ops->read_folio directly (bypassing f_op->read_iter) will hit this issue. This includes:
+
+	EROFS file-backed mode (read_mapping_folio() in fs/erofs/data.c)
+
+	Kernel module read_mapping_folio() calls
+
+	Any future in-kernel consumer of Lustre file page cache
+
+Impact
+
+	EROFS file-backed mode (Linux 6.14+) cannot mount images stored on Lustre.
+
+	Any in-kernel subsystem that calls read_mapping_folio() or read_cache_folio() on a Lustre file will get unexpected -ENODATA errors when the page is not cached.
+
+	The workaround of pre-populating page cache (e.g., via md5sum) is fragile and breaks after drop_caches or memory pressure.
+
+Proposed Fix
+
+Make ll_readpage() self-contained when called without a cl_io context, similar to how ll_writepage() handles the writeback path (which also lacks a pre-established cl_io).
+
+ll_writepage() already demonstrates the pattern of creating a temporary cl_io context:
+
+// lustre/llite/rw.c - ll_writepage() (existing code)
+int ll_writepage(struct page *vmpage, struct writeback_control *wbc)
+{
+    // ...
+    env = cl_env_get(&refcheck);
+    io = vvp_env_thread_io(env);
+    io->ci_obj = clob;
+    io->ci_ignore_layout = 1;
+    result = cl_io_init(env, io, CIT_MISC, clob);
+    if (result == 0) {
+        page = cl_page_find(env, clob, vmpage->index, vmpage, CPT_CACHEABLE);
+        // ... perform I/O with temporary cl_io context ...
+    }
+    cl_io_fini(env, io);
+    cl_env_put(env, &refcheck);
+    // ...
+}
+
+The same approach should be applied to ll_readpage() in the io == NULL && page == NULL branch — create a temporary cl_io context to service the read request, so that external callers get a proper result instead of the internal -ENODATA signal.
+
+Considerations
+
+	Performance: This path is only taken when io == NULL AND the page is not cached. In Lustre's normal read path, ll_do_fast_read() catches -ENODATA and retries via ll_file_io_generic(). So this new code path would primarily be exercised by external callers.
+
+	Locking: CIT_MISC with ci_ignore_layout = 1 avoids layout lock acquisition, matching the ll_writepage() pattern.
+
+	Backward compatibility: The existing -ENODATA fast read signal path for Lustre's own I/O is unchanged.
+
+Related: Secondary issue with loop device
+
+The same root cause also manifests when using a loop device (buffered I/O mode) on top of a Lustre file. After drop_caches, the -ENODATA from ll_readpage() during the page_cache_sync_ra() phase can leave non-uptodate folios in the page cache, which may cause subtle issues in subsequent reads.
+
+```
+
+--- Comment (paf0186, Tue, 14 Apr 2026 02:00:58 +0000) ---
+Thanks, Hui - I see one significant issue here, ll_file_data is a file level structure.  You need something process linked here, otherwise you can’t tell what process is doing a fast read.  You’ll get false positives.  It might seem to work but isn’t a reliable way to identify a call to readpage.
+
+I think the only option is probably going to be to use the existing mechanism for passing context from read_iter (etc) to readpage:
+
+struct ll_cl_context *lcc;
+
+My suggestion would be to look at that - today, we rely on there not being an IO in the context to identify a fast read.  We could probably stick a flag in the cl_context so we don’t have to start allocating a cl_io.
+
+The other part of the approach is probably ok, though I’ll have to look at the actual code.
+
+I encourage you to submit a patch in Gerrit and I’ll take a look.  (The Lustre community after all is all of us.)
+
+--- Comment (JIRAUSER17600, Tue, 14 Apr 2026 01:31:22 +0000) ---
+I apologize for the poor impression earlier. Let me describe the approach we've chosen.
+
+We add a `fd_fast_read_task` field to `ll_file_data`. `ll_do_fast_read()` sets it to `current` before entering and clears it upon exit. `ll_readpage()` then checks this field:
+
+	Equals `current` → Lustre's own fast read, behavior unchanged, returns `-ENODATA`.
+
+	Not equal to `current` → External caller, takes the newly added `external_read` path: triggers a full Lustre read via `cfs_kernel_read()` (going through `ll_file_read_iter` → DLM lock acquisition → OSC IO). Once the data is populated in the page cache, it returns `AOP_TRUNCATED_PAGE` so the caller retries and hits the cache directly.
+
+The reason we chose `cfs_kernel_read()` is that it goes through the normal VFS read path, keeping the lock acquisition order identical to a regular read, which avoids introducing any new lock ordering issues. The change is minimally invasive. That said, we are not yet certain whether there are potential risks, and we are still running stress tests.
+
+--- Comment (paf0186, Mon, 13 Apr 2026 16:59:24 +0000) ---
+OK, sorry - I'd like you to write up your proposed change yourself.
+
+This is clearly LLM generated text copy-pasted.  It repeats the problem statement and describes how you found it in detail, generating a post which is mostly noise.
+
+I would like a clear statement from you about the proposed change and its issues which does not have all of this boilerplate commentary about "I agree", etc.
+
+To be clear, I am happy to have LLMs used to help with Lustre dev (for example, I expect at least the initial patch to be generated by an LLM after we agree on a design), but we cannot entirely outsource the communication.
+
+--- Comment (JIRAUSER17600, Mon, 13 Apr 2026 14:43:40 +0000) ---
+Hi Patrick,
+
+Thank you for the review feedback on our patch. Let me share our complete approach with the actual code changes, and address the concerns raised.
+
+Problem Summary
+
+When EROFS operates in file-backed mode on top of a Lustre file, it calls read_mapping_folio() for metadata reads, which invokes ll_readpage(). The -ENODATA return — intended as a Lustre-internal signal for ll_do_fast_read() to fall back to the slow path — leaks out to EROFS and becomes a real ENODATA error visible to userspace (e.g. du reports "No data available").
+
+This is not specific to EROFS — any kernel subsystem that calls read_mapping_folio() on a Lustre file's address_space would hit the same issue.
+
+Root Cause (confirmed by ftrace)
+
+We reproduced the issue with ftrace function_graph tracing (with funcgraph-retval enabled) and confirmed two ENODATA leak scenarios:
+
+Scenario A — page == NULL (page not in cl_page cache):
+
+erofs_lookup → erofs_iget → erofs_read_inode → erofs_read_metabuf
+  → erofs_bread → read_mapping_folio → ll_readpage
+  → io == NULL, page == NULL → unconditionally returns -ENODATA
+  → propagates to vfs_statx → du reports "No data available"
+
+Scenario B — page != NULL but unusable:
+
+erofs_readdir → erofs_bread → read_mapping_folio → ll_readpage
+  → io == NULL, cl_vmpage_page() returns non-NULL
+  → vpg_defer_uptodate == false, ll_use_fast_io() == false
+  → result stays -ENODATA → leaks to EROFS
+
+From our trace log (~1.5M lines), statistics:
+
+	ll_readpage returned -61 (ENODATA): 506 times
+
+	vfs_statx returned -61 to userspace: 13 times (the visible failures)
+
+	The remaining ~494 were internal fast read misses handled correctly by ll_do_fast_read()
+
+Our Fix Approach
+
+The key idea: use a fd_fast_read_task marker to distinguish Lustre's own fast read path (which expects -ENODATA as an internal signal) from external callers (which need actual data). When an external caller is detected, use cfs_kernel_read() to re-enter through the standard VFS path and populate the page.
+
+Change 1: New field in ll_file_data (llite_internal.h)
+
+struct ll_file_data {
+    ...
+    /* Task pointer set by ll_do_fast_read() to indicate that the
+     * current task is in the fast read path. ll_readpage() checks
+     * this to distinguish Lustre's own fast read miss (should return
+     * -ENODATA for fallback to slow path) from external callers
+     * like EROFS file-backed mode (should perform actual read). */
+    struct task_struct *fd_fast_read_task;
+    ...
+};
+
+Change 2: Mark fast read context in ll_do_fast_read() (file.c)
+
+static ssize_t
+ll_do_fast_read(struct kiocb *iocb, struct iov_iter *iter)
+{
+    struct ll_file_data *fd = LUSTRE_FPRIVATE(iocb->ki_filp);
+    ssize_t result;
+
+    if (!ll_sbi_has_fast_read(ll_i2sbi(file_inode(iocb->ki_filp))))
+        return 0;
+
+    if (iocb->ki_filp->f_flags & O_DIRECT)
+        return 0;
+
+    /* Mark that current task is in fast read path so that
+     * ll_readpage() can distinguish Lustre's own fast read miss
+     * (return -ENODATA for fallback) from external callers like
+     * EROFS file-backed mode (perform actual read). */
+    fd->fd_fast_read_task = current;
+    result = generic_file_read_iter(iocb, iter);
+    fd->fd_fast_read_task = NULL;
+
+    if (result == -ENODATA)
+        result = 0;
+    ...
+}
+
+Change 3: Handle external callers in ll_readpage() (rw.c)
+
+/* In the io == NULL (fast read) branch: */
+
+if (io == NULL) { /* fast read */
+    ...
+    result = -ENODATA;
+
+    page = cl_vmpage_page(vmpage, clob);
+    if (page == NULL) {
+        /*
+         * Page not in Lustre cl_page cache and no cl_io context.
+         * Two cases:
+         *
+         * 1) Lustre fast read miss: ll_do_fast_read() sets
+         *    fd_fast_read_task before calling generic_file_read_iter().
+         *    Return -ENODATA so ll_do_fast_read() falls back to slow path.
+         *
+         * 2) External caller (e.g. EROFS file-backed
+         *    read_mapping_folio()): fall through to cfs_kernel_read() retry.
+         */
+        if (fd->fd_fast_read_task == current) {
+            /* Case 1: Lustre fast read miss — behavior unchanged */
+            unlock_page(vmpage);
+            ll_ra_stats_inc_sbi(sbi, RA_STAT_FAILED_FAST_READ);
+            RETURN(result);
+        }
+
+        /* Case 2: fall through to cfs_kernel_read retry */
+        unlock_page(vmpage);
+        goto external_read;
+    }
+
+    /* ... existing page handling (vpg_defer_uptodate, etc.) ... */
+
+    /*
+     * If result is still -ENODATA and this is NOT a Lustre internal
+     * fast read, then an external caller hit a page in cl_page cache
+     * but not usable. Fall through to cfs_kernel_read().
+     */
+    if (result == -ENODATA && fd->fd_fast_read_task != current)
+        goto external_read;
+
+    RETURN(result);
+}
+
+/* ... io != NULL path unchanged ... */
+RETURN(result);
+
+external_read:
+    /*
+     * External caller (e.g. EROFS file-backed read_mapping_folio())
+     * without cl_io context. Use cfs_kernel_read() to trigger the
+     * full Lustre IO path which acquires DLM locks properly, then
+     * return AOP_TRUNCATED_PAGE so the caller retries from page cache.
+     */
+    {
+        struct ll_file_data *fd = LUSTRE_FPRIVATE(file);
+        struct task_struct *saved_task;
+        loff_t pos = (loff_t)vmpage->index char *tmpbuf;
+        ssize_t readrc;
+
+        tmpbuf = kmalloc(PAGE_SIZE, GFP_NOFS);
+        if (tmpbuf == NULL)
+            RETURN(-ENOMEM);
+
+        /*
+         * Save/restore fd_fast_read_task: cfs_kernel_read() calls
+         * ll_file_read_iter() → ll_do_fast_read() which sets
+         * fd_fast_read_task = current. The re-entrant ll_readpage()
+         * correctly returns -ENODATA (Case 1), and ll_do_fast_read()
+         * handles it by falling back to the slow IO path.
+         */
+        saved_task = fd->fd_fast_read_task;
+        readrc = cfs_kernel_read(file, tmpbuf, PAGE_SIZE, &pos);
+        fd->fd_fast_read_task = saved_task;
+
+        kfree(tmpbuf);
+
+        if (readrc "kernel_read failed for page %ld: rc = %zd\n",
+                   vmpage->index, readrc);
+            RETURN(readrc);
+        }
+        if (readrc == 0) {
+            CERROR("kernel_read EOF for page %ld: page beyond file size\n",
+                   vmpage->index);
+            RETURN(-EIO);
+        }
+
+        RETURN(AOP_TRUNCATED_PAGE);
+    }
+}
+
+Addressing the Hot Path Concern
+
+The concern about io == NULL && page == NULL being a hot path is valid. However:
+
+1. Our patch adds only a single pointer comparison (fd->fd_fast_read_task == current) in this branch. The fd struct is already dereferenced on the same line to access fd->fd_ras, so fd_fast_read_task is in the same cache line with zero additional memory access cost.
+
+2. For Lustre's own fast read path, fd_fast_read_task == current is always true (set by ll_do_fast_read() just before calling generic_file_read_iter()), so the behavior is identical to the original code — we still return -ENODATA immediately.
+
+3. The external_read fallback is placed after the io != NULL path's RETURN(result), so it is never reached during normal Lustre IO.
+
+Why cfs_kernel_read() Instead of Calling ll_file_io_generic() Directly
+
+We considered calling ll_file_io_generic() directly from ll_readpage(), but:
+
+1. ll_file_io_generic() requires struct lu_env * and struct vvp_io_args with a properly initialized kiocb, which are non-trivial to construct from within a readpage callback.
+
+2. Creating a temporary cl_io is "way more complex than it looks" — and we agree.
+
+3. cfs_kernel_read() (wrapping kernel_read()) re-enters through the standard VFS path: vfs_read() → ll_file_read_iter() → ll_do_fast_read() (fails with -ENODATA, falls back) → ll_file_io_generic(). So it ultimately does call ll_file_io_generic(), just through the well-tested VFS entry point.
+
+Does the Lustre community plan to address the -ENODATA leaking from ll_readpage() to external callers in a future release? .
+
+We understand that our cfs_kernel_read() approach is a practical workaround rather than an ideal long-term solution. We look forward to seeing the community develop a more elegant fix — perhaps a cleaner way to handle external readpage callers within the Lustre IO framework, such as a lightweight cl_io initialization path or a dedicated external-caller API in ll_readpage().
+
+In the meantime, our patch resolves the immediate issue for EROFS file-backed mode and any other external caller that invokes read_mapping_folio() on a Lustre file. 
+
+Thanks,
+
+--- Comment (paf0186, Fri, 10 Apr 2026 16:45:34 +0000) ---
+OK, so this is well written (and the problem itself seems reasonable), but it seems to have a fatal flaw.  Also 'temporary cl io to service the read request' is doing a lot of work here - That covers a LOT of ground with a few words.  Anyway:
+
+The io == NULL and page == NULL path is an extremely common path.  All reads of uncached data hit this path - we always attempt a fast read, then whenever there's nothing in cache, we return ENODATA to fall back to regular read.  That's the primary read path in Lustre - attempt fast read, fail because data is not cached, go back to regular read.
+
+This proposed path would swallow that.  We could conceivably restructure the whole path here to actually just call ll_file_io_generic from readpage when we find no page in the cache?  In that case I think ll_file_read_iter would look pretty different.  That might work, but there is a lot more to this than just creating a temporary cl_io.

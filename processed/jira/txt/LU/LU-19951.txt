@@ -1,0 +1,157 @@
+Key:        LU-19951
+Summary:    Deadlock between kswapd writeback and writer extent hold
+Link:       https://jira.whamcloud.com/browse/LU-19951
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Sohei Koyama
+Reporter:   Sohei Koyama
+Created:    Fri, 6 Mar 2026 09:13:32 +0000
+Updated:    Fri, 10 Apr 2026 17:09:04 +0000
+Resolved:   Fri, 10 Apr 2026 17:09:04 +0000
+Attachments: repro-deadlock-v7.sh
+
+--- Environment ---
+RHEL 8
+
+--- Description ---
+A writer can permanently deadlock in `wait_on_page_writeback()` when kswapd's `osc_flush_async_page()` races with the writer's `osc_extent_find()`. The writer holds the extent (CACHE -> ACTIVE), removing it from the urgent list, while a page within that extent has already been marked PG_writeback by kswapd. Since the extent is no longer on any flush list, ptlrpcd cannot submit the RPC, and PG_writeback is never cleared.
+
+backtrace:
+
+PID: 276763   TASK: ff398e6f571e8000  CPU: 1    COMMAND: "orca_scfresp_mp"
+ #0 [ff567d29070c7920] __schedule at ffffffffaddfb5d1
+ #1 [ff567d29070c7978] schedule at ffffffffaddfbbc5
+ #2 [ff567d29070c7990] io_schedule at ffffffffaddfbff2
+ #3 [ff567d29070c79a0] wait_on_page_bit at ffffffffad69bb9d
+ #4 [ff567d29070c7a30] wait_on_page_writeback at ffffffffad6a530b
+ #5 [ff567d29070c7a50] cl_page_assume at ffffffffc0fb918f [obdclass]
+ #6 [ff567d29070c7a70] ll_write_begin at ffffffffc14f43d1 [lustre]
+ #7 [ff567d29070c7b08] generic_perform_write at ffffffffad69a122
+ #8 [ff567d29070c7b80] __generic_file_write_iter at ffffffffad69f5e2
+ #9 [ff567d29070c7bc0] vvp_io_write_start at ffffffffc150664b [lustre]
+#10 [ff567d29070c7c68] cl_io_start at ffffffffc0fbcafd [obdclass]
+#11 [ff567d29070c7c90] cl_io_loop at ffffffffc0fc03ba [obdclass]
+#12 [ff567d29070c7cc8] ll_file_io_generic at ffffffffc14ae287 [lustre]
+#13 [ff567d29070c7de0] ll_file_write_iter at ffffffffc14af377 [lustre]
+#14 [ff567d29070c7e48] new_sync_write at ffffffffad7619f2
+#15 [ff567d29070c7ed0] vfs_write at ffffffffad7651f5
+#16 [ff567d29070c7f00] ksys_write at ffffffffad76547f
+#17 [ff567d29070c7f38] do_syscall_64 at ffffffffad4052fb
+#18 [ff567d29070c7f50] entry_SYSCALL_64_after_hwframe at ffffffffae0000a9  
+
+This deadlock was observed in production (two independent crash dumps)
+
+and has been reproduced in a controlled environment.
+
+ 
+
+vmcore A
+[10526155.170217] LustreError: 171775:0:(osc_cache.c:966:osc_extent_wait()) extent 00000000e846159a@{[868352 -> 872447/872447], 0x640002b12:15526682, [3|1|-|active|wiumY|0000000034195d39], [16801792|4096|+|-|00000000f16e61a1|4096|0000000000000000]} lustre-OST000d-osc-ff398e8ad10c7800: wait ext to 0 timedout, recovery in progress?
+[10526155.204213] LustreError: 171775:0:(osc_cache.c:966:osc_extent_wait()) ### extent: 00000000e846159a ns: lustre-OST000d-osc-ff398e8ad10c7800 lock: 00000000f16e61a1/0x481b7cbf9e628197 lrc: 4/0,1 mode: PW/PW res: [0x640002b12:0xeceb1a:0x0].0x0 rrc: 2 type: EXT [0->18446744073709551615] (req 0->8191) gid 0 flags: 0x800020000020000 nid: local remote: 0x10b74e7a9ea44f72 expref: -99 pid: 276754 timeout: 0 lvb_type: 1
+
+vmcore B
+[10526428.585653] LustreError: 1945609:0:(osc_cache.c:966:osc_extent_wait()) extent 00000000af65055c@{[626688 -> 628623/630783], 0x380002341:17250588, [3|1|-|active|wiumY|00000000d6f15408], [7954432|1936|+|-|00000000d0868a5b|4096|0000000000000000]} lustre-OST0002-osc-ff446739cf1af000: wait ext to 0 timedout, recovery in progress?
+[10526428.619740] LustreError: 1945609:0:(osc_cache.c:966:osc_extent_wait()) ### extent: 00000000af65055c ns: lustre-OST0002-osc-ff446739cf1af000 lock: 00000000d0868a5b/0xb71b13af44b7eeca lrc: 4/0,1 mode: PW/PW res: [0x380002341:0x107391c:0x0].0x0 rrc: 2 type: EXT [0->18446744073709551615] (req 0->8191) gid 0 flags: 0x800020000020000 nid: local remote: 0x74720f32a65f052c expref: -99 pid: 1941346 timeout: 0 lvb_type: 1 
+
+ 
+
+The `|active|wiumY|` flags confirm the exact race sequence:
+
+	w: write extent
+
+	i: in RB tree
+
+	u: urgent (set by kswapd in osc_flush_async_page)
+
+	m: memalloc (set by kswapd, current->flags & PF_MEMALLOC)
+
+	Y: fsync_wait (set later by writeback worker's osc_cache_writeback_range)
+
+The m flag is the key evidence: it can only be set while the
+
+extent is in OES_CACHE state (osc_flush_async_page returns -EAGAIN
+
+for non-CACHE states). The extent being in ACTIVE state with m
+
+set proves that a CACHE -> ACTIVE transition occurred after kswapd
+
+set the flag.
+
+The reproducer is here. repro-deadlock-v7.sh
+
+Please run this script with Lustre before applying "LU-19014 memcg: fix client hang in balance_dirty_pages()"
+
+While the root cause exists in all Lustre versions that have
+
+`osc_extent_find()`, two recent changes significantly reduce the
+
+likelihood of hitting this deadlock:
+
+1. LU-19014: fix client hang in balance_dirty_pages()
+
+This change adds a mechanism
+
+in `osc_cache_writeback_range()` that converts OES_ACTIVE extents
+
+back to OES_CACHE and places them on the urgent list when the
+
+system detects dirty-exceeded conditions (`IO_PRIO_DIRTY_EXCEEDED`).
+
+This dramatically reduces the time an extent stays in OES_ACTIVE
+
+state, shrinking the race window. In testing with master,
+
+the reproducer could not trigger the
+
+deadlock: kswapd writeback was near zero because dirty pages were
+
+flushed proactively before kswapd needed to intervene.
+
+However, this is not a complete fix – the race window still exists
+
+when the system is not in a dirty-exceeded state.
+
+2. writepage be dropped on newer kernels?" class="issue-link" data-issue-key="LU-18675">LU-18675: drop writepage() implementation
+
+This change (under review) removes the `ll_writepage()` callback
+
+for kernels with `HAVE_FILEMAP_GET_FOLIOS` (>= 6.x). Without
+
+`.writepage`, kswapd cannot call `osc_flush_async_page()` on
+
+individual pages, eliminating the trigger for this deadlock entirely.
+
+On older kernels (RHEL 8/9 with 4.18/5.14) where `.writepage` is
+
+still registered, the deadlock remains possible.
+
+--- Comment (pjo, Fri, 10 Apr 2026 17:09:04 +0000) ---
+Merged for 2.18
+
+--- Comment (gerrit, Fri, 10 Apr 2026 05:28:21 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/64397/
+
+Subject: LU-19951 osc: fix kswapd writeback vs writer deadlock
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 7dc7cffb110fcb2ca1a79ba83f1cb5ac1b0f83a2
+
+--- Comment (gerrit, Fri, 6 Mar 2026 09:38:44 +0000) ---
+"Sohei Koyama " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/64397
+
+Subject: LU-19951 osc: fix kswapd writeback vs writer deadlock
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: ffe701aa057e30aa646e33489798d500f0e65f00

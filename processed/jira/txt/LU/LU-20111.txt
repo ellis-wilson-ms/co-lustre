@@ -1,0 +1,102 @@
+Key:        LU-20111
+Summary:    O/1/LAST_ID LMA xattr FID corruption
+Link:       https://jira.whamcloud.com/browse/LU-20111
+Type:       Bug
+Priority:   Minor
+Status:     Closed
+Resolution: Duplicate
+Assignee:   Nikitas Angelinas
+Reporter:   Nikitas Angelinas
+Created:    Thu, 9 Apr 2026 22:55:11 +0000
+Updated:    Thu, 16 Apr 2026 14:50:16 +0000
+Resolved:   Thu, 16 Apr 2026 14:49:45 +0000
+Links:      Duplicate: duplicates LU-18550
+
+--- Description ---
+OI scrub reuses osd_thread_info::oti_it_ea_buf between osd_scan_dir() calls (e.g. in osd_scan_O_main(), osd_scan_ml_file_main() and in osd_scan_last_id_main()), which can leave stale data in the buffer. When O/ direntry names are read from disk in ldiskfs using do_osd_ldiskfs_filldir(), they can be copied in parts of the buffer that contains stale data from previous osd_scan_dir() calls.
+
+During testing, we found that the name for O/1 was copied into a buffer that contained "300008100" as stale data from a previous call, which turned the buffer contents into "100008100". The iterator is then advanced to the next 8-byte boundary in do_osd_ldiskfs_filldir(), so that the next direntry can be copied into the buffer. 
+
+struct osd_it_ea_dirent uses 38 bytes:
+
+# pahole -C osd_it_ea_dirent lustre/osd-ldiskfs/osd_ldiskfs.ko 
+struct osd_it_ea_dirent {
+	struct lu_fid              oied_fid;             /*     0    16 */
+	__u64                      oied_ino;             /*    16     8 */
+	__u64                      oied_off;             /*    24     8 */
+	short unsigned int         oied_namelen;         /*    32     2 */
+	unsigned int               oied_type;            /*    34     4 */
+	char                       oied_name[];          /*    38     0 */
+
+	/* size: 38, cachelines: 1, members: 6 */
+	/* last cacheline: 38 bytes */
+} __attribute__((__packed__));
+
+so the iterator is moved to offset 40, relative to its previous position. Because the first field in the struct is the FID and do_osd_ldiskfs_filldir() zeroes all FIDs in O/ on OSTs, the next entry that is written into the buffer effectively NUL-terminates the name for the previous entry and turns it into "10".
+
+This is passed later to osd_scan_lastid_seq(), where it allows the following check to fail, as "10" is equal to FID_SEQ_LLOG_NAME:
+
+if (!fid_seq_is_local_storage(seq))
+
+The following check determines that sequence that was read from the file's LMA xattr, which is 0x1 for O/1/LAST_ID, is different from the name of the parent directory that has been corrupted to be "10" and attempts to repair the LMA xattr FID, but instead it corrupts it, by replacing the 0x1 sequence that is stored, with 0x10:
+
+	if (rc != 0 || lma->loa_lma.lma_self_fid.f_seq != seq ||
+	    lma->loa_lma.lma_self_fid.f_oid != 0 ||
+	    lma->loa_lma.lma_self_fid.f_ver != 0) {
+		lma->loa_lma.lma_self_fid.f_seq = seq;
+		lma->loa_lma.lma_self_fid.f_oid = 0;
+		lma->loa_lma.lma_self_fid.f_ver = 0;
+
+		rc = __osd_xattr_set(info, info->oti_lastid_inode,
+				     XATTR_NAME_LMA, lma, sizeof(*lma),
+
+Overall:
+
+static int osd_scan_dir(const struct lu_env *env, struct osd_device *dev,
+			struct inode *inode, scan_dir_helper_t cb)
+{
+	oie = osd_it_dir_init(env, dev, inode, LUDA_TYPE);    oie_file.f_pos = 0;
+	rc = osd_ldiskfs_it_fill(env, (struct dt_it *)oie);    and NUL-terminates the name
+	if (rc > 0)
+		rc = -ENODATA;
+	if (rc)
+		GOTO(out, rc);
+
+	while (oie->oie_it_dirent oie_rd_dirent) {
+		if (!name_is_dot_or_dotdot(oie->oie_dirent->oied_name,
+					   oie->oie_dirent->oied_namelen))
+			cb(env, dev, inode, oie); "10"
+
+This can prevent subsequent OST mounts, as llog_osd_setup->local_oid_storage_init()->...osd_check_lma(), which is called during MGC setup time, fails with -EREMCHG, due to the LMA FID being wrong on O/1/LAST_ID:
+
+	if (fid != NULL && unlikely(!lu_fid_eq(rfid, fid))) {
+            ...
+
+		rc = -EREMCHG;
+	}
+
+with error messages similar to:
+
+(tgt_mount.c:281:server_mgc_set_fs()) Set mgc disk for 
+(llog_obd.c:206:llog_setup()) MGC10.16.100.52@o2ib: ctxt 0 lop_setup=000000000858fee3 failed: rc = -115
+(osd_scrub.c:455:osd_scrub_check_update()) : inconsistent OI [0x1:0x0:0x0] -> 79/647953299 fixed
+(tgt_mount.c:288:server_mgc_set_fs()) can't set_fs -115
+tgt_mount.c:2238:server_fill_super()) Unable to start targets: -115
+
+This issue can possibly only happen if the OST uses sequences that have a '0' in their second byte, as in other cases the "!fid_seq_is_local_storage() check should succeed and osd_scan_lastid_seq() should exit early, without corrupting the LMA xattr.
+
+--- Comment (nangelinas, Thu, 16 Apr 2026 14:49:45 +0000) ---
+Resolving as a duplicate of LU-18550.
+
+--- Comment (gerrit, Thu, 9 Apr 2026 22:58:29 +0000) ---
+"Nikitas Angelinas " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/65209
+
+Subject: LU-20111 scrub: avoid O/1/LAST_ID LMA xattr FID corruption
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 8adaaad629a899995276875e06639bf6d757689d

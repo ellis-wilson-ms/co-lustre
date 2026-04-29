@@ -1,0 +1,345 @@
+Key:        LU-20053
+Summary:    buffer_head leak on inode deletion
+Link:       https://jira.whamcloud.com/browse/LU-20053
+Type:       Bug
+Priority:   Critical
+Status:     Open
+Resolution: Unresolved
+Assignee:   Sohei Koyama
+Reporter:   Sohei Koyama
+Created:    Sat, 28 Mar 2026 11:26:09 +0000
+Updated:    Tue, 14 Apr 2026 09:46:27 +0000
+Labels:     LTS15
+Attachments: test-bh-leak.sh
+
+--- Environment ---
+Rocky 9 (kernel 5.14.0-611.34.1.el9_7)
+
+--- Description ---
+Deleting files on an ldiskfs-backed Lustre filesystem permanently leaks buffer_head slab objects. The leaked references survive unmount, module unload, and drop_caches. We need to reboot to free these objects.
+
+The leak is proportional to the number of inodes deleted and only occurs when the ea_inode filesystem feature is enabled (the default).
+
+While this reproduction might appear to be a small leak, we've confirmed that it amounts to tens of GiB of leaks in a workload creating and deleting hundreds of millions of files using mdtest.
+
+Reproduction
+
+Single-node Lustre on Rocky 9 (kernel 5.14.0-611.34.1.el9_7), 2 MDTs + 2 OSTs on NVMe, default mkfs options. Created 50K empty files under /mnt/lustre/, then deleted them. Monitored buffer_head count in /proc/slabinfo at each stage, with drop_caches between steps. Full reproduction script is attached here. test-bh-leak.sh
+
+ 
+
+Step
+buffer_head count
+
+baseline (before Lustre)
+1,287
+
+after mount
+3,483
+
+after create 50K files
+10,534
+
+after delete + drop_caches
+21,916
+
+after umount + drop_caches
+14,311
+
+after rmmod + drop_caches
+14,258
+
+The controlled experiment demonstrates that ea_inode is involved.
+
+Same test, same build, reformatted with mkfs.lustre --mkfsoptions="-O ^ea_inode".
+
+Step
+ea_inode ON
+ea_inode OFF
+
+after delete + drop_caches
+21,916
+22,097
+
+after umount + drop_caches
+14,311
+2,576
+
+after rmmod + drop_caches
+14,258
+2,652
+
+Root Cause
+
+This is ext4's bug.
+
+ext4_xattr_inode_dec_ref_all() computes the end boundary of the inode xattr space differently depending on whether it is processing block xattrs or inline (ibody) xattrs. For the inline path (block_csum == false), it calls ext4_get_inode_loc() to obtain the raw inode and derive the boundary, but never calls brelse() on the resulting iloc.bh. Every call through this path bumps the buffer_head refcount by one and never releases it.
+
+It was introduced in v6.14.3 kernel, but it has also been ported to RHEL 8,9 and other versions.
+
+ref. https://elixir.bootlin.com/linux/v6.14.3/source/fs/ext4/xattr.c
+
+--- Comment (gerrit, Tue, 14 Apr 2026 09:46:27 +0000) ---
+"Etienne AUJAMES " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/65293
+
+Subject: LU-20053 ldiskfs: fix iloc.bh leak in dec_ref_all
+
+Project: fs/lustre-release
+
+Branch: b2_15
+
+Current Patch Set: 1
+
+Commit: da68d92521c4bbe31039eb79316b02009570a332
+
+--- Comment (JIRAUSER19217, Wed, 8 Apr 2026 15:19:44 +0000) ---
+Hi eaujames,
+
+> Did the following patch cause the regression?
+
+Yes.
+
+The commit c8e008b60492 ("ext4: ignore xattrs past end") introduced the leak.
+
+The fix is https://review.whamcloud.com/c/fs/lustre-release/+/64952 and https://lists.openwall.net/linux-ext4/2026/04/06/1
+
+Dongyang says that the backport created this issue was introduced in 4.18.0-553.61.1.el8_10 5.14.0-594.el9 and 6.12.0-96.el10.
+
+--- Comment (eaujames, Wed, 8 Apr 2026 14:45:17 +0000) ---
+Hi skoyama,
+
+Thanks for your analyze.
+
+Did the following patch cause the regression?
+
+commit c8e008b60492cf6fd31ef127aea6d02fd3d314cd
+Author: Bhupesh 
+Date:   Tue Jan 28 13:57:50 2025 +0530
+
+    ext4: ignore xattrs past end
+    
+    Once inside 'ext4_xattr_inode_dec_ref_all' we should
+    ignore xattrs entries past the 'end' entry.
+    
+    This fixes the following KASAN reported issue:
+    
+    ==================================================================
+    BUG: KASAN: slab-use-after-free in ext4_xattr_inode_dec_ref_all+0xb8c/0xe90
+    Read of size 4 at addr ffff888012c120c4 by task repro/2065
+    
+    CPU: 1 UID: 0 PID: 2065 Comm: repro Not tainted 6.13.0-rc2+ #11
+    Hardware name: QEMU Standard PC (Q35 + ICH9, 2009), BIOS rel-1.16.3-0-ga6ed6b701f0a-prebuilt.qemu.org 04/01/2014
+    Call Trace:
+     
+     dump_stack_lvl+0x1fd/0x300
+     ? tcp_gro_dev_warn+0x260/0x260
+     ? _printk+0xc0/0x100
+     ? read_lock_is_recursive+0x10/0x10
+     ? irq_work_queue+0x72/0xf0
+     ? __virt_addr_valid+0x17b/0x4b0
+     print_address_description+0x78/0x390
+     print_report+0x107/0x1f0
+     ? __virt_addr_valid+0x17b/0x4b0
+     ? __virt_addr_valid+0x3ff/0x4b0
+     ? __phys_addr+0xb5/0x160
+     ? ext4_xattr_inode_dec_ref_all+0xb8c/0xe90
+     kasan_report+0xcc/0x100
+     ? ext4_xattr_inode_dec_ref_all+0xb8c/0xe90
+     ext4_xattr_inode_dec_ref_all+0xb8c/0xe90
+     ? ext4_xattr_delete_inode+0xd30/0xd30
+     ? __ext4_journal_ensure_credits+0x5f0/0x5f0
+     ? __ext4_journal_ensure_credits+0x2b/0x5f0
+     ? inode_update_timestamps+0x410/0x410
+     ext4_xattr_delete_inode+0xb64/0xd30
+     ? ext4_truncate+0xb70/0xdc0
+     ? ext4_expand_extra_isize_ea+0x1d20/0x1d20
+     ? __ext4_mark_inode_dirty+0x670/0x670
+     ? ext4_journal_check_start+0x16f/0x240
+     ? ext4_inode_is_fast_symlink+0x2f2/0x3a0
+     ext4_evict_inode+0xc8c/0xff0
+     ? ext4_inode_is_fast_symlink+0x3a0/0x3a0
+     ? do_raw_spin_unlock+0x53/0x8a0
+     ? ext4_inode_is_fast_symlink+0x3a0/0x3a0
+     evict+0x4ac/0x950
+     ? proc_nr_inodes+0x310/0x310
+     ? trace_ext4_drop_inode+0xa2/0x220
+     ? _raw_spin_unlock+0x1a/0x30
+     ? iput+0x4cb/0x7e0
+     do_unlinkat+0x495/0x7c0
+     ? try_break_deleg+0x120/0x120
+     ? 0xffffffff81000000
+     ? __check_object_size+0x15a/0x210
+     ? strncpy_from_user+0x13e/0x250
+     ? getname_flags+0x1dc/0x530
+     __x64_sys_unlinkat+0xc8/0xf0
+     do_syscall_64+0x65/0x110
+     entry_SYSCALL_64_after_hwframe+0x67/0x6f
+    RIP: 0033:0x434ffd
+    Code: 66 2e 0f 1f 84 00 00 00 00 00 0f 1f 00 f3 0f 1e fa 48 89 f8 48 89 f7 48 89 d6 48 89 ca 4d 89 c2 4d 89 c8 8
+    RSP: 002b:00007ffc50fa7b28 EFLAGS: 00000246 ORIG_RAX: 0000000000000107
+    RAX: ffffffffffffffda RBX: 00007ffc50fa7e18 RCX: 0000000000434ffd
+    RDX: 0000000000000000 RSI: 0000000020000240 RDI: 0000000000000005
+    RBP: 00007ffc50fa7be0 R08: 0000000000000000 R09: 0000000000000000
+    R10: 0000000000000000 R11: 0000000000000246 R12: 0000000000000001
+    R13: 00007ffc50fa7e08 R14: 00000000004bbf30 R15: 0000000000000001
+     
+    
+    The buggy address belongs to the object at ffff888012c12000
+     which belongs to the cache filp of size 360
+    The buggy address is located 196 bytes inside of
+     freed 360-byte region [ffff888012c12000, ffff888012c12168)
+    
+    The buggy address belongs to the physical page:
+    page: refcount:1 mapcount:0 mapping:0000000000000000 index:0x0 pfn:0x12c12
+    head: order:1 mapcount:0 entire_mapcount:0 nr_pages_mapped:0 pincount:0
+    flags: 0x40(head|node=0|zone=0)
+    page_type: f5(slab)
+    raw: 0000000000000040 ffff888000ad7640 ffffea0000497a00 dead000000000004
+    raw: 0000000000000000 0000000000100010 00000001f5000000 0000000000000000
+    head: 0000000000000040 ffff888000ad7640 ffffea0000497a00 dead000000000004
+    head: 0000000000000000 0000000000100010 00000001f5000000 0000000000000000
+    head: 0000000000000001 ffffea00004b0481 ffffffffffffffff 0000000000000000
+    head: 0000000000000002 0000000000000000 00000000ffffffff 0000000000000000
+    page dumped because: kasan: bad access detected
+    
+    Memory state around the buggy address:
+     ffff888012c11f80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+     ffff888012c12000: fa fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+    > ffff888012c12080: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+                                               ^
+     ffff888012c12100: fb fb fb fb fb fb fb fb fb fb fb fb fb fc fc fc
+     ffff888012c12180: fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc
+    ==================================================================
+    
+    Reported-by: syzbot+b244bda78289b00204ed@syzkaller.appspotmail.com
+    Closes: https://syzkaller.appspot.com/bug?extid=b244bda78289b00204ed
+    Suggested-by: Thadeu Lima de Souza Cascardo 
+    Signed-off-by: Bhupesh 
+    Link: https://patch.msgid.link/20250128082751.124948-2-bhupesh@igalia.com
+    Signed-off-by: Theodore Ts'o 
+
+diff --git a/fs/ext4/xattr.c b/fs/ext4/xattr.c
+index 7647e9f6e190..6ff94cdf1515 100644
+--- a/fs/ext4/xattr.c
++++ b/fs/ext4/xattr.c
+@@ -1176,15 +1176,24 @@ ext4_xattr_inode_dec_ref_all(handle_t *handle, struct inode *parent,
+ {
+ 	struct inode *ea_inode;
+ 	struct ext4_xattr_entry *entry;
++	struct ext4_iloc iloc;
+ 	bool dirty = false;
+ 	unsigned int ea_ino;
+ 	int err;
+ 	int credits;
++	void *end;
++
++	if (block_csum)
++		end = (void *)bh->b_data + bh->b_size;
++	else {
++		ext4_get_inode_loc(parent, &iloc);
++		end = (void *)ext4_raw_inode(&iloc) + EXT4_SB(parent->i_sb)->s_inode_size;
++	}
+....
+
+RHEL8: 
+
+* Thu Jul 03 2025 Denys Vlasenko  [4.18.0-553.61.1.el8_10]
+- s390: Add z17 elf platform (Christoph Schlameuss) [RHEL-100409]
+- ext4: ignore xattrs past end (CKI Backport Bot) [RHEL-100375] {CVE-2025-37738}
+- ext4: fix off-by-one error in do_split (CKI Backport Bot) [RHEL-100361] {CVE-2025-23150}
+- net: atm: fix use after free in lec_send() (CKI Backport Bot) [RHEL-93119] {CVE-2025-22004}
+- x86/microcode/AMD: Fix out-of-bounds on systems with CPU-less NUMA nodes (CKI Backport Bot) [RHEL-98980] {CVE-2025-21991}
+
+RHEL9:
+
+* Tue Jun 17 2025 Augusto Caringi  [5.14.0-594.el9]
+- tools: ynl: add all headers to makefile deps (Jose Ignacio Tornos Martinez) [RHEL-89973]
+- selftests: drv-net: add missing trailing backslash (Jose Ignacio Tornos Martinez) [RHEL-89973]
+- net-shapers: implement cap validation in the core (Jose Ignacio Tornos Martinez) [RHEL-89973]
+...
+- ext4: ignore xattrs past end (CKI Backport Bot) [RHEL-94247] {CVE-2025-37738}
+...
+
+--- Comment (JIRAUSER19217, Sat, 28 Mar 2026 13:31:53 +0000) ---
+Here is a patch. I think we should push this patch into kernel upstream.
+
+$ cat ldiskfs/kernel_patches/patches/rhel8/ext4-xattr-inode-dec-ref-all-iloc-bh-leak.patch
+Index: linux-stage/fs/ext4/xattr.c
+===================================================================
+--- linux-stage.orig/fs/ext4/xattr.c
++++ linux-stage/fs/ext4/xattr.c
+@@ -1148,6 +1148,7 @@
+        else {
+                ext4_get_inode_loc(parent, &iloc);
+                end = (void *)ext4_raw_inode(&iloc) + EXT4_SB(parent->i_sb)->s_inode_size;
++               brelse(iloc.bh);
+        }
+
+        /* One credit for dec ref on ea_inode, one for orphan list addition, */
+
+--- Comment (sihara, Sat, 28 Mar 2026 12:19:59 +0000) ---
+Here are the test results showing MDT memory usage before and after IO500, with and without Sohei’s upcoming patch.
+
+The system configuration is 8 MDTs and 8 OSTs, with DoM enabled. IO500 creates approximately 250 million files across the 8 MDTs using mdtest-easy-write and mdtest-hard-write, performs stat operations, and finally deletes the files during the test.
+
+We collected “df -h” output at each of the following stages:
+
+	Before the test
+
+	After IO500 finishes
+
+	After dropping caches (echo 3 > /proc/sys/vm/drop_caches)
+
+	After unmounting the OSTs/MDTs
+
+Without Patch
+
+=== STEP 1: Before IO500 (after reboot/reformat) ===
+ai400x2-2-vm1:               total        used        free      shared  buff/cache   available
+ai400x2-2-vm1: Mem:          138Gi       3.4Gi       134Gi        33Mi       822Mi       134Gi
+ai400x2-2-vm1: Swap:          10Gi          0B        10Gi
+
+=== STEP 2: After IO500 ===       
+ai400x2-2-vm1:               total        used        free      shared  buff/cache   available
+ai400x2-2-vm1: Mem:          138Gi       6.9Gi        61Gi        33Mi        70Gi       128Gi
+ai400x2-2-vm1: Swap:          10Gi        12Mi        10Gi
+
+=== STEP 3: After drop_caches (echo 3 > /proc/sys/vm/drop_caches) === 
+ai400x2-2-vm1:               total        used        free      shared  buff/cache   available
+ai400x2-2-vm1: Mem:          138Gi       6.9Gi        69Gi        33Mi        62Gi       128Gi
+ai400x2-2-vm1: Swap:          10Gi        12Mi        10Gi
+
+=== STEP 4: After umount OST/MDTs ===
+ai400x2-2-vm1:               total        used        free      shared  buff/cache   available
+ai400x2-2-vm1: Mem:          138Gi        62Gi        74Gi        33Mi       2.0Gi       133Gi
+ai400x2-2-vm1: Swap:          10Gi        12Mi        10Gi
+
+With Patch
+
+=== STEP 1: Before IO500 (after reboot/reformat) ===
+ai400x2-2-vm1:               total        used        free      shared  buff/cache   available
+ai400x2-2-vm1: Mem:          138Gi       3.3Gi       134Gi        33Mi       833Mi       134Gi
+ai400x2-2-vm1: Swap:          10Gi          0B        10Gi
+
+=== STEP 2: After IO500 ===
+ai400x2-2-vm1:               total        used        free      shared  buff/cache   available
+ai400x2-2-vm1: Mem:          138Gi       6.7Gi        65Gi        33Mi        66Gi       130Gi
+ai400x2-2-vm1: Swap:          10Gi        26Mi        10Gi
+
+=== STEP 3: After drop_caches (echo 3 > /proc/sys/vm/drop_caches) ===
+ai400x2-2-vm1:               total        used        free      shared  buff/cache   available
+ai400x2-2-vm1: Mem:          138Gi       6.7Gi       131Gi        33Mi       356Mi       130Gi
+ai400x2-2-vm1: Swap:          10Gi        26Mi        10Gi 
+
+=== STEP 4: After umount OST/MDTs ===
+ai400x2-2-vm1:               total        used        free      shared  buff/cache   available
+ai400x2-2-vm1: Mem:          138Gi       2.3Gi       135Gi        33Mi       429Mi       135Gi
+ai400x2-2-vm1: Swap:          10Gi        25Mi        10Gi        
+
+Without the patch, the free output shows approximately 70 GiB in buff/cache after IO500 completes.
+
+However, this memory is not reclaimed even after dropping caches using echo 3 > /proc/sys/vm/drop_caches.
+
+Once the MDTs are unmounted, this memory is no longer shown as buff/cache and instead appears as used memory.
+
+With the patch, the memory is properly reclaimed and released back to the system as free memory.

@@ -1,0 +1,313 @@
+Key:        LU-20010
+Summary:    Control FatZAP leaf blocksize
+Link:       https://jira.whamcloud.com/browse/LU-20010
+Type:       Improvement
+Priority:   Major
+Status:     Reopened
+Resolution: Unresolved
+Assignee:   Akash B
+Reporter:   Akash B
+Created:    Tue, 17 Mar 2026 16:00:21 +0000
+Updated:    Mon, 6 Apr 2026 19:16:29 +0000
+Labels:     ZFS, server
+
+--- Description ---
+Lustre directories on ZFS always use the FatZAP format because each directory entry (luz_direntry) stores both the ZFS dnode ID and a Lustre FID, which exceeds the MicroZAP single uint64 value limitation. The FatZAP leaf block size was hardcoded to 14 (16K blocks) in Lustre, due to which even a single empty directory takes a lot of space.
+
+On dRAID or RAIDZ pools, this results in 90-110K dsize per empty directory due to stripe alignment and parity overhead. For a typical MDT with millions of directories, this wastes significant pool space.
+
+I did a minimal test by introducing osd_fzap_blockshift as a module parameter, replacing the hardcoded 14. The parameter is exposed via /sys/module/osd_zfs/parameters/osd_fzap_blockshift. 
+
+Before:
+
+# mkdir testdir1 && touch testfile1
+# du --si test*
+100k    testdir1
+1.1k    testfile1
+
+After:
+
+# mkdir testdir1 && touch testfile1
+# du --si test*
+67k     testdir1
+1.1k    testfile1
+
+Testing on the dRAID2:9d:12c:1s pool with different leaf_blockshift values showed the following dsize per empty directory:
+
+  blockshift=14 (16K): dsize=~100K (Currentdefault)
+
+Vary FatZAP leaf block size:
+
+  blockshift=12 (4K):  dsize=~67K
+
+  blockshift=13 (8K):  dsize=~67K 
+
+  blockshift=14 (16K): dsize=~100K
+
+  blockshift=15 (32K): dsize=~100K
+
+I think blockshift values from 12 to 15 make a lot of sense. The limits are already in place on ZFS, so I'm not explicitly adding any.
+
+Future Work: 
+
+The real fix would be to store luz_direntry (dnode + FID), allowing small directories to avoid FatZAP entirely. This TinyZAP implementation would require changes on both the ZFS and Lustre sides. This would reduce empty directory dsize to a very low value by storing entries in the existing dnode bonus buffer with no additional block allocation.
+
+--- Comment (JIRAUSER18017, Mon, 6 Apr 2026 19:16:29 +0000) ---
+Hi Andreas,
+
+I've pushed https://review.whamcloud.com/c/fs/lustre-release/+/65123 , most of which you've suggested. I've just modified the size to "+7k" which is better, renamed the two tests (test_56aa and test_56ab), and added the exempt file.
+
+Thank you for the feedback. (or I guess the test would have got pretty complicated.)
+
+--- Comment (adilger, Mon, 6 Apr 2026 17:56:44 +0000) ---
+IMHO, one reason to avoid "does parameter exist" as the version check is that the test can suddenly stop working if something happens to the parameter (e.g. it is accidentally removed or becomes inaccessible or does not return a valid value).  In that case, rather than also testing that the parameter is working, it results in the tests not being run at all and we don't notice the regression.
+
+My preference would be that (if necessary) there is an $OST1_VERSION check for the commit that added the fzap_blockshift parameter (v2_17_51-27-gab735e9962).  However, I think that always checking for size +7k does not significantly impact the validity of the test, and will pass for both old and new MDS versions.  The test could create more files so that the directory is always 8KiB in size, but I think that slows down the test without improving it in any way.
+
+In either case, there is still the problem that older clients will fail this test when run against a new MDS, so this test should be skipped for older clients by adding an entry into lustre/tests/except/sanity.56aa.ex like:
+
++# This is fetched from the *server* for the session running on the client.
++# Systems where the condition is TRUE run the test ("check || always_except").
++# Systems where the condition evaluates to FALSE will except the test.
++#
+ # facet op need_version             jira     space_separated_subtests
+ client    >= 2.17.51.54           LU-20010 56aa
+
+On a related note, I've started renaming the sanity.sh test_56aa() and later to test_56Aa() so that they do not conflict with subtests early in the test_56*() group.  Unfortunately there are already two test_56ca() subtests, so I've pushed patch https://review.whamcloud.com/65036 ("LU-10482 tests: renumber sanity/56ca to avoid conflict") to fix 56ba/56ca/56da, but if you are already modifying test_56aa it would be great it you could change this to test_56Aa, and the same for test_56ab (but not more to avoid patch conflicts and excessive testing).  That does not affect what should go into sanity.56.ex because that is for old clients which would have the old subtest names.
+
+--- Comment (bzzz, Mon, 6 Apr 2026 15:02:35 +0000) ---
+Instead of the version check, what do you think about the fzap block_shift check? 
+
+sure, fine as well, don't forget sanity.sh runs on the client, your check should be done on MDS
+
+--- Comment (JIRAUSER18017, Mon, 6 Apr 2026 14:34:55 +0000) ---
+Alex,
+
+Instead of the version check, what do you think about the fzap block_shift check? 
+
+something like (just the MDT0 blockshift would do)
+
+New code: 
+# lctl get_param osd-zfs.*.fzap_blockshift
+osd-zfs.pool-MDT0000.fzap_blockshift=13
+osd-zfs.pool-MDT0001.fzap_blockshift=13
+osd-zfs.pool-OST0000.fzap_blockshift=13
+osd-zfs.pool-OST0001.fzap_blockshift=13
+# echo $?
+0
+
+Old code:
+# lctl get_param osd-zfs.*.fzap_blockshift
+error: get_param: param_path 'osd-zfs/*/fzap_blockshift': No such file or directory
+# echo $?
+2
+
+Older code doesn't provide or understand the fzap_blockshift tunable, which can be used as a check, so older code checks for the existing +8K, and the newer checks for +7K, as older code would have 2^14/16K and newer 2^13/8K as the blockshift/size.
+
+Sound good?
+
+--- Comment (bzzz, Mon, 6 Apr 2026 12:09:58 +0000) ---
+I think the test needs to update the value to +7K atleast, possibly?
+
+fine with me, but the actual value should depend on MDS version so that interop testing doesn't fail
+
+--- Comment (JIRAUSER18017, Mon, 6 Apr 2026 12:01:51 +0000) ---
+Got it. I think my env was stuck in an older version of the code. 
+
+The test is failing due to the size reported is less than 8K, resulting in the "dirs" variable taking an empty string. The actual size of the directories are good enough, though. I think the test needs to update the value to +7K atleast, possibly? Any thoughts? 
+
+total: 1024 open/close in 0.34 seconds: 3024.79 ops/second
++ echo '>>> Done creating files'
+>>> Done creating files
++ echo '>>> Running: lfs find --size +8k /mnt/testfs/test_lfs_size_striped/'
+>>> Running: lfs find --size +8k /mnt/testfs/test_lfs_size_striped/
+++ lfs find --size +8k /mnt/testfs/test_lfs_size_striped/
++ dirs=
++ du --si /mnt/testfs/test_lfs_size_striped/
+533k    /mnt/testfs/test_lfs_size_striped/striped_dir
+534k    /mnt/testfs/test_lfs_size_striped/
++ '[' -n '' ']'
++ echo 'FAIL: lfs find --size returned nothing under striped dir'
+FAIL: lfs find --size returned nothing under striped dir
++ exit 1
++ cleanup
++ exit
+
+blockshift=13:
+
+# stat /mnt/testfs/test_lfs_size_striped/striped_dir/
+  File: /mnt/testfs/test_lfs_size_striped/striped_dir/
+  Size: 8192            Blocks: 16         IO Block: 1048576 directory
+Device: e32ed188h/3811496328d   Inode: 144115205289283023  Links: 2
+Access: (0755/drwxr-xr-x)  Uid: (    0/    root)   Gid: (    0/    root)
+Context: unconfined_u:object_r:unlabeled_t:s0
+Access: 2026-04-06 05:48:47.000000000 -0600
+Modify: 2026-04-06 05:48:47.000000000 -0600
+Change: 2026-04-06 05:48:47.000000000 -0600
+ Birth: 2026-04-06 05:48:47.000000000 -0600
+# stat /mnt/testfs/test_lfs_size_striped/
+  File: /mnt/testfs/test_lfs_size_striped/
+  Size: 7168            Blocks: 14         IO Block: 1048576 directory
+Device: e32ed188h/3811496328d   Inode: 162129603798765127  Links: 3
+Access: (0755/drwxr-xr-x)  Uid: (    0/    root)   Gid: (    0/    root)
+Context: unconfined_u:object_r:unlabeled_t:s0
+Access: 2026-04-06 05:48:47.000000000 -0600
+Modify: 2026-04-06 05:48:47.000000000 -0600
+Change: 2026-04-06 05:48:47.000000000 -0600
+ Birth: 2026-04-06 05:48:47.000000000 -0600
+
+blockshift=14: 
+
+# stat /mnt/testfs/test_lfs_size_striped/striped_dir/
+  File: /mnt/testfs/test_lfs_size_striped/striped_dir/
+  Size: 12288           Blocks: 24         IO Block: 1048576 directory
+Device: e32ed188h/3811496328d   Inode: 162129603798764634  Links: 2
+Access: (0755/drwxr-xr-x)  Uid: (    0/    root)   Gid: (    0/    root)
+Context: unconfined_u:object_r:unlabeled_t:s0
+Access: 2026-04-06 05:42:27.000000000 -0600
+Modify: 2026-04-06 05:42:27.000000000 -0600
+Change: 2026-04-06 05:42:27.000000000 -0600
+ Birth: 2026-04-06 05:42:27.000000000 -0600
+#
+# stat /mnt/testfs/test_lfs_size_striped/
+  File: /mnt/testfs/test_lfs_size_striped/
+  Size: 11264           Blocks: 22         IO Block: 1048576 directory
+Device: e32ed188h/3811496328d   Inode: 144115205289282490  Links: 3
+Access: (0755/drwxr-xr-x)  Uid: (    0/    root)   Gid: (    0/    root)
+Context: unconfined_u:object_r:unlabeled_t:s0
+Access: 2026-04-06 05:42:27.000000000 -0600
+Modify: 2026-04-06 05:42:27.000000000 -0600
+Change: 2026-04-06 05:42:27.000000000 -0600
+ Birth: 2026-04-06 05:42:27.000000000 -0600
+
+--- Comment (bzzz, Mon, 6 Apr 2026 10:31:39 +0000) ---
+# MDSCOUNT=2 FSTYPE=zfs ONLY=56aa    bash  sanity.sh
+..
+== sanity test 56aa: lfs find --size under striped dir === 10:30:22 (1775471422)
+[   42.300404] Lustre: DEBUG MARKER: == sanity test 56aa: lfs find --size under striped dir === 10:30:22 (1775471422)
+total: 1024 open/close in 0.61 seconds: 1678.10 ops/second
+ sanity test_56aa: @@@@@@ FAIL: lfs find --size wrong under striped dir 
+[   44.016835] Lustre: DEBUG MARKER: sanity test_56aa: @@@@@@ FAIL: lfs find --size wrong under striped dir
+  Trace dump:
+  = ./../tests/test-framework.sh:7400:error()
+  = sanity.sh:9549:test_56aa()
+  = ./../tests/test-framework.sh:7776:run_one()
+  = ./../tests/test-framework.sh:7839:run_one_logged()
+  = ./../tests/test-framework.sh:7639:run_test()
+  = sanity.sh:9551:main()
+Dumping lctl log to /tmp/ltest-logs/sanity.test_56aa.*.1775471424.log
+Dumping logs only on local client.
+FAIL 56aa (2s)
+
+this is clean master
+
+--- Comment (JIRAUSER18017, Mon, 6 Apr 2026 10:08:01 +0000) ---
+I've been unable to reproduce the issue on my local servers. I also can't access the logs from the Maloo server due to what appears to be some authentication issues.
+
+I'm currently attempting to reproduce the issue on the latest commit tip:
+
+git log --oneline
+472e0f27d4 (HEAD -> master, origin/master, origin/HEAD) LU-19545 ec: tight binding parity mirror to data mirror
+
+I've tested with both MDSCOUNT=4 and MDSCOUNT=2, but neither configuration has triggered the issue. My best guess is that it may be related to a different zpool layout being used on the MDTs during testing, though I'm not entirely certain. Any assistance on this would be greatly appreciated.
+
+Furthermore, I tied similar tests with various zpool layouts, and none of them revealed any issues:
+
+striped zpool:
++ du --si /mnt/testfs/test_lfs_size_striped/
+645k    /mnt/testfs/test_lfs_size_striped/striped_dir
+652k    /mnt/testfs/test_lfs_size_striped/
+mirror zpool:
++ du --si /mnt/testfs/test_lfs_size_striped/
+644k    /mnt/testfs/test_lfs_size_striped/striped_dir
+651k    /mnt/testfs/test_lfs_size_striped/
+raidz2 zpool:
++ du --si /mnt/testfs/test_lfs_size_striped/
+650k    /mnt/testfs/test_lfs_size_striped/striped_dir
+658k    /mnt/testfs/test_lfs_size_striped/
+
+--- Comment (bzzz, Fri, 3 Apr 2026 09:59:33 +0000) ---
+the test passes with MDSCOUNT=4, not with MDSCOUNT=2 - due to changed directory size
+
+--- Comment (adilger, Fri, 3 Apr 2026 00:59:10 +0000) ---
+Strange, since the patch passed all of the ZFS test sessions in Autotest, including sanity/56aa:
+
+https://testing.whamcloud.com/test_sets/963746c0-bc78-470d-a106-aa22a9a22763
+
+--- Comment (bzzz, Thu, 2 Apr 2026 19:47:54 +0000) ---
+a bit strange, but this patch fails sanity/56aa with ZFS backendi:
+
+COMMIT		TESTED	PASSED	FAILED		COMMIT DESCRIPTION
+752dd144c8	1	0	1	BAD	LU-19940 lfs: don't use lsa_pattern for hash
+c981360d6e	1	0	1	BAD	LU-19179 lustre: remove remaining 4.X kernel support
+dc808d3dfe	1	0	1	BAD	LU-19179 lustre: remove support for kernels 4.0 to 4.5
+ab735e9962	1	0	1	BAD	LU-20010 osd-zfs: modularise FatZAP default blockshift
+9a3b9236a9	10	10	0	GOOD	LU-18238 mdt: ghost hsm fix
+2943240549	10	10	0	GOOD	LU-18238 llite: deregister HSM agent on close()
+25e941730d	10	10	0	GOOD	LU-18951 utils: declare argv[argc] as NULL
+f5e198dc68	10	10	0	GOOD	LU-18951 utils: lctl lcfg_erase erase fsname params
+
+...
+
+== sanity test 56aa: lfs find --size under striped dir === 19:32:17 (1775158337)
+total: 1024 open/close in 1.33 seconds: 772.41 ops/second
+ sanity test_56aa: @@@@@@ FAIL: lfs find --size wrong under striped dir 
+  Trace dump:
+  = ./../tests/test-framework.sh:7400:error()
+  = sanity.sh:9446:test_56aa()
+  = ./../tests/test-framework.sh:7776:run_one()
+  = ./../tests/test-framework.sh:7839:run_one_logged()
+  = ./../tests/test-framework.sh:7639:run_test()
+  = sanity.sh:9448:main()
+Dumping lctl log to /tmp/ltest-logs/sanity.test_56aa.*.1775158344.log
+Dumping logs only on local client.
+FAIL 56aa (7s)
+
+I guess because it changes default shift from 14 to 13
+
+--- Comment (adilger, Wed, 1 Apr 2026 22:49:05 +0000) ---
+Adding comments here from the discussion in Gerrit so that they are not lost:
+
+The best outcome would be for osd-zfs to query the VDEV/zpool directly to determine what the best choice for directory blockshift should be. It would also be reasonable to take a hint from striped directory creation to assume that the directory will be large and use a larger blockshift.
+
+The truth is that 99% of admins won't even know that this parameter exists (even if there is a man page), let alone have some idea of what the optimum value is to use. My strong preference recently is that parameters should tune themselves, and only exist for when the auto-tuning got it wrong (or the 0.01% of users that know better).
+
+Should the examples be changed so that OSTs get a larger value (15 or 16) and MDTs get a smaller one (12 or 13)? Are those reasonable values to use for production?
+
+It still seems like the best outcome would be for the blockshift to be selected automatically for each ZAP object based on what it is used for:
+
+	regular MDT directories use 12 or 13 (typically small and very random IOPS avoids write amplification)
+
+	striped MDT directories could be larger if that improves performance (write inflation vs. wider tree for huge directories)
+
+	OST directories typically larger (14, 15, 16?) due to RAID-Z/dRAID usage
+
+This should probably be done to match the "typical use case" even without being able to probe the underlying VDEV geometry.
+
+--- Comment (JIRAUSER18017, Wed, 25 Mar 2026 14:09:46 +0000) ---
+"Akash B " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/64669
+
+Subject: LU-20010 osd-zfs: modularise FatZAP default blockshift
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 1ff3fa14017130d8fef74e07567091d5fe3e57a9
+
+--- Comment (JIRAUSER18017, Tue, 17 Mar 2026 16:08:48 +0000) ---
+Test results for 1.25 million directories:
+
+Before:
+
+Total Size: 118G
+K/Inode: 100
+Creation rate: 22.5 K ops/sec
+
+After:
+
+Total Size: 87G
+K/Inode: 70
+Creation rate: 27 K ops/sec
