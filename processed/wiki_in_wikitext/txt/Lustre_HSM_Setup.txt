@@ -1,0 +1,185 @@
+Title:        Lustre HSM Setup
+URL:          https://wiki.lustre.org/Lustre_HSM_Setup
+Last Updated: 2026-04-29T00:00:00Z
+Last Editor:  CopilotBot
+Edit Comment: New page: end-to-end HSM deployment guide
+
+--- Content (MediaWiki markup) ---
+== Overview ==
+
+Lustre Hierarchical Storage Management (HSM) positions the Lustre file system as a high-performance cache in front of a lower-cost archive storage tier. Files reside on Lustre for active use and can be archived to external storage (tape, object store, cloud) when they are no longer actively needed. When a user accesses an archived file, Lustre automatically restores it transparently.
+
+The HSM subsystem consists of three main components:
+
+* '''Coordinator''' — runs on the MDT and manages archive/restore/remove requests.
+* '''Copytool''' — a user-space agent that moves data between Lustre and the archive backend.
+* '''Archive backend''' — the external storage system (POSIX directory, tape library, S3-compatible object store, etc.).
+
+== Enabling the HSM Coordinator ==
+
+The coordinator must be enabled on every MDT that will participate in HSM operations. By default the coordinator is disabled.
+
+Enable the coordinator:
+
+ lctl set_param mdt.$FSNAME-MDT0000.hsm_control=enabled
+
+Check the current state:
+
+ lctl get_param mdt.$FSNAME-MDT0000.hsm_control
+
+Valid values are <code>enabled</code>, <code>disabled</code>, and <code>shutdown</code>. The <code>shutdown</code> state refuses new requests but allows in-flight requests to complete.
+
+== Starting a Copytool ==
+
+The reference copytool shipped with Lustre is '''lhsmtool_posix''', which archives data to a POSIX directory tree. It is suitable for testing, NFS-mounted archive targets, and simple production deployments.
+
+Start the POSIX copytool as a daemon:
+
+ lhsmtool_posix --daemon --hsm-root /archive/lustre1 --archive=1 /mnt/lustre
+
+Key options:
+
+{| class="wikitable"
+! Option !! Description
+|-
+| <code>--daemon</code> || Run in the background as a daemon process
+|-
+| <code>--hsm-root PATH</code> || Root directory of the archive storage
+|-
+| <code>--archive=N</code> || Archive ID this copytool serves (1–32)
+|-
+| <code>--bandwidth N</code> || Limit copy bandwidth in MB/s (0 = unlimited)
+|-
+| <code>--chunk-size N</code> || Copy data in chunks of N bytes
+|}
+
+Multiple copytool instances can run in parallel on different nodes to increase throughput. Each instance registers with the coordinator as an agent.
+
+== Archive IDs ==
+
+Lustre supports up to 32 archive IDs (1 through 32). Each archive ID represents a logical archive backend. Different copytools can serve different archive IDs, enabling multi-tier archive configurations. For example:
+
+* Archive ID 1 → fast disk-based near-line storage
+* Archive ID 2 → tape library for long-term retention
+* Archive ID 3 → cloud object storage
+
+Set a default archive ID for a directory:
+
+ lfs hsm_set --archive 2 /mnt/lustre/project_old
+
+== HSM User Commands ==
+
+=== Archiving Files ===
+
+Request that a file be copied to the archive:
+
+ lfs hsm_archive /mnt/lustre/myfile
+ lfs hsm_archive --archive 2 /mnt/lustre/myfile
+
+The file remains fully accessible on Lustre during and after archiving.
+
+=== Releasing Files ===
+
+Release the Lustre data blocks of an archived file, leaving only a stub:
+
+ lfs hsm_release /mnt/lustre/myfile
+
+After release the file appears with its original size and metadata, but the data blocks are freed from the OSTs. The file must be in the <code>archived</code> state before it can be released.
+
+=== Restoring Files ===
+
+Explicitly restore a released file from the archive:
+
+ lfs hsm_restore /mnt/lustre/myfile
+
+'''Automatic restore:''' When a user or application reads a released file, Lustre automatically triggers a restore. The read blocks until the data is available. This provides transparent access — applications do not need to know about HSM.
+
+=== Removing Archive Copies ===
+
+Remove the archive copy of a file (the Lustre copy is unaffected):
+
+ lfs hsm_remove /mnt/lustre/myfile
+
+After removal the file can no longer be released. Use with caution.
+
+== Checking HSM State ==
+
+Query the HSM state of a file:
+
+ lfs hsm_state /mnt/lustre/myfile
+
+Example output:
+
+ /mnt/lustre/myfile: (0x0000000d) archived exists, archive_id:1
+
+Common state flags:
+
+{| class="wikitable"
+! Flag !! Meaning
+|-
+| <code>exists</code> || File has an archive copy
+|-
+| <code>archived</code> || Archive copy is up to date
+|-
+| <code>released</code> || Data blocks freed from Lustre, stub remains
+|-
+| <code>dirty</code> || File modified since last archive
+|-
+| <code>lost</code> || Archive copy is missing or damaged
+|-
+| <code>noarchive</code> || File is excluded from archiving
+|}
+
+== Monitoring HSM Activity ==
+
+=== Active Requests ===
+
+View currently active HSM actions across all MDTs:
+
+ lctl get_param mdt.*.hsm.actions
+
+=== Registered Agents ===
+
+View copytool agents registered with the coordinator:
+
+ lctl get_param mdt.*.hsm.agents
+
+=== Request Counters ===
+
+ lctl get_param mdt.*.hsm.stats
+
+== Timeout Configuration ==
+
+The default HSM request timeout is '''3600 seconds''' (1 hour). If a copytool does not complete a request within this period, the coordinator marks the request as failed.
+
+Adjust the timeout:
+
+ lctl set_param mdt.$FSNAME-MDT0000.hsm.active_request_timeout=7200
+
+For large files or slow archive backends (e.g., tape), increase this value accordingly.
+
+== Deployment Checklist ==
+
+# Format and mount the Lustre file system normally.
+# Prepare the archive storage backend (e.g., create the POSIX archive directory tree).
+# Enable the coordinator on each MDT.
+# Start one or more copytool instances, each serving the appropriate archive ID.
+# Verify agents appear in <code>mdt.*.hsm.agents</code>.
+# Test with a small file: archive → release → restore → verify data.
+# Deploy a policy engine for automated archiving (see [[Lustre HSM Policy Automation]]).
+
+== Troubleshooting ==
+
+* '''Copytool not registering:''' Ensure the Lustre mount point is accessible and the coordinator is enabled. Check <code>mdt.*.hsm.agents</code>.
+* '''Restore hangs:''' Check the copytool logs for errors. Verify the archive backend is accessible.
+* '''Request stuck in queue:''' Use <code>lctl get_param mdt.*.hsm.actions</code> to inspect state. A copytool crash may leave orphaned requests; restarting the copytool picks them up.
+* '''Permission errors:''' The copytool must run as root or with <code>CAP_DAC_READ_SEARCH</code> capability.
+
+== See Also ==
+
+* [[Lustre HSM Policy Automation]] — automating archive and release with policy engines
+* [https://doc.lustre.org/ Lustre Operations Manual — HSM chapter]
+
+[[Category:HSM]]
+[[Category:Operations]]
+[[Category:HowTo]]

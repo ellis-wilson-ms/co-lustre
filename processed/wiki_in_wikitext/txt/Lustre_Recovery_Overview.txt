@@ -1,0 +1,205 @@
+Title:        Lustre Recovery Overview
+URL:          https://wiki.lustre.org/Lustre_Recovery_Overview
+Last Updated: 2026-04-29T00:00:00Z
+Last Editor:  CopilotBot
+Edit Comment: New page: comprehensive Lustre recovery mechanisms overview
+
+--- Content (MediaWiki markup) ---
+== Introduction ==
+
+Lustre provides several recovery mechanisms to handle failures of clients, servers, and networks. The goal of recovery is to restore the file system to a consistent state and allow operations to continue with minimal disruption.
+
+This page covers the major recovery mechanisms:
+
+* '''Metadata Replay''' — replaying uncommitted metadata operations after MDS restart
+* '''Version-Based Recovery (VBR)''' — allowing partial recovery when not all clients reconnect
+* '''Commit on Share (COS)''' — preventing cascading evictions during recovery
+* '''Imperative Recovery (IR)''' — accelerating recovery by proactively notifying clients
+
+== Failure Scenarios ==
+
+=== Client Failure ===
+
+When a client crashes or becomes unreachable:
+
+* The server detects the failure via ping timeout (1.5 × <code>obd_timeout</code>).
+* The server evicts the client and releases all locks held by it.
+* Other clients are unaffected unless they were waiting on locks held by the failed client.
+* No recovery replay is needed on the server side.
+
+=== MDS Failure ===
+
+When an MDS fails and restarts:
+
+* Clients detect the failure when RPCs time out or the connection is broken.
+* Clients enter recovery mode and queue metadata operations for replay.
+* When the MDS comes back, clients reconnect and replay their uncommitted operations.
+* The MDS processes replayed operations in transaction number order to ensure consistency.
+* Once all clients have reconnected (or the recovery timeout expires), the MDS resumes normal operation.
+
+=== OST Failure ===
+
+When an OST fails and restarts:
+
+* Clients with pending writes to that OST detect the failure.
+* Clients re-send uncommitted write RPCs during recovery.
+* Lock recovery restores the client lock state.
+* Applications may see delays but data is preserved if the client was not evicted.
+
+=== Network Partition ===
+
+Network partitions are the most complex failure case:
+
+* Clients on one side of the partition cannot reach servers on the other side.
+* Servers may evict unreachable clients after the ping timeout expires.
+* When the partition heals, evicted clients must remount or reconnect.
+
+== Metadata Replay ==
+
+=== How It Works ===
+
+Every metadata operation on the MDS is assigned a '''transaction number''' (transno). The client tracks the last committed transaction number reported by the server and the last transaction number it has received a reply for.
+
+When the MDS restarts:
+
+# The MDS reads its last committed transaction from disk.
+# Clients reconnect and report their last received transaction numbers.
+# Clients replay all operations with transaction numbers greater than the MDS's last committed transaction.
+# The MDS re-executes these operations in transaction number order.
+# '''XID ordering''' ensures that replayed operations within a single client are applied in the correct sequence.
+
+=== Transaction Number Tracking ===
+
+* '''last_committed''' — the most recent transaction durably written to the MDS backend (ldiskfs or ZFS).
+* '''last_rcvd''' — tracked per-client; the most recent transaction number the client received a reply for.
+
+During replay, only operations between <code>last_committed</code> and <code>last_rcvd</code> need to be replayed.
+
+== Version-Based Recovery (VBR) ==
+
+=== The Problem ===
+
+In standard recovery, if any client fails to reconnect before the recovery timeout expires, the MDS must evict all remaining clients because it cannot determine whether the missing client performed operations that conflict with those being replayed by connected clients.
+
+=== The Solution ===
+
+VBR adds an '''inode version number''' to each metadata object. Each metadata operation records the pre-operation version of the inode(s) it modifies. During recovery:
+
+# A client replays an operation along with the expected pre-operation inode version.
+# The MDS compares the expected version with the actual current version.
+# If they match, the operation is safe to replay — no conflicting operation was performed by a missing client.
+# If they do not match, the MDS knows a conflict exists and must handle it (typically by evicting the conflicting client).
+
+VBR allows recovery to succeed even when some clients are missing, as long as their operations do not conflict with those of connected clients. This dramatically reduces unnecessary evictions.
+
+VBR is enabled by default and requires no administrator configuration.
+
+== Commit on Share (COS) ==
+
+=== The Problem ===
+
+Without COS, when multiple clients modify objects on the same MDS, an MDS crash can create complex dependencies between clients during recovery. If one of those clients also crashes (fails to reconnect), the remaining clients may need to be evicted because their operations might depend on operations from the missing client.
+
+=== The Solution ===
+
+COS forces the MDS to commit (flush to disk) transactions when the modified objects are ''shared'' — i.e., when multiple clients hold locks on the same objects. By committing these transactions immediately, the MDS ensures that no uncommitted cross-client dependencies exist if a crash occurs.
+
+This eliminates the scenario where a missing client during recovery forces eviction of other clients.
+
+=== Configuration ===
+
+COS is '''enabled by default'''. Verify or modify:
+
+ lctl get_param mdt.*.commit_on_sharing
+ lctl set_param mdt.*.commit_on_sharing=1
+
+Setting to 0 disables COS and may slightly improve metadata performance at the risk of more evictions during recovery.
+
+== Imperative Recovery (IR) ==
+
+=== The Problem ===
+
+In standard recovery, when a server restarts, clients discover the failure only when their next RPC times out. For idle clients this may take up to <code>obd_timeout</code> seconds, delaying the start of recovery.
+
+=== The Solution ===
+
+With Imperative Recovery, the '''MGS''' (Management Server) maintains a list of all clients and their target connections. When a target (MDT or OST) restarts:
+
+# The target registers with the MGS.
+# The MGS sends '''IR notifications''' to all clients that were connected to the restarted target.
+# Clients immediately begin reconnection and recovery without waiting for an RPC timeout.
+
+This significantly reduces the recovery window, especially on large clusters with many idle clients.
+
+=== Configuration ===
+
+IR is enabled by default. Verify:
+
+ lctl get_param mgs.*.ir_factor
+
+The <code>ir_factor</code> parameter (default 5) is a multiplier used by the MGS to determine how aggressively to notify clients. Lower values result in faster notification but more MGS load.
+
+Check IR state:
+
+ lctl get_param mgs.*.live.$FSNAME
+
+=== Client-Side IR ===
+
+Verify IR is active on a client:
+
+ lctl get_param mgc.*.ir_state
+
+== Aborting Recovery ==
+
+In some situations an administrator may want to force a server to skip recovery and come up immediately, evicting all clients:
+
+# Find the device number:
+#: <code>lctl dl</code>
+# Abort recovery:
+#: <code>lctl --device N abort_recovery</code>
+
+Where <code>N</code> is the device number from <code>lctl dl</code>.
+
+'''Warning:''' Aborting recovery evicts all clients and discards their uncommitted operations. Only use this when recovery is stuck or when the clients are known to be gone.
+
+== Recovery Timeout Tuning ==
+
+The recovery window — how long the server waits for clients to reconnect — is controlled by several parameters:
+
+{| class="wikitable"
+! Parameter !! Default !! Description
+|-
+| <code>obd_timeout</code> || 100s || Base timeout for RPCs and pings; recovery timeout is derived from this
+|-
+| <code>at_max</code> || 600s || Maximum adaptive timeout value
+|-
+| <code>recovery_time_hard</code> || 900s || Absolute maximum time the server will wait for recovery
+|-
+| <code>recovery_time_soft</code> || 450s || Initial recovery window; extended if clients are still reconnecting
+|}
+
+View current recovery status on a server:
+
+ lctl get_param *.*.recovery_status
+
+Example output includes: status (RECOVERING or COMPLETE), time remaining, connected/recovered/evicted client counts, and the list of clients not yet reconnected.
+
+== Recovery Best Practices ==
+
+* '''Monitor recovery status''' after any server restart. Check <code>recovery_status</code> on all targets.
+* '''Tune timeouts''' for your cluster size. Large clusters may need longer recovery windows.
+* '''Enable IR''' to minimize recovery delays.
+* '''Leave COS enabled''' to prevent cascading evictions.
+* '''VBR is automatic''' — no action needed, but understand it when reading recovery logs.
+* '''Avoid aborting recovery''' unless absolutely necessary.
+* '''Test failover procedures''' regularly using controlled server restarts.
+
+== See Also ==
+
+* [[Lustre Client Eviction Guide]] — causes and remediation of client evictions
+* [[Imperative Recovery]] — detailed IR design documentation
+* [[Lustre Timeout Hierarchy]] — how timeouts interact
+
+[[Category:Recovery]]
+[[Category:Operations]]
+[[Category:Architecture]]

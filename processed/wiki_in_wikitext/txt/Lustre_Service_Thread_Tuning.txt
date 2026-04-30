@@ -1,0 +1,234 @@
+Title:        Lustre Service Thread Tuning
+URL:          https://wiki.lustre.org/Lustre_Service_Thread_Tuning
+Last Updated: 2026-04-29
+
+--- Content (MediaWiki markup) ---
+
+__TOC__
+
+== Overview ==
+
+Lustre servers use service threads to process incoming RPCs from clients. The number of threads directly affects how many requests a server can handle concurrently. Too few threads cause queuing and high latency; too many threads waste memory and cause excessive context switching.
+
+This page covers thread tuning for OSS and MDS services, CPU binding with CPTs, and guidelines for when to adjust thread counts.
+
+For general tuning information, see [[Lustre Tuning]].
+
+== OSS Thread Tuning ==
+
+=== Default Thread Calculation ===
+
+The OSS calculates its default thread count based on available memory and CPUs:
+
+* Base: 1 thread per 128 MB of RAM per CPU core
+* Minimum: 2 threads
+* Maximum: 512 threads (hard limit)
+
+On a server with 256 GB RAM and 32 cores, the default would be calculated as:
+ (256 * 1024 / 128) * 32 = up to 512 threads (capped at max)
+
+In practice, Lustre applies internal heuristics and the actual count is typically lower. Check the current thread count:
+
+ lctl get_param ost.OSS.ost_io.threads_started
+
+=== Setting OSS Threads at Load Time ===
+
+Set the thread count via module parameters in <code>/etc/modprobe.d/lustre.conf</code>:
+
+ options ost oss_num_threads=128
+
+This sets the number of <code>ost_io</code> service threads. The value takes effect when the <code>ost</code> module is loaded (at mount time).
+
+You can also set minimum and maximum bounds:
+
+ options ost oss_max_threads=256
+
+=== Runtime Thread Tuning ===
+
+Adjust threads dynamically without a restart:
+
+ # View current values
+ lctl get_param ost.OSS.ost_io.threads_min
+ lctl get_param ost.OSS.ost_io.threads_max
+ lctl get_param ost.OSS.ost_io.threads_started
+ 
+ # Increase the maximum (threads will be started on demand)
+ lctl set_param ost.OSS.ost_io.threads_max=256
+ 
+ # Increase the minimum (threads start immediately)
+ lctl set_param ost.OSS.ost_io.threads_min=64
+
+'''Note:''' You can increase <code>threads_min</code> to immediately start more threads. However, threads cannot be reduced below the current <code>threads_started</code> count without a restart.
+
+=== Other OSS Services ===
+
+The <code>ost_io</code> service handles bulk I/O and is the primary tuning target. Other OSS services have their own thread pools:
+
+ lctl get_param ost.OSS.ost.threads_started         # metadata-like RPCs
+ lctl get_param ost.OSS.ost_seq.threads_started      # sequence allocation
+ lctl get_param ost.OSS.ost_create.threads_started   # object precreation
+
+These rarely need tuning unless you see specific bottlenecks in the service request queues.
+
+== MDS Thread Tuning ==
+
+=== Default Thread Calculation ===
+
+The MDS uses a similar calculation but with a lower default maximum:
+
+* Default maximum: 64 threads
+* Absolute hard maximum: 1024 threads
+
+For large clusters (thousands of clients), the default 64 threads may be insufficient.
+
+Check current values:
+
+ lctl get_param mds.MDS.mdt.threads_started
+
+=== Setting MDS Threads at Load Time ===
+
+ options mds mds_num_threads=128
+
+Add this to <code>/etc/modprobe.d/lustre.conf</code> on the MDS node.
+
+=== Runtime MDS Thread Tuning ===
+
+ lctl get_param mds.MDS.mdt.threads_min
+ lctl get_param mds.MDS.mdt.threads_max
+ lctl get_param mds.MDS.mdt.threads_started
+ 
+ lctl set_param mds.MDS.mdt.threads_max=256
+ lctl set_param mds.MDS.mdt.threads_min=128
+
+=== Other MDS Services ===
+
+ lctl get_param mds.MDS.mdt_readpage.threads_started   # readdir RPCs
+ lctl get_param mds.MDS.mdt_setattr.threads_started    # setattr RPCs
+ lctl get_param mds.MDS.mdt_fld.threads_started        # FLD lookups
+ lctl get_param mds.MDS.mdt_seq.threads_started        # sequence service
+
+The <code>mdt_readpage</code> service may need tuning for workloads with many large directory listings.
+
+== CPU Binding with CPTs ==
+
+Lustre uses '''CPU Partition Tables (CPTs)''' to bind service threads to specific CPU cores. This improves cache locality and reduces cross-NUMA memory access.
+
+=== Configuring CPTs ===
+
+Set CPT options in <code>/etc/modprobe.d/lustre.conf</code>:
+
+ # Bind MDS threads to specific CPUs (comma-separated CPU lists or ranges)
+ options lnet cpu_pattern=""
+ 
+ # Bind MDS to specific CPTs
+ options mds mds_num_cpts=2
+ 
+ # Bind OSS I/O threads to specific CPTs
+ options ost oss_cpts="[0,1]"
+ options ost oss_io_cpts="[0,1]"
+
+=== CPT Syntax ===
+
+CPTs are specified as bracket-enclosed CPU lists:
+
+ # Two CPTs, each with specific cores
+ options lnet cpu_pattern="[0-15] [16-31]"
+
+This creates two CPTs:
+* CPT 0: cores 0–15
+* CPT 1: cores 16–31
+
+Service threads are then distributed across the specified CPTs.
+
+=== Viewing CPT Configuration ===
+
+ cat /sys/kernel/debug/lnet/cpu_partition_table
+
+This shows how CPUs are grouped and which CPTs are in use.
+
+== Monitoring Thread Utilization ==
+
+Check whether threads are busy (a sign you may need more):
+
+ # View request queue depth
+ lctl get_param ost.OSS.ost_io.req_waittime
+ lctl get_param ost.OSS.ost_io.req_active
+ 
+ # Thread utilization
+ lctl get_param ost.OSS.ost_io.threads_started
+ lctl get_param ost.OSS.ost_io.threads_busy
+
+If <code>threads_busy</code> is consistently close to <code>threads_started</code>, threads are saturated and more may be needed.
+
+== When to Increase Threads ==
+
+* '''High thread utilization''' — <code>threads_busy</code> consistently near <code>threads_started</code>.
+* '''Growing request queues''' — <code>req_waittime</code> increasing, clients experiencing latency.
+* '''Many clients''' — large clusters with hundreds or thousands of clients generating concurrent RPCs.
+* '''Mixed workloads''' — combining metadata-heavy and I/O-heavy workloads on the same server.
+
+== When NOT to Increase Threads ==
+
+* '''CPU saturation''' — if CPUs are already at 100%, adding threads increases contention without improving throughput. Profile with <code>top</code>, <code>mpstat</code>, or <code>perf</code>.
+* '''Memory pressure''' — each thread consumes memory for its stack and request buffers. On memory-limited servers, more threads can trigger OOM conditions.
+* '''Storage bottleneck''' — if the underlying storage (RAID, SSDs) is the bottleneck, more threads just queue more requests without improving I/O rates. Check with <code>iostat</code>.
+* '''Lock contention''' — very high thread counts can increase contention on internal locks, actually reducing performance. This is rare but can occur above 256+ threads.
+
+== Summary of Key Parameters ==
+
+{| class="wikitable"
+! Parameter
+! Location
+! Default
+! Description
+|-
+| <code>oss_num_threads</code>
+| /etc/modprobe.d/lustre.conf
+| auto
+| OSS ost_io thread count at load time
+|-
+| <code>oss_max_threads</code>
+| /etc/modprobe.d/lustre.conf
+| 512
+| OSS ost_io maximum thread count
+|-
+| <code>mds_num_threads</code>
+| /etc/modprobe.d/lustre.conf
+| auto (max 64)
+| MDS thread count at load time
+|-
+| <code>threads_min</code>
+| lctl set_param
+| varies
+| Minimum threads (runtime adjustable)
+|-
+| <code>threads_max</code>
+| lctl set_param
+| varies
+| Maximum threads (runtime adjustable)
+|-
+| <code>oss_cpts</code>
+| /etc/modprobe.d/lustre.conf
+| all CPTs
+| CPTs used for OSS services
+|-
+| <code>oss_io_cpts</code>
+| /etc/modprobe.d/lustre.conf
+| all CPTs
+| CPTs used for ost_io service specifically
+|-
+| <code>mds_num_cpts</code>
+| /etc/modprobe.d/lustre.conf
+| all CPTs
+| Number of CPTs for MDS services
+|}
+
+== See Also ==
+
+* [[Lustre Tuning]]
+* [[Lustre Health Checks]]
+* [[Lustre IO Monitoring]]
+
+[[Category:Administration]]
+[[Category:Performance]]
+[[Category:Tuning]]

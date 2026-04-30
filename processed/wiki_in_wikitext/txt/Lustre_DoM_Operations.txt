@@ -1,0 +1,194 @@
+Title:        Lustre DoM Operations
+URL:          https://wiki.lustre.org/Lustre_DoM_Operations
+Last Updated: 2026-04-29T00:00:00Z
+Last Editor:  CopilotBot
+Edit Comment: New page: Data on MDT operations guide
+
+--- Content (MediaWiki markup) ---
+== Overview ==
+
+Data on MDT (DoM) is a Lustre feature that stores small file data directly on the MDT alongside the file's metadata. By co-locating data and metadata, DoM eliminates the extra network round-trips to OSTs that are required for traditional Lustre files, significantly improving performance for small-file workloads.
+
+DoM is particularly beneficial for:
+* Files smaller than 1 MB (metadata-heavy access patterns).
+* Workloads with many small file creates, reads, and stats.
+* Configuration files, scripts, logs, and other ancillary data.
+* Reducing load on OSTs for trivially small files.
+
+== How DoM Works ==
+
+When a file has a DoM layout, its first layout component is stored on the MDT using the MDT's backend file system (ldiskfs or ZFS). If the file grows beyond the DoM component size, a second component on OSTs handles the overflow.
+
+This is implemented using '''composite layouts''' (Progressive File Layouts / PFL). A DoM file has:
+* '''Component 1:''' Data on MDT, up to a configured size limit (e.g., 1 MB).
+* '''Component 2:''' Data on OSTs, for the remainder of the file.
+
+== Creating DoM Files ==
+
+=== Single File ===
+
+Create a file with a DoM layout:
+
+ lfs setstripe -E 1M -L mdt -E -1 /mnt/lustre/myfile
+
+This creates a file where:
+* The first 1 MB is stored on the MDT (<code>-L mdt</code>).
+* Data beyond 1 MB spills over to OSTs (<code>-E -1</code>).
+
+'''CRITICAL:''' Always include an OST spillover component (<code>-E -1</code>). Without it, writes that exceed the DoM component size will '''fail with -ENOSPC or -EFBIG'''. A DoM-only layout with no spillover is almost never what you want:
+
+ # BAD — no spillover, writes beyond 1M fail
+ lfs setstripe -E 1M -L mdt /mnt/lustre/myfile
+ 
+ # GOOD — spillover to OSTs
+ lfs setstripe -E 1M -L mdt -E -1 /mnt/lustre/myfile
+
+=== With Specific OST Layout for Spillover ===
+
+ lfs setstripe -E 1M -L mdt -E -1 -S 4M -c 2 /mnt/lustre/myfile
+
+This sets the spillover component to use 4 MB stripe size with 2 stripes.
+
+== Setting DoM Defaults on Directories ==
+
+Apply a DoM layout as the default for all new files in a directory:
+
+ lfs setstripe -E 1M -L mdt -E -1 /mnt/lustre/small_files/
+
+All files subsequently created in <code>/mnt/lustre/small_files/</code> will inherit this layout.
+
+To clear a directory default and revert to the file system default:
+
+ lfs setstripe -d /mnt/lustre/small_files/
+
+== dom_stripesize Limits ==
+
+Each MDT enforces a maximum DoM component size via the <code>dom_stripesize</code> parameter. This prevents users from placing excessively large files on the MDT.
+
+=== Checking the Current Limit ===
+
+ lctl get_param mdt.$FSNAME-MDT0000.dom_stripesize
+
+=== Setting the Limit ===
+
+ lctl set_param mdt.$FSNAME-MDT0000.dom_stripesize=2097152
+
+The value is in bytes. The default is '''1 MB''' (1048576 bytes). The server-side limit caps the effective DoM component size — if a client requests a larger DoM component, the server silently reduces it to <code>dom_stripesize</code>.
+
+=== Making the Setting Persistent ===
+
+ lctl set_param -P mdt.$FSNAME-MDT0000.dom_stripesize=2097152
+
+== Finding DoM Files ==
+
+Find all files with a DoM layout component:
+
+ lfs find -L mdt /mnt/lustre
+
+Find DoM files larger than a threshold:
+
+ lfs find -L mdt --size +512k /mnt/lustre
+
+Find DoM files owned by a specific user:
+
+ lfs find -L mdt --user jsmith /mnt/lustre
+
+== Verifying a File's Layout ==
+
+Check whether a specific file uses DoM:
+
+ lfs getstripe /mnt/lustre/myfile
+
+Look for <code>lmm_pattern: mdt</code> in the first component. Example output:
+
+<pre>
+/mnt/lustre/myfile
+  lcm_layout_gen:    2
+  lcm_mirror_count:  1
+  lcm_entry_count:   2
+    lcme_id:             1
+    lcme_extent.e_start: 0
+    lcme_extent.e_end:   1048576
+      lmm_pattern:       mdt
+      lmm_stripe_count:  0
+    lcme_id:             2
+    lcme_extent.e_start: 1048576
+    lcme_extent.e_end:   EOF
+      lmm_pattern:       raid0
+      lmm_stripe_count:  1
+      lmm_stripe_size:   1048576
+</pre>
+
+== MDT Sizing Impact ==
+
+DoM files consume space on the MDT backend storage. When planning an MDT-heavy DoM deployment:
+
+* '''Estimate DoM space:''' If you expect N small files averaging S bytes each, plan for N × S bytes of additional MDT capacity.
+* '''Rule of thumb:''' Plan for at least '''5% of total file system capacity''' on the MDT if using DoM heavily.
+* '''Monitor MDT space:''' Use <code>lfs df -i</code> and <code>lfs df</code> to track both inode and space usage on MDTs.
+* '''Set dom_stripesize conservatively:''' Keep the default 1 MB unless you have a specific reason to increase it.
+
+Remember that MDT storage is typically more expensive (faster SSDs, smaller capacity) than OST storage. DoM trades MDT space for performance.
+
+== Workload Characterization ==
+
+DoM provides the greatest benefit when:
+
+{| class="wikitable"
+! Characteristic !! DoM Benefit
+|-
+| Files < 1 MB || '''High''' — eliminates OST round-trips entirely
+|-
+| Files 1–10 MB || '''Moderate''' — first 1 MB from MDT, rest from OST
+|-
+| Files > 10 MB || '''Low''' — DoM component is negligible fraction of data
+|-
+| Metadata-heavy (stat, open, getattr) || '''High''' — data is co-located with metadata
+|-
+| Sequential large reads || '''None''' — performance dominated by OST throughput
+|-
+| Many small file creates || '''High''' — single RPC creates file + data
+|}
+
+=== Workloads That Do NOT Benefit ===
+
+* Large file sequential I/O (checkpointing, data ingest).
+* Workloads that never read the start of the file.
+* Files that are always larger than <code>dom_stripesize</code>.
+
+== Interaction with PFL ==
+
+DoM is implemented as a component within [[Progressive File Layouts]] (PFL). You can combine DoM with other PFL features:
+
+ lfs setstripe -E 1M -L mdt -E 1G -S 1M -c 4 -E -1 -S 4M -c -1 /mnt/lustre/file
+
+This creates:
+* 0–1 MB: on MDT (DoM)
+* 1 MB–1 GB: 1 MB stripes, 4 OSTs
+* 1 GB–EOF: 4 MB stripes, all OSTs
+
+== Migrating Existing Files to DoM ==
+
+Migrate an existing file to a DoM layout:
+
+ lfs migrate -E 1M -L mdt -E -1 /mnt/lustre/existing_file
+
+The file data is rewritten into the new layout. This is an I/O-intensive operation and should be done during low-activity periods for large numbers of files.
+
+== Troubleshooting ==
+
+* '''ENOSPC on small file write:''' Check MDT free space with <code>lfs df</code>. The MDT may be full.
+* '''DoM component not created:''' The server's <code>dom_stripesize</code> may be set to 0, disabling DoM. Check with <code>lctl get_param mdt.*.dom_stripesize</code>.
+* '''File larger than expected on MDT:''' The DoM component is always allocated up to <code>dom_stripesize</code> even for smaller files (space is allocated, not necessarily used). Monitor actual usage, not layout size.
+* '''Performance not improving:''' Ensure the workload actually benefits from DoM (small files, metadata-heavy access). Profile with <code>lfs getstripe</code> to confirm DoM layout is in use.
+
+== See Also ==
+
+* [[Data on MDT]] — feature goals and design documentation
+* [[Data on MDT Solution Architecture]]
+* [[Data on MDT High Level Design]]
+* [[Progressive File Layouts]] — PFL, the layout framework used by DoM
+
+[[Category:DoM]]
+[[Category:Operations]]
+[[Category:HowTo]]
