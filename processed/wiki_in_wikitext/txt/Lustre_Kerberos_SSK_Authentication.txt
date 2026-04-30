@@ -1,0 +1,154 @@
+Title:        Lustre Kerberos SSK Authentication
+URL:          https://wiki.lustre.org/Lustre_Kerberos_SSK_Authentication
+Last Updated: 2026-04-29T00:00:00Z
+Last Editor:  CopilotBot
+Edit Comment: New page: Shared-Secret Key authentication guide
+
+--- Content (MediaWiki markup) ---
+== Overview ==
+
+Lustre Shared-Secret Key (SSK) authentication provides Kerberos-like node authentication '''without''' requiring a centralized Key Distribution Center (KDC). Instead of relying on Kerberos infrastructure, SSK uses pre-shared key files distributed to participating nodes. This makes it well suited for clusters where deploying and maintaining a KDC is impractical.
+
+SSK was introduced in Lustre 2.9 and builds on the Generic Security Services API (GSSAPI) framework already used by Lustre's Kerberos support. It uses HMAC-based integrity checking and optional AES encryption to protect RPC traffic between nodes.
+
+For the authoritative reference, see the ''Lustre Operations Manual'' chapter on [[Setting up Lustre Security|Shared-Secret Key Security]].
+
+== Security Flavors ==
+
+SSK offers three security flavors that can be configured independently per file system, per service, or per [[Lustre_Multi_Tenancy|nodemap]].
+
+{| class="wikitable"
+! Flavor !! Authentication !! Integrity !! Privacy (Encryption) !! Use Case
+|-
+| <code>null</code> || None || None || None || Trusted networks with no security requirements
+|-
+| <code>skn</code> || HMAC shared key || HMAC on every RPC || No || Authenticate nodes and prevent tampering; minimal CPU overhead
+|-
+| <code>ska</code> || HMAC shared key || HMAC on every RPC || AES-256-CTR || Full protection including bulk data encryption; higher CPU cost
+|}
+
+'''Recommendation:''' Use <code>skn</code> when you need to verify that only authorized nodes mount the file system. Use <code>ska</code> when data confidentiality on the wire is also required (e.g., traffic crosses untrusted network segments).
+
+== Generating Key Files ==
+
+Key files are created with the <code>lgss_sk</code> utility. Each key file embeds the shared secret, the security flavor, an expiry timestamp, and HMAC/encryption parameters.
+
+Generate a key for file system <code>testfs</code>:
+
+ lgss_sk -t mgs -f testfs -w /etc/lustre/ssk/testfs.key
+
+Common <code>lgss_sk</code> options:
+
+{| class="wikitable"
+! Option !! Description
+|-
+| <code>-t mgs&#124;server&#124;client</code> || Key type: MGS, server (MDS/OSS), or client
+|-
+| <code>-f ''fsname''</code> || File system name the key is valid for
+|-
+| <code>-w ''path''</code> || Write the generated key to this file
+|-
+| <code>-e ''seconds''</code> || Key expiration time (default: no expiry)
+|-
+| <code>-d ''prime_size''</code> || Diffie-Hellman prime size in bits (default: 2048)
+|}
+
+To inspect an existing key file:
+
+ lgss_sk -r /etc/lustre/ssk/testfs.key
+
+== Distributing Keys ==
+
+After generating a key file, copy it to '''every''' node that should communicate using SSK. All nodes in the same trust domain must share the same key.
+
+ scp /etc/lustre/ssk/testfs.key root@oss1:/etc/lustre/ssk/
+ scp /etc/lustre/ssk/testfs.key root@client1:/etc/lustre/ssk/
+
+'''Security note:''' Key files must be readable only by root (<code>chmod 0600</code>). Distribute them over a trusted channel (e.g., <code>scp</code>, configuration management). Never place key files on a shared file system that clients without SSK could read.
+
+== Server-Side Configuration ==
+
+=== Setting the Default Flavor at mkfs Time ===
+
+To require SSK for all connections by default:
+
+ mkfs.lustre --mgs --param=mgsnode.srpc.flavor.default=skn /dev/sda1
+ mkfs.lustre --mdt --fsname=testfs --param=srpc.flavor.default=skn /dev/sdb1
+ mkfs.lustre --ost --fsname=testfs --param=srpc.flavor.default=skn /dev/sdc1
+
+Replace <code>skn</code> with <code>ska</code> if encryption is required.
+
+=== Enabling SSK on an Existing File System ===
+
+Set the SRPC flavor at runtime:
+
+ lctl conf_param testfs.srpc.flavor.default=skn
+
+This takes effect on new connections. Existing clients must remount to negotiate the new flavor.
+
+== Mounting with SSK ==
+
+=== Server Mount ===
+
+When mounting an SSK-enabled target, specify the key file path:
+
+ mount -t lustre -o skpath=/etc/lustre/ssk/testfs.key /dev/sdb1 /mnt/testfs-MDT0000
+
+=== Client Mount ===
+
+ mount -t lustre -o skpath=/etc/lustre/ssk/testfs.key mgs@tcp:/testfs /mnt/testfs
+
+If <code>skpath</code> points to a directory, Lustre searches for a key file matching the file system name inside that directory.
+
+== Nodemap Integration ==
+
+SSK flavors can be enforced per [[Lustre_Multi_Tenancy|nodemap]], allowing different trust levels for different groups of nodes:
+
+ lctl nodemap_modify --name restricted --property srpc_flavor --value ska
+
+This forces all nodes in the <code>restricted</code> nodemap to use <code>ska</code>. Nodes that connect without the correct key or with a weaker flavor are rejected.
+
+== Key Rotation ==
+
+To rotate keys without downtime:
+
+# Generate a new key with <code>lgss_sk</code>.
+# Distribute the new key to all nodes.
+# Update the <code>skpath</code> mount option or replace the key file in place.
+# Remount clients (or wait for reconnect) to pick up the new key.
+
+'''Note:''' There is no automatic key rotation mechanism. Key rotation requires manual distribution or integration with a configuration management tool (Ansible, Puppet, etc.).
+
+== Performance Considerations ==
+
+* <code>skn</code> adds HMAC computation to every RPC but does '''not''' encrypt bulk data. The CPU overhead is typically negligible on modern hardware.
+* <code>ska</code> encrypts all bulk data transfers using AES-256-CTR. On CPUs with AES-NI instructions the throughput impact is roughly 5–15%, but can be higher on older hardware without hardware acceleration.
+* For large clusters, benchmark with <code>ska</code> before committing to encryption system-wide.
+
+== Limitations ==
+
+* SSK does '''not''' provide user-level authentication — it authenticates ''nodes'', not individual users. Combine with [[Lustre_Multi_Tenancy|nodemaps]] and UID/GID squashing for multi-tenant isolation.
+* Key files are static secrets. Compromise of a key file requires regenerating and redistributing keys to all nodes.
+* SSK is not compatible with Kerberos on the same connection — choose one mechanism per file system or per nodemap.
+
+== Troubleshooting ==
+
+Common errors:
+
+* <code>EACCES</code> on mount — key file permissions are too open or the key does not match the server's key.
+* <code>GSS negotiation failed</code> — verify that the same key file is present on both sides and that the security flavor matches.
+* Check the kernel log (<code>dmesg</code>) for detailed GSSAPI error messages.
+
+Enable GSSAPI debug logging:
+
+ lctl set_param sptlrpc.gss.lgss_keyring.debug_level=1
+
+== See Also ==
+
+* [[Setting up Lustre Security]] — Operations Manual chapter on security configuration
+* [[Lustre Multi Tenancy]] — Nodemap-based multi-tenant isolation
+* [[Lustre_Shared_Secret_Key|Shared-Secret Key]] — Additional SSK reference material
+
+[[Category:Security]]
+[[Category:Configuration]]
+[[Category:Authentication]]

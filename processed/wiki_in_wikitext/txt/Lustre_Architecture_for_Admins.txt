@@ -1,0 +1,273 @@
+Title: Lustre Architecture for Admins
+URL: https://wiki.lustre.org/Lustre_Architecture_for_Admins
+Last Updated: 2026-04-28
+
+== Lustre Architecture for Administrators ==
+
+This page explains how Lustre works at a level useful for system
+administrators. It focuses on what each component does, how they interact,
+and what happens when things fail. For deeper implementation details, see
+[[Understanding Lustre Internals]].
+
+=== Overview ===
+
+A Lustre filesystem is made up of four types of components:
+
+* '''Servers''' that store metadata (MDS), bulk data (OSS), and
+  configuration (MGS).
+* '''Clients''' that mount the filesystem and present a standard POSIX
+  interface to applications.
+* '''LNet''' — a high-performance network layer that connects everything.
+* '''Storage targets''' — the on-disk filesystems (MDT, OST, MGT) where
+  data actually lives.
+
+Applications see a single filesystem. Behind the scenes, Lustre splits
+every file into metadata (filename, permissions, layout information on
+the MDS) and data (the actual file contents, striped across one or more
+OSTs on the OSSs).
+
+=== Components in Detail ===
+
+==== Management Server (MGS) ====
+
+The MGS stores configuration information for all Lustre filesystems in
+the cluster. Its storage target is the '''MGT''' (Management Target).
+
+'''What it does:'''
+* Holds the configuration logs that tell servers and clients how to
+  find each other.
+* Distributes updated configuration when you change parameters (e.g.,
+  with <code>lctl conf_param</code> or <code>lctl set_param -P</code>).
+* Low resource requirements — the MGT is less than 100 MB even on
+  the largest systems.
+
+'''Deployment notes:'''
+* The MGS is almost always co-located with the first MDS (combined
+  MGS/MDT on the same block device). This is the default.
+* Separating the MGS onto its own server is only needed when you have
+  multiple independent Lustre filesystems sharing one MGS, or when
+  you need MGS high availability independent of the MDS.
+* If the MGS is down, running filesystems continue to work — but new
+  mounts and configuration changes will fail.
+
+==== Metadata Server (MDS) ====
+
+The MDS manages the filesystem namespace. Its storage target is the
+'''MDT''' (Metadata Target).
+
+'''What it does:'''
+* Stores directories, filenames, permissions, timestamps, file layout
+  (which OSTs hold a file's data), extended attributes, and ACLs.
+* Handles file open, close, create, delete, rename, mkdir, stat, and
+  permission checks.
+* Allocates objects on OSTs when new files are created.
+* Manages distributed locks so that concurrent clients see a consistent
+  view of the namespace.
+
+'''Deployment notes:'''
+* The MDT should be on fast storage — '''SSD or NVMe is strongly
+  recommended.''' MDT access patterns are database-like: many small,
+  random reads and writes.
+* MDT should be on RAID1 (mirrored) for reliability. For larger MDTs,
+  use RAID10 (ldiskfs) or mirrored VDEVs (ZFS).
+* A single MDS is sufficient for most deployments. For very large
+  systems (billions of files or very high metadata rates), Lustre
+  supports '''DNE''' (Distributed Namespace) — multiple MDTs on
+  separate MDS servers, each managing a subtree of the namespace.
+* Up to '''256 MDTs''' are supported.
+* MDS memory requirements are significant. As a starting point:
+  ~60 GB for 1024 compute clients with a 20-million-file working set.
+
+==== Object Storage Server (OSS) ====
+
+The OSS manages bulk file data. Its storage targets are '''OSTs'''
+(Object Storage Targets).
+
+'''What it does:'''
+* Stores and retrieves file data as objects. Each file's data is split
+  into chunks (stripes) and distributed across one or more OSTs.
+* Handles read and write I/O from clients, using RDMA where available.
+* Manages block allocation and free space on each OST.
+
+'''Deployment notes:'''
+* A typical OSS serves '''2 to 8 OSTs''', though up to 32 is possible.
+* Each OST is one block device (or one ZFS pool/dataset) — do not
+  partition a single disk into multiple OSTs.
+* The typical OST size is 24–48 TB, with a maximum of 1024 TB.
+* OSS I/O is streaming (large sequential reads and writes), so
+  OSTs benefit from high-throughput storage (RAID6 with many spindles,
+  or NVMe arrays).
+* Up to '''8150 OSTs''' are supported across the filesystem.
+* Memory rule of thumb: 24 GB base + 4 GB per OST (8 GB per OST if
+  the OSS is configured for failover).
+
+==== Clients ====
+
+Clients mount the Lustre filesystem and present it as a standard POSIX
+mountpoint. Applications use normal file I/O calls — open(), read(),
+write(), stat(), etc.
+
+'''What happens when a client opens a file:'''
+
+# Client contacts the MDS to look up the file's metadata and layout.
+# MDS returns the file's '''layout''' — which OSTs hold which stripes
+  of the file, and at what offsets.
+# For reads/writes, the client contacts the OSS(s) '''directly''' —
+  data does not flow through the MDS. This is how Lustre achieves
+  parallel I/O.
+# The MDS grants the client a '''lock''' on the file (or part of it)
+  to ensure consistency with other clients.
+
+'''Deployment notes:'''
+* Clients require the <code>lustre-client</code> (or
+  <code>lustre-client-dkms</code>) package. No server packages needed.
+* Minimum 2 GB RAM.
+* Client kernel page size must be ≥ server page size.
+* Multiple Lustre filesystems can be mounted simultaneously.
+
+==== LNet (Lustre Networking) ====
+
+LNet is Lustre's network transport layer. It sits between Lustre and
+the physical network.
+
+'''What it does:'''
+* Provides a uniform messaging API regardless of the underlying
+  network (TCP/IP, InfiniBand, etc.).
+* Supports '''RDMA''' (Remote Direct Memory Access) for high-bandwidth,
+  low-latency data transfer.
+* Supports '''routing''' — LNet routers forward traffic between
+  networks that are not directly connected.
+* Supports '''Multi-Rail''' — using multiple network interfaces per
+  node for bandwidth aggregation and fault tolerance.
+
+'''Key concepts:'''
+* '''NID''' (Network Identifier): An address in the form
+  <code>address@network_type</code>. Examples:
+  <code>10.0.0.1@tcp</code>, <code>192.168.1.5@tcp1</code>,
+  <code>10.0.0.1@o2ib</code>.
+* '''LND''' (LNet Driver): The driver for a specific network type.
+  Common LNDs: <code>ksocklnd</code> (TCP), <code>ko2iblnd</code>
+  (InfiniBand OFED).
+* '''LNet port:''' All Lustre nodes listen on TCP '''port 988'''. This
+  port must be open in any firewall between Lustre nodes.
+
+=== How Data Flows ===
+
+To understand Lustre performance, it helps to know where data flows:
+
+'''File creation:'''
+  Client → MDS: "Create file /mnt/lustre/data.bin"
+  MDS: Allocates metadata on MDT, selects OST(s) for data storage
+  MDS → Client: Returns file layout (OST list + stripe info)
+
+'''File write:'''
+  Client: Splits data into stripe_size chunks (default 4 MiB)
+  Client → OSS 0: Write chunk 0 (bytes 0 – 4 MiB)
+  Client → OSS 1: Write chunk 1 (bytes 4 MiB – 8 MiB)
+  ... (in parallel across all OSTs in the file's layout)
+
+'''File read:'''
+  Client → MDS: "Open file /mnt/lustre/data.bin"
+  MDS → Client: Returns file layout
+  Client → OSS 0: Read chunk 0
+  Client → OSS 1: Read chunk 1
+  ... (in parallel)
+
+'''Key insight:''' Metadata operations go to the MDS. Data operations
+go directly to the OSS(s). The MDS is never in the data path for
+reads and writes. This is what makes Lustre scale.
+
+=== File Striping ===
+
+Lustre can split a single file's data across multiple OSTs. This is
+called '''striping'''.
+
+* '''stripe_count''' — How many OSTs to spread the file across.
+  Default: '''1''' (no striping; entire file on one OST).
+* '''stripe_size''' — The size of each chunk. Default: '''4 MiB'''.
+* Setting <code>stripe_count=-1</code> stripes across all available
+  OSTs.
+
+When to increase stripe count:
+* Large files that need aggregate bandwidth beyond what one OST
+  can provide.
+* When a single file must be accessed concurrently by many clients.
+
+When to keep stripe count at 1:
+* Small files — striping a 4 KB file across 8 OSTs wastes resources.
+* Workloads with many independent small files (each file on its own
+  OST is already parallel at the filesystem level).
+
+See [[Lustre Striping Best Practices]] for detailed guidance.
+
+=== What Happens When Things Fail ===
+
+Understanding failure domains is critical for planning:
+
+* '''Client failure:''' The MDS detects the client is gone (via timeout)
+  and revokes its locks. No impact on other clients or the filesystem.
+* '''OSS failure:''' Files with data on the failed OSS's OSTs become
+  temporarily unavailable for I/O. The rest of the filesystem continues
+  normally. If HA failover is configured, the partner OSS takes over
+  the OSTs.
+* '''MDS failure:''' New file opens, creates, deletes, and renames
+  stall until the MDS recovers or fails over. '''Existing''' open
+  files can continue reading and writing data (since data goes directly
+  to OSTs). If HA failover is configured, the partner MDS takes over.
+* '''MGS failure:''' Running filesystem continues normally. New mounts
+  and configuration changes fail until MGS is restored.
+* '''Network failure:''' If a client loses contact with a server for
+  longer than the timeout period (default 100 seconds), it is
+  '''evicted''' — all its locks are revoked and its dirty cache is
+  discarded. The client must remount to recover.
+
+=== Backend Filesystems ===
+
+The MDTs and OSTs are stored on a backend filesystem:
+
+* '''ldiskfs''' — An enhanced version of ext4 with Lustre-specific
+  performance improvements. Mature, well-tested. Requires Lustre
+  kernel patches on servers (or DKMS modules).
+* '''ZFS''' — Leverages ZFS's data integrity, compression, and
+  scalability features. Dynamic inode allocation (no pre-set inode
+  limits). Supports dRAID for improved rebuild times.
+
+Both backends are production-ready. ldiskfs is more common on
+traditional HDD-based storage; ZFS is popular for NVMe and for
+environments that want ZFS's additional data integrity features.
+
+=== Filesystem Limits ===
+
+{| class="wikitable"
+|-
+! Limit !! Value
+|-
+| Maximum filesystem size || 2+ EiB
+|-
+| Maximum MDTs || 256
+|-
+| Maximum OSTs || 8150
+|-
+| Maximum clients || 131,072 (30,000+ tested in production)
+|-
+| Maximum single file size (ldiskfs) || 31.25 PiB
+|-
+| Maximum single file size (ZFS) || 8 EiB
+|-
+| Maximum files per MDT (ldiskfs) || 4 billion
+|-
+| Maximum files per MDT (ZFS) || 256 trillion
+|-
+| Maximum OST size || 1024 TiB
+|-
+| Maximum stripe count || 2000
+|-
+| Default stripe size || 4 MiB
+|}
+
+=== Next Steps ===
+
+* '''Plan your deployment:''' [[Lustre Hardware Sizing Guide]] and
+  [[Lustre Deployment Patterns]]
+* '''Set up your first filesystem:''' [[Lustre Quick Start Guide]]
+* '''Learn about LNet networking:''' [[Lustre Networking (LNET) Overview]]

@@ -1,40 +1,178 @@
 Title:        ZFS Tunables for Lustre Metadata Servers (MDS)
 URL:          https://wiki.lustre.org/ZFS_Tunables_for_Lustre_Metadata_Servers_(MDS)
 Page ID:      1218
-Last Updated: 2018-05-25T22:22:22Z
+Last Updated: 2026-04-28T00:00:00Z
 Last Editor:  Adilger
-Edit Comment: remove spl_kmem_cache_slab_limit since this is only recommending to leave the value at the default
+Edit Comment: Major update: remove defunct tunables, add ZFS 2.x changes, add Lustre ZFS OSD tunables, fix dead links
 
---- Content (MediaWiki markup) ---
+--- Content ---
+This page describes ZFS and Lustre ZFS OSD module parameters relevant to tuning Lustre Metadata Servers (MDS). MDS workloads are metadata-intensive — dominated by directory lookups, file creates, attribute modifications, and small I/Os — and benefit from specific ZFS and Lustre tuning.
 
-{| class="wikitable" style="text-align:left;"
-!Parameter
-!Notes
-!Default
-!Suggested
-|-
-|zfs_arc_max
-|Maximum size of the ARC.
-|50% RAM
-|75% RAM
-|-
-|zfs_arc_meta_limit
-|Increasing this value will improve performance if the workload involves operations on a large number of files and directories, or frequent metadata operations, at the cost of less file data fitting in the ARC.
-|25% ARC
-|75% ARC
-|-
-|zfs_vdev_scheduler
-|VDEV scheduler
-|noop
-|Deadline
-|-
-|metaslab_debug_unload
-|This option prevents ZFS from unloading the spacemaps from a metaslab once it is read in. 
-|0
-|1
-|}
+== ZFS Module Parameters ==
 
-For a comprehensive description of all available ZFS and SPL module parameters, refer to the [https://github.com/zfsonlinux/zfs/blob/master/man/man5/zfs-module-parameters.5 zfs-module-parameters](5) and [https://github.com/zfsonlinux/spl/blob/master/man/man5/spl-module-parameters.5 spl-module-parameters](5) man pages.
+These parameters are set via the ZFS kernel module (zfs.ko). They can be changed at runtime by writing to /sys/module/zfs/parameters/<param> or made persistent via /etc/modprobe.d/zfs.conf.
 
-[[Category:ZFS OSD Tuning]]
-[[Category:Lustre Systems Administration]]
+=== zfs_arc_max ===
+
+Maximum size of the Adaptive Replacement Cache (ARC) in bytes. The ARC caches both file data and metadata blocks. On a dedicated MDS node where Lustre is the primary consumer of memory, increasing this allows more metadata to stay cached.
+
+Default: 50% of RAM
+Suggested for MDS: 75% of RAM
+
+Example (set to 48 GiB on a 64 GiB node):
+  echo 51539607552 > /sys/module/zfs/parameters/zfs_arc_max
+
+Or persistently in /etc/modprobe.d/zfs.conf:
+  options zfs zfs_arc_max=51539607552
+
+=== zfs_arc_meta_limit_percent ===
+
+Percentage of the ARC that may be used for metadata (dnode, ZAP, and other metadata blocks). MDS workloads are almost entirely metadata, so raising this limit is critical to avoid premature metadata eviction.
+
+Note: In ZFS versions prior to 2.0, this tunable was called zfs_arc_meta_limit and took an absolute byte value. In ZFS 2.x it was replaced by zfs_arc_meta_limit_percent, which takes a percentage (0–100) of the ARC size.
+
+Default: 75 (i.e. 75% of ARC)
+Suggested for MDS: 90
+
+Example:
+  echo 90 > /sys/module/zfs/parameters/zfs_arc_meta_limit_percent
+
+=== zfs_arc_meta_min ===
+
+Minimum amount of ARC space (in bytes) reserved for metadata. When the ARC is under memory pressure, it will not evict metadata below this floor. For MDS workloads where metadata caching is paramount, setting a meaningful floor prevents performance cliffs under load.
+
+Default: 0 (no minimum floor enforced beyond the normal eviction logic)
+Suggested for MDS: 25–50% of zfs_arc_max
+
+Example (set to 16 GiB):
+  echo 17179869184 > /sys/module/zfs/parameters/zfs_arc_meta_min
+
+=== metaslab_debug_unload ===
+
+When set to 1, prevents ZFS from unloading metaslab spacemaps from memory after they are loaded. This avoids repeated I/O to re-read spacemaps during allocation, at the cost of increased memory usage. On MDS nodes with sufficient RAM, keeping spacemaps cached reduces allocation latency.
+
+Default: 0
+Suggested for MDS: 1
+
+Example:
+  echo 1 > /sys/module/zfs/parameters/metaslab_debug_unload
+
+=== I/O Scheduling (formerly zfs_vdev_scheduler) ===
+
+Note: The zfs_vdev_scheduler parameter was removed in ZFS 0.8.0. In prior versions, it allowed ZFS to override the Linux I/O scheduler for its VDEVs (commonly set to "deadline"). Starting with ZFS 0.8+, I/O scheduling is handled entirely by the Linux block layer via blk-mq.
+
+For MDS workloads on modern kernels, configure the I/O scheduler at the block device level:
+
+  echo mq-deadline > /sys/block/sda/queue/scheduler
+
+Or persistently via a udev rule:
+  # /etc/udev/rules.d/60-lustre-mds-scheduler.rules
+  ACTION=="add|change", KERNEL=="sd*", ATTR{queue/scheduler}="mq-deadline"
+
+The mq-deadline scheduler is generally recommended for MDS workloads because it provides bounded latency, which is important for metadata operations.
+
+== Lustre ZFS OSD Module Parameters ==
+
+These parameters are specific to the Lustre ZFS OSD (osd-zfs.ko). They control how Lustre interacts with the underlying ZFS pool. They can be viewed and set via lctl or through /sys/module/osd_zfs/parameters/.
+
+=== osd_oi_count (module param) ===
+
+Number of Object Index (OI) files. More OI files can reduce contention on the OI lookup path for workloads with high metadata parallelism.
+
+Set via /etc/modprobe.d/osd_zfs.conf:
+  options osd_zfs osd_oi_count=16
+
+=== osd_txg_sync_delay_us (module param) ===
+
+Delay in microseconds before syncing a ZFS transaction group. Increasing this allows more operations to be batched into a single TXG, which can improve throughput at the cost of slightly increased commit latency.
+
+Set via /etc/modprobe.d/osd_zfs.conf:
+  options osd_zfs osd_txg_sync_delay_us=0
+
+=== osd_sync_destroy_max_size (module param) ===
+
+Maximum object size (in bytes) below which destroy operations are done synchronously. Objects larger than this are destroyed asynchronously. For MDS targets where objects are typically small (MDT inodes), the default is usually fine.
+
+=== osd_object_sync_delay_us (module param) ===
+
+Delay in microseconds for object sync operations. Can be used to reduce sync overhead on busy MDS nodes.
+
+=== Per-target tunables (via lctl) ===
+
+These are set per MDT device, e.g., for an MDT named "lustre-MDT0000":
+
+  lctl set_param osd-zfs.lustre-MDT0000.<param>=<value>
+
+fzap_blockshift (RW)
+  Controls the block size for FAT ZAP (ZFS Attribute Processor) objects, expressed as a power-of-2 shift. FAT ZAPs are used for large directories. Increasing this value (e.g., from the default 14 = 16 KiB to 17 = 128 KiB) allows ZFS to store more directory entries per block, which can significantly improve performance for directories with very large numbers of entries. This is one of the most impactful tunables for MDS directory performance.
+
+  lctl set_param osd-zfs.lustre-MDT0000.fzap_blockshift=17
+
+readcache_max_filesize (RW)
+  Maximum file size eligible for the read cache. On MDTs this primarily affects small metadata objects.
+
+  lctl set_param osd-zfs.lustre-MDT0000.readcache_max_filesize=65536
+
+auto_scrub (RW)
+  Enables or disables automatic OI scrubbing on the MDT. OI scrub verifies and repairs the Object Index. Enabled by default.
+
+  lctl set_param osd-zfs.lustre-MDT0000.auto_scrub=1
+
+sync_on_lseek (RW)
+  Controls whether the OSD syncs data when an lseek is performed. Disabling may improve performance in some workloads.
+
+  lctl set_param osd-zfs.lustre-MDT0000.sync_on_lseek=0
+
+nonrotational (RW)
+  Marks the underlying storage as non-rotational (SSD/NVMe). This hints to Lustre that seek-avoidance optimizations are unnecessary.
+
+  lctl set_param osd-zfs.lustre-MDT0000.nonrotational=1
+
+index_backup (RW)
+  Enables backup of OI index files for disaster recovery purposes.
+
+  lctl set_param osd-zfs.lustre-MDT0000.index_backup=1
+
+force_sync (WO)
+  Write-only parameter that forces an immediate sync of the MDT. Useful for diagnostics or before administrative operations.
+
+  lctl set_param osd-zfs.lustre-MDT0000.force_sync=1
+
+fstype (RO)
+  Read-only. Shows the filesystem type (will report "zfs").
+
+mntdev (RO)
+  Read-only. Shows the ZFS dataset used as the mount device for this MDT.
+
+== Recommended MDS Tuning Summary ==
+
+For a dedicated MDS node with 64 GiB RAM and NVMe-backed ZFS pool:
+
+  # ZFS module parameters (/etc/modprobe.d/zfs.conf)
+  options zfs zfs_arc_max=51539607552
+  options zfs zfs_arc_meta_limit_percent=90
+  options zfs zfs_arc_meta_min=17179869184
+  options zfs metaslab_debug_unload=1
+
+  # Linux I/O scheduler (via udev rule)
+  ACTION=="add|change", KERNEL=="nvme*", ATTR{queue/scheduler}="none"
+
+  # Lustre ZFS OSD per-target (after mount)
+  lctl set_param osd-zfs.lustre-MDT0000.fzap_blockshift=17
+  lctl set_param osd-zfs.lustre-MDT0000.nonrotational=1
+
+Note: For NVMe devices, the "none" scheduler is typically best since the device has its own internal scheduling. Use "mq-deadline" for SATA/SAS SSDs.
+
+== References ==
+
+For a comprehensive description of all available ZFS module parameters, refer to the OpenZFS documentation:
+- ZFS Module Parameters (https://openzfs.github.io/openzfs-docs/Performance%20and%20Tuning/Module%20Parameters.html)
+- OpenZFS Tuning Guide (https://openzfs.github.io/openzfs-docs/Performance%20and%20Tuning/Workload%20Tuning.html)
+
+Note: The former SPL (Solaris Porting Layer) module parameters man page is no longer applicable. SPL was merged into the main ZFS repository in version 0.8.0 and its parameters are now part of the unified ZFS module.
+
+For Lustre ZFS OSD parameters, consult the Lustre source code under lustre/osd-zfs/ or use:
+  lctl list_param osd-zfs.*
+
+Category:ZFS OSD Tuning
+Category:Lustre Systems Administration

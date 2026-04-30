@@ -1,0 +1,150 @@
+Title:        Lustre Client Eviction Guide
+URL:          https://wiki.lustre.org/Lustre_Client_Eviction_Guide
+Last Updated: 2026-04-29T00:00:00Z
+Last Editor:  CopilotBot
+Edit Comment: New page: eviction causes and remediation guide
+
+--- Content (MediaWiki markup) ---
+== What Is Client Eviction? ==
+
+Client eviction occurs when a Lustre server (MDS or OSS) forcibly revokes all locks and state held by a client. The server discards any knowledge of the client's cached data, and the client's dirty (unwritten) page cache for that target is '''discarded'''. Any in-flight or buffered writes that have not been acknowledged by the server are lost.
+
+Eviction is a last-resort mechanism. It ensures that server resources (locks, open file handles, recovery slots) are not held indefinitely by a client that may be dead or unresponsive.
+
+== Causes of Eviction ==
+
+=== Lock Callback Timeout ===
+
+When the server needs to revoke a lock (e.g., because another client needs conflicting access), it sends a blocking callback (AST) to the lock holder. If the client does not respond within the lock callback timeout, the server evicts the client.
+
+The callback timeout is derived from the adaptive timeout mechanism or the static <code>obd_timeout</code> parameter.
+
+=== Ping Timeout ===
+
+Clients and servers exchange periodic ping messages. If the server does not receive a ping from a client within '''1.5 × obd_timeout''' seconds, it evicts the client. With the default <code>obd_timeout=100</code>, this gives a ping deadline of 150 seconds.
+
+=== Server Shutdown ===
+
+When a server target is unmounted or the server node is shut down, all clients connected to that target are evicted. Clients detect this when they fail to reconnect and begin recovery.
+
+=== Network Failure ===
+
+Sustained network partitions between a client and a server lead to both ping timeouts and lock callback timeouts, resulting in eviction.
+
+=== Administrative Eviction ===
+
+Administrators can manually evict a specific client:
+
+ lctl --device $OSDNAME evict_client $CLIENT_NID
+
+This is sometimes used to unstick a server waiting on a misbehaving client during recovery.
+
+== Detecting Eviction ==
+
+=== Client-Side Detection ===
+
+Check the kernel log (dmesg) on the client:
+
+ dmesg | grep -i evict
+
+Typical messages:
+
+ Lustre: testfs-MDT0000-mdc-ffff8800deadbeef: server evicted this client; invalidating state
+ Lustre: testfs-OST0001-osc-ffff8800deadbeef: server evicted this client; invalidating state
+
+=== Server-Side Detection ===
+
+Check the recovery status on the server:
+
+ lctl get_param *.*.recovery_status
+
+Look for <code>evicted_clients</code> counts and the list of connected vs. recovered clients.
+
+Server-side kernel log also records evictions:
+
+ dmesg | grep -i evict
+
+== Impact of Eviction ==
+
+=== Data Loss Risk ===
+
+'''Buffered writes that have not been flushed to the server are lost.''' This is the most critical consequence. If an application writes data, receives a successful <code>write()</code> return code, but the data is still in the client page cache when eviction occurs, that data is silently discarded.
+
+After eviction the client returns <code>-EIO</code> (Input/output error) on subsequent operations to the affected target.
+
+=== The write() Return Code Problem ===
+
+The POSIX <code>write()</code> system call succeeds as soon as data is copied into the kernel page cache — it does '''not''' wait for data to reach the server. This means:
+
+* <code>write()</code> returns success even though data may be lost on eviction.
+* Applications '''must''' call <code>fsync()</code> or <code>fdatasync()</code> and check its return code to confirm data durability.
+* Applications '''must''' check <code>close()</code> return codes, as <code>close()</code> flushes remaining dirty pages.
+
+This is not specific to Lustre — it is POSIX behavior — but Lustre's distributed nature makes eviction-induced data loss more likely than on local file systems.
+
+=== Application Impact ===
+
+* Applications receive <code>-EIO</code> on the next operation after eviction.
+* Open file descriptors become invalid for the evicted target.
+* NFS re-exports over Lustre may return stale file handle errors.
+* MPI jobs typically abort when any rank receives an I/O error.
+
+== Prevention ==
+
+=== Tune obd_timeout ===
+
+Increase <code>obd_timeout</code> to give clients more time to respond. The default is 100 seconds. Large-scale systems or sites with known network variability often increase this:
+
+On servers and clients:
+
+ lctl set_param timeout=300
+
+Note: This was historically called <code>obd_timeout</code>. Cray systems commonly used 300 seconds. Larger values increase recovery time after genuine failures, so choose a value that balances tolerance and recovery speed.
+
+=== Enable Adaptive Timeouts ===
+
+Adaptive timeouts (enabled by default since Lustre 2.x) dynamically adjust timeouts based on observed RPC latency. Verify they are enabled:
+
+ lctl get_param at_max
+ lctl get_param at_min
+
+If <code>at_max=0</code>, adaptive timeouts are disabled and the static <code>obd_timeout</code> is used. Ensure <code>at_max</code> is set to a reasonable value (default is 600).
+
+=== Network Reliability ===
+
+* Monitor network health between clients and servers.
+* Ensure LNet routes are redundant where possible (see [[Multi-Rail LNet]]).
+* Avoid oversubscribing network switches serving Lustre traffic.
+* Use dedicated Lustre networks to avoid contention with other traffic.
+
+=== Client Health ===
+
+A client under heavy memory pressure or CPU starvation may fail to respond to lock callbacks in time. Monitor client nodes for:
+
+* High memory usage and swapping (prevents timely RPC processing).
+* CPU saturation (kernel threads cannot run).
+* Long interrupt storms or driver issues on the network interface.
+
+== Remediation After Eviction ==
+
+# '''Check application status:''' Determine whether the application detected the I/O error. Check application logs and exit codes.
+# '''Check data integrity:''' If the application did not <code>fsync()</code> before eviction, recently written data may be lost. Verify output files.
+# '''Remount the client:''' In many cases the client automatically reconnects. If errors persist, unmount and remount:
+#: <code>umount /mnt/lustre && mount -t lustre $MGSNID:/$FSNAME /mnt/lustre</code>
+# '''Investigate root cause:''' Determine why the eviction happened:
+#* Network outage? Check switch logs, LNet status (<code>lctl get_param nis</code>).
+#* Overloaded client? Check memory and CPU metrics at the time of eviction.
+#* Server issue? Check server logs and recovery status.
+#* Slow copytool or HSM activity blocking locks?
+# '''Review timeout tuning:''' If evictions are recurring, consider adjusting <code>obd_timeout</code> and adaptive timeout parameters.
+
+== See Also ==
+
+* [[Lustre Common Mistakes]] — common pitfalls including write handling
+* [[Lustre Recovery Overview]] — how Lustre recovers from failures
+* [[Lustre Resiliency  Understanding Lustre Message Loss and Tuning for Resiliency]]
+* [[Lustre Timeout Hierarchy]]
+
+[[Category:Troubleshooting]]
+[[Category:Operations]]
+[[Category:HowTo]]

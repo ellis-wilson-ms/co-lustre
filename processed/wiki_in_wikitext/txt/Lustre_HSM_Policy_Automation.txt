@@ -1,0 +1,164 @@
+Title:        Lustre HSM Policy Automation
+URL:          https://wiki.lustre.org/Lustre_HSM_Policy_Automation
+Last Updated: 2026-04-29T00:00:00Z
+Last Editor:  CopilotBot
+Edit Comment: New page: policy-driven HSM automation guide
+
+--- Content (MediaWiki markup) ---
+== Overview ==
+
+While [[Lustre HSM Setup]] describes manual HSM operations, production deployments require automated policies to decide ''when'' files should be archived, released, or restored. This page covers the event sources, policy engines, and tuning parameters needed to build an automated HSM workflow.
+
+The general architecture is:
+
+ Lustre changelogs → Policy engine → HSM commands (archive/release/restore)
+
+== Changelogs as the Event Source ==
+
+Lustre changelogs record metadata events (file create, open, close, rename, unlink, setattr, HSM state changes, etc.) on each MDT. A policy engine reads these events to make data-management decisions.
+
+=== Registering a Changelog Consumer ===
+
+Register a consumer on an MDT:
+
+ lctl --device $FSNAME-MDT0000 changelog_register
+
+The command returns a consumer ID such as <code>cl1</code>. Each consumer maintains its own read cursor so multiple tools can consume changelogs independently.
+
+=== Reading Changelogs ===
+
+Read changelog records:
+
+ lfs changelog $FSNAME-MDT0000 [startrec [endrec]]
+
+Example output:
+
+ 3 01CREAT 14:23:44.123456789 2026-04-28 0x0 t=[0x200000401:0x1:0x0] ef=0xf u=500:500 nid=10.0.0.1@tcp p=[0x200000007:0x1:0x0] file.dat
+
+=== Clearing Changelogs ===
+
+After processing, clear consumed records to free space on the MDT:
+
+ lfs changelog_clear $FSNAME-MDT0000 cl1 0
+
+'''Warning:''' Failing to clear changelogs causes unbounded catalog growth on the MDT, eventually consuming all available space. Always ensure your policy engine clears records after processing.
+
+== Policy Engines ==
+
+=== Robinhood (v3) ===
+
+[[Robinhood Policy Engine|Robinhood]] is the most widely deployed policy engine for Lustre HSM. Version 3 is the current stable release.
+
+Key capabilities:
+* Maintains a MySQL/MariaDB database of file system metadata.
+* Applies user-defined policies based on file attributes (age, size, path, owner, pool, stripe count, etc.).
+* Drives HSM archive and release operations.
+* Provides reporting and quota-awareness features.
+* Consumes Lustre changelogs for near-real-time metadata updates.
+
+Example Robinhood policy snippet (v3 syntax):
+
+<pre>
+define_policy archive_policy {
+    scope { type == file }
+    condition { last_mod > 7d }
+    action { lhsm_archive(archive_id=1) }
+}
+
+define_policy release_policy {
+    scope { type == file and status == "synced" }
+    condition { last_access > 30d }
+    action { lhsm_release() }
+}
+</pre>
+
+=== LiPE (Lustre Integrated Policy Engine) ===
+
+LiPE is a newer policy engine under active development within the Lustre community. It aims to provide tighter integration with Lustre internals and reduce dependency on external databases.
+
+LiPE is not yet as widely deployed as Robinhood, but is being adopted at several large HPC sites. Check the Lustre mailing lists and JIRA for current status.
+
+== Basic Automated Workflow ==
+
+A typical automated HSM workflow follows these steps:
+
+# '''Changelog ingestion:''' The policy engine reads changelog events and updates its metadata database.
+# '''Policy evaluation:''' Periodically (or on each event), the engine evaluates rules against the metadata.
+# '''HSM action:''' When a rule matches, the engine issues the appropriate command:
+#* <code>lfs hsm_archive</code> — copy file to the archive.
+#* <code>lfs hsm_release</code> — free Lustre data blocks after archiving.
+#* <code>lfs hsm_restore</code> — explicit pre-stage of data (rarely policy-driven; usually automatic on read).
+# '''Changelog clearing:''' The engine advances its consumer cursor and clears processed records.
+
+== Common Policies ==
+
+{| class="wikitable"
+! Policy !! Trigger !! Action
+|-
+| Archive after N days unmodified || <code>last_mod > Nd</code> || <code>hsm_archive</code>
+|-
+| Release after M days unaccessed || <code>last_access > Md</code> AND <code>status == archived</code> || <code>hsm_release</code>
+|-
+| Restore on access || User or application reads a released file || Automatic (handled by Lustre, no policy needed)
+|-
+| Archive on close || File closed after write || <code>hsm_archive</code> (event-driven)
+|-
+| Protect from release || File matches a keep-hot pattern (e.g., path regex) || Set <code>norelease</code> flag
+|}
+
+== Tuning the HSM Coordinator ==
+
+The coordinator on each MDT has several tunables that control how aggressively it dispatches requests to copytools.
+
+=== max_requests ===
+
+Maximum number of active HSM requests the coordinator dispatches at once:
+
+ lctl set_param mdt.$FSNAME-MDT0000.hsm.max_requests=20
+
+Default is typically 3. Increase for higher throughput when multiple copytool agents are available.
+
+=== loop_period ===
+
+How often (in seconds) the coordinator checks for new pending requests:
+
+ lctl set_param mdt.$FSNAME-MDT0000.hsm.loop_period=2
+
+Default is 10 seconds. Reduce for lower latency at the cost of slightly higher MDT CPU usage.
+
+=== grace_delay ===
+
+Time in seconds before a failed request can be retried:
+
+ lctl set_param mdt.$FSNAME-MDT0000.hsm.grace_delay=60
+
+Default is 60 seconds. Increase if transient failures are common in your archive backend.
+
+== Monitoring Active Requests ==
+
+View currently queued and active HSM requests:
+
+ lctl get_param mdt.*.hsm.actions
+
+Output fields include request type (ARCHIVE, RESTORE, REMOVE), file FID, copytool UUID, and start time. Use this to detect backlogs or stalled requests.
+
+Count pending requests:
+
+ lctl get_param mdt.*.hsm.actions | grep -c WAITING
+
+== Capacity Planning ==
+
+* '''Changelog volume:''' Busy file systems can generate millions of changelog records per day. Ensure the policy engine can keep up and clears records promptly.
+* '''Database sizing:''' Robinhood's MySQL database grows with the number of files. Plan for adequate disk and memory on the database server.
+* '''Copytool throughput:''' Size the number of copytool agents to match your archive bandwidth requirements. Monitor <code>mdt.*.hsm.agents</code> to confirm they are registered.
+* '''MDT space:''' Uncollected changelogs consume MDT space. Set alerts on MDT free space.
+
+== See Also ==
+
+* [[Lustre HSM Setup]] — basic HSM deployment and commands
+* [[Robinhood Policy Engine]] — detailed Robinhood documentation and links
+* [https://doc.lustre.org/ Lustre Operations Manual — HSM chapter]
+
+[[Category:HSM]]
+[[Category:Operations]]
+[[Category:HowTo]]

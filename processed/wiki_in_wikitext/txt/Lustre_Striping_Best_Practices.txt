@@ -1,0 +1,260 @@
+Title: Lustre Striping Best Practices
+URL: https://wiki.lustre.org/Lustre_Striping_Best_Practices
+Last Updated: 2026-04-28
+
+== Lustre Striping Best Practices ==
+
+This page provides practical guidance for configuring Lustre file
+striping. It explains when and how to stripe files for different
+workloads, and covers features like Progressive File Layouts (PFL)
+and overstriping. For command reference, see
+[[Configuring Lustre File Striping]].
+
+=== Striping Basics ===
+
+Lustre can split a file's data across multiple OSTs. Each chunk is
+called a '''stripe'''. The two key parameters are:
+
+* '''stripe_count''' — How many OSTs to spread the file across.
+  Default: '''1'''.
+* '''stripe_size''' — The size of each chunk written to one OST
+  before moving to the next. Default: '''4 MiB''' (compiled default
+  in current Lustre source; some systems may override this to 1 MiB
+  at mkfs time).
+
+Set with:
+
+ lfs setstripe -c <count> -S <size> <file_or_directory>
+
+=== When to Stripe (and When Not To) ===
+
+{| class="wikitable"
+|-
+! Workload !! Recommended Stripe Count !! Why
+|-
+| Many small files (< 1 MiB)
+| '''1''' (default)
+| Each file fits in a single stripe. Striping adds overhead:
+  more locks, more RPCs, more OSTs involved if one fails.
+|-
+| Medium files (1 MiB – 1 GiB)
+| '''1 to 4'''
+| Usually one OST has enough bandwidth. Stripe wider only if
+  multiple clients read/write the same file concurrently.
+|-
+| Large files (> 1 GiB), single client
+| '''4 to 8'''
+| Aggregates bandwidth across multiple OSTs. Diminishing returns
+  beyond the point where network bandwidth is saturated.
+|-
+| Large files, many concurrent clients
+| '''8+''' or '''-1''' (all OSTs)
+| Spreads the I/O load so no single OST becomes a bottleneck.
+  Use for shared checkpoint files or large datasets accessed
+  in parallel.
+|-
+| Append-heavy workloads (logs)
+| '''1'''
+| Appends serialize at the tail — striping adds lock contention
+  without improving throughput.
+|}
+
+'''Rule of thumb:''' If you don't know what to use, keep the default
+(<code>-c 1</code>). It works well for most workloads. Only increase
+stripe count when you have a specific performance need.
+
+=== Stripe Count Sizing ===
+
+The ideal stripe count balances I/O parallelism against overhead:
+
+ Ideal stripe count = required file bandwidth / per-OST bandwidth
+
+'''Example:''' You need 10 GB/s for a large checkpoint file. Each
+OST sustains 2 GB/s. Use <code>-c 5</code> or higher.
+
+'''Caution with -c -1 (all OSTs):'''
+
+Setting <code>-c -1</code> stripes across every OST. This can cause
+problems:
+* When any single OST fills up, writes to the file fail with
+  <code>ENOSPC</code> — even if other OSTs have plenty of space.
+  The MDS cannot skip full OSTs when the file is already allocated
+  across all of them.
+* Every I/O involves all OSTs, increasing the blast radius of any
+  single OST failure.
+
+Use <code>-c -1</code> only for specific large files, not as a
+directory or filesystem default. A moderate stripe count (4–16) is
+almost always better as a default.
+
+=== Stripe Size Selection ===
+
+* '''Minimum:''' 64 KiB (hard limit).
+* '''Practical minimum:''' 512 KiB — Lustre sends data in 1 MiB
+  RPC chunks over the network; smaller stripe sizes waste bandwidth.
+* '''Best for most workloads:''' '''1 MiB to 4 MiB'''.
+* '''Maximum:''' 4 GiB.
+
+'''Alignment tip:''' Match stripe size to your application's I/O
+size when possible. If an application writes 1 MiB blocks, use a
+1 MiB stripe size. This avoids splitting a single write across
+two OSTs (which doubles the lock and network overhead).
+
+=== Progressive File Layouts (PFL) ===
+
+PFL (since Lustre 2.10) lets a file start with a narrow layout and
+grow wider automatically as it gets larger. This is '''the best
+approach for mixed workloads''' where you don't know file sizes in
+advance.
+
+'''Example: start with 1 stripe, widen at 256 MiB, go full-width at
+4 GiB:'''
+
+ lfs setstripe -E 256M -c 1 -S 1M \
+               -E 4G -c 4 -S 4M \
+               -E -1 -c -1 -S 4M \
+               /mnt/lustre/project/
+
+* Files smaller than 256 MiB use 1 OST (low overhead).
+* Files between 256 MiB and 4 GiB use 4 OSTs.
+* Files larger than 4 GiB stripe across all OSTs.
+
+Set on a '''directory''' to apply to all new files created in it.
+
+PFL is strongly recommended as the default layout for directories
+with mixed workloads. It eliminates the need to predict file sizes
+at creation time.
+
+=== Overstriping ===
+
+Overstriping (since Lustre 2.13) allows placing '''multiple stripes
+on the same OST'''. This is useful when:
+
+* You have more I/O threads than OSTs.
+* You want to maximize concurrency on a small number of OSTs.
+
+Set with the capital <code>-C</code> flag:
+
+ lfs setstripe -C 32 /mnt/lustre/workfile
+
+If you have 8 OSTs and request 32 stripes, each OST gets 4 stripes.
+
+'''When to use:''' Overstriping primarily helps when the application
+uses many threads and each thread operates on a different region of
+the file. It reduces lock contention by giving each thread its own
+stripe. It does '''not''' increase per-OST bandwidth.
+
+=== OST Pools ===
+
+OST pools group a subset of OSTs for targeted allocation:
+
+ # Create a pool
+ lctl pool_new testfs.flash
+ 
+ # Add OSTs to the pool
+ lctl pool_add testfs.flash OST[0-3]
+ 
+ # Stripe files to the pool
+ lfs setstripe -p flash /mnt/lustre/fast_project/
+
+'''Use cases:'''
+* '''Tiered storage:''' Flash pool for hot data, HDD pool for bulk.
+* '''Rack-aware placement:''' Pool per rack to keep I/O local.
+* '''FLR fault domains:''' Use pools as mirror placement targets.
+
+=== Free Space Balancing ===
+
+Lustre automatically balances new file allocations across OSTs using
+two algorithms:
+
+* '''Round-robin:''' Used when free space is roughly balanced
+  (difference < 17% by default). Distributes stripes evenly across
+  OSSs for maximum network bandwidth utilization.
+* '''Weighted random:''' Used when free space is imbalanced. Prefers
+  OSTs with more free space.
+
+Key tunables:
+
+ # Imbalance threshold (% difference) to switch from round-robin
+ # to weighted allocation. Default: 17
+ lctl set_param lod.*.qos_threshold_rr=25
+ 
+ # Free-space priority weight (0-100). Default: 91
+ # 100 = allocate purely by free space
+ # 0 = allocate purely by location (network locality)
+ lctl set_param lod.*.qos_prio_free=100
+
+=== Do Not Set the Starting OST ===
+
+Unless you have a specific reason, do '''not''' use
+<code>lfs setstripe -i <ost_index></code>. Explicitly pinning files
+to a specific starting OST causes severe imbalance — one OST fills
+up while others remain empty.
+
+Let the MDS auto-select the starting OST. Its weighted algorithm
+handles load balancing automatically.
+
+=== Setting Defaults ===
+
+Striping can be set at three levels:
+
+* '''Per-file:''' <code>lfs setstripe <file></code> — only that file.
+* '''Per-directory:''' <code>lfs setstripe <dir></code> — all new
+  files created in that directory inherit the layout.
+* '''Per-filesystem:''' <code>lfs setstripe <mount_point></code> —
+  default for the entire filesystem (set on the root directory).
+
+Directory-level defaults are the most common and practical approach.
+
+To view current striping:
+
+ lfs getstripe /mnt/lustre/myfile
+ lfs getstripe -d /mnt/lustre/mydir   # directory default
+
+=== Stripe Count Limits ===
+
+{| class="wikitable"
+|-
+! Condition !! Maximum Stripe Count
+|-
+| ldiskfs MDT without ea_inode || 160
+|-
+| ldiskfs MDT with ea_inode (default since 2.13) || 2000
+|-
+| ZFS MDT || 2000
+|}
+
+To enable wider striping on older ldiskfs MDTs:
+
+ tune2fs -O ea_inode /dev/mdt_device
+
+=== Quick Reference ===
+
+{| class="wikitable"
+|-
+! Parameter !! Default !! Set With
+|-
+| Stripe count || 1 || <code>lfs setstripe -c N</code>
+|-
+| Stripe size || 4 MiB || <code>lfs setstripe -S 4M</code>
+|-
+| Starting OST || auto-selected || <code>lfs setstripe -i N</code> (not recommended)
+|-
+| Pool || none || <code>lfs setstripe -p poolname</code>
+|-
+| Overstripe count || N/A || <code>lfs setstripe -C N</code>
+|-
+| Max stripe count || 2000 || <code>lod.*.max_stripecount</code>
+|-
+| QoS threshold || 17% || <code>lod.*.qos_threshold_rr</code>
+|-
+| Free space priority || 91% || <code>lod.*.qos_prio_free</code>
+|}
+
+=== See Also ===
+
+* [[Configuring Lustre File Striping]] — Command reference
+* [[Progressive File Layouts]] — PFL design and advanced usage
+* [[Creating and Managing OST Pools]] — Pool administration
+* [[Handling Full OSTs]] — Managing OST space issues
+* [[Lustre Common Mistakes]] — Common striping mistakes
