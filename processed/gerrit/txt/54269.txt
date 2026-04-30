@@ -1,0 +1,149 @@
+Change:     54269
+Subject:    LU-17605 obdclass: do not wait forever acquiring entry
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/54269
+Change-Id:  I50ee59654adc221027c79cb68fa182b9abed50fa
+Project:    fs/lustre-release
+Branch:     master
+Status:     MERGED
+Owner:      Sebastien Buisson
+Created:    2024-03-04 16:31:06.000000000
+Updated:    2024-03-23 05:57:22.000000000
+Patch Set:  2
+Insertions: +1
+Deletions:  -0
+Comments:   0 (0 unresolved)
+
+--- Labels ---
+  Code-Review: Yang Sheng: +1; Andreas Dilger: +1; Oleg Drokin: +2
+  Verified: jenkins: +1; Maloo: +1
+
+--- Reviewers ---
+  REVIEWER: Oleg Drokin, Andreas Dilger, Yang Sheng, Sebastien Buisson
+
+--- Commit Message ---
+LU-17605 obdclass: do not wait forever acquiring entry
+
+The process of refreshing an entry via refresh_entry() goes through
+an upcall/downcall. If the upcall succeeds, we enter a wait queue.
+If after that the downcall is never called, we hit the expiry timeout,
+and we get removed from the wait queue.
+But if the entry is not new, the expiry time will be
+MAX_SCHEDULE_TIMEOUT == LONG_MAX, which means an infinite wait.
+So avoid waiting forever if an entry could not be refreshed, and call
+wake_up_all() if the wait for the ACQUIRING state failed.
+
+Signed-off-by: Sebastien Buisson <sbuisson@ddn.com>
+Change-Id: I50ee59654adc221027c79cb68fa182b9abed50fa
+Reviewed-on: https://review.whamcloud.com/c/fs/lustre-release/+/54269
+Tested-by: jenkins <devops@whamcloud.com>
+Tested-by: Maloo <maloo@whamcloud.com>
+Reviewed-by: Yang Sheng <ys@whamcloud.com>
+Reviewed-by: Andreas Dilger <adilger@whamcloud.com>
+Reviewed-by: Oleg Drokin <green@whamcloud.com>
+
+--- Review History ---
+
+--- Message (Sebastien Buisson, 2024-03-04 16:31:06.000000000) ---
+Uploaded patch set 1.
+
+--- Message (wc-checkpatch, 2024-03-04 16:33:22.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (jenkins, 2024-03-04 16:55:46.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/102800/ : SUCCESS
+
+--- Message (Yang Sheng, 2024-03-05 15:21:42.000000000) ---
+Patch Set 1: Code-Review+1
+
+--- Message (Andreas Dilger, 2024-03-09 07:21:27.000000000) ---
+Patch Set 1: Code-Review+1
+
+What is the behavior if an existing entry cannot be refreshed?  Does the server continue to use the old entry, or does it return an error to the client?  I think it makes sense to allow the expired entry to be used for some time and allow the upcall to be retried at some later time in case the LDAP server was overloaded or unavailable.
+
+--- Message (Sebastien Buisson, 2024-03-11 09:55:35.000000000) ---
+Patch Set 1:
+
+> Patch Set 1: Code-Review+1
+> 
+> What is the behavior if an existing entry cannot be refreshed?  Does the server continue to use the old entry, or does it return an error to the client?  I think it makes sense to allow the expired entry to be used for some time and allow the upcall to be retried at some later time in case the LDAP server was overloaded or unavailable.
+
+There is no 'grace' period when an entry expires. But there is already a retry mechanism to mitigate an overloaded LDAP server:
+
+   	if (UC_CACHE_IS_ACQUIRING(entry)) {
+   		long expiry = (entry == new) ?
+   			      cfs_time_seconds(cache->uc_acquire_expire) :
+   			      MAX_SCHEDULE_TIMEOUT;
+   		long left;
+   
+   		init_wait(&wait);
+   		add_wait_queue(&entry->ue_waitq, &wait);
+   		set_current_state(TASK_INTERRUPTIBLE);
+   		write_unlock(&cache->uc_lock);
+   
+   		left = schedule_timeout(expiry);
+   
+   		write_lock(&cache->uc_lock);
+   		remove_wait_queue(&entry->ue_waitq, &wait);
+   		if (UC_CACHE_IS_ACQUIRING(entry)) {
+   			/* we're interrupted or upcall failed in the middle */
+   			rc = left > 0 ? -EINTR : -ETIMEDOUT;
+   			/* if we waited uc_acquire_expire, we can try again
+   			 * with same data, but only if acquire is replayable
+   			 */
+   			if (left <= 0 && !cache->uc_acquire_replay)
+   				failedacquiring = true;
+   			put_entry(cache, entry);
+   			if (!failedacquiring) {
+   				write_unlock(&cache->uc_lock);
+   				failedacquiring = true;
+   				new = NULL;
+   				CDEBUG(D_OTHER,
+   				       "retry acquire for key %llu (got %d)\n",
+   				       entry->ue_key, rc);
+   				goto find_again;
+   			}
+   			CERROR("%s: acquire for key %lld after %llu: rc = %d\n",
+   			       cache->uc_name, entry->ue_key,
+   			       cache->uc_acquire_expire, rc);
+   			GOTO(out, entry = ERR_PTR(rc));
+   		}
+   	}
+
+--- Message (Andreas Dilger, 2024-03-11 10:13:58.000000000) ---
+Patch Set 1:
+
+> There is no 'grace' period when an entry expires. But there is
+ > already a retry mechanism to mitigate an overloaded LDAP server:
+
+The retry mechanism means the client won't get an *error* back if the upcall failed once, but it *does* mean that the client (maybe many of them) may suddenly become stuck waiting for the entry to be refreshed,  even though 1ms earlier that entry was OK to use.
+
+I'm wondering if it makes sense to have some "soft" and "hard" timeout on the entries, where the MDS upcall _tries_ to refresh the entry, but if this times out/fails it will continue to use that entry for some time before it actually blocks the client or returns an error.
+
+We don't want to give users extra time if their account was removed, so if the upcall succeeds but returns an error that the user does not exist, that is totally different than the upcall timing out and 99.9999% of the time the user was not coincidentally removed in those seconds before the entry expired.
+
+A relatively safe approach would be to *try* to update the entry after it has expired, but only block the thread doing the upcall if the entry has been expired more than, say, 5x the expiry interval and the downcall has not completed in a few seconds.
+
+That allows requests to continue processing for a few minutes if the LDAP server is suddenly busy/offline.  This would also allow removing the explicit upcall retry mechanism, since some other RPC arriving for the same UID in a short time will retrigger the upcall again (though it should still be rate limited so that only one upcall can be in progress at one time).
+
+--- Message (wc-checkpatch, 2024-03-20 22:12:10.000000000) ---
+Patch Set 1: Code-Review-1
+
+This change cannot be cherry-picked to master.
+Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (wc-checkpatch, 2024-03-20 23:05:54.000000000) ---
+Patch Set 1: -Code-Review
+
+previous -1 sent incorrectly
+
+--- Message (Oleg Drokin, 2024-03-23 05:57:18.000000000) ---
+Patch Set 1: Code-Review+2
+
+--- Message (Oleg Drokin, 2024-03-23 05:57:22.000000000) ---
+Change has been successfully cherry-picked as d3157bc43390b56e2de2c7251802a67ccebe4952 by Oleg Drokin

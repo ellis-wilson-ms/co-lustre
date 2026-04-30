@@ -1,0 +1,1979 @@
+Change:     50645
+Subject:    LU-16741 ptlrpc: defer & parallelize free_committed
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/50645
+Change-Id:  I5e9b8d556770dc4a33dce0ceb50f745201328c5e
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Patrick Farrell
+Created:    2023-04-15 22:24:42.000000000
+Updated:    2023-04-23 08:44:27.000000000
+Patch Set:  18
+Insertions: +74
+Deletions:  -23
+Comments:   100 (9 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: -1
+
+--- Reviewers ---
+  REVIEWER: Oleg Drokin, Andreas Dilger, Alex Zhuravlev, Qian Yingjin, Patrick Farrell
+
+--- Commit Message ---
+LU-16741 ptlrpc: defer & parallelize free_committed
+
+ptlrpc_free_committed can be extremely time consuming
+when there are many async requests outstanding, such as
+with small async DIO as potentially created by LU-13805,
+or in other unusual circumstances.
+
+Most of the work (in terms of time consumed) in
+ptlrpc_free_committed can be deferred and moved out from
+under the imp_lock.  Additionally, if there is a process
+waiting to do the ptlrpc_free_committed work, the current
+thread can grab a 'batch' of requests to process, then drop
+the import lock and allow the waiting thread to grab the
+next batch.
+
+This splits the work across waiting threads.  In cases
+where the lock is highly contended, it has the effect of
+having each thread do one 'batch' of work, but mostly in
+parallel.
+
+This has the effect of parallelizing this work and speeds
+it up enormously when there are many threads (the most
+important case, as they can generate a lot of work).
+
+If there are only a small number of threads working on
+the import, the load can be split unevenly - Consider
+the case of two threads.  The first to arrive defers one
+batch of requests, notices the second thread is waiting,
+and leaves all the remaining requests for that thread.
+This is uneven, but doesn't really matter for a few
+reasons:
+1. In the 'small number of threads' case, there isn't
+much work to do anyway, so it's not very impactful if it
+is unevenly distributed.
+2. If it really takes a long time, the first thread will
+arrive again as a 'waiter', and will pick up work.
+
+A good example is this IO500 ior-hard-write test with async
+DIO; this is a bit of an extreme example, and this also
+helps IO500 hard write without async DIO, but that hits
+other limitations so it is harder to see the benefit.
+
+mpirun -n 80 ior -k -e -o $file -t 47008 -b 47008 -s 11990 -w -a POSIX --posix.odirect
+
+Performance without the patch:
+2018.19 MiB/s
+Improves to:
+4800 MiB/s with this patch
+(This was done with fake_io to reduce server side limits
+and better show the contention.)
+
+And the time spent in the imp spinlock drops from 40-50%
+of all client CPU time to ~0% (imp_lock spinning no longer
+shows up in the perf traces).
+
+Signed-off-by: Patrick Farrell <pfarrell@whamcloud.com>
+Change-Id: I5e9b8d556770dc4a33dce0ceb50f745201328c5e
+
+--- Review History ---
+
+--- Message (Patrick Farrell, 2023-04-15 22:24:42.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Lustre Gerrit Janitor, 2023-04-15 22:27:17.000000000) ---
+Patch Set 1:
+
+Builds for x86_64 centos7,rhel8.5 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/30313/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (wc-checkpatch, 2023-04-15 22:28:12.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre Gerrit Janitor, 2023-04-15 22:30:19.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+Crash (id 68434 seen 0) in runtests@zfs
+- Failed run: https://testing.whamcloud.com/gerrit-janitor/30313/testresults/runtests-zfs-centos7_x86_64-centos7_x86_64
+
+--- Message (Lustre Gerrit Janitor, 2023-04-15 22:30:33.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+Crash (id 68435 seen 0) in runtests@ldiskfs+DNE
+- Failed run: https://testing.whamcloud.com/gerrit-janitor/30313/testresults/runtests-ldiskfs-DNE-centos7_x86_64-centos7_x86_64
+
+--- Message (Lustre Gerrit Janitor, 2023-04-15 22:33:35.000000000) ---
+Patch Set 1:
+
+Initial testing failed:
+
+> runtests@ldiskfs+DNE Client crashed(125s)
+- (Untriaged #68435, seen 0 times before)
+> runtests-ssk@ldiskfs+SharedKey Client crashed(305s)
+- (Untriaged #68435, seen 1 times before)
+> runtests@zfs Client crashed(110s)
+- (Untriaged #68434, seen 0 times before)
+
+(centos7)All results and logs: https://testing.whamcloud.com/gerrit-janitor/30313/results.html
+
+--- Message (jenkins, 2023-04-15 22:47:30.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/93970/ : SUCCESS
+
+--- Message (Maloo, 2023-04-15 22:47:57.000000000) ---
+Patch Set 1:
+
+Build 93970 (patch #1) will not be tested because: it is marked forbuildonly
+
+--- Message (Andreas Dilger, 2023-04-16 09:30:34.000000000) ---
+Patch Set 1:
+
+(4 comments)
+
+One thing that I recalled from looking through this code is that open RPCs are never actually freed on commit, they are kept around until the file is closed, so that the open can be replayed if the MDS crashes, to preserve the links on the file if it is open-unlinked during replay.
+
+Having a large number of opens might clog up the replay list, unless the opens are moved to a separate list (I don't recall if that was ever done).
+
+The other solution is just to keep track of the open file handles and then generate *new* open RPCs during replay, rather than resending the old ones.  That has the added benefit of not preserving the old layout and other irrelevant RPC info after the open+create was committed, and avoids saving the "old" RPC binary blobs if the MDS was upgraded and the client negotiated a new RPC protocol.
+
+--- Message (Patrick Farrell, 2023-04-17 14:38:25.000000000) ---
+Patch Set 1:
+
+(3 comments)
+
+--- Message (Patrick Farrell, 2023-04-17 15:16:05.000000000) ---
+Uploaded patch set 2: Commit message was updated.
+
+--- Message (Patrick Farrell, 2023-04-17 15:16:25.000000000) ---
+Uploaded patch set 3.
+
+--- Message (jenkins, 2023-04-17 15:16:27.000000000) ---
+Patch Set 2:
+
+No Builds Executed
+
+--- Message (Patrick Farrell, 2023-04-17 15:17:38.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+--- Message (Lustre Gerrit Janitor, 2023-04-17 15:17:47.000000000) ---
+Patch Set 2:
+
+Newer revision detected, aborting all work on revision 2
+
+--- Message (Lustre Gerrit Janitor, 2023-04-17 15:19:01.000000000) ---
+Patch Set 3:
+
+Builds for x86_64 centos7,rhel8.5 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/30347/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (wc-checkpatch, 2023-04-17 15:20:44.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre Gerrit Janitor, 2023-04-17 15:25:54.000000000) ---
+Patch Set 3:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(centos7)All results and logs: https://testing.whamcloud.com/gerrit-janitor/30347/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single@ldiskfs+DNE replay-single@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (jenkins, 2023-04-17 15:42:29.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/93998/ : SUCCESS
+
+--- Message (Maloo, 2023-04-17 15:42:46.000000000) ---
+Patch Set 3:
+
+Build 93998 (patch #3) will not be tested because: it is marked forbuildonly
+
+--- Message (Patrick Farrell, 2023-04-17 16:43:56.000000000) ---
+Uploaded patch set 4.
+
+--- Message (Lustre Gerrit Janitor, 2023-04-17 16:46:26.000000000) ---
+Patch Set 4:
+
+Builds for x86_64 centos7,rhel8.5 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/30352/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (wc-checkpatch, 2023-04-17 16:46:33.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre Gerrit Janitor, 2023-04-17 17:00:06.000000000) ---
+Patch Set 4:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(centos7)All results and logs: https://testing.whamcloud.com/gerrit-janitor/30352/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single@ldiskfs+DNE replay-single@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (jenkins, 2023-04-17 17:08:33.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/94003/ : SUCCESS
+
+--- Message (Maloo, 2023-04-17 17:09:20.000000000) ---
+Patch Set 4:
+
+Build 94003 (patch #4) will not be tested because: it is marked forbuildonly
+
+--- Message (Lustre Gerrit Janitor, 2023-04-17 19:21:34.000000000) ---
+Patch Set 4:
+
+Testing has completed with errors!
+IMPORTANT: these tests appear to be new failures unique to this patch
+- sanity2@zfs:test_77k(NEW unique failure for this branch in the last 30 days, and was seen 0 times across 0 other branches 0 reviews), test_77l(NEW unique failure for this branch in the last 30 days, and was seen 0 times across 0 other branches 0 reviews), test_81b(Seen in reviews: 49164 41092), test_398a(Seen in reviews: 47526 44310), test_428(NEW unique failure for this branch in the last 30 days, and was seen 0 times across 0 other branches 0 reviews), test_812a(NEW unique failure for this branch in the last 30 days, and was seen 0 times across 0 other branches 0 reviews), test_812b(NEW unique failure for this branch in the last 30 days, and was seen 0 times across 0 other branches 0 reviews), test_816(NEW unique failure for this branch in the last 30 days, and was seen 0 times across 0 other branches 0 reviews)
+- sanity-pfl@ldiskfs+DNE:test_16b(Seen in reviews: 50558 50547 50499 50344 50210 50086 49987 47812 38424)
+
+
+> ost-pools@zfs  Test script terminated with error 2(1254s)
+> racer@ldiskfs+DNE  Test script terminated with error 2(491s)
+> racer@zfs  Test script terminated with error 2(396s)
+> recovery-small@ldiskfs+DNE Server crashed(1459s)
+- (Untriaged #67713, seen 23 times before)
+> recovery-small@zfs Server crashed(1500s)
+- (Untriaged #67713, seen 24 times before)
+> replay-dual@ldiskfs+DNE  Test script terminated with error 2(2819s)
+> replay-dual@zfs Server crashed(2267s)
+- (Untriaged #67713, seen 27 times before)
+> replay-single@ldiskfs+DNE Server crashed(5213s)
+- (Untriaged #67713, seen 29 times before)
+> replay-single@zfs Server crashed(3612s)
+- (Untriaged #67713, seen 28 times before)
+> sanity2@ldiskfs+DNE Server crashed(6289s)
+- (Untriaged #67713, seen 30 times before)
+> sanity-slow@ldiskfs+DNE  Test script terminated with error 2(3065s)
+> sanity1@zfs  Test script terminated with error 2(2098s)
+> sanity2@zfs Failure Test script terminated with error 2(7365s)
+- 77k(failed to mount client with option 'nochecksum') 77l(fail to set checksum type crc32) 81b(dd should fail for -ENOSPC, but succeed.) 398a(lock still must be held by DIO append) 428(test_428 returned 22) 812a(client: import is not in CONNECTING state after 40) 812b(client: import is not in CONNECTING state after 40) 816(client: import is not in IDLE state after 40) 
+> sanity-benchmark@ldiskfs+DNE Server crashed(1189s)
+- (Untriaged #67713, seen 22 times before)
+> sanity-dom@ldiskfs+DNE  Test script terminated with error 2(893s)
+> sanity-flr@ldiskfs+DNE  Test script terminated with error 2(762s)
+> sanity-flr@zfs  Test script terminated with error 2(752s)
+> sanity-hsm@ldiskfs+DNE  Test script terminated with error 2(1681s)
+> sanity-lfsck@ldiskfs+DNE Failure Test script terminated with error 2(1756s)
+> sanity-pfl@ldiskfs+DNE Failure(1941s)
+- 16b(Create /mnt/lustre/d16b.sanity-pfl/f16b.sanity-pfl failed) 
+> sanity-pfl@zfs Server crashed(2117s)
+- (Untriaged #67713, seen 25 times before)
+> sanity-quota@ldiskfs+DNE Server crashed(2558s)
+- (Untriaged #67713, seen 26 times before)
+
+Tests with NEW Warning messages:
+- sanity2@zfs(Client: Creation of duplicate sysfs name) 
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE pjdfstest@ldiskfs+DNE pjdfstest@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity-slow@zfs sanity-benchmark@zfs sanity-dom@zfs sanity-hsm@zfs sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs 
+
+(centos7)All results and logs: https://testing.whamcloud.com/gerrit-janitor/30352/results.html
+
+--- Message (Patrick Farrell, 2023-04-17 19:44:03.000000000) ---
+Patch Set 5: Commit message was updated.
+
+--- Message (Lustre Gerrit Janitor, 2023-04-17 19:46:23.000000000) ---
+Patch Set 5:
+
+Builds for x86_64 centos7,rhel8.5 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/30355/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (wc-checkpatch, 2023-04-17 19:47:22.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Patrick Farrell, 2023-04-17 19:49:14.000000000) ---
+Patch Set 5:
+
+So this patch worked really well - I saw contention on the imp lock drop from 40-50% of CPU time on the client to *not visible in the traces* at 40 or 80 procs per node.  When I went up to 120 procs per node, it re-appears, but, like, 1-2%.
+
+Unfortunately, it looks like I'm somehow leaking an OSC reference as I can't unmount.  So there's something off, but that should be fixable.
+
+So I'll try to sort out that reference issue, which is obviously important, but this seems to do the job of reducing contention as well as could be asked.  (The sentinel value identifying presence of waiters was essential here, a good trick to remember.)
+
+Ready for at least initial review.
+
+--- Message (Patrick Farrell, 2023-04-17 19:57:35.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+Sorry, this isn't as ready as I thought - Alex, Oleg, please ignore for now.  We're leaking import references sometimes.
+
+--- Message (Lustre Gerrit Janitor, 2023-04-17 19:57:58.000000000) ---
+Patch Set 5:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(centos7)All results and logs: https://testing.whamcloud.com/gerrit-janitor/30355/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single@ldiskfs+DNE replay-single@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (jenkins, 2023-04-17 20:07:56.000000000) ---
+Patch Set 5:
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/94006/ : SUCCESS
+
+--- Message (Maloo, 2023-04-17 20:08:10.000000000) ---
+Patch Set 5:
+
+The following sessions will be run for build 94006 patch 5
+
+Enforced:
+- review-ldiskfs on el8.7-x86_64/ldiskfs servers and clients
+- review-zfs on el8.7-x86_64/zfs servers and clients
+- review-dne-part-1 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-2 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-3 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-4 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-5 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-6 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-7 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-zfs-part-1 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-2 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-3 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-4 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-5 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-6 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-7 on el8.7-x86_64/zfs servers and clients
+- review-ldiskfs-arm on el8.7-x86_64/ldiskfs servers and el8.7-aarch64/ldiskfs clients
+- review-dne-selinux-ssk-part-1 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-selinux-ssk-part-2 on el8.7-x86_64/ldiskfs servers and clients
+- review-ldiskfs-ubuntu on el8.7-x86_64/ldiskfs servers and ubuntu2004-x86_64/ldiskfs clients
+
+Optional:
+- review-dne-part-8 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-9 on el8.7-x86_64/ldiskfs servers and clients
+- review-ldiskfs on el8.7-x86_64/ldiskfs servers and sles15sp3-x86_64/ldiskfs clients
+- review-ldiskfs-ubuntu on el8.7-x86_64/ldiskfs servers and ubuntu2204-x86_64/ldiskfs clients
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=94006&commit=Apply+Filter
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=94006#redirect
+
+--- Message (Patrick Farrell, 2023-04-17 21:05:55.000000000) ---
+Uploaded patch set 6.
+
+--- Message (Lustre Gerrit Janitor, 2023-04-17 21:07:16.000000000) ---
+Patch Set 6:
+
+(5 comments)
+
+centos7: Compile failed
+
+rhel8.5: Compile failed
+
+
+ Job output URL: https://testing.whamcloud.com/gerrit-janitor/30356/results.html
+
+--- Message (Patrick Farrell, 2023-04-17 21:07:28.000000000) ---
+Patch Set 6:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2023-04-17 21:07:38.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Patrick Farrell, 2023-04-17 21:08:39.000000000) ---
+Uploaded patch set 7.
+
+--- Message (jenkins, 2023-04-17 21:08:42.000000000) ---
+Patch Set 6:
+
+No Builds Executed
+
+--- Message (Lustre Gerrit Janitor, 2023-04-17 21:10:31.000000000) ---
+Patch Set 7:
+
+Builds for x86_64 centos7,rhel8.5 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/30357/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (wc-checkpatch, 2023-04-17 21:12:49.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Patrick Farrell, 2023-04-17 21:12:52.000000000) ---
+Uploaded patch set 8.
+
+--- Message (jenkins, 2023-04-17 21:12:55.000000000) ---
+Patch Set 7: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/94007/ : ABORTED
+
+--- Message (Lustre Gerrit Janitor, 2023-04-17 21:15:10.000000000) ---
+Patch Set 8:
+
+Builds for x86_64 centos7,rhel8.5 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/30358/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (wc-checkpatch, 2023-04-17 21:18:00.000000000) ---
+Patch Set 8:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre Gerrit Janitor, 2023-04-17 21:27:53.000000000) ---
+Patch Set 8:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(centos7)All results and logs: https://testing.whamcloud.com/gerrit-janitor/30358/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single@ldiskfs+DNE replay-single@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (Maloo, 2023-04-17 21:36:49.000000000) ---
+Patch Set 5:
+
+Passed enforced test review-dne-zfs-part-7 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-26vm1: https://testing.whamcloud.com/test_sessions/d08bf868-cddf-4877-90cb-dcb24006de96 ran 4 tests.
+
+--- Message (jenkins, 2023-04-17 21:37:18.000000000) ---
+Patch Set 8: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/94008/ : SUCCESS
+
+--- Message (Maloo, 2023-04-17 21:37:37.000000000) ---
+Patch Set 8:
+
+The following sessions will be run for build 94008 patch 8
+
+Enforced:
+- review-ldiskfs on el8.7-x86_64/ldiskfs servers and clients
+- review-zfs on el8.7-x86_64/zfs servers and clients
+- review-dne-part-1 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-2 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-3 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-4 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-5 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-6 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-7 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-zfs-part-1 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-2 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-3 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-4 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-5 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-6 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-7 on el8.7-x86_64/zfs servers and clients
+- review-ldiskfs-arm on el8.7-x86_64/ldiskfs servers and el8.7-aarch64/ldiskfs clients
+- review-dne-selinux-ssk-part-1 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-selinux-ssk-part-2 on el8.7-x86_64/ldiskfs servers and clients
+- review-ldiskfs-ubuntu on el8.7-x86_64/ldiskfs servers and ubuntu2004-x86_64/ldiskfs clients
+
+Optional:
+- review-dne-part-8 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-9 on el8.7-x86_64/ldiskfs servers and clients
+- review-ldiskfs on el8.7-x86_64/ldiskfs servers and sles15sp3-x86_64/ldiskfs clients
+- review-ldiskfs-ubuntu on el8.7-x86_64/ldiskfs servers and ubuntu2204-x86_64/ldiskfs clients
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=94008&commit=Apply+Filter
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=94008#redirect
+
+--- Message (Autotest, 2023-04-17 21:37:49.000000000) ---
+Patch Set 5:
+
+Trevis Autotest is abandoning the following sessions because: later build 94008 found
+- Enforced review-ldiskfs on el8.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-1 on el8.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-3 on el8.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-5 on el8.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-7 on el8.7-x86_64/ldiskfs servers and clients
+- Optional review-dne-part-9 on el8.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-part-2 on el8.7-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-4 on el8.7-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-6 on el8.7-x86_64/zfs servers and clients
+- Optional review-ldiskfs on el8.7-x86_64/ldiskfs servers and sles15sp3-x86_64/ldiskfs clients
+- Enforced review-dne-selinux-ssk-part-1 on el8.7-x86_64/ldiskfs servers and clients
+- Enforced review-ldiskfs-ubuntu on el8.7-x86_64/ldiskfs servers and ubuntu2004-x86_64/ldiskfs clients
+
+--- Message (Autotest, 2023-04-17 21:38:17.000000000) ---
+Patch Set 5:
+
+Onyx Autotest is abandoning the following sessions because: later build 94008 found
+- Enforced review-zfs on el8.7-x86_64/zfs servers and clients
+- Enforced review-dne-part-2 on el8.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-4 on el8.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-6 on el8.7-x86_64/ldiskfs servers and clients
+- Optional review-dne-part-8 on el8.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-part-1 on el8.7-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-3 on el8.7-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-5 on el8.7-x86_64/zfs servers and clients
+- Enforced review-ldiskfs-arm on el8.7-x86_64/ldiskfs servers and el8.7-aarch64/ldiskfs clients
+- Enforced review-dne-selinux-ssk-part-2 on el8.7-x86_64/ldiskfs servers and clients
+- Optional review-ldiskfs-ubuntu on el8.7-x86_64/ldiskfs servers and ubuntu2204-x86_64/ldiskfs clients
+
+--- Message (Maloo, 2023-04-17 22:59:07.000000000) ---
+Patch Set 8:
+
+Passed enforced test review-dne-part-7 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-96vm1: https://testing.whamcloud.com/test_sessions/59a37a69-8348-4847-b758-131a9b4f168c ran 4 tests.
+
+--- Message (Maloo, 2023-04-17 23:03:49.000000000) ---
+Patch Set 8:
+
+Passed enforced test review-dne-zfs-part-7 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-108vm1: https://testing.whamcloud.com/test_sessions/94d6bb0b-8bc7-4874-9521-3df097fea6e1 ran 4 tests.
+
+--- Message (Maloo, 2023-04-18 00:00:36.000000000) ---
+Patch Set 8:
+
+Failed enforced test review-dne-zfs-part-4 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-81vm1: https://testing.whamcloud.com/test_sessions/d21ce8a3-158b-4d2e-b0ea-e92c482fddd6 ran 9 tests.  3 tests failed: sanity-quota, sanity-hsm, sanity-flr.
+
+--- Message (Maloo, 2023-04-18 00:50:00.000000000) ---
+Patch Set 8:
+
+Failed enforced test review-dne-zfs-part-6 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-113vm1: https://testing.whamcloud.com/test_sessions/826e9967-07fb-4ac1-8e42-eef2e97a2df6 ran 6 tests.  2 tests failed: ost-pools, replay-single.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2023-04-18 00:59:01.000000000) ---
+Patch Set 8:
+
+Failed enforced test review-zfs on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-70vm1: https://testing.whamcloud.com/test_sessions/98dc6285-5ccb-4d4c-9a6f-d1ffc8f7ac86 ran 10 tests.  1 tests failed: replay-single.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2023-04-18 01:09:36.000000000) ---
+Patch Set 8:
+
+Passed optional test review-ldiskfs on RHEL 8.7/x86_64, SLES 15.3/x86_64 uploaded by Trevis Autotest from trevis-128vm1: https://testing.whamcloud.com/test_sessions/22a37e7e-9c75-49f5-b60a-7dce8464e0dd ran 5 tests.
+
+--- Message (Maloo, 2023-04-18 01:27:09.000000000) ---
+Patch Set 8:
+
+Failed enforced test review-dne-zfs-part-2 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-84vm1: https://testing.whamcloud.com/test_sessions/e0842872-bfd0-4c25-af39-6d0cd370bf14 ran 9 tests.  1 tests failed: sanity-lfsck.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2023-04-18 01:35:21.000000000) ---
+Patch Set 8:
+
+Failed enforced test review-dne-part-2 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-66vm1: https://testing.whamcloud.com/test_sessions/6aea870e-86d4-42fc-a692-d4c1220212cc ran 7 tests.  1 tests failed: sanity-sec.
+
+--- Message (Maloo, 2023-04-18 01:42:12.000000000) ---
+Patch Set 8:
+
+Failed optional test review-dne-part-8 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-64vm1: https://testing.whamcloud.com/test_sessions/955de5ef-dbc1-489c-990b-0fde697784d3 ran 6 tests.  1 tests failed: racer.
+
+--- Message (Maloo, 2023-04-18 02:01:03.000000000) ---
+Patch Set 8:
+
+Passed enforced test review-ldiskfs on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-77vm1: https://testing.whamcloud.com/test_sessions/6c17d8be-6493-4336-a143-2310dea777f2 ran 5 tests.
+
+--- Message (Maloo, 2023-04-18 02:04:32.000000000) ---
+Patch Set 8:
+
+Failed enforced test review-dne-part-6 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-65vm1: https://testing.whamcloud.com/test_sessions/d24ce101-37c5-4931-88af-21358c78919c ran 4 tests.  1 tests failed: ost-pools.
+
+--- Message (Maloo, 2023-04-18 02:20:41.000000000) ---
+Patch Set 8:
+
+Failed enforced test review-dne-zfs-part-5 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-61vm1: https://testing.whamcloud.com/test_sessions/9afc493a-8766-4355-bc51-85e7df7a2deb ran 8 tests.  1 tests failed: recovery-small.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2023-04-18 02:27:22.000000000) ---
+Patch Set 8:
+
+Failed optional test review-ldiskfs-ubuntu on RHEL 8.7/x86_64, Ubuntu 22.04/x86_64 uploaded by Onyx Autotest from onyx-116vm1: https://testing.whamcloud.com/test_sessions/6dc04e9e-2be3-4432-9aad-c18b31517a03 ran 6 tests.  1 tests failed: sanity-sec.
+
+--- Message (Maloo, 2023-04-18 02:30:53.000000000) ---
+Patch Set 8:
+
+Failed enforced test review-ldiskfs-ubuntu on RHEL 8.7/x86_64, Ubuntu 20.04/x86_64 uploaded by Trevis Autotest from trevis-76vm1: https://testing.whamcloud.com/test_sessions/a92e3b79-e484-4d98-b514-73a05f2490b7 ran 6 tests.  1 tests failed: sanity-sec.
+
+--- Message (Maloo, 2023-04-18 02:32:08.000000000) ---
+Patch Set 8:
+
+Failed enforced test review-dne-selinux-ssk-part-2 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-119vm1: https://testing.whamcloud.com/test_sessions/9b4c880c-6966-4cae-a5f5-cf3513773840 ran 7 tests.  2 tests failed: sanity-selinux, recovery-small.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2023-04-18 02:41:24.000000000) ---
+Patch Set 8:
+
+Passed enforced test review-dne-part-1 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-98vm1: https://testing.whamcloud.com/test_sessions/ddfc62b4-84e9-443f-9287-34cbc2f49b42 ran 4 tests.
+
+--- Message (Maloo, 2023-04-18 02:47:00.000000000) ---
+Patch Set 8:
+
+Failed enforced test review-ldiskfs-arm on RHEL 8.7/aarch64, RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-108vm1: https://testing.whamcloud.com/test_sessions/ff63f4a6-3d6c-44f0-9dee-c05ceec5c93c ran 6 tests.  3 tests failed: sanity-sec, sanity-lnet, sanity.
+
+--- Message (Andreas Dilger, 2023-04-18 02:53:30.000000000) ---
+Patch Set 8:
+
+(12 comments)
+
+--- Message (Maloo, 2023-04-18 03:03:38.000000000) ---
+Patch Set 8:
+
+Failed enforced test review-dne-part-4 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-58vm1: https://testing.whamcloud.com/test_sessions/ac6db0ca-ed3f-4cf4-93dc-8d7985370fbc ran 9 tests.  1 tests failed: sanity-quota.
+
+--- Message (Maloo, 2023-04-18 03:15:14.000000000) ---
+Patch Set 8:
+
+Failed enforced test review-dne-zfs-part-1 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-78vm1: https://testing.whamcloud.com/test_sessions/fcb7ef0e-5263-419e-845c-37a54d2f5ed5 ran 4 tests.  2 tests failed: sanity-pfl, sanity.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2023-04-18 03:43:12.000000000) ---
+Patch Set 8:
+
+Passed enforced test review-dne-part-5 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-99vm1: https://testing.whamcloud.com/test_sessions/c0a874df-676a-435b-9c90-0a70984325df ran 6 tests.
+
+--- Message (Maloo, 2023-04-18 03:59:54.000000000) ---
+Patch Set 8:
+
+Failed enforced test review-dne-selinux-ssk-part-1 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-78vm1: https://testing.whamcloud.com/test_sessions/19d55294-acfd-492b-b07f-2dd148de031d ran 3 tests.  1 tests failed: sanity.
+
+--- Message (Maloo, 2023-04-18 05:49:07.000000000) ---
+Patch Set 8:
+
+Passed enforced test review-dne-zfs-part-3 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-77vm1: https://testing.whamcloud.com/test_sessions/aeee1f3c-ab60-488e-bbe6-9629aec80533 ran 3 tests.
+
+--- Message (Maloo, 2023-04-18 08:00:37.000000000) ---
+Patch Set 8: Verified-1
+
+Passed enforced test review-dne-part-3 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-20vm1: https://testing.whamcloud.com/test_sessions/8d041d5c-1051-4e4b-891e-18e31193d674 ran 3 tests.
+
+--- Message (Maloo, 2023-04-18 12:10:33.000000000) ---
+Patch Set 8:
+
+Failed optional test review-dne-part-9 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-79vm1: https://testing.whamcloud.com/test_sessions/9003d1eb-cf45-425e-89d0-28c2e779e6e5 ran 9 tests.  1 tests failed: performance-sanity.
+
+--- Message (Patrick Farrell, 2023-04-18 14:02:01.000000000) ---
+Patch Set 8:
+
+Thanks, Andreas - I could tell when working on it that the structure and naming weren't great, but I hadn't really thought of how to improve it.  This gives a basis for that.
+
+I'm going to give the naming + code structure stuff a crack first and then come back and look carefully at your points about the loop/batch handling.
+
+--- Message (Patrick Farrell, 2023-04-18 16:06:35.000000000) ---
+Uploaded patch set 9.
+
+--- Message (Patrick Farrell, 2023-04-18 16:06:47.000000000) ---
+Patch Set 8:
+
+(2 comments)
+
+--- Message (Patrick Farrell, 2023-04-18 16:10:08.000000000) ---
+Patch Set 9:
+
+(1 comment)
+
+I haven't tested this yet, so it may contain some severe mistake, but this + the previous patches in the new series is my attempt at refactoring.
+
+I think this is much cleaner and easier to read, though I'm sure it could stand improvement.
+
+I have not yet considered the issue with looping behavior Andreas raised; I'll think about that shortly.
+
+--- Message (wc-checkpatch, 2023-04-18 16:10:10.000000000) ---
+Patch Set 9:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre Gerrit Janitor, 2023-04-18 16:10:17.000000000) ---
+Patch Set 9:
+
+Builds for x86_64 centos7,rhel8.5 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/30417/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (Lustre Gerrit Janitor, 2023-04-18 16:14:22.000000000) ---
+Patch Set 9:
+
+(1 comment)
+
+Crash (id 68446 seen 0) in runtests@ldiskfs+DNE
+- Failed run: https://testing.whamcloud.com/gerrit-janitor/30417/testresults/runtests-ldiskfs-DNE-centos7_x86_64-centos7_x86_64
+
+--- Message (Patrick Farrell, 2023-04-18 16:16:01.000000000) ---
+Uploaded patch set 10: Patch Set 9 was rebased.
+
+--- Message (jenkins, 2023-04-18 16:16:06.000000000) ---
+Patch Set 9: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/94070/ : ABORTED
+
+--- Message (Lustre Gerrit Janitor, 2023-04-18 16:20:10.000000000) ---
+Patch Set 10:
+
+Builds for x86_64 centos7,rhel8.5 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/30422/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (wc-checkpatch, 2023-04-18 16:20:22.000000000) ---
+Patch Set 10:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre Gerrit Janitor, 2023-04-18 16:23:41.000000000) ---
+Patch Set 10:
+
+(1 comment)
+
+Crash (id 68446 seen 1) in runtests@ldiskfs+DNE
+- Failed run: https://testing.whamcloud.com/gerrit-janitor/30422/testresults/runtests-ldiskfs-DNE-centos7_x86_64-centos7_x86_64
+
+--- Message (Lustre Gerrit Janitor, 2023-04-18 16:29:16.000000000) ---
+Patch Set 10:
+
+Initial testing failed:
+
+> runtests@ldiskfs+DNE Server crashed(105s)
+- (Untriaged #68446, seen 1 times before)
+> runtests-ssk@ldiskfs+SharedKey  Test script terminated with error 2(511s)
+> runtests@zfs  Test script terminated with error 2(225s)
+
+(centos7)All results and logs: https://testing.whamcloud.com/gerrit-janitor/30422/results.html
+
+--- Message (jenkins, 2023-04-18 17:19:01.000000000) ---
+Patch Set 10: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/94076/ : FAILURE
+
+--- Message (Patrick Farrell, 2023-04-18 17:56:57.000000000) ---
+Uploaded patch set 11.
+
+--- Message (Patrick Farrell, 2023-04-18 17:58:19.000000000) ---
+Patch Set 11:
+
+I'm just pushing this to get it a little testing to confirm I've fixed the crash; not quite ready for review
+
+--- Message (Lustre Gerrit Janitor, 2023-04-18 17:58:41.000000000) ---
+Patch Set 11:
+
+Builds for x86_64 centos7,rhel8.5 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/30425/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (wc-checkpatch, 2023-04-18 18:01:44.000000000) ---
+Patch Set 11:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre Gerrit Janitor, 2023-04-18 18:07:34.000000000) ---
+Patch Set 11:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(centos7)All results and logs: https://testing.whamcloud.com/gerrit-janitor/30425/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single@ldiskfs+DNE replay-single@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (jenkins, 2023-04-18 18:21:57.000000000) ---
+Patch Set 11: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/94078/ : SUCCESS
+
+--- Message (Maloo, 2023-04-18 18:23:04.000000000) ---
+Patch Set 11:
+
+The following sessions will be run for build 94078 patch 11
+
+Enforced:
+- review-ldiskfs on el8.7-x86_64/ldiskfs servers and clients
+- review-zfs on el8.7-x86_64/zfs servers and clients
+- review-dne-part-1 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-2 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-3 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-4 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-5 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-6 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-7 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-zfs-part-1 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-2 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-3 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-4 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-5 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-6 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-7 on el8.7-x86_64/zfs servers and clients
+- review-ldiskfs-arm on el8.7-x86_64/ldiskfs servers and el8.7-aarch64/ldiskfs clients
+- review-dne-selinux-ssk-part-1 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-selinux-ssk-part-2 on el8.7-x86_64/ldiskfs servers and clients
+- review-ldiskfs-ubuntu on el8.7-x86_64/ldiskfs servers and ubuntu2004-x86_64/ldiskfs clients
+
+Optional:
+- review-dne-part-8 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-9 on el8.7-x86_64/ldiskfs servers and clients
+- review-ldiskfs on el8.7-x86_64/ldiskfs servers and sles15sp3-x86_64/ldiskfs clients
+- review-ldiskfs-ubuntu on el8.7-x86_64/ldiskfs servers and ubuntu2204-x86_64/ldiskfs clients
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=94078&commit=Apply+Filter
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=94078#redirect
+
+--- Message (Andreas Dilger, 2023-04-18 18:32:25.000000000) ---
+Patch Set 11:
+
+(2 comments)
+
+I'm not sure I have a good answer here. It looks like this could use a good cleanup, but I don't want to make it too much work to land and port the optimizations...
+
+--- Message (Patrick Farrell, 2023-04-18 19:15:53.000000000) ---
+Patch Set 11:
+
+(1 comment)
+
+> Patch Set 11:
+> 
+> (2 comments)
+> 
+> I'm not sure I have a good answer here. It looks like this could use a good cleanup, but I don't want to make it too much work to land and port the optimizations...
+
+Eh, it's already going to be a decent bit of work because of the earlier refactoring.  This is minor in comparison.
+
+I think splitting it up with helpers as I did before would probably help.
+
+--- Message (Patrick Farrell, 2023-04-18 19:29:01.000000000) ---
+Uploaded patch set 12.
+
+--- Message (Patrick Farrell, 2023-04-18 19:30:37.000000000) ---
+Patch Set 12:
+
+I didn't end up splitting the functions like before; I created two versions of ptlrpc_commit_request_deferred because it's quite different between deferred and not, but left the other stuff as it was previously.
+
+Still need to work on the looping issue you noted.
+
+--- Message (Lustre Gerrit Janitor, 2023-04-18 19:32:27.000000000) ---
+Patch Set 12:
+
+Builds for x86_64 centos7,rhel8.5 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/30433/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (wc-checkpatch, 2023-04-18 19:33:05.000000000) ---
+Patch Set 12:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Patrick Farrell, 2023-04-18 19:45:10.000000000) ---
+Patch Set 12:
+
+(1 comment)
+
+--- Message (Lustre Gerrit Janitor, 2023-04-18 19:45:34.000000000) ---
+Patch Set 12:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(centos7)All results and logs: https://testing.whamcloud.com/gerrit-janitor/30433/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single@ldiskfs+DNE replay-single@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (Patrick Farrell, 2023-04-18 19:46:03.000000000) ---
+Uploaded patch set 13.
+
+--- Message (jenkins, 2023-04-18 19:46:06.000000000) ---
+Patch Set 12: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/94086/ : ABORTED
+
+--- Message (Patrick Farrell, 2023-04-18 19:46:35.000000000) ---
+Patch Set 13:
+
+(And let's see if I accidentally fixed that unload issue while restructuring...)
+
+--- Message (wc-checkpatch, 2023-04-18 19:48:27.000000000) ---
+Patch Set 13:
+
+Looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2023-04-18 19:48:42.000000000) ---
+Patch Set 13:
+
+Builds for x86_64 centos7,rhel8.5 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/30434/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (Maloo, 2023-04-18 19:54:33.000000000) ---
+Patch Set 11:
+
+Passed enforced test review-dne-zfs-part-7 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-68vm3: https://testing.whamcloud.com/test_sessions/1866b7b8-a2f7-4455-b468-2ae2762a8cb0 ran 4 tests.
+
+--- Message (Maloo, 2023-04-18 19:56:05.000000000) ---
+Patch Set 11:
+
+Passed enforced test review-dne-part-7 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-70vm1: https://testing.whamcloud.com/test_sessions/33fb3bb8-6407-4b4c-bbd7-676a046de2e3 ran 4 tests.
+
+--- Message (Lustre Gerrit Janitor, 2023-04-18 20:02:49.000000000) ---
+Patch Set 13:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(centos7)All results and logs: https://testing.whamcloud.com/gerrit-janitor/30434/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single@ldiskfs+DNE replay-single@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (jenkins, 2023-04-18 20:17:06.000000000) ---
+Patch Set 13: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/94087/ : SUCCESS
+
+--- Message (Autotest, 2023-04-18 20:17:32.000000000) ---
+Patch Set 11:
+
+Onyx Autotest is abandoning the following sessions because: later build 94087 found
+- Enforced review-zfs on el8.7-x86_64/zfs servers and clients
+- Enforced review-dne-part-2 on el8.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-4 on el8.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-6 on el8.7-x86_64/ldiskfs servers and clients
+- Optional review-dne-part-8 on el8.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-part-2 on el8.7-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-4 on el8.7-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-6 on el8.7-x86_64/zfs servers and clients
+- Optional review-ldiskfs on el8.7-x86_64/ldiskfs servers and sles15sp3-x86_64/ldiskfs clients
+- Enforced review-ldiskfs-arm on el8.7-x86_64/ldiskfs servers and el8.7-aarch64/ldiskfs clients
+- Enforced review-ldiskfs-ubuntu on el8.7-x86_64/ldiskfs servers and ubuntu2004-x86_64/ldiskfs clients
+
+--- Message (Autotest, 2023-04-18 20:17:37.000000000) ---
+Patch Set 11:
+
+Trevis Autotest is abandoning the following sessions because: later build 94087 found
+- Enforced review-ldiskfs on el8.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-1 on el8.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-3 on el8.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-5 on el8.7-x86_64/ldiskfs servers and clients
+- Optional review-dne-part-9 on el8.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-part-1 on el8.7-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-3 on el8.7-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-5 on el8.7-x86_64/zfs servers and clients
+- Enforced review-dne-selinux-ssk-part-1 on el8.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-selinux-ssk-part-2 on el8.7-x86_64/ldiskfs servers and clients
+- Optional review-ldiskfs-ubuntu on el8.7-x86_64/ldiskfs servers and ubuntu2204-x86_64/ldiskfs clients
+
+--- Message (Maloo, 2023-04-18 20:18:10.000000000) ---
+Patch Set 13:
+
+The following sessions will be run for build 94087 patch 13
+
+Enforced:
+- review-ldiskfs on el8.7-x86_64/ldiskfs servers and clients
+- review-zfs on el8.7-x86_64/zfs servers and clients
+- review-dne-part-1 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-2 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-3 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-4 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-5 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-6 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-7 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-zfs-part-1 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-2 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-3 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-4 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-5 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-6 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-7 on el8.7-x86_64/zfs servers and clients
+- review-ldiskfs-arm on el8.7-x86_64/ldiskfs servers and el8.7-aarch64/ldiskfs clients
+- review-dne-selinux-ssk-part-1 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-selinux-ssk-part-2 on el8.7-x86_64/ldiskfs servers and clients
+- review-ldiskfs-ubuntu on el8.7-x86_64/ldiskfs servers and ubuntu2004-x86_64/ldiskfs clients
+
+Optional:
+- review-dne-part-8 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-9 on el8.7-x86_64/ldiskfs servers and clients
+- review-ldiskfs on el8.7-x86_64/ldiskfs servers and sles15sp3-x86_64/ldiskfs clients
+- review-ldiskfs-ubuntu on el8.7-x86_64/ldiskfs servers and ubuntu2204-x86_64/ldiskfs clients
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=94087&commit=Apply+Filter
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=94087#redirect
+
+--- Message (Andreas Dilger, 2023-04-18 20:23:20.000000000) ---
+Patch Set 8:
+
+(1 comment)
+
+--- Message (Maloo, 2023-04-18 21:13:41.000000000) ---
+Patch Set 13:
+
+Failed enforced test review-dne-zfs-part-7 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-33vm1: https://testing.whamcloud.com/test_sessions/5a9c61be-94cd-4701-9398-1edd29454827 ran 4 tests.  1 tests failed: sanity-pcc.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2023-04-18 21:38:42.000000000) ---
+Patch Set 13:
+
+Passed enforced test review-dne-part-7 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-97vm1: https://testing.whamcloud.com/test_sessions/80580c50-ffa0-44d1-a4e6-3dbde537c4b8 ran 4 tests.
+
+--- Message (Andreas Dilger, 2023-04-18 21:56:26.000000000) ---
+Patch Set 13: Code-Review+1
+
+(5 comments)
+
+Mostly minor style suggestions.  I think the patch looks good, hopefully the testing issue is resolved, or at least can be isolated to one patch (though the others appear to be functional no-ops, so I can't see how they could break anything).
+
+--- Message (Patrick Farrell, 2023-04-18 22:12:57.000000000) ---
+Patch Set 13:
+
+(1 comment)
+
+--- Message (Patrick Farrell, 2023-04-18 22:18:34.000000000) ---
+Uploaded patch set 14.
+
+--- Message (Patrick Farrell, 2023-04-18 22:18:37.000000000) ---
+Patch Set 13:
+
+(4 comments)
+
+--- Message (wc-checkpatch, 2023-04-18 22:18:47.000000000) ---
+Patch Set 14:
+
+Looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2023-04-18 22:20:11.000000000) ---
+Patch Set 14:
+
+(34 comments)
+
+centos7: Compile failed
+
+rhel8.5: Compile failed
+
+
+ Job output URL: https://testing.whamcloud.com/gerrit-janitor/30439/results.html
+
+--- Message (Patrick Farrell, 2023-04-18 22:26:30.000000000) ---
+Uploaded patch set 15.
+
+--- Message (jenkins, 2023-04-18 22:26:34.000000000) ---
+Patch Set 14:
+
+No Builds Executed
+
+--- Message (Patrick Farrell, 2023-04-18 22:27:22.000000000) ---
+Uploaded patch set 16.
+
+--- Message (jenkins, 2023-04-18 22:27:24.000000000) ---
+Patch Set 15:
+
+No Builds Executed
+
+--- Message (wc-checkpatch, 2023-04-18 22:29:52.000000000) ---
+Patch Set 16:
+
+Looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2023-04-18 22:30:32.000000000) ---
+Patch Set 15:
+
+Newer revision detected, aborting all work on revision 15
+
+--- Message (Lustre Gerrit Janitor, 2023-04-18 22:31:39.000000000) ---
+Patch Set 16:
+
+Builds for x86_64 centos7,rhel8.5 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/30447/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (Lustre Gerrit Janitor, 2023-04-18 22:41:09.000000000) ---
+Patch Set 16:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(centos7)All results and logs: https://testing.whamcloud.com/gerrit-janitor/30447/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single@ldiskfs+DNE replay-single@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (Andreas Dilger, 2023-04-18 22:46:50.000000000) ---
+Patch Set 16: Code-Review+1
+
+Thanks.
+
+I _think_ there is some support in Gerrit now for WIP or private patches that avoid spinning up Jenkins and Autotest for fast review cycles like this, but then you're never sure if/when the next refresh will happen or if the current version is good.
+
+At least both of them are smart enough to cancel in-flight builds/tests so that they aren't spinning wheels testing a patch/build that is 5 versions old...
+
+--- Message (Maloo, 2023-04-18 23:18:12.000000000) ---
+Patch Set 13:
+
+Failed enforced test review-dne-zfs-part-6 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-34vm1: https://testing.whamcloud.com/test_sessions/5252d295-7642-4961-bdd8-7816919f9e31 ran 6 tests.  2 tests failed: ost-pools, replay-single.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (jenkins, 2023-04-18 23:29:33.000000000) ---
+Patch Set 16: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/94098/ : SUCCESS
+
+--- Message (Autotest, 2023-04-18 23:29:50.000000000) ---
+Patch Set 13:
+
+Onyx Autotest is abandoning the following sessions because: later build 94098 found
+- Enforced review-zfs on el8.7-x86_64/zfs servers and clients
+- Enforced review-dne-part-2 on el8.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-4 on el8.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-5 on el8.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-6 on el8.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-part-1 on el8.7-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-3 on el8.7-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-5 on el8.7-x86_64/zfs servers and clients
+- Enforced review-dne-selinux-ssk-part-1 on el8.7-x86_64/ldiskfs servers and clients
+- Enforced review-ldiskfs-ubuntu on el8.7-x86_64/ldiskfs servers and ubuntu2004-x86_64/ldiskfs clients
+- Optional review-ldiskfs-ubuntu on el8.7-x86_64/ldiskfs servers and ubuntu2204-x86_64/ldiskfs clients
+
+--- Message (Autotest, 2023-04-18 23:29:56.000000000) ---
+Patch Set 13:
+
+Trevis Autotest is abandoning the following sessions because: later build 94098 found
+- Enforced review-ldiskfs on el8.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-1 on el8.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-3 on el8.7-x86_64/ldiskfs servers and clients
+- Optional review-dne-part-8 on el8.7-x86_64/ldiskfs servers and clients
+- Optional review-dne-part-9 on el8.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-part-2 on el8.7-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-4 on el8.7-x86_64/zfs servers and clients
+- Optional review-ldiskfs on el8.7-x86_64/ldiskfs servers and sles15sp3-x86_64/ldiskfs clients
+- Enforced review-ldiskfs-arm on el8.7-x86_64/ldiskfs servers and el8.7-aarch64/ldiskfs clients
+- Enforced review-dne-selinux-ssk-part-2 on el8.7-x86_64/ldiskfs servers and clients
+
+--- Message (Maloo, 2023-04-18 23:30:32.000000000) ---
+Patch Set 16:
+
+The following sessions will be run for build 94098 patch 16
+
+Enforced:
+- review-ldiskfs on el8.7-x86_64/ldiskfs servers and clients
+- review-zfs on el8.7-x86_64/zfs servers and clients
+- review-dne-part-1 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-2 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-3 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-4 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-5 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-6 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-7 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-zfs-part-1 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-2 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-3 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-4 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-5 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-6 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-7 on el8.7-x86_64/zfs servers and clients
+- review-ldiskfs-arm on el8.7-x86_64/ldiskfs servers and el8.7-aarch64/ldiskfs clients
+- review-dne-selinux-ssk-part-1 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-selinux-ssk-part-2 on el8.7-x86_64/ldiskfs servers and clients
+- review-ldiskfs-ubuntu on el8.7-x86_64/ldiskfs servers and ubuntu2004-x86_64/ldiskfs clients
+
+Optional:
+- review-dne-part-8 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-9 on el8.7-x86_64/ldiskfs servers and clients
+- review-ldiskfs on el8.7-x86_64/ldiskfs servers and sles15sp3-x86_64/ldiskfs clients
+- review-ldiskfs-ubuntu on el8.7-x86_64/ldiskfs servers and ubuntu2204-x86_64/ldiskfs clients
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=94098&commit=Apply+Filter
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=94098#redirect
+
+--- Message (Maloo, 2023-04-19 00:59:03.000000000) ---
+Patch Set 16:
+
+Passed enforced test review-dne-part-7 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-107vm1: https://testing.whamcloud.com/test_sessions/d53c9e3f-aa94-49e5-94c1-f733669ac5a5 ran 4 tests.
+
+--- Message (Maloo, 2023-04-19 01:04:50.000000000) ---
+Patch Set 16:
+
+Passed enforced test review-dne-zfs-part-7 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-28vm1: https://testing.whamcloud.com/test_sessions/89565ef4-3564-4696-bdd2-7ba8f963785f ran 4 tests.
+
+--- Message (Maloo, 2023-04-19 01:18:47.000000000) ---
+Patch Set 16:
+
+Failed enforced test review-dne-part-1 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-109vm1: https://testing.whamcloud.com/test_sessions/177b1aca-dc2e-463a-910d-f6455e41fd6a ran 6 tests.  1 tests failed: sanity.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Lustre Gerrit Janitor, 2023-04-19 01:45:24.000000000) ---
+Patch Set 16:
+
+Testing has completed with errors!
+IMPORTANT: these tests appear to be new failures unique to this patch
+- sanity2@zfs:test_64f(Seen in reviews: 50676 50508 49225 48814 48715 48278 48225 48070 47983 47873 47839 47788 47152 47017 46889 46779 46763 46629 46614 45822 45627 45234 45098 44729 44624 43883 43613 41994 39973), test_398a(Seen in reviews: 47526 44310), test_812a(NEW unique failure for this branch in the last 30 days, and was seen 1 times across 1 other branches 1 reviews), test_812b(NEW unique failure for this branch in the last 30 days, and was seen 1 times across 1 other branches 1 reviews), test_816(NEW unique failure for this branch in the last 30 days, and was seen 1 times across 1 other branches 1 reviews)
+- sanityn@ldiskfs+DNE:test_109(NEW unique failure for this branch in the last 30 days, and was seen 0 times across 0 other branches 0 reviews), test_112(NEW unique failure for this branch in the last 30 days, and was seen 0 times across 0 other branches 0 reviews), test_113(NEW unique failure for this branch in the last 30 days, and was seen 0 times across 0 other branches 0 reviews)
+
+
+> ost-pools@zfs Server crashed(1264s)
+- (Untriaged #67713, seen 67 times before)
+> racer@ldiskfs+DNE  Test script terminated with error 2(461s)
+> racer@zfs  Test script terminated with error 2(406s)
+> recovery-small@ldiskfs+DNE Server crashed(1515s)
+- (Untriaged #67713, seen 68 times before)
+> recovery-small@zfs Server crashed(1726s)
+- (Untriaged #67713, seen 70 times before)
+> replay-dual@ldiskfs+DNE Server crashed(2529s)
+- (Untriaged #67713, seen 72 times before)
+> replay-dual@zfs Server crashed(1847s)
+- (Untriaged #67713, seen 71 times before)
+> replay-single@ldiskfs+DNE Server crashed(3938s)
+- (Untriaged #67713, seen 69 times before)
+> replay-single@zfs Server crashed(1524s)
+- (Untriaged #67713, seen 63 times before)
+> replay-vbr@zfs Server crashed(2016s)
+- (Untriaged #67713, seen 64 times before)
+> sanity1@ldiskfs+DNE Server crashed(3436s)
+- (Untriaged #67713, seen 66 times before)
+> sanity2@ldiskfs+DNE Server crashed(2649s)
+- (Untriaged #67713, seen 65 times before)
+> sanity1@zfs  Test script terminated with error 2(2373s)
+> sanity2@zfs Failure Test script terminated with error 2(10997s)
+- 64f(buffered io, not write rpc: grants mismatch: 5111808, expected 1703936) 398a(lock still must be held by DIO append) 812a(client: import is not in CONNECTING state after 40) 812b(client: import is not in CONNECTING state after 40) 816(client: import is not in IDLE state after 40) 
+> sanity-benchmark@ldiskfs+DNE  Test script terminated with error 2(1264s)
+> sanity-flr@ldiskfs+DNE Failure Test script terminated with error 2(712s)
+- 200(checksum error for mirror 2) 
+> sanity-flr@zfs  Test script terminated with error 2(727s)
+> sanity-hsm@ldiskfs+DNE  Test script terminated with error 2(1731s)
+> sanity-lfsck@ldiskfs+DNE Failure Test script terminated with error 2(1931s)
+> sanity-quota@ldiskfs+DNE  Test script terminated with error 2(4099s)
+> sanity-quota@zfs  Test script terminated with error 2(5088s)
+> sanity-scrub@ldiskfs+DNE Timeout(2410s)
+> sanityn@ldiskfs+DNE Failure Test script terminated with error 2(4530s)
+- 109(Fail to remove lustre modules) 112(mkdir s3 failed) 113(cannot get instance of /mnt/lustre) 
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE pjdfstest@ldiskfs+DNE pjdfstest@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-vbr@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity-slow@zfs sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-hsm@zfs sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@zfs 
+
+(centos7)All results and logs: https://testing.whamcloud.com/gerrit-janitor/30447/results.html
+
+--- Message (Maloo, 2023-04-19 02:03:19.000000000) ---
+Patch Set 16:
+
+Failed enforced test review-zfs on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-82vm1: https://testing.whamcloud.com/test_sessions/2625361d-a207-48c8-93a0-b4d73d9ee76a ran 8 tests.  5 tests failed: sanity-lsnapshot, insanity, replay-ost-single, replay-single, sanity-flr.
+
+--- Message (Maloo, 2023-04-19 02:39:44.000000000) ---
+Patch Set 16:
+
+Failed enforced test review-dne-zfs-part-2 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-61vm1: https://testing.whamcloud.com/test_sessions/7f69c49b-bf12-4444-a837-22ba8fe4dcdb ran 9 tests.  3 tests failed: sanity-sec, sanity-lfsck, replay-dual.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2023-04-19 03:01:42.000000000) ---
+Patch Set 16:
+
+Passed optional test review-ldiskfs on RHEL 8.7/x86_64, SLES 15.3/x86_64 uploaded by Trevis Autotest from trevis-64vm1: https://testing.whamcloud.com/test_sessions/bb7443ad-c9f6-42c8-b75a-5fd807fe8f94 ran 5 tests.
+
+--- Message (Patrick Farrell, 2023-04-19 03:25:33.000000000) ---
+Patch Set 16: Code-Review-1
+
+So *something* is going wrong on the MDT-OST connection with this patch; that's what the crashes look to be.  Definitely looks related.
+
+I'll look closer tomorrow, it may be it's a specific test and reproducible.  Either there's an error here or perhaps we have some callback that has a hidden dependence on the import lock...
+
+--- Message (Maloo, 2023-04-19 03:29:54.000000000) ---
+Patch Set 16:
+
+Passed enforced test review-ldiskfs on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-77vm1: https://testing.whamcloud.com/test_sessions/6cd7841e-ff94-4ed2-a5cd-fe10e4952944 ran 5 tests.
+
+--- Message (Maloo, 2023-04-19 03:48:59.000000000) ---
+Patch Set 16:
+
+Failed optional test review-dne-part-8 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-71vm1: https://testing.whamcloud.com/test_sessions/3db212db-fc90-4821-8c3d-e77544f7f83e ran 8 tests.  2 tests failed: racer, replay-dual.
+
+--- Message (Maloo, 2023-04-19 03:56:12.000000000) ---
+Patch Set 16:
+
+Failed enforced test review-dne-zfs-part-6 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-29vm1: https://testing.whamcloud.com/test_sessions/c22322ac-477d-455b-86e3-53c184820ad7 ran 4 tests.  1 tests failed: ost-pools.
+
+--- Message (Maloo, 2023-04-19 04:02:42.000000000) ---
+Patch Set 16:
+
+Failed enforced test review-dne-zfs-part-5 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-56vm1: https://testing.whamcloud.com/test_sessions/1806f0fc-e694-4155-b765-2462f00131c3 ran 8 tests.  1 tests failed: recovery-small.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2023-04-19 04:05:48.000000000) ---
+Patch Set 16:
+
+Failed enforced test review-dne-part-6 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-32vm1: https://testing.whamcloud.com/test_sessions/8a8d972a-d3af-459a-a9f4-dd48d53e4b1c ran 4 tests.  1 tests failed: ost-pools.
+
+--- Message (Maloo, 2023-04-19 04:06:56.000000000) ---
+Patch Set 16:
+
+Failed enforced test review-ldiskfs-ubuntu on RHEL 8.7/x86_64, Ubuntu 20.04/x86_64 uploaded by Onyx Autotest from onyx-110vm1: https://testing.whamcloud.com/test_sessions/b32584d0-334d-41ff-9078-1bb9f4ade781 ran 6 tests.  1 tests failed: sanity-sec.
+
+--- Message (Maloo, 2023-04-19 04:22:59.000000000) ---
+Patch Set 16:
+
+Failed optional test review-ldiskfs-ubuntu on RHEL 8.7/x86_64, Ubuntu 22.04/x86_64 uploaded by Onyx Autotest from onyx-32vm1: https://testing.whamcloud.com/test_sessions/25226b79-2064-493f-bb33-1fbe1fe64cf3 ran 6 tests.  1 tests failed: sanity-sec.
+
+--- Message (Maloo, 2023-04-19 04:46:51.000000000) ---
+Patch Set 16:
+
+Failed enforced test review-dne-selinux-ssk-part-2 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-66vm1: https://testing.whamcloud.com/test_sessions/d0d2dd09-3adc-4743-adbf-b41b315f314f ran 5 tests.  2 tests failed: sanity-selinux, sanity-sec.
+
+--- Message (Maloo, 2023-04-19 04:51:20.000000000) ---
+Patch Set 16:
+
+Passed enforced test review-dne-part-4 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-72vm1: https://testing.whamcloud.com/test_sessions/871ead51-6018-46a2-8c22-c2dc753138f0 ran 9 tests.
+
+--- Message (Maloo, 2023-04-19 04:58:07.000000000) ---
+Patch Set 16:
+
+Passed enforced test review-dne-selinux-ssk-part-1 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-38vm1: https://testing.whamcloud.com/test_sessions/7153fe1a-d326-40ed-92a9-659080d0eef2 ran 3 tests.
+
+--- Message (Maloo, 2023-04-19 05:03:20.000000000) ---
+Patch Set 16:
+
+Failed enforced test review-dne-zfs-part-4 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-53vm1: https://testing.whamcloud.com/test_sessions/cc2ac270-98bf-4a0a-9ac9-19a3d561607a ran 9 tests.  1 tests failed: sanity-quota.
+
+--- Message (Maloo, 2023-04-19 05:16:22.000000000) ---
+Patch Set 16:
+
+Failed enforced test review-dne-part-2 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-79vm1: https://testing.whamcloud.com/test_sessions/397e065d-6804-43f2-b5c4-fa572d63746e ran 9 tests.  2 tests failed: sanity-sec, replay-dual.
+
+--- Message (Maloo, 2023-04-19 05:38:37.000000000) ---
+Patch Set 16:
+
+Passed enforced test review-dne-part-5 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-116vm1: https://testing.whamcloud.com/test_sessions/818b2925-552c-4cb0-b12d-796730da4174 ran 6 tests.
+
+--- Message (Maloo, 2023-04-19 05:52:27.000000000) ---
+Patch Set 16:
+
+Failed enforced test review-ldiskfs-arm on RHEL 8.7/aarch64, RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-108vm19: https://testing.whamcloud.com/test_sessions/1770cbcb-ae97-4e10-9f2d-329079b1363b ran 6 tests.  3 tests failed: sanity-sec, sanity-lnet, sanity.
+
+--- Message (Maloo, 2023-04-19 05:58:56.000000000) ---
+Patch Set 16:
+
+Failed enforced test review-dne-zfs-part-1 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-70vm1: https://testing.whamcloud.com/test_sessions/ccbe2901-58d1-4103-b910-db8524ccaeca ran 4 tests.  2 tests failed: sanity-pfl, sanity.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2023-04-19 06:20:29.000000000) ---
+Patch Set 16:
+
+Passed optional test review-dne-part-9 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-82vm1: https://testing.whamcloud.com/test_sessions/624968cf-df39-4d1a-9988-d880f4e7a009 ran 7 tests.
+
+--- Message (Maloo, 2023-04-19 06:26:18.000000000) ---
+Patch Set 16:
+
+Failed enforced test review-dne-zfs-part-3 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-103vm1: https://testing.whamcloud.com/test_sessions/9958f58f-9511-4db7-8e89-d742f48889eb ran 3 tests.  1 tests failed: conf-sanity.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2023-04-19 09:28:39.000000000) ---
+Patch Set 16: Verified-1
+
+Passed enforced test review-dne-part-3 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-117vm1: https://testing.whamcloud.com/test_sessions/63eb7c68-8d3a-42af-b5f5-c13e26a5ef7c ran 3 tests.
+
+--- Message (Patrick Farrell, 2023-04-19 16:57:42.000000000) ---
+Uploaded patch set 17.
+
+--- Message (Lustre Gerrit Janitor, 2023-04-19 17:00:24.000000000) ---
+Patch Set 17:
+
+Builds for x86_64 centos7,rhel8.5 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/30478/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (wc-checkpatch, 2023-04-19 17:02:12.000000000) ---
+Patch Set 17:
+
+Looks good to me.
+
+--- Message (Patrick Farrell, 2023-04-19 17:05:51.000000000) ---
+Patch Set 17:
+
+Ugh, yes - the osp_request_commit_cb has a dependency on the imp_lock() being held, it uses various bits of info from the import that must be locked to be consistent, etc.
+
+I *really* don't know the OSP code, so I'm going to consider that dependency (which does seem screwy - it's checking to see if the request has *really* been committed?  Why is that an open question when commit_cb is called?), but...  I think I'm going to add a 'locked' parameter to the commit_cb function and just have the osp commit take the lock.
+
+--- Message (Lustre Gerrit Janitor, 2023-04-19 17:07:57.000000000) ---
+Patch Set 17:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(centos7)All results and logs: https://testing.whamcloud.com/gerrit-janitor/30478/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single@ldiskfs+DNE replay-single@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (Patrick Farrell, 2023-04-19 17:28:17.000000000) ---
+Patch Set 17:
+
+I've just pushed a number of test patches atop this one, to gather various bits of information and try some things.  So, please ignore - none of them are intended to land as is, and I took care to mark them as trivial with a testlist specified, so they aren't spamming Maloo too badly.
+
+--- Message (Patrick Farrell, 2023-04-19 17:29:08.000000000) ---
+Patch Set 17:
+
+(1 comment)
+
+--- Message (jenkins, 2023-04-19 17:31:40.000000000) ---
+Patch Set 17: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/94127/ : SUCCESS
+
+--- Message (Maloo, 2023-04-19 17:32:45.000000000) ---
+Patch Set 17:
+
+The following sessions will be run for build 94127 patch 17
+
+Enforced:
+- review-ldiskfs on el8.7-x86_64/ldiskfs servers and clients
+- review-zfs on el8.7-x86_64/zfs servers and clients
+- review-dne-part-1 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-2 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-3 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-4 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-5 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-6 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-7 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-zfs-part-1 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-2 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-3 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-4 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-5 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-6 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-7 on el8.7-x86_64/zfs servers and clients
+- review-ldiskfs-arm on el8.7-x86_64/ldiskfs servers and el8.7-aarch64/ldiskfs clients
+- review-dne-selinux-ssk-part-1 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-selinux-ssk-part-2 on el8.7-x86_64/ldiskfs servers and clients
+- review-ldiskfs-ubuntu on el8.7-x86_64/ldiskfs servers and ubuntu2004-x86_64/ldiskfs clients
+
+Optional:
+- review-dne-part-8 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-9 on el8.7-x86_64/ldiskfs servers and clients
+- review-ldiskfs on el8.7-x86_64/ldiskfs servers and sles15sp3-x86_64/ldiskfs clients
+- review-ldiskfs-ubuntu on el8.7-x86_64/ldiskfs servers and ubuntu2204-x86_64/ldiskfs clients
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=94127&commit=Apply+Filter
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=94127#redirect
+
+--- Message (Maloo, 2023-04-19 19:07:40.000000000) ---
+Patch Set 17:
+
+Passed enforced test review-dne-part-7 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-74vm5: https://testing.whamcloud.com/test_sessions/2ed4ed4d-ba0a-4743-a7af-a389833e2c97 ran 4 tests.
+
+--- Message (Lustre Gerrit Janitor, 2023-04-19 19:31:21.000000000) ---
+Patch Set 17:
+
+Testing has completed with errors!
+IMPORTANT: these tests appear to be new failures unique to this patch
+- sanity2@zfs:test_398a(Seen in reviews: 50692 47526 44310), test_812a(Seen in reviews: 50692), test_812b(Seen in reviews: 50692), test_816(Seen in reviews: 50692)
+- sanityn@ldiskfs+DNE:test_109(NEW unique failure for this branch in the last 30 days, and was seen 1 times across 1 other branches 1 reviews), test_112(NEW unique failure for this branch in the last 30 days, and was seen 1 times across 1 other branches 1 reviews), test_113(NEW unique failure for this branch in the last 30 days, and was seen 1 times across 1 other branches 1 reviews)
+
+
+> ost-pools@zfs  Test script terminated with error 2(1230s)
+> racer@ldiskfs+DNE Timeout(709s)
+> racer@zfs  Test script terminated with error 2(411s)
+> recovery-small@ldiskfs+DNE Server crashed(1460s)
+- (Untriaged #67713, seen 86 times before)
+> recovery-small@zfs Server crashed(1365s)
+- (Untriaged #67713, seen 89 times before)
+> replay-dual@ldiskfs+DNE  Test script terminated with error 2(2780s)
+> replay-dual@zfs Server crashed(356s)
+- (Untriaged #67713, seen 77 times before)
+> replay-single@ldiskfs+DNE  Test script terminated with error 2(8485s)
+> replay-single@zfs Server crashed(4626s)
+- (Untriaged #67713, seen 105 times before)
+> sanity1@ldiskfs+DNE Server crashed(326s)
+- (Untriaged #67713, seen 76 times before)
+> sanity2@ldiskfs+DNE Server crashed(2689s)
+- (Untriaged #67713, seen 98 times before)
+> sanity-slow@ldiskfs+DNE  Test script terminated with error 2(2901s)
+> sanity1@zfs  Test script terminated with error 2(2298s)
+> sanity2@zfs Failure Test script terminated with error 2(6919s)
+- 398a(lock still must be held by DIO append) 812a(client: import is not in CONNECTING state after 40) 812b(client: import is not in CONNECTING state after 40) 816(client: import is not in IDLE state after 40) 
+> sanity-benchmark@ldiskfs+DNE Server crashed(1093s)
+- (Untriaged #67713, seen 79 times before)
+> sanity-flr@ldiskfs+DNE  Test script terminated with error 2(737s)
+> sanity-flr@zfs  Test script terminated with error 2(797s)
+> sanity-hsm@ldiskfs+DNE  Test script terminated with error 2(1565s)
+> sanity-lfsck@ldiskfs+DNE Failure Test script terminated with error 2(1621s)
+> sanity-lfsck@zfs Failure Test script terminated with error 2(908s)
+> sanity-pfl@zfs  Test script terminated with error 2(2057s)
+> sanity-quota@ldiskfs+DNE Server crashed(2478s)
+- (Untriaged #67713, seen 96 times before)
+> sanity-quota@zfs  Test script terminated with error 2(5088s)
+> sanityn@ldiskfs+DNE Failure Test script terminated with error 2(4481s)
+- 109(Fail to remove lustre modules) 112(mkdir s3 failed) 113(cannot get instance of /mnt/lustre) 
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE pjdfstest@ldiskfs+DNE pjdfstest@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity-slow@zfs sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-hsm@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@zfs 
+
+(centos7)All results and logs: https://testing.whamcloud.com/gerrit-janitor/30478/results.html
+
+--- Message (Maloo, 2023-04-19 19:34:22.000000000) ---
+Patch Set 17:
+
+Passed enforced test review-dne-zfs-part-7 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-67vm12: https://testing.whamcloud.com/test_sessions/8a99ce0d-d866-4d62-8378-5d5e7a044fc2 ran 4 tests.
+
+--- Message (Maloo, 2023-04-19 20:25:53.000000000) ---
+Patch Set 17:
+
+Failed enforced test review-dne-zfs-part-6 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-101vm8: https://testing.whamcloud.com/test_sessions/e2cda695-c57e-4b2a-a542-dd314b103855 ran 6 tests.  2 tests failed: ost-pools, replay-single.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2023-04-19 20:32:00.000000000) ---
+Patch Set 17:
+
+Failed enforced test review-dne-zfs-part-4 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-20vm8: https://testing.whamcloud.com/test_sessions/217b9bcc-1484-43f8-a555-49642716f8b1 ran 9 tests.  3 tests failed: sanity-quota, sanity-hsm, sanity-flr.
+
+--- Message (Maloo, 2023-04-19 21:08:03.000000000) ---
+Patch Set 17:
+
+Passed optional test review-ldiskfs on RHEL 8.7/x86_64, SLES 15.3/x86_64 uploaded by Trevis Autotest from trevis-64vm1: https://testing.whamcloud.com/test_sessions/39633a87-09d6-4163-b9d4-8c8c0132fdde ran 5 tests.
+
+--- Message (Maloo, 2023-04-19 21:59:37.000000000) ---
+Patch Set 17:
+
+Failed optional test review-dne-part-8 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-43vm6: https://testing.whamcloud.com/test_sessions/84ef31a0-1368-4671-9dc8-4e4f2238106b ran 8 tests.  2 tests failed: racer, replay-dual.
+
+--- Message (Maloo, 2023-04-19 21:59:47.000000000) ---
+Patch Set 17:
+
+Passed enforced test review-dne-zfs-part-2 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-26vm2: https://testing.whamcloud.com/test_sessions/d5488f69-10b4-4e4f-9477-595fe002db80 ran 7 tests.
+
+--- Message (Maloo, 2023-04-19 22:05:20.000000000) ---
+Patch Set 17:
+
+Failed enforced test review-dne-part-6 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-48vm6: https://testing.whamcloud.com/test_sessions/b816e362-dbe6-48bc-a34c-10dfc20c04d9 ran 4 tests.  1 tests failed: ost-pools.
+
+--- Message (Maloo, 2023-04-19 22:08:44.000000000) ---
+Patch Set 17:
+
+Passed enforced test review-ldiskfs on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-25vm1: https://testing.whamcloud.com/test_sessions/03ff7132-2d33-4b76-ba4b-93bf0fe61643 ran 5 tests.
+
+--- Message (Maloo, 2023-04-19 22:16:49.000000000) ---
+Patch Set 17:
+
+Failed enforced test review-dne-selinux-ssk-part-2 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-40vm7: https://testing.whamcloud.com/test_sessions/98e3ce06-3214-4ff9-85d0-6d516be7c56a ran 5 tests.  1 tests failed: sanity-selinux.
+
+--- Message (Maloo, 2023-04-19 22:25:57.000000000) ---
+Patch Set 17:
+
+Failed enforced test review-zfs on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-25vm6: https://testing.whamcloud.com/test_sessions/17ab5587-2d77-4254-a780-905aea88c043 ran 12 tests.  2 tests failed: replay-single, sanity-flr.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2023-04-19 22:57:02.000000000) ---
+Patch Set 17:
+
+Failed optional test review-ldiskfs-ubuntu on RHEL 8.7/x86_64, Ubuntu 22.04/x86_64 uploaded by Onyx Autotest from onyx-97vm13: https://testing.whamcloud.com/test_sessions/77381492-54a8-4255-b1c7-1757b69640d5 ran 6 tests.  1 tests failed: sanity-sec.
+
+--- Message (Maloo, 2023-04-19 22:58:12.000000000) ---
+Patch Set 17:
+
+Failed enforced test review-dne-part-2 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-24vm6: https://testing.whamcloud.com/test_sessions/782544d0-e23b-4b7f-8a24-7ccbf3ae2ae5 ran 9 tests.  2 tests failed: sanity-sec, replay-dual.
+
+--- Message (Maloo, 2023-04-19 23:07:16.000000000) ---
+Patch Set 17:
+
+Passed enforced test review-dne-part-4 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-61vm11: https://testing.whamcloud.com/test_sessions/2eece8d3-91a5-44de-a4ad-21c99e7eb21e ran 9 tests.
+
+--- Message (Maloo, 2023-04-19 23:25:58.000000000) ---
+Patch Set 17:
+
+Failed enforced test review-dne-zfs-part-5 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-111vm9: https://testing.whamcloud.com/test_sessions/92a7531a-b01f-479f-9f9e-5766c0bb6213 ran 8 tests.  2 tests failed: sanityn, recovery-small.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2023-04-19 23:27:01.000000000) ---
+Patch Set 17:
+
+Passed enforced test review-dne-selinux-ssk-part-1 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-97vm3: https://testing.whamcloud.com/test_sessions/654b4b20-cef5-4244-b4a2-76f98ed8beef ran 3 tests.
+
+--- Message (Maloo, 2023-04-19 23:52:49.000000000) ---
+Patch Set 17:
+
+Passed enforced test review-dne-part-5 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-49vm5: https://testing.whamcloud.com/test_sessions/f13d5744-c30f-43b3-b28b-83ebfa80dfd7 ran 6 tests.
+
+--- Message (Andreas Dilger, 2023-04-19 23:54:59.000000000) ---
+Patch Set 17:
+
+> I've just pushed a number of test patches atop this one, to gather
+ > various bits of information and try some things.  So, please ignore
+ > - none of them are intended to land as is, and I took care to mark
+ > them as trivial with a testlist specified, so they aren't spamming
+ > Maloo too badly.
+
+Strictly speaking, "fortestonly" seems the right thing for those patches.  That will not run *any* of the standard testing (sanity and sanity-lnet on x86 and aarch64) if a testlist is specified.  It also will never mark a patch Maloo Verified +1, so no danger of it accidentally being landed.
+
+ > the osp_request_commit_cb has a dependency on the imp_lock()
+ > being held, it uses various bits of info from the import that
+ > must be locked to be consistent, etc.
+ >
+ > I *really* don't know the OSP code, so I'm going to consider
+ > that dependency (which does seem screwy - it's checking to see
+ > if the request has *really* been committed?  Why is that an
+ > open question when commit_cb is called?)
+
+OSP is the interface to perform operations on a remote MDT or OST, so I think there are two types of "commit" involved here.  One is the local (MDT) disk commit, and the other is the remote (MDT or OST) disk commit.  There may also be an RPC commit callback.
+
+I can't say without looking into the code details to say which one is which, but that is likely what is involved here, trying to only return "committed" to the local caller when both the local and remote operations are sync'd to persistent storage (into the journal at least).
+
+--- Message (Maloo, 2023-04-20 00:12:10.000000000) ---
+Patch Set 17:
+
+Failed enforced test review-ldiskfs-ubuntu on RHEL 8.7/x86_64, Ubuntu 20.04/x86_64 uploaded by Trevis Autotest from trevis-83vm8: https://testing.whamcloud.com/test_sessions/706aafce-f575-48e9-9889-4a9448851f28 ran 6 tests.  1 tests failed: sanity-sec.
+
+--- Message (Maloo, 2023-04-20 00:56:33.000000000) ---
+Patch Set 17:
+
+Passed optional test review-dne-part-9 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-44vm7: https://testing.whamcloud.com/test_sessions/a04ed541-9270-474e-8e0b-23dab01c1283 ran 7 tests.
+
+--- Message (Maloo, 2023-04-20 00:59:33.000000000) ---
+Patch Set 17:
+
+Failed enforced test review-dne-part-1 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-72vm7: https://testing.whamcloud.com/test_sessions/3cfcff94-a163-4490-919b-fb35f877039a ran 4 tests.  1 tests failed: sanity.
+
+--- Message (Maloo, 2023-04-20 01:07:17.000000000) ---
+Patch Set 17:
+
+Failed enforced test review-dne-zfs-part-1 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-31vm6: https://testing.whamcloud.com/test_sessions/385c90f4-3472-4572-9c24-57ba1ba8ff8c ran 4 tests.  2 tests failed: sanity-pfl, sanity.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2023-04-20 01:10:33.000000000) ---
+Patch Set 17:
+
+Failed enforced test review-ldiskfs-arm on RHEL 8.7/aarch64, RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-91vm3: https://testing.whamcloud.com/test_sessions/440934de-93b6-4c86-9fd1-d089c62420a7 ran 6 tests.  1 tests failed: sanity-sec.
+
+--- Message (Maloo, 2023-04-20 04:33:13.000000000) ---
+Patch Set 17:
+
+Failed enforced test review-dne-zfs-part-3 on RHEL 8.7/x86_64 uploaded by Onyx Autotest from onyx-71vm1: https://testing.whamcloud.com/test_sessions/e1d50e2d-7297-4eff-9bc1-338e3284a6e8 ran 3 tests.  1 tests failed: conf-sanity.
+
+--- Message (Maloo, 2023-04-20 04:55:26.000000000) ---
+Patch Set 17: Verified-1
+
+Failed enforced test review-dne-part-3 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-29vm7: https://testing.whamcloud.com/test_sessions/5c5096a7-78fc-45de-8303-119f6ad613fd ran 3 tests.  1 tests failed: conf-sanity.
+
+--- Message (Patrick Farrell, 2023-04-22 20:49:40.000000000) ---
+Uploaded patch set 18: Patch Set 17 was rebased.
+
+--- Message (wc-checkpatch, 2023-04-22 20:54:25.000000000) ---
+Patch Set 18:
+
+Looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2023-04-22 20:54:45.000000000) ---
+Patch Set 18:
+
+Builds for x86_64 centos7,rhel8.5 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/30584/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (Lustre Gerrit Janitor, 2023-04-22 21:08:31.000000000) ---
+Patch Set 18:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(centos7)All results and logs: https://testing.whamcloud.com/gerrit-janitor/30584/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single@ldiskfs+DNE replay-single@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (jenkins, 2023-04-22 22:41:38.000000000) ---
+Patch Set 18: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/94227/ : SUCCESS
+
+--- Message (Maloo, 2023-04-22 22:42:22.000000000) ---
+Patch Set 18:
+
+The following sessions will be run for build 94227 patch 18
+
+Enforced:
+- review-ldiskfs on el8.7-x86_64/ldiskfs servers and clients
+- review-zfs on el8.7-x86_64/zfs servers and clients
+- review-dne-part-1 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-2 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-3 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-4 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-5 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-6 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-7 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-zfs-part-1 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-2 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-3 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-4 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-5 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-6 on el8.7-x86_64/zfs servers and clients
+- review-dne-zfs-part-7 on el8.7-x86_64/zfs servers and clients
+- review-ldiskfs-arm on el8.7-x86_64/ldiskfs servers and el8.7-aarch64/ldiskfs clients
+- review-dne-selinux-ssk-part-1 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-selinux-ssk-part-2 on el8.7-x86_64/ldiskfs servers and clients
+- review-ldiskfs-ubuntu on el8.7-x86_64/ldiskfs servers and ubuntu2004-x86_64/ldiskfs clients
+
+Optional:
+- review-dne-part-8 on el8.7-x86_64/ldiskfs servers and clients
+- review-dne-part-9 on el8.7-x86_64/ldiskfs servers and clients
+- review-ldiskfs on el8.7-x86_64/ldiskfs servers and sles15sp3-x86_64/ldiskfs clients
+- review-ldiskfs-ubuntu on el8.7-x86_64/ldiskfs servers and ubuntu2204-x86_64/ldiskfs clients
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=94227&commit=Apply+Filter
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=94227#redirect
+
+--- Message (Lustre Gerrit Janitor, 2023-04-23 00:03:56.000000000) ---
+Patch Set 18:
+
+Testing has completed with errors!
+IMPORTANT: these tests appear to be new failures unique to this patch
+- sanity2@ldiskfs+DNE:test_124c(NEW unique failure for this branch in the last 30 days, and was seen 1 times across 1 other branches 1 reviews), test_124d(NEW unique failure for this branch in the last 30 days, and was seen 1 times across 1 other branches 1 reviews), test_134a(NEW unique failure for this branch in the last 30 days, and was seen 1 times across 1 other branches 1 reviews), test_812a(NEW unique failure for this branch in the last 30 days, and was seen 0 times across 0 other branches 0 reviews), test_812b(NEW unique failure for this branch in the last 30 days, and was seen 0 times across 0 other branches 0 reviews), test_816(NEW unique failure for this branch in the last 30 days, and was seen 0 times across 0 other branches 0 reviews)
+- sanity2@zfs:test_398a(Seen in reviews: 50692 47526 44310), test_812a(Seen in reviews: 50692), test_812b(Seen in reviews: 50692), test_816(Seen in reviews: 50692)
+- sanityn@zfs:test_109(NEW unique failure for this branch in the last 30 days, and was seen 0 times across 0 other branches 0 reviews), test_113(NEW unique failure for this branch in the last 30 days, and was seen 0 times across 0 other branches 0 reviews)
+
+
+> racer@ldiskfs+DNE Timeout(709s)
+> racer@zfs  Test script terminated with error 2(401s)
+> recovery-small@ldiskfs+DNE Server crashed(2062s)
+- (Untriaged #67713, seen 108 times before)
+> recovery-small@zfs Server crashed(1389s)
+- (Untriaged #67713, seen 106 times before)
+> replay-dual@ldiskfs+DNE Server crashed(3035s)
+- (Untriaged #67713, seen 109 times before)
+> replay-dual@zfs Server crashed(1876s)
+- (Untriaged #67713, seen 107 times before)
+> replay-single@ldiskfs+DNE  Test script terminated with error 2(8446s)
+> sanity1@ldiskfs+DNE Server crashed(3447s)
+- (Untriaged #67713, seen 110 times before)
+> sanity2@ldiskfs+DNE Failure Test script terminated with error 2(9457s)
+- 124c(test_124c returned 1) 124d(test_124d returned 127) 134a($'0n0 locks are not cleared') 812a(client: import is not in CONNECTING state after 40) 812b(client: import is not in CONNECTING state after 40) 816(client: import is not in IDLE state after 40) 
+> sanity-slow@ldiskfs+DNE  Test script terminated with error 2(2574s)
+> sanity1@zfs  Test script terminated with error 2(2159s)
+> sanity2@zfs Failure Test script terminated with error 2(7420s)
+- 398a(lock still must be held by DIO append) 812a(client: import is not in CONNECTING state after 40) 812b(client: import is not in CONNECTING state after 40) 816(client: import is not in IDLE state after 40) 
+> sanity-benchmark@ldiskfs+DNE  Test script terminated with error 2(1389s)
+> sanity-flr@ldiskfs+DNE  Test script terminated with error 2(833s)
+> sanity-flr@zfs  Test script terminated with error 2(747s)
+> sanity-hsm@ldiskfs+DNE  Test script terminated with error 2(1836s)
+> sanity-lfsck@ldiskfs+DNE Failure Test script terminated with error 2(1887s)
+> sanity-quota@ldiskfs+DNE  Test script terminated with error 2(4171s)
+> sanityn@ldiskfs+DNE Failure(4958s)
+- 80b(migration stopped 2) 
+> sanityn@zfs Failure Test script terminated with error 2(3885s)
+- 109(Fail to remove lustre modules) 113(cannot get instance of /mnt/lustre) 
+
+Tests with NEW Warning messages:
+- sanity2@ldiskfs+DNE(command not found) 
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity-slow@zfs sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-hsm@zfs sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs 
+
+(centos7)All results and logs: https://testing.whamcloud.com/gerrit-janitor/30584/results.html
+
+--- Message (Maloo, 2023-04-23 00:16:58.000000000) ---
+Patch Set 18:
+
+Passed enforced test review-dne-zfs-part-7 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-54vm5: https://testing.whamcloud.com/test_sessions/ab7b05c4-6f61-4745-8e86-c4472fcae27b ran 4 tests.
+
+--- Message (Maloo, 2023-04-23 00:39:03.000000000) ---
+Patch Set 18:
+
+Passed enforced test review-dne-part-7 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-28vm5: https://testing.whamcloud.com/test_sessions/93c9985f-1ca2-4df2-b97d-b93eced9d8d8 ran 4 tests.
+
+--- Message (Maloo, 2023-04-23 01:06:29.000000000) ---
+Patch Set 18:
+
+Failed enforced test review-dne-zfs-part-4 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-57vm5: https://testing.whamcloud.com/test_sessions/4060b66e-e5d6-44cc-b7cd-42f9a182a0cd ran 9 tests.  3 tests failed: sanity-quota, sanity-hsm, sanity-flr.
+
+--- Message (Maloo, 2023-04-23 02:32:01.000000000) ---
+Patch Set 18:
+
+Failed enforced test review-dne-zfs-part-6 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-55vm5: https://testing.whamcloud.com/test_sessions/cf94b2b5-98e9-4a5b-8f1a-d0b731f2ebf0 ran 6 tests.  2 tests failed: ost-pools, replay-single.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2023-04-23 02:43:39.000000000) ---
+Patch Set 18:
+
+Passed optional test review-ldiskfs on RHEL 8.7/x86_64, SLES 15.3/x86_64 uploaded by Trevis Autotest from trevis-50vm5: https://testing.whamcloud.com/test_sessions/35da8a5b-5375-47b0-8006-1a38b0492d0b ran 5 tests.
+
+--- Message (Maloo, 2023-04-23 02:46:04.000000000) ---
+Patch Set 18:
+
+Passed enforced test review-dne-zfs-part-2 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-49vm5: https://testing.whamcloud.com/test_sessions/44ec5e67-4059-4ac7-8bb9-13d46cef9528 ran 7 tests.
+
+--- Message (Maloo, 2023-04-23 03:35:20.000000000) ---
+Patch Set 18:
+
+Failed enforced test review-ldiskfs-ubuntu on RHEL 8.7/x86_64, Ubuntu 20.04/x86_64 uploaded by Trevis Autotest from trevis-36vm5: https://testing.whamcloud.com/test_sessions/1587cb48-106f-415c-9bd6-feb977bb904c ran 6 tests.  1 tests failed: sanity-sec.
+
+--- Message (Maloo, 2023-04-23 03:37:16.000000000) ---
+Patch Set 18:
+
+Failed enforced test review-dne-zfs-part-5 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-56vm5: https://testing.whamcloud.com/test_sessions/74c9e8d7-4d1a-4ab2-bbed-199b89b115cb ran 8 tests.  2 tests failed: sanityn, recovery-small.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2023-04-23 03:48:49.000000000) ---
+Patch Set 18:
+
+Failed enforced test review-dne-part-6 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-29vm5: https://testing.whamcloud.com/test_sessions/1ec8d59b-fde6-4eb3-b5de-1098fa212a03 ran 4 tests.  1 tests failed: ost-pools.
+
+--- Message (Maloo, 2023-04-23 03:49:40.000000000) ---
+Patch Set 18:
+
+Failed optional test review-ldiskfs-ubuntu on RHEL 8.7/x86_64, Ubuntu 22.04/x86_64 uploaded by Trevis Autotest from trevis-35vm5: https://testing.whamcloud.com/test_sessions/e5ea9d47-3bfd-4275-ae99-d9362d5f3fd3 ran 6 tests.  1 tests failed: sanity-sec.
+
+--- Message (Maloo, 2023-04-23 03:55:31.000000000) ---
+Patch Set 18:
+
+Failed enforced test review-dne-selinux-ssk-part-2 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-38vm5: https://testing.whamcloud.com/test_sessions/def73a18-20ba-461d-b04c-46f0fb876007 ran 5 tests.  2 tests failed: sanity-selinux, sanity-sec.
+
+--- Message (Maloo, 2023-04-23 04:04:38.000000000) ---
+Patch Set 18:
+
+Failed optional test review-dne-part-8 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-65vm5: https://testing.whamcloud.com/test_sessions/f3b7f042-77a5-4067-87f1-d44d24843672 ran 8 tests.  2 tests failed: racer, replay-dual.
+
+--- Message (Maloo, 2023-04-23 04:13:21.000000000) ---
+Patch Set 18:
+
+Failed enforced test review-dne-part-2 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-59vm5: https://testing.whamcloud.com/test_sessions/46182537-c1c0-4d61-aba9-e26e49d99503 ran 7 tests.  1 tests failed: sanity-sec.
+
+--- Message (Maloo, 2023-04-23 04:15:52.000000000) ---
+Patch Set 18:
+
+Passed enforced test review-ldiskfs on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-76vm5: https://testing.whamcloud.com/test_sessions/367f524c-0b04-45af-9bbd-aca11fbd4ee6 ran 5 tests.
+
+--- Message (Maloo, 2023-04-23 04:27:46.000000000) ---
+Patch Set 18:
+
+Failed enforced test review-zfs on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-73vm5: https://testing.whamcloud.com/test_sessions/875fa532-02a3-483a-824b-eeceb3ee8ef1 ran 10 tests.  1 tests failed: replay-single.
+
+--- Message (Maloo, 2023-04-23 04:28:34.000000000) ---
+Patch Set 18:
+
+Passed enforced test review-dne-selinux-ssk-part-1 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-39vm5: https://testing.whamcloud.com/test_sessions/ddea732f-684d-47f4-998a-038e3699bf51 ran 3 tests.
+
+--- Message (Maloo, 2023-04-23 04:28:49.000000000) ---
+Patch Set 18:
+
+Failed optional test review-dne-part-9 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-64vm5: https://testing.whamcloud.com/test_sessions/ad1b42be-6087-41dd-8ab4-8154b525c211 ran 7 tests.  1 tests failed: obdfilter-survey.
+
+--- Message (Maloo, 2023-04-23 05:00:05.000000000) ---
+Patch Set 18:
+
+Passed enforced test review-dne-part-5 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-70vm5: https://testing.whamcloud.com/test_sessions/bffc734f-2e93-4e68-9292-8608cfa1c692 ran 6 tests.
+
+--- Message (Maloo, 2023-04-23 05:21:29.000000000) ---
+Patch Set 18:
+
+Failed enforced test review-ldiskfs-arm on RHEL 8.7/aarch64, RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-108vm21: https://testing.whamcloud.com/test_sessions/19c3fe42-63a2-4b70-ac61-1e0d3506e512 ran 6 tests.  2 tests failed: sanity-sec, sanity-lnet.
+
+--- Message (Maloo, 2023-04-23 05:36:57.000000000) ---
+Patch Set 18:
+
+Passed enforced test review-dne-part-1 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-72vm5: https://testing.whamcloud.com/test_sessions/648fea88-3c13-4105-96ab-41b7e07f440d ran 4 tests.
+
+--- Message (Maloo, 2023-04-23 05:41:10.000000000) ---
+Patch Set 18:
+
+Failed enforced test review-dne-zfs-part-1 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-63vm5: https://testing.whamcloud.com/test_sessions/c2e1339f-43c5-4a13-bde2-09326ad9b5e4 ran 4 tests.  2 tests failed: sanity-pfl, sanity.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2023-04-23 05:46:30.000000000) ---
+Patch Set 18:
+
+Failed enforced test review-dne-zfs-part-3 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-66vm5: https://testing.whamcloud.com/test_sessions/5c091363-275f-47cb-8bea-17ba879952bc ran 3 tests.  1 tests failed: conf-sanity.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2023-04-23 06:26:47.000000000) ---
+Patch Set 18:
+
+Failed enforced test review-dne-part-4 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-32vm5: https://testing.whamcloud.com/test_sessions/3fb6b8fe-8e23-4a8c-8d0b-535ff0427e84 ran 9 tests.  1 tests failed: sanity-quota.
+
+--- Message (Maloo, 2023-04-23 08:44:27.000000000) ---
+Patch Set 18: Verified-1
+
+Passed enforced test review-dne-part-3 on RHEL 8.7/x86_64 uploaded by Trevis Autotest from trevis-58vm5: https://testing.whamcloud.com/test_sessions/8c883c1f-e6ac-4d11-a3d6-456707799c77 ran 3 tests.

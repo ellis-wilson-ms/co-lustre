@@ -1,0 +1,547 @@
+Change:     53844
+Subject:    LU-17478 clio: parallelize unaligned DIO write copy
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/53844
+Change-Id:  Ic8209e1fda97cda83e5b87baba48d15dd4dcc15f
+Project:    fs/lustre-release
+Branch:     master
+Status:     MERGED
+Owner:      Patrick Farrell
+Created:    2024-01-27 21:05:13.000000000
+Updated:    2024-07-06 04:12:18.000000000
+Patch Set:  16
+Insertions: +97
+Deletions:  -16
+Comments:   22 (1 unresolved)
+Topic:      hio
+
+--- Labels ---
+  Code-Review: Shaun Tancheff: +1; Andreas Dilger: +1; Oleg Drokin: +2
+  Verified: jenkins: +1; Maloo: +1
+
+--- Reviewers ---
+  CC: Jian Yu
+  REVIEWER: Oleg Drokin, Andreas Dilger, Sebastien Buisson, Qian Yingjin, Shaun Tancheff, Patrick Farrell
+
+--- Commit Message ---
+LU-17478 clio: parallelize unaligned DIO write copy
+
+The data copying for unaligned/hybrid IO reads is already
+parallel because it is done by the ptlrpc threads at the
+end of the IO.  That for the writes is not - it is done
+by the submitting thread during IO submission.
+
+This has a huge performance impact, limiting writes to
+around 3.0 GiB/s when reads are at 12 GiB/s.
+
+With the iov iter issue fixed, we can do this copy as
+part of IO submission.
+
+With this and the patch to use page pools for buffer
+allocation (https://review.whamcloud.com/53670), the
+maximum performance of hybrid IO is basically the same as
+DIO, at least for current speeds.
+
+This means hybrid reads and writes at 20 GiB/s with
+current master + this and the pool patch.
+
+Note this requires a funny workaround: If a user thread
+calls fsync while a DIO write is in progress, the user
+thread can pick that write up at the RPC layer and become
+responsible for writing it out, even though that write
+isn't in cache.  (Because the write is waiting to be
+picked up by a ptlrpcd thread.)
+
+If that DIO write is unaligned, the user thread is unable
+to do the memory copy.  It's not an option to have the
+thread ignore a ready RPC, so instead we spawn a kthread
+to handle this case.
+
+This only occurs when DIO is racing with fsync, so
+performance doesn't really matter, and this cost is OK.
+
+Signed-off-by: Patrick Farrell <patrick.farrell@oracle.com>
+Change-Id: Ic8209e1fda97cda83e5b87baba48d15dd4dcc15f
+Reviewed-on: https://review.whamcloud.com/c/fs/lustre-release/+/53844
+Reviewed-by: Andreas Dilger <adilger@whamcloud.com>
+Reviewed-by: Shaun Tancheff <shaun.tancheff@hpe.com>
+Reviewed-by: Oleg Drokin <green@whamcloud.com>
+Tested-by: jenkins <devops@whamcloud.com>
+Tested-by: Maloo <maloo@whamcloud.com>
+
+--- Review History ---
+
+--- Message (Patrick Farrell, 2024-01-27 21:05:13.000000000) ---
+Uploaded patch set 1.
+
+--- Message (wc-checkpatch, 2024-01-27 21:08:03.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (Andreas Dilger, 2024-01-27 21:15:59.000000000) ---
+Patch Set 1:
+
+/me checks whether this patch is deep in a list of dependencies...
+
+Yay!  It looks like it could be landed reasonably independently. :-)
+
+--- Message (jenkins, 2024-01-27 21:39:07.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/101701/ : SUCCESS
+
+--- Message (Patrick Farrell, 2024-01-27 21:39:11.000000000) ---
+Patch Set 1:
+
+Mhm!  It only requires Shaun's not-quite-complete fix.
+
+It benefits from being combined with that big list of stuff in LU-13814, but it works just fine by itself.  And obviously it also benefits from being combined with the pools patch, but that's also on a short list of dependencies.
+
+--- Message (Patrick Farrell, 2024-01-27 21:41:36.000000000) ---
+Patch Set 1:
+
+Also this is actually a surprisingly simple patch...  I had expected to spend real time on this problem, but using the page pools for allocations means we don't need to parallelize the allocation phase, so this got easier.  (Because the big allocations can sleep, we can't do them in the ptlrpcd threads, so we couldn't parallelize there... But using the pools means allocation is so fast there's no need to parallelize it.  I've confirmed this on one of our DGXes.)
+
+--- Message (Andreas Dilger, 2024-01-27 22:21:43.000000000) ---
+Patch Set 1:
+
+> Also this is actually a surprisingly simple patch...  I had
+ > expected to spend real time on this problem, but using the page
+ > pools for allocations means we don't need to parallelize the
+ > allocation phase, so this got easier.  (Because the big allocations
+ > can sleep, we can't do them in the ptlrpcd threads, so we couldn't
+ > parallelize there... But using the pools means allocation is so
+ > fast there's no need to parallelize it.  I've confirmed this on one
+ > of our DGXes.)
+
+What does that imply for the size of the page pool?  Do we need one RPC-sized chunk per core, per RPC-in-flight, enough for max_dirty_mb, possibly of different sizes?
+
+On the one hand, having buffers available for fast allocation is great, but there can't be an huge number of pages pinned in the pools if we start hitting memory pressure.  At some point we need to start throttling the dirtying thread(s) and/or free pages from the less-used parts of the pool and/or bound the upper size of individual pool entries so that they are only used for rapid small-RPC IO, while large IO where the network/storage transfer time is noticeable can do their own alloc/free?
+
+--- Message (Patrick Farrell, 2024-01-27 22:41:48.000000000) ---
+Patch Set 1:
+
+> Patch Set 1:
+> 
+> > Also this is actually a surprisingly simple patch...  I had
+>  > expected to spend real time on this problem, but using the page
+>  > pools for allocations means we don't need to parallelize the
+>  > allocation phase, so this got easier.  (Because the big allocations
+>  > can sleep, we can't do them in the ptlrpcd threads, so we couldn't
+>  > parallelize there... But using the pools means allocation is so
+>  > fast there's no need to parallelize it.  I've confirmed this on one
+>  > of our DGXes.)
+> 
+> What does that imply for the size of the page pool?  Do we need one RPC-sized chunk per core, per RPC-in-flight, enough for max_dirty_mb, possibly of different sizes?
+> 
+> On the one hand, having buffers available for fast allocation is great, but there can't be an huge number of pages pinned in the pools if we start hitting memory pressure.  At some point we need to start throttling the dirtying thread(s) and/or free pages from the less-used parts of the pool and/or bound the upper size of individual pool entries so that they are only used for rapid small-RPC IO, while large IO where the network/storage transfer time is noticeable can do their own alloc/free?
+
+So, this is a page for every DIO page which is in flight.  Any core or thread can throw multiple RPCs out there, in theory, so no relation to those.
+
+So it could end up being quite a bit, and yes, we probably do need some throttling.  We have shrinkers registered for the pools, so the freeing part is taken care of.
+
+It is in fact large IOs that benefit the most from this, as strange as that sounds.  Essentially, for small IOs, the fixed costs (per-IO setup, round trip time, etc) dominate, then for larger ones, the running costs dominate.  Allocation is a running cost.  With very large IOs, we see IO submission and server activity running in parallel - The network and server are handling RPCs while we're still submitting.
+
+Also worth noting that because we do the network/storage stuff in parallel, it can go *really* fast relative to IO submission.
+
+So...  I don't think we'd ever not want to use the pools - I think the worst case scenario is we add a little overhead to allocation by going through the pools if we're absolutely slammed on memory.  I can sort of imagine how that might bite us, but I think in practice we'll be happy with it.
+
+But we should almost certainly limit the total amount of IO outstanding, which we could limit through the pool.  For example, 1 GiB of IO from one thread can hit 60 GiB/s on a DGX to an AI400 (not hybrid, regular DIO with LU-13814, but the point applies...).  So that's a total of 1 GiB of outstanding IO across all OSTs for a lot of throughput.
+
+So that's all to say we could likely limit the pool size to a few GiB and that would get us plenty of throughput - that would be my preferred method, limiting the pool size.  I'm not sure how we should limit it (like, how to determine the limit), but fairly small amounts (relative to total system memory, anyway) should do.
+
+(For example, if we compare that to max_dirty_mb at 2 GiB per OSC, compare to that 1 GiB of IO getting you 60 GiB/s of throughput...)
+
+--- Message (Patrick Farrell, 2024-01-27 22:42:24.000000000) ---
+Patch Set 1:
+
+> Patch Set 1:
+> 
+> > Patch Set 1:
+> > 
+> > > Also this is actually a surprisingly simple patch...  I had
+> >  > expected to spend real time on this problem, but using the page
+> >  > pools for allocations means we don't need to parallelize the
+> >  > allocation phase, so this got easier.  (Because the big allocations
+> >  > can sleep, we can't do them in the ptlrpcd threads, so we couldn't
+> >  > parallelize there... But using the pools means allocation is so
+> >  > fast there's no need to parallelize it.  I've confirmed this on one
+> >  > of our DGXes.)
+> > 
+> > What does that imply for the size of the page pool?  Do we need one RPC-sized chunk per core, per RPC-in-flight, enough for max_dirty_mb, possibly of different sizes?
+> > 
+> > On the one hand, having buffers available for fast allocation is great, but there can't be an huge number of pages pinned in the pools if we start hitting memory pressure.  At some point we need to start throttling the dirtying thread(s) and/or free pages from the less-used parts of the pool and/or bound the upper size of individual pool entries so that they are only used for rapid small-RPC IO, while large IO where the network/storage transfer time is noticeable can do their own alloc/free?
+> 
+> So, this is a page for every DIO page which is in flight.  Any core or thread can throw multiple RPCs out there, in theory, so no relation to those.
+> 
+> So it could end up being quite a bit, and yes, we probably do need some throttling.  We have shrinkers registered for the pools, so the freeing part is taken care of.
+> 
+> It is in fact large IOs that benefit the most from this, as strange as that sounds.  Essentially, for small IOs, the fixed costs (per-IO setup, round trip time, etc) dominate, then for larger ones, the running costs dominate.  Allocation is a running cost.  With very large IOs, we see IO submission and server activity running in parallel - The network and server are handling RPCs while we're still submitting.
+> 
+> Also worth noting that because we do the network/storage stuff in parallel, it can go *really* fast relative to IO submission.
+> 
+> So...  I don't think we'd ever not want to use the pools - I think the worst case scenario is we add a little overhead to allocation by going through the pools if we're absolutely slammed on memory.  I can sort of imagine how that might bite us, but I think in practice we'll be happy with it.
+> 
+> But we should almost certainly limit the total amount of IO outstanding, which we could limit through the pool.  For example, 1 GiB of IO from one thread can hit 60 GiB/s on a DGX to an AI400 (not hybrid, regular DIO with LU-13814, but the point applies...).  So that's a total of 1 GiB of outstanding IO across all OSTs for a lot of throughput.
+> 
+> So that's all to say we could likely limit the pool size to a few GiB and that would get us plenty of throughput - that would be my preferred method, limiting the pool size.  I'm not sure how we should limit it (like, how to determine the limit), but fairly small amounts (relative to total system memory, anyway) should do.
+> 
+> (For example, if we compare that to max_dirty_mb at 2 GiB per OSC, compare to that 1 GiB of IO getting you 60 GiB/s of throughput...)
+
+"So, this is a page for every DIO page which is in flight.  Any core or thread can throw multiple RPCs out there, in theory, so no relation to those."
+Sorry, every unaligned/hybrid page in flight.  No allocation for regular DIO.
+
+--- Message (Qian Yingjin, 2024-01-28 08:35:44.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Patrick Farrell, 2024-01-28 17:58:48.000000000) ---
+Patch Set 1: Code-Review-1
+
+Thanks
+
+This also has a problem with fsync that I need to resolve (I know what it is and have a fix in mind, but need to put it together)
+
+--- Message (Patrick Farrell, 2024-01-30 04:17:46.000000000) ---
+Uploaded patch set 2: Patch Set 1 was rebased.
+
+--- Message (wc-checkpatch, 2024-01-30 04:18:15.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (Patrick Farrell, 2024-01-30 04:21:15.000000000) ---
+Uploaded patch set 3.
+
+--- Message (jenkins, 2024-01-30 04:21:51.000000000) ---
+Patch Set 2: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/101736/ : ABORTED
+
+--- Message (wc-checkpatch, 2024-01-30 04:23:26.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (Patrick Farrell, 2024-01-30 04:35:59.000000000) ---
+Uploaded patch set 4.
+
+--- Message (jenkins, 2024-01-30 04:36:04.000000000) ---
+Patch Set 3: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/101738/ : ABORTED
+
+--- Message (Patrick Farrell, 2024-01-30 04:36:57.000000000) ---
+Uploaded patch set 5.
+
+--- Message (jenkins, 2024-01-30 04:37:00.000000000) ---
+Patch Set 4:
+
+No Builds Executed
+
+--- Message (wc-checkpatch, 2024-01-30 04:38:38.000000000) ---
+Patch Set 5:
+
+Looks good to me.
+
+--- Message (jenkins, 2024-01-30 05:39:23.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/101740/ : SUCCESS
+
+--- Message (Patrick Farrell, 2024-01-30 16:57:28.000000000) ---
+Uploaded patch set 6.
+
+--- Message (wc-checkpatch, 2024-01-30 16:57:40.000000000) ---
+Patch Set 6:
+
+(5 comments)
+
+5 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Patrick Farrell, 2024-01-30 16:59:49.000000000) ---
+Uploaded patch set 7.
+
+--- Message (jenkins, 2024-01-30 16:59:53.000000000) ---
+Patch Set 6:
+
+No Builds Executed
+
+--- Message (Lustre Gerrit Janitor, 2024-01-30 17:00:11.000000000) ---
+Patch Set 6:
+
+Newer revision detected, aborting all work on revision 6
+
+--- Message (Patrick Farrell, 2024-01-30 17:00:48.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2024-01-30 17:02:51.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Patrick Farrell, 2024-01-30 17:04:55.000000000) ---
+Uploaded patch set 8.
+
+--- Message (jenkins, 2024-01-30 17:04:59.000000000) ---
+Patch Set 7: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/101757/ : ABORTED
+
+--- Message (wc-checkpatch, 2024-01-30 17:08:02.000000000) ---
+Patch Set 8:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2024-01-30 19:49:01.000000000) ---
+Patch Set 8: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/101758/ : SUCCESS
+
+--- Message (Patrick Farrell, 2024-01-31 01:39:46.000000000) ---
+Patch Set 8: Code-Review-1
+
+FLR test crash to investigate.
+
+--- Message (Andreas Dilger, 2024-01-31 07:51:07.000000000) ---
+Patch Set 8: Code-Review+1
+
+(2 comments)
+
+--- Message (Andreas Dilger, 2024-01-31 07:51:25.000000000) ---
+Patch Set 8: -Code-Review
+
+--- Message (Patrick Farrell, 2024-01-31 19:04:06.000000000) ---
+Uploaded patch set 9.
+
+--- Message (wc-checkpatch, 2024-01-31 19:08:18.000000000) ---
+Patch Set 9:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Patrick Farrell, 2024-01-31 19:15:36.000000000) ---
+Uploaded patch set 10.
+
+--- Message (jenkins, 2024-01-31 19:15:40.000000000) ---
+Patch Set 9: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/101779/ : ABORTED
+
+--- Message (wc-checkpatch, 2024-01-31 19:18:30.000000000) ---
+Patch Set 10:
+
+Looks good to me.
+
+--- Message (Patrick Farrell, 2024-01-31 19:19:42.000000000) ---
+Uploaded patch set 11.
+
+--- Message (jenkins, 2024-01-31 19:19:46.000000000) ---
+Patch Set 10: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/101780/ : ABORTED
+
+--- Message (wc-checkpatch, 2024-01-31 19:23:41.000000000) ---
+Patch Set 11:
+
+Looks good to me.
+
+--- Message (jenkins, 2024-01-31 20:04:29.000000000) ---
+Patch Set 11: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/101781/ : SUCCESS
+
+--- Message (Andreas Dilger, 2024-02-01 09:44:46.000000000) ---
+Patch Set 11:
+
+(1 comment)
+
+It looks reasonable?
+
+--- Message (Patrick Farrell, 2024-02-01 15:31:05.000000000) ---
+Patch Set 11:
+
+(1 comment)
+
+119m test failures are from the parent and Shaun is looking in to it.
+
+--- Message (Patrick Farrell, 2024-02-02 19:49:49.000000000) ---
+Topic set to hio
+
+--- Message (Jian Yu, 2024-02-28 20:12:56.000000000) ---
+Patch Set 12: Patch Set 11 was rebased
+
+--- Message (wc-checkpatch, 2024-02-28 20:14:26.000000000) ---
+Patch Set 12:
+
+Looks good to me.
+
+--- Message (jenkins, 2024-02-28 20:56:40.000000000) ---
+Patch Set 12: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/102644/ : SUCCESS
+
+--- Message (Patrick Farrell, 2024-04-24 22:27:55.000000000) ---
+Uploaded patch set 13.
+
+--- Message (Patrick Farrell, 2024-04-24 22:29:05.000000000) ---
+Patch Set 13:
+
+Ping for review
+
+--- Message (jenkins, 2024-04-25 02:24:46.000000000) ---
+Patch Set 13: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/104362/ : SUCCESS
+
+--- Message (Charlie Olmstead, 2024-04-25 14:46:19.000000000) ---
+Patch Set 13:
+
+The test config was configured to use el8.8 arm clients but Jenkins was changed to only build el9.3 arm clients. I have updated the test config and restarted testing for your patch.
+
+--- Message (Charlie Olmstead, 2024-04-25 14:46:21.000000000) ---
+Removed reviewer Charlie Olmstead.
+
+--- Message (wc-checkpatch, 2024-04-25 21:21:55.000000000) ---
+Patch Set 13:
+
+Looks good to me.
+
+--- Message (Patrick Farrell, 2024-04-27 21:45:05.000000000) ---
+Patch Set 13:
+
+BUILD
+
+--- Message (jenkins, 2024-04-27 22:20:25.000000000) ---
+Patch Set 13:
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/104472/ : SUCCESS
+
+--- Message (Patrick Farrell, 2024-05-06 21:14:28.000000000) ---
+Patch Set 13:
+
+Ping for review
+
+--- Message (Patrick Farrell, 2024-06-13 19:57:29.000000000) ---
+Patch Set 14: Patch Set 13 was rebased
+
+--- Message (wc-checkpatch, 2024-06-13 19:58:26.000000000) ---
+Patch Set 14:
+
+Looks good to me.
+
+--- Message (Patrick Farrell, 2024-06-13 19:59:51.000000000) ---
+Patch Set 14:
+
+Purely a rebase since it was getting old and the preceding patch has been adjusted.
+
+Ping for review  (Reminder that this patch has substantial performance benefits - 3 GiB/s to 20 GiB/s on hybrid writes)
+
+--- Message (Andreas Dilger, 2024-06-13 20:04:02.000000000) ---
+Patch Set 14:
+
+(5 comments)
+
+Comments on previous version of patch, I guess I was a few minutes too late to the party.  Nothing critical to fix, but some useful (IMHO) small improvements.
+
+There is an open question about whether there is a better way to do the user thread copy handling, but I'm also OK to do it this way (which is at least very simple and isolated) and fix it later if needed.
+
+--- Message (jenkins, 2024-06-13 20:12:19.000000000) ---
+Patch Set 14: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/105466/ : ABORTED
+
+--- Message (Patrick Farrell, 2024-06-13 20:31:52.000000000) ---
+Uploaded patch set 15.
+
+--- Message (jenkins, 2024-06-13 20:31:55.000000000) ---
+Patch Set 14:
+
+No Builds Executed
+
+--- Message (wc-checkpatch, 2024-06-13 20:34:34.000000000) ---
+Patch Set 15:
+
+Looks good to me.
+
+--- Message (Andreas Dilger, 2024-06-13 20:40:53.000000000) ---
+Patch Set 15: Code-Review+1
+
+--- Message (jenkins, 2024-06-13 21:08:34.000000000) ---
+Patch Set 15: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/105470/ : SUCCESS
+
+--- Message (Shaun Tancheff, 2024-06-14 01:44:03.000000000) ---
+Patch Set 15: Code-Review+1
+
+--- Message (Autotest, 2024-06-15 05:57:28.000000000) ---
+Patch Set 15:
+
+Onyx Autotest retesting enforced review-dne-part-5 session on el9.3-x86_64/ldiskfs servers and clients for build 105470 patch 15. Requested by Andreas Dilger because of LU-17712.
+
+--- Message (Oleg Drokin, 2024-06-25 03:25:48.000000000) ---
+Patch Set 15: Code-Review+2
+
+--- Message (Oleg Drokin, 2024-06-25 03:25:52.000000000) ---
+Change has been successfully cherry-picked as 1fa633c2031c3e34072d5486aeedfbf222091ac7 by Oleg Drokin
+
+--- Message (Patrick Farrell, 2024-07-06 04:09:26.000000000) ---
+Patch Set 16:
+
+(3 comments)
+
+--- Message (Patrick Farrell, 2024-07-06 04:12:09.000000000) ---
+Patch Set 16:
+
+Huh, sorry - thought I had posted those comments a while ago.
+
+In light of the scheduling while atomic error, I'm considering the "just skip the RPC since it's DIO and arguably fsync doesn't apply" approach, but that is distinctly tricky.
+
+Maybe that's a question:
+If fsync and a DIO RPC are racing, should fsync force out that RPC?  I suppose it's moot once we eventually support async DIO, so we should just solve it now.
+
+--- Message (Patrick Farrell, 2024-07-06 04:12:18.000000000) ---
+Patch Set 16:
+
+Sorry for the old comments...

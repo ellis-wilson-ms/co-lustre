@@ -1,0 +1,435 @@
+Change:     52038
+Subject:    LU-17044 ptlrpc: add TBF minrate floor scheduling
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/52038
+Change-Id:  I779e63cd84b7a9ca99b54bbe8df8616de77fc770
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Etienne AUJAMES
+Created:    2023-08-22 09:41:50.000000000
+Updated:    2026-04-22 15:42:14.000000000
+Patch Set:  9
+Insertions: +866
+Deletions:  -154
+Comments:   197 (5 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: +1
+
+--- Reviewers ---
+  CC: Nathan Rutman, DELBARY Gael
+  REVIEWER: Andreas Dilger, James Simmons, Nikitas Angelinas, Chris Horn, Qian Yingjin, Etienne AUJAMES
+
+--- Commit Message ---
+LU-17044 ptlrpc: add TBF minrate floor scheduling
+
+The TBF rule model can currently express only one rate. Normal rules
+treat rate as a ceiling and realtime rules treat it as both floor and
+ceiling, so one rule cannot say "guarantee G RPC/s but cap at
+L RPC/s". That makes it impossible to reserve RPC bandwidth for a
+loaded class without either removing the cap or moving the class onto
+a dedicated realtime rule.
+
+Extend the existing heap-based scheduler with a second token bucket
+per class for minimum-rate accounting. The existing bucket continues
+to enforce the configured rate ceiling, while the new bucket tracks
+saved minrate credit for classes that are falling behind their
+guaranteed share. That floor credit only changes heap priority for
+classes that are already eligible to run under the ceiling, so minrate
+cannot bypass the configured cap. Explicit minrate rules also bound
+the amount of saved floor credit so an idle class can recover its
+guaranteed share after becoming active under load without accumulating
+enough priority to starve other traffic.
+
+Add a tbf_mindepth module parameter (default -1, meaning adaptive)
+that controls the maximum number of saved guaranteed tokens for
+explicit minrate rules. The adaptive default is 8x the minrate for
+realtime rules and 2x the minrate for non-realtime rules. Operators
+can override this to a fixed value to tune how much priority an idle
+class accumulates before re-entering the scheduler under load.
+
+Add an explicit minrate= parameter to TBF rules and thread it through
+the parser, rule update paths, and rule dumps. start and change
+commands can now configure both floor and ceiling, change ...
+minrate=0 clears an explicit floor, and get_param shows the effective
+range as "min-max". Reject invalid combinations where the floor
+exceeds the ceiling. Because the rule model is shared, the new
+parameter works across the existing TBF rule types.
+
+Two issues found during testing/review and are fixed here:
+ - nrs_tbf_cli_reset_value() updated to set ti_deadline = now so that
+   a rate or rule change does not leave a stale past deadline that
+   would give the reset client an unfair heap advantage over other
+   eligible clients.
+ - ptlrpc_nrs_req_throttling_nolock() adjusted so that when a policy
+   is stopping or inactive during a runtime policy switch, its
+   throttle gate does not prevent queued requests from draining.
+   Without this, a policy change can stall the service partition until
+   the old policy finishes stopping, because the throttle flag was set
+   globally and checked without regard to which policy owns the queued
+   work.
+
+Heap comparison and dequeue changes:
+
+The single scheduler heap now uses a two-tier comparison. When either
+class being compared has accumulated floor tokens, both are ranked by
+their min-bucket deadlines; otherwise they are ranked by max-bucket
+(ceiling) deadlines. This asymmetry is the mechanism by which floor
+credit boosts scheduling priority while keeping floor-ineligible
+classes on the normal ceiling path. The comparator adds two strict
+tiebreakers beyond deadline and check_time -- head request sequence
+number and pointer address -- so that classes with equal refreshed
+deadlines cannot oscillate indefinitely (resolving a pre-existing TODO
+in the old comparator).
+
+The dequeue path (nrs_tbf_req_get) takes a single frozen ktime_get()
+snapshot and then runs a retry loop bounded by binheap_size + 1 to
+lazily refresh stale per-class token state before selecting the heap
+root. This replaces the old recursive self-call that realtime mode
+used when a refreshed class moved off the root. Per-dequeue cost is
+O(log n) in the common case but O(n log n) in the worst case when
+every class needs a refresh in the same pass.
+
+Floor bucket initialization:
+
+Legacy realtime rules (without minrate=) start with preloaded floor
+tokens (ti_ntoken = tr_depth) to preserve existing behavior where rate
+acts as both floor and ceiling. Explicit minrate rules start with zero
+floor tokens because the heap comparator treats any non-zero floor
+token count as a priority signal: when either class in a comparison
+has floor tokens, both are ranked on their min-bucket deadlines. If a
+newly created minrate class started with preloaded floor tokens it
+would immediately jump ahead of all non-floor traffic in the heap
+without having actually fallen behind its guaranteed share. Starting
+empty ensures that floor priority is only earned while a class is
+genuinely being underserved.
+
+Realtime flag interaction with explicit minrate:
+
+When a rule combines realtime=1 with minrate=, the max (ceiling)
+bucket loses realtime token semantics and operates as a normal capped
+bucket: its deadline advances forward by one token interval after each
+service. Only the min (floor) bucket retains realtime scheduling,
+where overdue saved tokens keep its deadline in the past to
+prioritize catching up. This means "realtime applies to the lower
+bound and rate remains the hard cap."
+
+Test-Parameters: trivial
+Test-Parameters: testlist=sanityn,conf-sanity
+Test-Parameters: testlist=sanityn env=ONLY=77v,ONLY_REPEAT=30
+Signed-off-by: Chris Horn <chris.horn@hpe.com>
+Change-Id: I779e63cd84b7a9ca99b54bbe8df8616de77fc770
+
+--- Review History ---
+
+--- Message (Etienne AUJAMES, 2023-08-22 09:41:50.000000000) ---
+Uploaded patch set 1.
+
+--- Message (wc-checkpatch, 2023-08-22 09:42:50.000000000) ---
+Patch Set 1:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2023-08-22 10:23:48.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/97094/ : SUCCESS
+
+--- Message (Etienne AUJAMES, 2023-08-28 10:10:34.000000000) ---
+Uploaded patch set 2.
+
+--- Message (wc-checkpatch, 2023-08-28 10:13:46.000000000) ---
+Patch Set 2:
+
+(15 comments)
+
+16 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2023-08-28 10:40:04.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/97264/ : SUCCESS
+
+--- Message (Etienne AUJAMES, 2023-08-28 12:56:13.000000000) ---
+Uploaded patch set 3.
+
+--- Message (wc-checkpatch, 2023-08-28 12:59:29.000000000) ---
+Patch Set 3:
+
+(15 comments)
+
+16 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2023-08-28 13:25:17.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/97267/ : SUCCESS
+
+--- Message (Etienne AUJAMES, 2023-08-28 16:04:17.000000000) ---
+Uploaded patch set 4.
+
+--- Message (wc-checkpatch, 2023-08-28 16:07:35.000000000) ---
+Patch Set 4:
+
+(15 comments)
+
+16 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2023-08-28 16:43:40.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/97285/ : SUCCESS
+
+--- Message (Autotest, 2023-08-29 08:33:06.000000000) ---
+Patch Set 4:
+
+Trevis Autotest retesting enforced review-dne-part-2 session on el8.8-x86_64/ldiskfs servers and clients for build 97285 patch 4. Requested by eaujames because of LU-16408.
+
+--- Message (Autotest, 2023-08-29 08:36:39.000000000) ---
+Patch Set 4:
+
+Trevis Autotest retesting enforced review-dne-zfs-part-4 session on el8.8-x86_64/zfs servers and clients for build 97285 patch 4. Requested by eaujames because of LU-16641.
+
+--- Message (Etienne AUJAMES, 2023-09-04 15:14:48.000000000) ---
+Patch Set 4:
+
+The sanityn test 77s is a bit tricky: we need to saturate all the ost_io threads with 1 or 2 nodes to simulate a congestion.
+
+This misses a real-life use case with several nodes (>20) to evaluate if the feature works as desired.
+
+--- Message (Nathan Rutman, 2023-11-17 16:28:20.000000000) ---
+Patch Set 4:
+
+(9 comments)
+
+Questions in particular at line 617, 3214
+
+--- Message (wc-checkpatch, 2024-02-08 18:58:17.000000000) ---
+Patch Set 4: Code-Review-1
+
+This change cannot be cherry-picked to master.
+Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (Andreas Dilger, 2024-02-12 07:34:36.000000000) ---
+Removed Code-Review-1 by WC Checkpatch (377)
+
+--- Message (Andreas Dilger, 2024-03-10 20:44:18.000000000) ---
+Patch Set 4:
+
+(6 comments)
+
+Yingjin, it would be good to have your review here.
+
+--- Message (Qian Yingjin, 2024-03-11 08:02:05.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+I agree with Nathan.
+Once taken a token from a NRS class, we should take them from both min/max token info, and also we need to handle the residue time carefully.
+
+--- Message (wc-checkpatch, 2024-03-20 22:11:02.000000000) ---
+Patch Set 4: Code-Review-1
+
+This change cannot be cherry-picked to master.
+Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (wc-checkpatch, 2024-03-20 23:01:09.000000000) ---
+Patch Set 4: -Code-Review
+
+previous -1 sent incorrectly
+
+--- Message (wc-checkpatch, 2024-04-15 20:19:30.000000000) ---
+Patch Set 4: Code-Review-1
+
+This change cannot be cherry-picked to master.
+Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (wc-checkpatch, 2024-04-25 21:49:08.000000000) ---
+Patch Set 4: -Code-Review
+
+(15 comments)
+
+16 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (wc-checkpatch, 2025-08-04 15:58:14.000000000) ---
+Patch Set 4: Code-Review-1
+
+This change cannot be cherry-picked to master.
+Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (wc-checkpatch, 2025-08-04 17:19:43.000000000) ---
+Patch Set 4: -Code-Review
+
+(12 comments)
+
+12 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Chris Horn, 2026-04-09 21:54:34.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-04-09 22:01:13.000000000) ---
+Patch Set 5:
+
+(13 comments)
+
+15 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-04-09 22:44:37.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/123662/ : SUCCESS
+
+--- Message (Chris Horn, 2026-04-10 21:46:12.000000000) ---
+Uploaded patch set 6.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-04-10 21:49:02.000000000) ---
+Patch Set 6:
+
+(13 comments)
+
+15 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-04-10 22:24:38.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/123736/ : SUCCESS
+
+--- Message (Chris Horn, 2026-04-12 22:21:12.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+--- Message (Maloo, 2026-04-13 17:08:25.000000000) ---
+Patch Set 6:
+
+#### The following Test-Parameters sessions will be run for Build 123736 (patch #6):
+
+- Test-Parameters: testlist=sanityn env=ONLY=77v,ONLY_REPEAT=30
+
+--- Message (Chris Horn, 2026-04-13 19:58:32.000000000) ---
+Uploaded patch set 7.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-04-13 20:05:57.000000000) ---
+Patch Set 7:
+
+(18 comments)
+
+20 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-04-13 20:24:39.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/123849/ : SUCCESS
+
+--- Message (Chris Horn, 2026-04-15 20:42:04.000000000) ---
+Uploaded patch set 8.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-04-15 20:48:28.000000000) ---
+Patch Set 8:
+
+(18 comments)
+
+20 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Chris Horn, 2026-04-15 21:13:13.000000000) ---
+Patch Set 8:
+
+(1 comment)
+
+--- Message (jenkins, 2026-04-16 00:11:37.000000000) ---
+Patch Set 8: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/124010/ : SUCCESS
+
+--- Message (Andreas Dilger, 2026-04-16 06:39:27.000000000) ---
+Patch Set 8:
+
+(11 comments)
+
+--- Message (Chris Horn, 2026-04-16 20:17:07.000000000) ---
+Patch Set 8:
+
+(5 comments)
+
+--- Message (Chris Horn, 2026-04-16 22:24:39.000000000) ---
+Patch Set 8:
+
+(2 comments)
+
+--- Message (Chris Horn, 2026-04-17 19:50:20.000000000) ---
+Uploaded patch set 9.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Chris Horn, 2026-04-17 19:53:33.000000000) ---
+Patch Set 9:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-04-17 19:54:08.000000000) ---
+Patch Set 9:
+
+(18 comments)
+
+20 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-04-17 20:18:54.000000000) ---
+Patch Set 9: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/124095/ : SUCCESS
+
+--- Message (Autotest, 2026-04-20 15:09:19.000000000) ---
+Patch Set 9:
+
+Onyx Autotest retesting enforced review-ldiskfs-dne session on el9.5-x86_64/ldiskfs servers and clients for build 124095 patch 9. Requested by Chris Horn because of LU-20117.
+
+--- Message (Chris Horn, 2026-04-22 15:42:14.000000000) ---
+Patch Set 9:
+
+(1 comment)

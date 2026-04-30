@@ -1,0 +1,272 @@
+Change:     65458
+Subject:    LU-17296 ptlrpc: fairshare prototype
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/65458
+Change-Id:  I6adc55873edbc70532baec53fa00fe0912e2a1ed
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Chris Horn
+Created:    2026-04-22 05:43:47.000000000
+Updated:    2026-04-22 20:53:38.000000000
+Patch Set:  3
+Insertions: +4709
+Deletions:  -2
+Comments:   79 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: -1
+
+--- Commit Message ---
+LU-17296 ptlrpc: fairshare prototype
+
+Introduce a new NRS policy, "fairshare", that combines mechanisms
+previously spread across three separate policies (FIFO, TBF, ORR)
+into a single schedulable unit. The motivation is to remove the
+"pick one" constraint NRS currently imposes on administrators:
+deployments that need rate ceilings on a handful of tenants, a
+minrate floor for a VIP job, and locality-aware ordering on HDD
+OSTs should not have to trade one capability for another.
+
+The policy composes four mechanisms behind one op_policy_start:
+
+1. Dynamic statistical fair-share between entities (jobid, uid,
+   gid, projid, or nid). Zero-config: any entity sending RPCs
+   gets an equal slice. Based on ThemisIO's opportunity-fair
+   model rather than strict round-robin, so an idle entity does
+   not starve the service.
+
+2. TBF-compatible rate/minrate rule overrides via the same
+   start/change/stop syntax. Rules are a per-entity refinement
+   of the fair-share baseline; entities without rules still
+   share fairly. This is a strict superset of TBF behavior for
+   administrators who only care about caps.
+
+3. ORR-style intra-entity offset-sorted dispatch for BRW RPCs.
+   Enabled per-service via nrs_fairshare_locality. Orthogonal
+   to fair-share selection: pickers still choose the winner
+   entity as if locality were off; locality only reorders *which
+   request within that entity* dispatches.
+
+4. Two-level composite hierarchy ("A_then_B_fair", e.g.
+   uid_then_jobid_fair). Collapses to a nested equal-partition
+   over the group key then the leaf; rules match the leaf key
+   only.
+
+Non-obvious implementation details
+
+* Lock and allocation discipline. fsh_lock is a per-CPT spinlock
+held on every enqueue/dequeue/dispatch. Nothing on the hot path
+allocates. All variable-size work (range-array rebuilds, rule
+CRUD) is staged outside the lock and committed under it.
+op_req_get is called under ptlrpc's scp_req_lock, which is also
+a spinlock - there is no sleepable context available on the
+hot path, which cascades into several design choices below.
+
+* delta-kthread for range rebuild. A per-head kthread
+(nrs_fs_delta_fn) wakes every fsh_delta_ms and rebuilds the entity
+dispatch-range array if an enqueue marked the head dirty. The picker
+then walks a stable array under fsh_lock. Rebuild cadence (10..10000
+ms) is a tunable. kthread_stop MUST be called *before* taking fsh_lock
+in nrs_fairshare_stop, because the kthread itself takes fsh_lock;
+taking the lock first would deadlock.
+
+* Opportunity fairness vs. strict rotation. When the next-in-
+line entity's queue is below nrs_fairshare_opp_threshold
+requests, the picker opportunistically dispatches from any
+non-empty entity to keep the service busy. This trades exact
+rotation for throughput; it is what prevents fair-share from
+regressing against FIFO under bursty load. Set the threshold
+to 0 for strict rotation.
+
+* Token bucket math. nrs_fs_tokens_refill uses
+mul_u64_u64_div_u64 with a 1-second elapsed clamp. An NRS
+that sat idle for an hour would otherwise overflow the
+fixed-point product at NRS_FS_TOKEN_SCALE (2^20). The clamp is
+safe because a bucket that refills to its cap in 1s is already
+at steady state.
+
+* Composite mode. Collapses cleanly to an insertion-sort by
+fse_key0 followed by the same equal-share partition used at
+depth 1. We do not build a real transition matrix; at depth 2
+the matrix degenerates to "group, then split". Rules match
+the leaf field only - a uid rule under uid_then_jobid_fair
+caps/floors the whole uid group, which is the intended
+semantics (the rule belongs to the coarser key holder).
+
+* Rule refcounting and entity lifetime. Rules are refcounted and
+survive entity churn. An entity on create takes a ref on its
+matching rule (if any). Rule updates do not walk the entity
+list; the next range rebuild picks them up. Rule stop only
+succeeds when refs drop to zero - in practice the entity
+takes care of this via its own release path.
+
+* Locality RB-tree. Per-entity (fse_req_tree) keyed on
+(first-niobuf logical offset, monotonic fsh_seq) giving a stable
+total order. Offset extraction (nrs_fs_req_extract_offset) runs
+*outside* fsh_lock because req_capsule_client_get may touch
+the RPC pill; the offset is stashed and consumed under lock.
+Commit-phase re-pick (nrs_fs_entity_head_locked) returns the
+leftmost tree entry when locality is effective-on, else the
+FIFO list head. Both list_del_init and tree-remove run in the
+commit path; tree-remove is a no-op when fsr_in_tree is false,
+so it is safe to call unconditionally.
+
+* Logical offsets only. Physical translation via fiemap requires
+obd_get_info, which can sleep, so it cannot be used under
+fsh_lock. Logical ordering captures the bulk of the rotational
+win; physical refinement is a post-v1 item.
+
+* locality=auto. Intentionally collapses to off in v1.
+Rotational-media auto-detect needs an OSD->block-device bridge
+that does not yet exist. The tunable still accepts "auto" and
+reports "auto (effective: off)" so operators can opt into "on"
+explicitly on HDD services without a schema change later.
+
+* Live switch semantics. OFF->ON takes effect on new enqueues
+only; existing requests drain via FIFO until the tree fills.
+ON->OFF leaves treed entries to drain naturally - no scan-and-
+unlink. This avoids any scan under fsh_lock on configuration
+change.
+
+* Per-CPT fairness. Each CPT has its own nrs_fs_head; there is
+no cross-CPT coordination in v1. Under the common RPC-hashing
+placement this is close to global fairness; it can skew when
+a few clients' traffic collapses onto few CPTs. Cross-CPT
+delta-sync is documented as a post-v1 item.
+
+* Rule-write broadcast. Writes to nrs_fairshare_rule are
+broadcast to every fairshare head on the service so rule state
+stays consistent across CPTs without any shared rule table.
+The command is re-parsed per head - cheap, and avoids any
+cross-CPT locking.
+
+* Stats schema stability. nrs_fairshare_stats emits one YAML
+document per CPT head. The schema is declared stable with
+append-only evolution; field names and meanings are preserved
+across releases. Consumers can rely on key, key0, active,
+queue_depth, dispatched, cost_total, opportunity, throttled,
+
+* Union sizing. nrs_fs_req extends the per-request NRS union with
+rb_node + offset + seq + bool (~48 bytes), safely below the
+existing TBF/ORR union members. No change to struct
+ptlrpc_request layout.
+
+* Shared rule header. lustre_nrs_rule.h factors the enum/field
+definitions that TBF and fairshare now both consume. TBF's
+existing behavior is unchanged; it continues to use its own
+parser. A parser-reuse refactor is deferred.
+
+User-facing surface
+-------------------
+
+Tunables on each service's debugfs NRS directory:
+
+nrs_fairshare_mode            RW  sharing key (jobid_fair,
+			       uid_fair, gid_fair,
+			       projid_fair, nid_fair,
+			       A_then_B_fair composites)
+nrs_fairshare_delta_ms        RW  rebuild cadence (10..10000)
+nrs_fairshare_opp_threshold   RW  opportunity threshold
+nrs_fairshare_rule            RW  rate/minrate rules
+			       (start/change/stop syntax)
+nrs_fairshare_locality        RW  auto | off | on
+nrs_fairshare_stats           RO  YAML per-entity snapshot
+
+Activation: "lctl set_param <service>.nrs_policies=fairshare".
+
+Tests
+-----
+
+sanityn.sh tests 77aa..77ag cover:
+77aa  mode tunable + default fairness
+77ab  opportunity-fairness throughput regression vs FIFO
+77ac  rate ceiling enforcement
+77ad  minrate floor under contention
+77ae  composite mode round-trip + bogus rejection
+77af  delta_ms tunable + delta-kthread liveness
+77ag  locality tunable round-trip + BRW under on
+
+A comparison-benchmark helper, lustre/tests/nrs-fairshare-bench.sh,
+cycles a shared IOR workload through FIFO/TBF/ORR/fairshare/
+fairshare+locality and logs per-policy throughput.
+
+Documentation
+-------------
+
+Documentation/nrs_fairshare.txt              operator guide
+Documentation/nrs_fairshare_future_work.txt  post-v1 roadmap
+
+The future-work doc catalogs 12 deferred items (rotational
+auto-detect, cross-CPT delta-sync, cross-server fairness, wall-clock
+cost model, size-fair, deeper composites, per-opcode locality,
+tree size caps, fiemap ordering, parser refactor, kunit harness,
+Prometheus metrics) with enough context per item for a planner
+to turn it into an implementation plan.
+
+TBF and ORR are left untouched. The existing policies continue
+to work and remain selectable; fairshare is additive.
+
+Test-Parameters: fortestonly
+Test-Parameters: testlist=sanityn
+Signed-off-by: Chris Horn <chris.horn@hpe.com>
+Change-Id: I6adc55873edbc70532baec53fa00fe0912e2a1ed
+
+--- Review History ---
+
+--- Message (Chris Horn, 2026-04-22 05:43:47.000000000) ---
+Uploaded patch set 1.
+
+--- Message (wc-checkpatch, 2026-04-22 05:46:40.000000000) ---
+Patch Set 1:
+
+(34 comments)
+
+36 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Chris Horn, 2026-04-22 05:48:37.000000000) ---
+Uploaded patch set 2.
+
+--- Message (jenkins, 2026-04-22 05:48:45.000000000) ---
+Patch Set 1: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/124241/ : ABORTED
+
+--- Message (wc-checkpatch, 2026-04-22 06:02:14.000000000) ---
+Patch Set 2:
+
+(34 comments)
+
+36 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-04-22 06:22:22.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/124242/ : SUCCESS
+
+--- Message (Chris Horn, 2026-04-22 17:57:00.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-04-22 18:01:27.000000000) ---
+Patch Set 3:
+
+(10 comments)
+
+10 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-04-22 18:22:43.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/124271/ : SUCCESS

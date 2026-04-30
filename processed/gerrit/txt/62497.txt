@@ -1,0 +1,489 @@
+Change:     62497
+Subject:    LU-7266 ldlm: Fix LDLM pool Server Lock Volume
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/62497
+Change-Id:  If8a6f247127576965ae45c349a4ab04fb286615a
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      kg.xu
+Created:    2025-11-12 09:27:39.000000000
+Updated:    2026-02-27 18:45:14.000000000
+Patch Set:  10
+Insertions: +765
+Deletions:  -37
+Comments:   125 (11 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: -1
+
+--- Reviewers ---
+  CC: Oleg Drokin
+  REVIEWER: Andreas Dilger, Vitaly Fertman, Qian Yingjin, Patrick Farrell, Timothy Day
+
+--- Commit Message ---
+LU-7266 ldlm: Fix LDLM pool Server Lock Volume
+
+In the previous implementation of SLV/CLV, there exists misalignment
+between SLV and CLV, causing their comparison failed to produce the
+desired lock revocation behavior.
+
+The goal of this patch is to fix the impl, so we could
+1. Enable clients to retain sufficient locks to accelerate their
+   computation when resources are abundant;
+2. Properly revoke locks from clients during memory pressure.
+
+Implementation changes:
+- Align lock granularity: both SLV and CLV now use sizeof(ldlm_lock)
+  as the base unit
+- Align SVR_POOL_MAX_AGE with CLI_LRU_MAX_AGE: reduce from 36000s
+  to 600s (LDLM_DEFAULT_LRU_MAX_AGE) for consistency
+- Replace gradual adjustment based on grant_plan (which exhibits
+  significant delay) with a pressure-based method that considers:
+  * Memory pressure: ratio of total-available/total-granted locks
+  * Client count: number of connected clients
+  This approach ensures proper alignment between SLV and CLV
+
+New SLV calculation formula:
+  slv = (lock_limit * pool_max_age * adjust_factor) / client_count
+
+Where adjust_factor = exp(4 * (available/granted - 1)), which:
+- Increases SLV when resources are abundant (available >> granted)
+- Decreases SLV under memory pressure (available << granted)
+- Maintains stability when available ~= granted, and by `-1` we could reach the balance target (adjust_factor = 1)
+- Apply exp() transformation to smooth and amplify values which helps to
+  * Enable clients to retain sufficient locks to accelerate their computation when resources are abundant, and
+  * Actively revoke locks from clients during memory pressure.
+
+Backward compatibility:
+- Parameter 'slv_pressure_adjust' is provided to fallback to the
+  previous implementation if needed
+
+A simple test sanity-ldlm-pool.sh is introduced, with some output,
+
+Phase 1: Gradual file creation with lock monitoring
+--------------------------------------------------------------
+Phase                 Granted    Limit Avai/Grant             SLV
+--------------------------------------------------------------
+Batch 1 (subdir 0)      10006   100000 89994/10006   1489666526458
+Batch 2 (subdir 1)      20008   100000 79992/20008   1933486114518
+Batch 3 (subdir 2)      30010   100000 69990/30010   1347042858596
+Batch 4 (subdir 3)      40012   100000 59988/40012     44241836402
+Batch 5 (subdir 4)      50014   100000 49986/50014      1935912934
+Batch 6 (subdir 5)      60016   100000 39984/60016        70554719
+Batch 7 (subdir 6)      70018   100000 29982/70018         5466001
+Batch 8 (subdir 7)      61084   100000 38916/61084         4861214
+Batch 9 (subdir 8)      70018   100000 29982/70018         2590221
+Batch 10 (subdir 9)     59720   100000 40280/59720         7609647
+
+Phase 2: Sustained workload with continuous monitoring
+--------------------------------------------------------------
+Phase                 Granted    Limit Avai/Grant             SLV
+--------------------------------------------------------------
+16:58:33                59724   100000 40276/59724         3397819
+16:58:43                59742   100000 40258/59742         2657108
+16:58:54                49744   100000 50256/49744         6328254
+16:59:04                59750   100000 40250/59750         4458436
+16:59:14                59752   100000 40248/59752         2307801
+16:59:24                63014   100000 36986/63014         2249070
+16:59:34                69744   100000 30256/69744         2271087
+16:59:44                60050   100000 39950/60050         7916277
+16:59:54                60050   100000 39950/60050         3412491
+17:00:04                60048   100000 39952/60048         2868834
+17:00:14                61048   100000 38952/61048         2237576
+17:00:24                50480   100000 49520/50480         2812093
+--------------------------------------------------------------
+
+Note, the number fluctuation is likely because the test only involved
+two clients and a relatively large volume of lock requests. In
+production environment, it should be smoother.
+
+
+PENDING TO DO ==============================================================
+Currently SLV/CLV treat all clients equally.
+Under pressure, large and small clients may keep a similar number
+of locks, which is not ideal for HPC workloads.
+
+Introduce a proportional target:
+target = CPU_cores × locks_per_core
+
+CLV takes actual_locks / target into account, so clients retain
+locks relative to their capacity rather than in absolute terms.
+
+To avoid oscillation under sustained pressure, locks_per_core
+must not be fixed. Since only the server has global visibility,
+it dynamically determines this value and embeds it into SLV.
+
+SLV layout extension (backward compatible):
+
+bit 63..60 : 0xF, for compatibility, old SLV not fill this part,
+bit 59..48 : reserved
+bit 47..40 : locks_per_core
+bit 39..0  : original SLV
+
+This improves proportional fairness while keeping server-side
+pressure control centralized.
+
+Signed-off-by: Keguang Xu <squalfof@gmail.com>
+Change-Id: If8a6f247127576965ae45c349a4ab04fb286615a
+
+--- Review History ---
+
+--- Message (kg.xu, 2025-11-12 09:27:39.000000000) ---
+Uploaded patch set 1.
+
+--- Message (kg.xu, 2025-11-12 09:28:51.000000000) ---
+Set Work In Progress
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2025-11-12 09:31:05.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2025-11-12 09:34:32.000000000) ---
+Patch Set 1:
+
+(6 comments)
+
+6 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2025-11-12 09:58:38.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/118430/ : SUCCESS
+
+--- Message (kg.xu, 2025-11-13 09:37:17.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2025-11-13 09:40:35.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2025-11-13 09:51:21.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (kg.xu, 2025-11-13 10:13:03.000000000) ---
+Uploaded patch set 3.
+
+--- Message (jenkins, 2025-11-13 10:13:04.000000000) ---
+Patch Set 2:
+
+No Builds Executed
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2025-11-13 10:16:31.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2025-11-13 10:21:50.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (kg.xu, 2025-11-13 10:24:58.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+This change is ready for review.
+
+--- Message (Patrick Farrell, 2025-11-13 14:38:48.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2025-11-13 16:08:21.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+--- Message (jenkins, 2025-11-13 16:50:07.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/118500/ : SUCCESS
+
+--- Message (Andreas Dilger, 2025-11-13 16:52:39.000000000) ---
+Patch Set 3:
+
+(7 comments)
+
+--- Message (kg.xu, 2025-11-19 05:27:08.000000000) ---
+Uploaded patch set 4.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2025-11-19 05:30:37.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2025-11-19 05:37:10.000000000) ---
+Patch Set 4:
+
+(10 comments)
+
+10 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2025-11-19 05:55:58.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/118803/ : SUCCESS
+
+--- Message (kg.xu, 2025-11-19 06:27:38.000000000) ---
+Set Work In Progress
+
+--- Message (kg.xu, 2025-11-20 02:07:37.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2025-11-20 02:10:25.000000000) ---
+Patch Set 5:
+
+(10 comments)
+
+10 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2025-11-20 02:10:35.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2025-11-20 02:41:17.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/118824/ : SUCCESS
+
+--- Message (kg.xu, 2025-11-21 00:47:16.000000000) ---
+Patch Set 5:
+
+(4 comments)
+
+This change is ready for review.
+
+--- Message (Qian Yingjin, 2025-11-21 08:32:34.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+--- Message (kg.xu, 2025-11-21 09:51:54.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+--- Message (kg.xu, 2025-11-24 02:42:32.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+--- Message (Patrick Farrell, 2025-11-24 04:02:01.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+--- Message (kg.xu, 2025-11-24 07:10:25.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+--- Message (kg.xu, 2025-11-24 10:54:54.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+--- Message (kg.xu, 2025-11-26 09:24:49.000000000) ---
+Uploaded patch set 6.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (kg.xu, 2025-11-26 09:27:37.000000000) ---
+Set Work In Progress
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2025-11-26 09:28:01.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2025-11-26 09:37:00.000000000) ---
+Patch Set 6:
+
+(20 comments)
+
+20 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2025-11-26 09:58:56.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/118989/ : SUCCESS
+
+--- Message (kg.xu, 2025-11-27 06:31:22.000000000) ---
+Uploaded patch set 7.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2025-11-27 06:34:14.000000000) ---
+Patch Set 7:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2025-11-27 06:45:22.000000000) ---
+Patch Set 7:
+
+(10 comments)
+
+10 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (kg.xu, 2025-11-27 07:59:09.000000000) ---
+Uploaded patch set 8.
+
+--- Message (jenkins, 2025-11-27 07:59:13.000000000) ---
+Patch Set 7: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/119038/ : ABORTED
+
+--- Message (wc-checkpatch, 2025-11-27 08:01:31.000000000) ---
+Patch Set 8:
+
+(10 comments)
+
+10 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2025-11-27 08:02:15.000000000) ---
+Patch Set 8:
+
+Code-wise looks good to me.
+
+--- Message (kg.xu, 2025-11-27 08:41:49.000000000) ---
+Uploaded patch set 9.
+
+--- Message (jenkins, 2025-11-27 08:41:53.000000000) ---
+Patch Set 8: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/119040/ : ABORTED
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2025-11-27 08:45:13.000000000) ---
+Patch Set 9:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2025-11-27 08:47:11.000000000) ---
+Patch Set 9:
+
+(10 comments)
+
+10 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2025-11-27 13:43:19.000000000) ---
+Patch Set 9: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/119041/ : SUCCESS
+
+--- Message (kg.xu, 2025-11-28 00:43:34.000000000) ---
+Patch Set 9:
+
+(1 comment)
+
+This change is ready for review.
+
+--- Message (kg.xu, 2026-02-24 06:54:07.000000000) ---
+Patch Set 9:
+
+(1 comment)
+
+--- Message (Qian Yingjin, 2026-02-24 09:29:42.000000000) ---
+Patch Set 9:
+
+(5 comments)
+
+--- Message (kg.xu, 2026-02-25 02:25:05.000000000) ---
+Patch Set 9:
+
+(3 comments)
+
+--- Message (Qian Yingjin, 2026-02-25 03:07:43.000000000) ---
+Patch Set 9:
+
+(2 comments)
+
+--- Message (Qian Yingjin, 2026-02-25 03:10:33.000000000) ---
+Patch Set 9:
+
+(1 comment)
+
+--- Message (kg.xu, 2026-02-25 05:53:55.000000000) ---
+Patch Set 9:
+
+(3 comments)
+
+--- Message (kg.xu, 2026-02-27 08:09:57.000000000) ---
+Patch Set 10: Commit message was updated.
+
+Copied Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR **changekind:NO_CODE_CHANGE**")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-02-27 08:14:34.000000000) ---
+Patch Set 10:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-02-27 08:22:48.000000000) ---
+Patch Set 10:
+
+(10 comments)
+
+10 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-02-27 08:35:49.000000000) ---
+Patch Set 10: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/121985/ : SUCCESS
+
+--- Message (kg.xu, 2026-02-27 13:52:54.000000000) ---
+Set Work In Progress

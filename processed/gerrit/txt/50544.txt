@@ -1,0 +1,1093 @@
+Change:     50544
+Subject:    LU-16713 llite: writeback/commit pages under memory pressure
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/50544
+Change-Id:  I7b548dcc214995c9f00d57817028ec64fd917eab
+Project:    fs/lustre-release
+Branch:     master
+Status:     MERGED
+Owner:      Qian Yingjin
+Created:    2023-04-05 14:22:22.000000000
+Updated:    2023-09-26 14:33:35.000000000
+Patch Set:  26
+Insertions: +267
+Deletions:  -46
+Comments:   306 (18 unresolved)
+Topic:      cg
+
+--- Labels ---
+  Code-Review: Alex Deiter: +1; Shaun Tancheff: +1; Oleg Drokin: +2; Patrick Farrell: +1
+  Verified: jenkins: +1; Maloo: +1
+
+--- Reviewers ---
+  CC: Arshad Hussain
+  REVIEWER: Oleg Drokin, Andreas Dilger, Andrew Perepechko, Qian Yingjin, Shaun Tancheff, Alex Deiter, Patrick Farrell
+
+--- Commit Message ---
+LU-16713 llite: writeback/commit pages under memory pressure
+
+Lustre buffered I/O does not work well with restrictive memcg
+control. This may result in OOM when the system is under memroy
+pressure.
+
+Lustre has implemented unstable pages support similar to NFS.
+But it is disabled by default due to the performance reason.
+
+In Lustre, a client pins the cache pages for writes until the
+write transcation is committed on the server (OST) even these
+pinned pages have been finished writeback. The server starts
+a transaction commit either because the commit interval (5
+second, by default) for the backend storage (i.e. OST/ldiskfs)
+has been reached or there is not enough room in the journal
+for a particular handle to start. Before the write transcation
+has been committed and notify the client, these pages are
+pinned and not flushable in any way by the kernel.
+This means that when a client hits memory pressure there can
+be a large number of unfreeable (pinned and uncommitted) pages,
+so the application on the client will end up OOM killed because
+when asked to free up memory it can not.
+This is particularly common with cgroups. Because when cgroups
+are in use, the memory limit is generally much lower than the
+total system memory limits and it is more likely to reach the
+limits.
+
+Linux kernel has matured memory reclaim mechanism to avoid OOM
+even with cgroups.
+After perform dirtied write for a page, the kernel calls
+@balance_dirty_pages(). If the dirtied and uncommitted pages
+are over background threshold for the global memory limits or
+memory cgroup limits, the writeback threads are woken to perform
+some writeout.
+When allocate a new page for I/O under memory pressure, the
+kernel will try direct reclaim and then allocating. For cgroup,
+it will try to reclaim pages from the memory cgroup over soft
+limit. The slow page allocation path with direct reclaim will
+call @wakeup_flusher_threads() with WB_REASON_VMSCAN to start
+writeback dirty pages.
+
+Our solution uses the page reclaim mechanism in the kernel
+directly.
+In the completion of page writeback (in @brw_interpret), call
+@__mark_inode_dirty() to add this dirty inode which has pinned
+uncommitted pages into the @bdi_writeback where each memory
+cgroup has itw own @bdi_writeback to contorl the writeback for
+buffered writes within it.
+Thus under memory pressure, the writeback threads will be woken
+up, and it will call @ll_writepages() to write out data.
+For background writeout (over background dirty threshold) or
+writeback with WB_REASON_VMSCAN for direct reclaim, we first
+flush dirtied pages to OSTs and then sync them to OSTs and force
+to commit these pages to release them quickly.
+
+When a cgroup is under memory pressure, the kernel asks to do
+writeback and then it does a fsync to OSTs. This will commit
+uncommitted/unstable pages, and then the kernel can free them
+finally.
+
+In the following, we will give out some performance results.
+The client has 512G memory in total.
+1. dd if=/dev/zero of=$test bs=1M count=$size
+I/O size	128G	256G	512G	1024G
+unpatch (GB/s)	2.2	2.2	2.1	2.0
+patched (GB/s)	2.2	2.2	2.1	2.0
+There is no preformance regession after enable unstable page
+account with the patch.
+
+2. One process under different memcg limits and total I/O
+size varies from 2X memlimit to 0.5 memlimit:
+dd if=/dev/zero of=$file bs=1M count=$((memlimit_mb * time))
+memcg limits		1G	4G	16G	64G
+2X memlimit (GB/s)	1.7	1.6	1.8	1.7
+1X memlimit (GB/s)	1.9	1.9	2.2	2.2
+.5X memlimit(GB/s)	2.3	2.3	2.2	2.3
+Without this patch, dd with I/O size > memcg limit will be
+OOM-killed.
+
+3. Multiple cgroups Testing:
+8 cgroups in total each with memory limit of 8G.
+Run dd write on each cgrop with I/O size of 2X memory limit
+(16G).
+17179869184 bytes (17 GB, 16 GiB) copied, 12.7842 s, 1.3 GB/s
+17179869184 bytes (17 GB, 16 GiB) copied, 12.7889 s, 1.3 GB/s
+17179869184 bytes (17 GB, 16 GiB) copied, 12.9504 s, 1.3 GB/s
+17179869184 bytes (17 GB, 16 GiB) copied, 12.9577 s, 1.3 GB/s
+17179869184 bytes (17 GB, 16 GiB) copied, 13.4066 s, 1.3 GB/s
+17179869184 bytes (17 GB, 16 GiB) copied, 13.5397 s, 1.3 GB/s
+17179869184 bytes (17 GB, 16 GiB) copied, 13.5769 s, 1.3 GB/s
+17179869184 bytes (17 GB, 16 GiB) copied, 13.6605 s, 1.3 GB/s
+
+4. Two dd writers one (A) is under memcg control and another
+(B) is not. The total write data is 128G. Memcg limits varies
+from 1G to 128G.
+cmd: ./t2p.sh $memlimit_mb
+memlimit	dd writer (A)	dd writer (B)
+1G		1.3GB/s		2.2GB/s
+4G		1.3GB/s		2.2GB/s
+16G		1.4GB/s		2.2GB/s
+32G		1.5GB/s		2.2GB/s
+64G		1.8GB/s		2.2GB/s
+128G		2.1GB/s		2.1GB/s
+
+The results demonstrates that the process with memcg limits
+nearly has no impact on the performance of the process without
+limits.
+
+Test-Parameters: clientdistro=el8.7 testlist=sanity env=ONLY=411b,ONLY_REPEAT=10
+Test-Parameters: clientdistro=el9.1 testlist=sanity env=ONLY=411b,ONLY_REPEAT=10
+Signed-off-by: Qian Yingjin <qian@ddn.com>
+Change-Id: I7b548dcc214995c9f00d57817028ec64fd917eab
+Reviewed-on: https://review.whamcloud.com/c/fs/lustre-release/+/50544
+Tested-by: jenkins <devops@whamcloud.com>
+Tested-by: Maloo <maloo@whamcloud.com>
+Reviewed-by: Oleg Drokin <green@whamcloud.com>
+Reviewed-by: Shaun Tancheff <shaun.tancheff@hpe.com>
+Reviewed-by: Patrick Farrell <pfarrell@whamcloud.com>
+Reviewed-by: Alex Deiter <alex.deiter@gmail.com>
+
+--- Review History ---
+
+--- Message (Qian Yingjin, 2023-04-05 14:22:22.000000000) ---
+Uploaded patch set 1.
+
+--- Message (wc-checkpatch, 2023-04-05 14:23:53.000000000) ---
+Patch Set 1:
+
+(18 comments)
+
+18 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre Gerrit Janitor, 2023-04-05 14:26:32.000000000) ---
+Patch Set 1:
+
+(15 comments)
+
+centos7: Compile failed
+
+
+ Job output URL: https://testing.whamcloud.com/gerrit-janitor/29901/results.html
+
+--- Message (Qian Yingjin, 2023-04-05 14:32:56.000000000) ---
+Patch Set 1:
+
+Some build failure on CentOS 7.
+
+However, it passed sanity/test_411b (copied form Patrick's patch) on my local testing.
+
+--- Message (jenkins, 2023-04-05 14:49:52.000000000) ---
+Patch Set 1: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/93623/ : FAILURE
+
+--- Message (Qian Yingjin, 2023-04-06 12:55:07.000000000) ---
+Uploaded patch set 2.
+
+--- Message (wc-checkpatch, 2023-04-06 12:57:29.000000000) ---
+Patch Set 2:
+
+(14 comments)
+
+14 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre Gerrit Janitor, 2023-04-06 12:58:49.000000000) ---
+Patch Set 2:
+
+(2 comments)
+
+rhel8.5: Compile failed
+
+
+ Job output URL: https://testing.whamcloud.com/gerrit-janitor/29944/results.html
+
+--- Message (Qian Yingjin, 2023-04-06 13:02:49.000000000) ---
+Uploaded patch set 3.
+
+--- Message (jenkins, 2023-04-06 13:02:52.000000000) ---
+Patch Set 2: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/93662/ : ABORTED
+
+--- Message (wc-checkpatch, 2023-04-06 13:07:41.000000000) ---
+Patch Set 3:
+
+(14 comments)
+
+14 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2023-04-06 13:28:52.000000000) ---
+Patch Set 3: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/93663/ : FAILURE
+
+--- Message (Qian Yingjin, 2023-04-06 14:29:12.000000000) ---
+Uploaded patch set 4.
+
+--- Message (wc-checkpatch, 2023-04-06 14:33:07.000000000) ---
+Patch Set 4:
+
+(14 comments)
+
+14 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Qian Yingjin, 2023-04-06 14:36:07.000000000) ---
+Patch Set 3:
+
+It seems that disable unstable pages can also pass the testing on reel 7.
+
+--- Message (Lustre Gerrit Janitor, 2023-04-06 14:38:18.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+Crash (id 68373 seen 0) in sanity@zfs
+- Failed run: https://testing.whamcloud.com/gerrit-janitor/29947/testresults/sanity2-zfs-centos7_x86_64-centos7_x86_64-retry1
+
+--- Message (jenkins, 2023-04-06 14:53:24.000000000) ---
+Patch Set 4: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/93665/ : FAILURE
+
+--- Message (Patrick Farrell, 2023-04-06 15:12:24.000000000) ---
+Patch Set 4:
+
+I'm most concerned about the performance with writeback - Panda had patch which enabled writeback in a simpler way (I think yours is more complete) and he said it was very bad for write performance for even one thread, due (I believe) to dirty page rate limiting.
+
+--- Message (Qian Yingjin, 2023-04-06 15:57:07.000000000) ---
+Patch Set 4:
+
+Dirty page rate limiting only disabled when:
+if (!bdi_cap_account_dirty(bdi))
+		return;
+
+BDI_CAP_NO_ACCT_DIRTY is set on bdi.
+
+From kernel source code, I can not find any way we can avoid it...
+
+And moreover, the writeback is done via another kernel writeback flusher thread, not current thread. And I forbid the kernel periodic writeback (for_kupdate).
+
+Could you pleasegive out the patch URL for Panda's writeback code?
+I search but not found...
+
+I will try to benchmark it later if conditions permit.
+
+--- Message (Patrick Farrell, 2023-04-06 17:06:21.000000000) ---
+Patch Set 4:
+
+I don't know if he shared it, I think he just informed me about the perf issue?
+
+--- Message (Qian Yingjin, 2023-04-07 02:01:27.000000000) ---
+Uploaded patch set 5.
+
+--- Message (wc-checkpatch, 2023-04-07 02:01:56.000000000) ---
+Patch Set 5:
+
+(14 comments)
+
+14 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre Gerrit Janitor, 2023-04-07 02:10:55.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+Crash (id 68373 seen 8) in sanity@zfs
+- Failed run: https://testing.whamcloud.com/gerrit-janitor/29962/testresults/sanity2-zfs-centos7_x86_64-centos7_x86_64
+
+--- Message (jenkins, 2023-04-07 02:27:26.000000000) ---
+Patch Set 5: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/93677/ : FAILURE
+
+--- Message (Qian Yingjin, 2023-04-07 06:13:35.000000000) ---
+Uploaded patch set 6.
+
+--- Message (wc-checkpatch, 2023-04-07 06:17:46.000000000) ---
+Patch Set 6:
+
+(14 comments)
+
+14 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre Gerrit Janitor, 2023-04-07 06:22:25.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+Crash (id 68373 seen 17) in sanity@zfs
+- Failed run: https://testing.whamcloud.com/gerrit-janitor/29965/testresults/sanity2-zfs-centos7_x86_64-centos7_x86_64-retry2
+
+--- Message (jenkins, 2023-04-07 06:38:23.000000000) ---
+Patch Set 6: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/93680/ : FAILURE
+
+--- Message (Qian Yingjin, 2023-04-07 07:55:28.000000000) ---
+Uploaded patch set 7.
+
+--- Message (wc-checkpatch, 2023-04-07 07:58:14.000000000) ---
+Patch Set 7:
+
+(14 comments)
+
+14 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2023-04-07 08:19:52.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/93682/ : SUCCESS
+
+--- Message (Qian Yingjin, 2023-04-07 08:23:28.000000000) ---
+Uploaded patch set 8.
+
+--- Message (wc-checkpatch, 2023-04-07 08:28:27.000000000) ---
+Patch Set 8:
+
+(14 comments)
+
+14 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2023-04-07 08:48:32.000000000) ---
+Patch Set 8: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/93683/ : SUCCESS
+
+--- Message (Qian Yingjin, 2023-04-11 09:36:32.000000000) ---
+Uploaded patch set 9.
+
+--- Message (Lustre Gerrit Janitor, 2023-04-11 09:38:09.000000000) ---
+Patch Set 9:
+
+(1 comment)
+
+centos7: Compile failed
+
+
+ Job output URL: https://testing.whamcloud.com/gerrit-janitor/30115/results.html
+
+--- Message (wc-checkpatch, 2023-04-11 09:38:14.000000000) ---
+Patch Set 9:
+
+(14 comments)
+
+14 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Qian Yingjin, 2023-04-11 09:40:46.000000000) ---
+Uploaded patch set 10.
+
+--- Message (jenkins, 2023-04-11 09:40:50.000000000) ---
+Patch Set 9: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/93786/ : ABORTED
+
+--- Message (wc-checkpatch, 2023-04-11 09:43:26.000000000) ---
+Patch Set 10:
+
+(14 comments)
+
+14 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre Gerrit Janitor, 2023-04-11 09:43:44.000000000) ---
+Patch Set 10:
+
+(3 comments)
+
+centos7: Compile failed
+
+
+ Job output URL: https://testing.whamcloud.com/gerrit-janitor/30117/results.html
+
+--- Message (Qian Yingjin, 2023-04-11 09:47:08.000000000) ---
+Uploaded patch set 11.
+
+--- Message (jenkins, 2023-04-11 09:47:11.000000000) ---
+Patch Set 10: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/93788/ : ABORTED
+
+--- Message (wc-checkpatch, 2023-04-11 09:48:37.000000000) ---
+Patch Set 11:
+
+(14 comments)
+
+14 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2023-04-11 10:10:03.000000000) ---
+Patch Set 11: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/93789/ : FAILURE
+
+--- Message (Qian Yingjin, 2023-04-11 15:18:03.000000000) ---
+Uploaded patch set 12.
+
+--- Message (wc-checkpatch, 2023-04-11 15:20:45.000000000) ---
+Patch Set 12:
+
+(12 comments)
+
+12 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2023-04-11 16:13:46.000000000) ---
+Patch Set 12: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/93799/ : SUCCESS
+
+--- Message (Qian Yingjin, 2023-04-12 16:03:50.000000000) ---
+Patch Set 12:
+
+(1 comment)
+
+--- Message (Patrick Farrell, 2023-04-12 16:21:43.000000000) ---
+Patch Set 12:
+
+(6 comments)
+
+OK, making sure I understand...
+
+Basically, when we have an uncommited write RPC, we mark an inode dirty (I_DIRTY_FDATASYNC) (brw_interpret/cl_object_mark_dirty).  Because we have 'registered' with the kernel writeback code (by setting sb->s_bdi->capabilities in ll_fill_super), when we get cgroups memory pressure, we get a writeback request.
+
+This shows up in ll_writepages().  Then we do a new type of fsync - CL_FSYNC_RECLAIM.
+
+How CL_FSYNC_RECLAIM differs from a 'normal' fsync is it does *not* force out dirty pages.  Instead, it just sends an fsync RPC to the OST, which forces commit of *uncommitted* pages.  (see osc_io_fsync_start() for this)
+
+So, in effect, when we get cgroups memory pressure, the kernel asks us to do writeback, and then we do an fsync to the OST.  This will commit uncommitted/unstable pages, but does not free any memory *directly*.  Once the pages are committed, the kernel can free them.
+
+Is this correct?  This patch is simpler than I expected.
+
+--- Message (Patrick Farrell, 2023-04-12 16:24:15.000000000) ---
+Patch Set 12:
+
+Other thoughts:
+The previous patch use mod_lruvec_page_state to register our unstable pages with the kernel so they are visible to writeback, correct?  How does that relate to marking inodes dirty with I_DIRTY_DATASYNC?  Do we have to do both?
+
+We should change the split between this patch and the previous patch, I think.  The previous patch should *just* fix the bugs in unstable page accounting and not also register pages for writeback - registering pages for writeback should be done in the same patch which adds writeback support.
+
+--- Message (Patrick Farrell, 2023-04-12 16:27:13.000000000) ---
+Patch Set 12:
+
+btw, I think this looks really good overall.  This is a much more 'correct' solution than the lowmem sync approach.
+
+We should test performance cost for non-cgroup process when 1 cgroup is doing IO at memory limit and make sure perf for other process has minimal impact.
+
+(And add performance numbers to commit message)
+
+--- Message (Patrick Farrell, 2023-04-12 16:28:18.000000000) ---
+Patch Set 12:
+
+(1 comment)
+
+--- Message (Qian Yingjin, 2023-04-13 03:24:40.000000000) ---
+Patch Set 12:
+
+(3 comments)
+
+Patrick, your understanding is completely correct!
+"
+The previous patch use mod_lruvec_page_state to register our unstable pages with the kernel so they are visible to writeback, correct?  How does that relate to marking inodes dirty with I_DIRTY_DATASYNC?  Do we have to do both?
+"
+We use mod_lruvec_page_state() to account the unstable pages, thus in balance_dirty_pages(), we can know dirty page stat for memcg without  strictlimit (bool strictlimit = bdi->capabilities & BDI_CAP_STRICTLIMIT;
+).
+
+--- Message (Qian Yingjin, 2023-04-13 03:31:28.000000000) ---
+Patch Set 12:
+
+(1 comment)
+
+--- Message (Qian Yingjin, 2023-04-13 09:38:03.000000000) ---
+Uploaded patch set 13.
+
+--- Message (wc-checkpatch, 2023-04-13 09:41:33.000000000) ---
+Patch Set 13:
+
+(7 comments)
+
+7 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2023-04-13 10:01:18.000000000) ---
+Patch Set 13: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/93899/ : SUCCESS
+
+--- Message (Qian Yingjin, 2023-04-13 13:48:44.000000000) ---
+Patch Set 12:
+
+It seems that Cgroup not enabled in rhel9.1 and ubuntu2204: no setup for cgroup
+https://testing.whamcloud.com/test_sets/2553b027-a53d-4f57-8c97-4f4ac9c8263f
+
+--- Message (Shaun Tancheff, 2023-04-13 14:08:19.000000000) ---
+Patch Set 13:
+
+> Patch Set 12:
+> 
+> It seems that Cgroup not enabled in rhel9.1 and ubuntu2204: no setup for cgroup
+> https://testing.whamcloud.com/test_sets/2553b027-a53d-4f57-8c97-4f4ac9c8263f
+
+FWIW I believe RHEL9 is cgroups-v2 by default.
+
+I think Ubuntu 22.04 is also cgroups-v2 by default, but the shipping cgroup-tools only supports -v1
+
+--- Message (Qian Yingjin, 2023-04-14 03:28:47.000000000) ---
+Patch Set 13:
+
+The reply-single.sh test_89 failed on my local testing and Maloo testing:
+There are some problem in the current unstable code.
+It may cause hang during unmount:
+[root@qdb ~]# cat /proc/7677/stack
+[<0>] ll_put_super+0x5da/0x630 [lustre]
+[<0>] generic_shutdown_super+0x6c/0x100
+[<0>] kill_anon_super+0x14/0x30
+[<0>] deactivate_locked_super+0x34/0x70
+[<0>] cleanup_mnt+0x3b/0x70
+[<0>] task_work_run+0x8a/0xb0
+[<0>] exit_to_usermode_loop+0xeb/0xf0
+[<0>] do_syscall_64+0x198/0x1a0
+[<0>] entry_SYSCALL_64_after_hwframe+0x65/0xca
+
+ll_put_super():
+/* Wait for unstable pages to be committed to stable storage */
+	if (force == 0) {
+		rc = l_wait_event_abortable(
+			sbi->ll_cache->ccc_unstable_waitq,
+			atomic_long_read(&sbi->ll_cache->ccc_unstable_nr) == 0);
+	}
+
+	ccc_count = atomic_long_read(&sbi->ll_cache->ccc_unstable_nr);
+	if (force == 0 && rc != -ERESTARTSYS)
+		LASSERTF(ccc_count == 0, "count: %li\n", ccc_count);
+
+--- Message (Qian Yingjin, 2023-04-17 02:55:26.000000000) ---
+Uploaded patch set 14.
+
+--- Message (wc-checkpatch, 2023-04-17 02:56:58.000000000) ---
+Patch Set 14:
+
+(6 comments)
+
+6 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2023-04-17 03:18:46.000000000) ---
+Patch Set 14: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/93982/ : SUCCESS
+
+--- Message (Qian Yingjin, 2023-04-17 08:37:17.000000000) ---
+Uploaded patch set 15.
+
+--- Message (wc-checkpatch, 2023-04-17 08:38:23.000000000) ---
+Patch Set 15:
+
+(6 comments)
+
+6 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2023-04-17 09:00:20.000000000) ---
+Patch Set 15: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/93988/ : SUCCESS
+
+--- Message (Shaun Tancheff, 2023-04-23 14:42:56.000000000) ---
+Patch Set 15:
+
+Tested with memcg-v1 and it works great.
+Tested with memcg-v2 and I/O works but is very slow (unless there is other activity on the client, in which case it works well).
+
+--- Message (Qian Yingjin, 2023-04-23 15:01:04.000000000) ---
+Patch Set 15:
+
+Hi Shaun,
+
+I am only benchmarking it on rhel8.
+Could you please post your testing results on the ticket?
+And I am not familiar with Cgroup-v2, could you please give the benchmark steps for cgroup-v2 and OS version?
+
+Thanks,
+Qian
+
+--- Message (Patrick Farrell, 2023-04-26 15:13:32.000000000) ---
+Patch Set 15:
+
+Yeah, Shaun - Can you post a run down of how you tested?  It would be great to be able to replicate on our side; we want to fix this if it's not doing well in important cases
+
+--- Message (Shaun Tancheff, 2023-04-27 00:29:25.000000000) ---
+Patch Set 15:
+
+> Patch Set 15:
+> 
+> Yeah, Shaun - Can you post a run down of how you tested?  It would be great to be able to replicate on our side; we want to fix this if it's not doing well in important cases
+
+Yes. It seems for cgroups-v2 the page accounting i/o throttle kicks in and effectively disables this improvement.
+Also cgroups-v2 needs about 20% higher memory limit to achieve parity with cgroups-v1 [as far as this is concerned.
+
+Also rebased this directly onto master to avoid the unstable pages and writeback flags should give similar to the following:
+
+No cgroups: ~1.1G/s
+cgroups-v2: 
+MEMGROUP=ll-sync
+sudo cgcreate -a $USER -t $USER -g memory:${MEMGROUP}
+echo 120M | sudo tee /sys/fs/cgroup/${MEMGROUP}/memory.max
+sudo cgclassify -g memory:${MEMGROUP} $$
+
+sudo rm -fr /mnt/lustre/*
+sudo mkdir /mnt/lustre/ior
+sudo lfs setstripe -c 4 -S 1M /mnt/lustre/ior
+sudo chown shaun /mnt/lustre/ior
+sync; sync; echo 3 | sudo tee /proc/sys/vm/drop_caches
+
+dd if=/dev/zero of=/mnt/lustre/ior/striped-$$.bin bs=10M status=progress
+75958845440 bytes (76 GB, 71 GiB) copied, 94 s, 808 MB/s 
+dd: error writing '/mnt/lustre/ior/striped-1165.bin': No space left on device
+7309+0 records in
+7308+0 records out
+76634497024 bytes (77 GB, 71 GiB) copied, 95.1998 s, 805 MB/s
+
+cgroups-v1:
+MEMGROUP=ll-sync
+sudo mkdir /sys/fs/cgroup/memory/${MEMGROUP}
+echo 100M | sudo tee /sys/fs/cgroup/memory/${MEMGROUP}/memory.limit_in_bytes 
+echo $$ | sudo tee /sys/fs/cgroup/memory/${MEMGROUP}/tasks
+
+sudo rm -fr /mnt/lustre/*
+sudo mkdir /mnt/lustre/ior
+sudo lfs setstripe -c 4 -S 1M /mnt/lustre/ior
+sudo chown shaun /mnt/lustre/ior
+sync; sync; echo 3 | sudo tee /proc/sys/vm/drop_caches
+
+dd if=/dev/zero of=/mnt/lustre/ior/striped-$$.bin bs=10M status=progress
+76577505280 bytes (77 GB, 71 GiB) copied, 96 s, 798 MB/s 
+dd: error writing '/mnt/lustre/ior/striped-1167.bin': No space left on device
+7309+0 records in
+7308+0 records out
+76634497024 bytes (77 GB, 71 GiB) copied, 96.3581 s, 795 MB/s
+
+--- Message (Patrick Farrell, 2023-04-27 01:43:31.000000000) ---
+Patch Set 15:
+
+Shaun,
+
+"Also rebased this directly onto master to avoid the unstable pages and writeback flags should give similar to the following:"
+
+I'm confused - I think this work depends on both of those to work correctly.  Did you test it with the earlier patch as well or just without?
+
+--- Message (Shaun Tancheff, 2023-04-27 02:35:15.000000000) ---
+Patch Set 15:
+
+> Patch Set 15:
+> 
+> Shaun,
+> 
+> "Also rebased this directly onto master to avoid the unstable pages and writeback flags should give similar to the following:"
+> 
+> I'm confused - I think this work depends on both of those to work correctly.  Did you test it with the earlier patch as well or just without?
+
+Tested both ways.
+cgroups-v1 works with or without the unstable pages and writeback flags.
+cgroups-v2 gives horrible performance [because it throttles and the early soft sync is not triggered].
+
+--- Message (Shaun Tancheff, 2023-04-27 02:42:23.000000000) ---
+Patch Set 15:
+
+> Patch Set 15:
+> 
+> > Patch Set 15:
+> > 
+> > Shaun,
+> > 
+> > "Also rebased this directly onto master to avoid the unstable pages and writeback flags should give similar to the following:"
+> > 
+> > I'm confused - I think this work depends on both of those to work correctly.  Did you test it with the earlier patch as well or just without?
+> 
+> Tested both ways.
+> cgroups-v1 works with or without the unstable pages and writeback flags.
+> cgroups-v2 gives horrible performance [because it throttles and the early soft sync is not triggered]. 
+
+So to get good performance with cgroups-v2 the unstable page account needs to be disabled.
+
+The alternative is to trigger the soft sync when the lustre is being throttled by cgroups-v2 (not sure how at the moment).
+
+Note that if the server is otherwise busy performance is 'okay-ish', poor throughput is seen during testing while the server is otherwise idle (no other concurrent client activity).
+
+--- Message (Shaun Tancheff, 2023-06-07 05:18:56.000000000) ---
+Uploaded patch set 16.
+
+--- Message (wc-checkpatch, 2023-06-07 05:22:49.000000000) ---
+Patch Set 16:
+
+(6 comments)
+
+6 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2023-06-07 05:48:42.000000000) ---
+Patch Set 16: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/95403/ : SUCCESS
+
+--- Message (Shaun Tancheff, 2023-06-13 08:26:54.000000000) ---
+Uploaded patch set 17: Patch Set 16 was rebased.
+
+--- Message (wc-checkpatch, 2023-06-13 08:27:42.000000000) ---
+Patch Set 17:
+
+(6 comments)
+
+6 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2023-06-13 09:31:56.000000000) ---
+Patch Set 17: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/95552/ : SUCCESS
+
+--- Message (Shaun Tancheff, 2023-07-14 11:55:02.000000000) ---
+Uploaded patch set 18: Patch Set 17 was rebased.
+
+--- Message (wc-checkpatch, 2023-07-14 12:00:25.000000000) ---
+Patch Set 18:
+
+(6 comments)
+
+6 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2023-07-14 12:30:25.000000000) ---
+Patch Set 18: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/96288/ : SUCCESS
+
+--- Message (Qian Yingjin, 2023-07-25 03:10:44.000000000) ---
+Uploaded patch set 19: Commit message was updated.
+
+--- Message (wc-checkpatch, 2023-07-25 03:13:09.000000000) ---
+Patch Set 19:
+
+(6 comments)
+
+6 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2023-07-25 03:36:46.000000000) ---
+Patch Set 19:
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/96413/ : SUCCESS
+
+--- Message (Qian Yingjin, 2023-08-17 07:34:50.000000000) ---
+Uploaded patch set 20.
+
+--- Message (wc-checkpatch, 2023-08-17 07:38:27.000000000) ---
+Patch Set 20:
+
+(6 comments)
+
+6 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2023-08-17 07:59:27.000000000) ---
+Patch Set 20: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/97001/ : SUCCESS
+
+--- Message (Patrick Farrell, 2023-08-17 16:21:33.000000000) ---
+Patch Set 20:
+
+Yingjin,
+
+I recall that you performance tested this a while ago and the performance when at the cgroup limit was still poor.
+
+Do you have thoughts on that?  We obviously can't land this until that's understood and fixed.
+
+--- Message (Qian Yingjin, 2023-08-17 16:24:58.000000000) ---
+Patch Set 20:
+
+Patrick, what's the test case for cgroups do you mean?
+
+Many docker on many clients?
+All send sync to OSTs, causing too many journal commits on OST?
+that cuases the performance bad?
+
+--- Message (Qian Yingjin, 2023-08-17 16:52:09.000000000) ---
+Patch Set 20:
+
+maybe we can use 'soft_sync' instead of 'sync' when try to reclaim pages due to reach cgroup's memory limit?
+
+See LU-16713 for details.
+
+--- Message (Qian Yingjin, 2023-08-17 16:52:26.000000000) ---
+Patch Set 20:
+
+And this could be a separate patch
+
+--- Message (Patrick Farrell, 2023-08-17 17:16:25.000000000) ---
+Patch Set 20:
+
+No, I'm just talking about the simple case where you:
+
+Set cgroup memory limit
+Run dd on the client to do IO > cgroup limit
+So writeback/commit starts
+
+Confirm performance is OK
+
+Can also try multiple dds at the same time and see how that works.
+
+Other cases are possible issues too but just that one.  That's the simplest case and we must make sure it works well.
+
+--- Message (Qian Yingjin, 2023-08-22 09:33:23.000000000) ---
+Uploaded patch set 21: Patch Set 20 was rebased.
+
+--- Message (wc-checkpatch, 2023-08-22 09:37:38.000000000) ---
+Patch Set 21:
+
+(6 comments)
+
+6 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2023-08-22 10:14:37.000000000) ---
+Patch Set 21: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/97093/ : SUCCESS
+
+--- Message (Patrick Farrell, 2023-08-28 16:46:50.000000000) ---
+Uploaded patch set 22: Patch Set 21 was rebased.
+
+--- Message (wc-checkpatch, 2023-08-28 16:50:44.000000000) ---
+Patch Set 22:
+
+(6 comments)
+
+6 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Patrick Farrell, 2023-08-28 17:55:48.000000000) ---
+Patch Set 22:
+
+(10 comments)
+
+Some things to clean up and a few questions, but patch, approach, and benchmarks look good.
+
+--- Message (Peter Jones, 2023-08-28 19:25:23.000000000) ---
+Topic set to cg
+
+--- Message (jenkins, 2023-08-28 23:09:05.000000000) ---
+Patch Set 22: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/97328/ : SUCCESS
+
+--- Message (Qian Yingjin, 2023-08-29 03:34:06.000000000) ---
+Uploaded patch set 23.
+
+--- Message (Qian Yingjin, 2023-08-29 03:34:19.000000000) ---
+Patch Set 22:
+
+(8 comments)
+
+--- Message (wc-checkpatch, 2023-08-29 03:37:42.000000000) ---
+Patch Set 23:
+
+(6 comments)
+
+6 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2023-08-29 03:58:26.000000000) ---
+Patch Set 23: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/97333/ : SUCCESS
+
+--- Message (Patrick Farrell, 2023-08-29 04:06:48.000000000) ---
+Patch Set 23: Code-Review+1
+
+--- Message (Shaun Tancheff, 2023-08-31 02:40:45.000000000) ---
+Patch Set 23: Code-Review+1
+
+--- Message (Autotest, 2023-08-31 15:48:20.000000000) ---
+Patch Set 23:
+
+Onyx Autotest retesting enforced review-dne-part-7 session on el8.8-x86_64/ldiskfs servers and clients for build 97333 patch 23. Requested by paf because of LU-16554.
+
+--- Message (Patrick Farrell, 2023-08-31 16:02:39.000000000) ---
+Patch Set 23: Code-Review-1
+
+This failed its own test:
+https://testing.whamcloud.com/test_sets/fa41fa12-0660-48cc-80c6-a0da7c6a126a
+
+:(
+
+It may be the cgroups limits there just need to be a bit more generous?  They are pretty small
+
+--- Message (Qian Yingjin, 2023-09-01 02:02:10.000000000) ---
+Patch Set 23:
+
+I will rebase the patch and change the men_limit to 256MiB.
+
+--- Message (Qian Yingjin, 2023-09-01 02:49:04.000000000) ---
+Uploaded patch set 24.
+
+--- Message (wc-checkpatch, 2023-09-01 02:52:14.000000000) ---
+Patch Set 24:
+
+(6 comments)
+
+6 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2023-09-01 03:22:51.000000000) ---
+Patch Set 24: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/97536/ : SUCCESS
+
+--- Message (Shaun Tancheff, 2023-09-05 09:08:14.000000000) ---
+Patch Set 24: Code-Review+1
+
+--- Message (Patrick Farrell, 2023-09-05 15:12:36.000000000) ---
+Patch Set 24: Code-Review+1
+
+--- Message (Alex Deiter, 2023-09-09 11:14:02.000000000) ---
+Patch Set 24: Code-Review+1
+
+Looks good to me - thank you!
+
+--- Message (Qian Yingjin, 2023-09-15 07:14:38.000000000) ---
+Uploaded patch set 25: Patch Set 24 was rebased.
+
+--- Message (wc-checkpatch, 2023-09-15 07:18:25.000000000) ---
+Patch Set 25:
+
+(6 comments)
+
+6 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2023-09-15 07:53:02.000000000) ---
+Patch Set 25: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/98492/ : SUCCESS
+
+--- Message (Autotest, 2023-09-15 14:37:32.000000000) ---
+Patch Set 25:
+
+Trevis Autotest retesting enforced review-dne-part-5 session on el8.8-x86_64/ldiskfs servers and clients for build 98492 patch 25. Requested by Qian Yingjin because of LU-17119.
+
+--- Message (Autotest, 2023-09-15 16:19:30.000000000) ---
+Patch Set 25:
+
+Trevis Autotest retesting enforced review-dne-part-3 session on el8.8-x86_64/ldiskfs servers and clients for build 98492 patch 25. Requested by paf because of LU-17119.
+
+--- Message (Autotest, 2023-09-15 21:40:44.000000000) ---
+Patch Set 25:
+
+Trevis Autotest retesting enforced review-dne-part-5 session on el8.8-x86_64/ldiskfs servers and clients for build 98492 patch 25. Requested by paf because of LU-17119.
+
+--- Message (Autotest, 2023-09-16 03:33:46.000000000) ---
+Patch Set 25:
+
+Onyx Autotest retesting enforced review-dne-zfs-part-1 session on el8.8-x86_64/zfs servers and clients for build 98492 patch 25. Requested by HUANG XING because of LU-15941.
+
+--- Message (Oleg Drokin, 2023-09-23 05:59:49.000000000) ---
+Patch Set 25:
+
+(2 comments)
+
+--- Message (Oleg Drokin, 2023-09-23 06:10:00.000000000) ---
+Patch Set 25:
+
+(1 comment)
+
+--- Message (Qian Yingjin, 2023-09-24 13:33:32.000000000) ---
+Patch Set 25:
+
+The reason I remove the wait in llite layer is because it may cause hang when umount on a Lustre client with a failed OSC.
+The reply-single.sh test_89 failed on my local testing and Maloo testing:
+There are some problem in the current unstable code.
+It may cause hang during unmount:
+[root@qdb ~]# cat /proc/7677/stack
+[<0>] ll_put_super+0x5da/0x630 [lustre]
+[<0>] generic_shutdown_super+0x6c/0x100
+[<0>] kill_anon_super+0x14/0x30
+[<0>] deactivate_locked_super+0x34/0x70
+[<0>] cleanup_mnt+0x3b/0x70
+[<0>] task_work_run+0x8a/0xb0
+[<0>] exit_to_usermode_loop+0xeb/0xf0
+[<0>] do_syscall_64+0x198/0x1a0
+[<0>] entry_SYSCALL_64_after_hwframe+0x65/0xca
+ll_put_super():
+/* Wait for unstable pages to be committed to stable storage */
+	if (force == 0) {
+		rc = l_wait_event_abortable(
+			sbi->ll_cache->ccc_unstable_waitq,
+			atomic_long_read(&sbi->ll_cache->ccc_unstable_nr) == 0);
+	}
+	ccc_count = atomic_long_read(&sbi->ll_cache->ccc_unstable_nr);
+	if (force == 0 && rc != -ERESTARTSYS)
+		LASSERTF(ccc_count == 0, "count: %li\n", ccc_count);
+
+See the Patchset 13 for details:
+https://testing.whamcloud.com/test_sessions/9b0ab0e0-dfc5-4b10-8065-7967e557aed4
+
+--- Message (Oleg Drokin, 2023-09-26 14:33:31.000000000) ---
+Patch Set 25: Code-Review+2
+
+--- Message (Oleg Drokin, 2023-09-26 14:33:35.000000000) ---
+Change has been successfully cherry-picked as 8aa231a994683a9224d42c0e7ae48aaebe2f583c by Oleg Drokin

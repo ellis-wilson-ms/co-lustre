@@ -1,0 +1,652 @@
+Change:     59223
+Subject:    LU-19014 memcg: fix client hang in balance_dirty_pages()
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/59223
+Change-Id:  Iecee60484f1b65fad6f4c9eac7bd4d2c53f38b8d
+Project:    fs/lustre-release
+Branch:     master
+Status:     MERGED
+Owner:      Qian Yingjin
+Created:    2025-05-14 09:17:43.000000000
+Updated:    2025-07-10 04:38:51.000000000
+Patch Set:  11
+Insertions: +289
+Deletions:  -85
+Comments:   21 (2 unresolved)
+
+--- Labels ---
+  Code-Review: Zhenyu Xu: +1; Oleg Drokin: +2; Patrick Farrell: +1
+  Verified: jenkins: +1; Maloo: +1
+
+--- Reviewers ---
+  CC: James Simmons, Shaun Tancheff
+  REVIEWER: Zhenyu Xu, Oleg Drokin, Andreas Dilger, Qian Yingjin, Patrick Farrell
+
+--- Commit Message ---
+LU-19014 memcg: fix client hang in balance_dirty_pages()
+
+Two nodes (at least) append write a shared file in Lustre with
+memcg enabled.
+The client randomly hung in balance_dirty_pages() with the
+following call trace:
+[<0>] balance_dirty_pages+0x2ee/0xd10
+[<0>] balance_dirty_pages_ratelimited_flags+0x27a/0x380
+[<0>] generic_perform_write+0x150/0x210
+[<0>] vvp_io_write_start+0x516/0xc00 [lustre]
+[<0>] cl_io_start+0x5a/0x110 [obdclass]
+[<0>] cl_io_loop+0x97/0x1f0 [obdclass]
+[<0>] ll_file_io_generic+0x4d2/0xe50 [lustre]
+[<0>] do_file_write_iter+0x3e9/0x5d0 [lustre]
+[<0>] vfs_write+0x2cb/0x410
+[<0>] ksys_write+0x5f/0xe0
+[<0>] do_syscall_64+0x5c/0xf0
+
+After analyze the core dump of the hung system, we found that the
+bdi_writeback data structure (wb) corresponded to the memcg has
+pending dirty pages (in state WB_registered | WB_has_diry_io), but
+can not write-out the dirty pages and loop in balance_dirty_pages
+function.
+
+This is a bug in Lustre memcg code. In OSC/MDC layer, it will stop
+to flush dirty pages once found that there are no any unstable
+pages.
+However, there may be some dirty pages queued in the cache. In
+this case, the client should still write back the dirty pages.
+Thus the wb stat accounting will be updated and the write process
+can continue instead of looping endless.
+
+Moreover, there are some problem in the current Lustre CLIO engine.
+When the system or a certain memcg is under memory pressure, the
+client just queues the dirty page in page cache or in the current
+active extent (OES_ACTIVE osc_extent) when vvp_io_write_commit()/
+cl_io_commit_async() is called in ->write_end(). The queued pages
+can not be written back even the kernel is trying to flush dirty
+pages in writeback via ->ll_writepages().
+The client is looping in the following call sequences:
+
+loop:
+->write_begin()
+->write_end()
+->balance_dirty_pages()
+  ->Launch file writeback in background but cannot flush any
+    dirty pages.
+  ->The current process is paused a certain time (i.e. 200ms) as
+    the corresponding @wb is dirty exceeded.
+-> GOTO loop:
+
+The write progress is very slow: write a page and sleep/pause for
+a period of time alternately.
+
+We fix this hang in ->ll_write_end(). When detect the corresponding
+@wb is dirty exceeded, the client will submit the dirty pages into
+OSC writeback cache. The state of current extent will change from
+OES_ACTIVE to OES_CACHE and this kind of extents can be written
+back. Moreover, we mark the current extent as urgent, thus it can
+be flushed much more quickly.
+
+Fixes: 8aa231a99 ("LU-16713 llite: writeback/commit pages under memory pressure")
+Signed-off-by: Yingjin Qian <qian@ddn.com>
+Change-Id: Iecee60484f1b65fad6f4c9eac7bd4d2c53f38b8d
+Reviewed-on: https://review.whamcloud.com/c/fs/lustre-release/+/59223
+Tested-by: jenkins <devops@whamcloud.com>
+Tested-by: Maloo <maloo@whamcloud.com>
+Reviewed-by: Zhenyu Xu <bobijam@whamcloud.com>
+Reviewed-by: Patrick Farrell <pfarrell@whamcloud.com>
+Reviewed-by: Oleg Drokin <green@whamcloud.com>
+
+--- Review History ---
+
+--- Message (Qian Yingjin, 2025-05-14 09:17:43.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2025-05-14 09:21:05.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2025-05-14 09:22:39.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (Andreas Dilger, 2025-05-14 10:04:17.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Patrick Farrell, 2025-05-14 18:21:38.000000000) ---
+Patch Set 1:
+
+Yingjin,
+
+Can you test if this resolves the performance issue with vm_dirty_ratio set to 0?  It looks like it might well
+
+--- Message (jenkins, 2025-05-14 19:19:07.000000000) ---
+Patch Set 1: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/113365/ : FAILURE
+
+--- Message (Patrick Farrell, 2025-05-14 21:20:17.000000000) ---
+Patch Set 1:
+
+OK, this doesn't resolve the performance issue with vm_dirty_ratio set to 0.
+
+It would be good to look at this at the same time, I think, since it's probably pretty closely related.
+
+I notice unstable pages is going up - in my case, I have vm_dirty_ratio to 0 and vm_dirty_bytes to 512MB:
+
+[root@rocky801 lustre]# dd if=/dev/zero bs=16M count=64 of=./newfile &
+[1] 10248
+[root@rocky801 lustre]# lctl get_param llite.*.*unstable*
+llite.lustre-ffff9d1ce7cfe800.unstable_stats=
+unstable_check:            1
+unstable_pages:       131072
+unstable_mb:             512
+
+It stays stuck there, and the dd is not quite hung - it will complete, a very long time from now.
+
+I now also wonder if it would really resolve the apparent deadlock?  I agree it seems correct...
+
+--- Message (Patrick Farrell, 2025-05-15 00:51:10.000000000) ---
+Patch Set 1:
+
+Interesting point:
+With this patch, disabling unstable check seems to avoid the slowdown, without it (master), it does not seem to.
+
+--- Message (Qian Yingjin, 2025-05-15 02:44:34.000000000) ---
+Patch Set 1:
+
+okey, with vm_dirty_bytes to 512MB, when the dirty cache pages exceed the allowed values, it will trigger write back (flush: wb_workfn()->ll_writepages()) work to flush dirty data and maybe the write process will wait in balance_dirty_pages() until the flush work finished and update the wb stat accounting and then continue the write progress.
+
+in ->ll_writepages(), once detect the system or a memcg is under memory pressure, it will send a OST sync RPC to OST after write-back the dirty pages and commit the unstable pages for the subsequent writes.
+Here we can do some optimization: make the OST sync RPC asynchronously (we have a patch for it: https://review.whamcloud.com/#/c/fs/lustre-release/+/56722) or give a hint to the write RPC to OSTs to commit the unstable write on OSTs.
+
+--- Message (Qian Yingjin, 2025-05-15 02:48:55.000000000) ---
+Patch Set 1:
+
+"
+disabling unstable check seems to avoid the slowdown
+"
+This may be that disabling unstable check reduces the trigger of flush (ll_writepages) and send OST sync RPCs.
+
+Maybe we should add a small patch to stat the account of sync RPCs in ll_writepages due to memory pressure?
+
+--- Message (Qian Yingjin, 2025-05-15 03:00:30.000000000) ---
+Uploaded patch set 2: Commit message was updated.
+
+--- Message (jenkins, 2025-05-15 03:00:32.000000000) ---
+Patch Set 1:
+
+No Builds Executed
+
+--- Message (wc-checkpatch, 2025-05-15 03:03:31.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2025-05-15 03:03:39.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2025-05-15 03:31:40.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/113399/ : SUCCESS
+
+--- Message (Patrick Farrell, 2025-05-16 00:24:49.000000000) ---
+Patch Set 2:
+
+I figured out why disabling unstable page accounting avoids the issue.
+
+The issue with the client is that it’s hit the unstable pages limit and isn’t finding out they’ve been committed.  All pages are clean but unstable and it can’t add new dirty pages.  I recall this from working on write back/cgroups support and can’t remember if we ever solved it.
+
+But the issue here isn’t dirty pages on the client or uncommitted pages on the server - it’s that the client doesn’t find out about committed pages in a timely manner.  I’m not sure why it is able to make progress - maybe ping? - at all but that progress is super slow.
+
+I think write back needs to send an empty RPC or sync request, even when there are no dirty pages…?  We both need to request commit AND get a reply back saying pages were committed and do that when there are no dirty pages waiting.
+
+--- Message (Andreas Dilger, 2025-05-16 03:06:24.000000000) ---
+Patch Set 2:
+
+Patrick, there _should_ be a pipeline of transaction commits (last_committed_transno) that allow the client to know RPCs have committed, and in turn clean up the associated bulk pages that are persistent on storage.
+
+There is also patch https://review.whamcloud.com/56773 ("EX-10481 sec: set page sync flags to avoid ENOMEM") that I thought implemented a reasonable mechanism to avoid stop-and-go IO traffic.  It sends OBD_BRW_SOFT_SYNC to prod the OST to start syncing early (75% of limit), *before* the client is totally OOM (or at unstable page limit, or whatever limit it might be bumping up against).
+
+Then, if the client gets closer to its hard limit (ideally "num_rpcs_in_flight away") if the OST hasn't yet started higher last_committed_transno in the RPC replies, it clears OBD_BRW_ASYNC (forcing the BRW RPC to be a synchronous write before reply), which should ensure that all previous BRW RPCs should also be committed and the pages can be cleaned up.
+
+I can fully imagine that something has become broken in the page cleanup life cycle over years of kernel updates, since we definitely hit client OOM issues in VM testing.
+
+--- Message (Patrick Farrell, 2025-05-16 19:32:04.000000000) ---
+Patch Set 2:
+
+"Then, if the client gets closer to its hard limit (ideally "num_rpcs_in_flight away") if the OST hasn't yet started higher last_committed_transno in the RPC replies, it clears OBD_BRW_ASYNC (forcing the BRW RPC to be a synchronous write before reply), which should ensure that all previous BRW RPCs should also be committed and the pages can be cleaned up."
+
+Yes, I think this is the part that isn't working.  I don't think there's anything that checks these limits and forces a sync - when we hit the unstable pages limit, we use SOFT_SYNC, but soft sync requests soft sync, it doesn't make the RPC sync.
+
+So when we get close, we send a soft sync RPC, but it doesn't force syncing of that RPC, it's a soft sync.  So we don't get a reply and so we stay stuck.
+
+We could either force that RPC to be sync or implement something a bit more complicated.
+
+But ALSO:
+The soft sync limit has nothing to do with the kernel VM limits.  It's just using Lustre tunables internally.
+
+So we're not even requesting soft sync, depending on the exact combination of settings. :(
+
+I think the thing to do is Yingjin's change, but also probably something with having writeback send an RPC whenever there are unstable pages, so sending an empty RPC if there are unstable pages but no dirty pages.
+
+--- Message (Autotest, 2025-05-16 20:32:30.000000000) ---
+Patch Set 2:
+
+Trevis Autotest retesting enforced review-dne-zfs-part-3 session on el8.10-x86_64/zfs servers and clients for build 113399 patch 2. Requested by Peter Jones because of LU-18181.
+
+--- Message (Qian Yingjin, 2025-05-17 09:15:23.000000000) ---
+Patch Set 2:
+
+"
+but also probably something with having writeback send an RPC whenever there are unstable pages, so sending an empty RPC if there are unstable pages but no dirty pages.
+"
+
+That's what we have done in the current Lustre memcg, I think.
+
+Upon the completion of a write RPC, it the write does not commit, we will mark the inode as dirty (__mark_inode_dirty) again and add it into @wb inode list. The purpose is to write back and sync the uncommitted unstable pages when the system is under memory pressure.
+
+When the system or a certain memcg is under memory pressure or under rate limiting, it will trigger the write back of the @wb as following: 
+->balance_dirty_pages()
+    ->wb_start_background_writeback()
+   ...
+or
+->shrink_inactive_list()
+   ->wakeup_flusher_threads(WB_REASON_VMSCAN)
+   ...
+
+# trigger write back on a @wb:
+-> wb_workfn()
+     ->wb_do_writeback()
+         ->__writeback_single_inode
+            -> ll_writepages()
+
+In ll_writepages, we will send a OST sync RPC to commit  the unstable pages and release the unstable pages when detect that it needs a OST sync RPC via wbc->for_background or wb->start_all_reason == WB_REASON_VMSCAN.
+
+--- Message (Andreas Dilger, 2025-05-17 11:28:08.000000000) ---
+Patch Set 2:
+
+> But ALSO:
+ > The soft sync limit has nothing to do with the kernel VM limits.
+ > It's just using Lustre tunables internally.
+
+Sure, I understand this, but that doesn't necessarily mean the Lustre code cannot check the kernel limits and start sending BRW RPCs with SOFT_SYNC before we hit those limits.
+
+--- Message (Patrick Farrell, 2025-05-18 01:01:17.000000000) ---
+Patch Set 2:
+
+> Patch Set 2:
+> 
+> "
+> but also probably something with having writeback send an RPC whenever there are unstable pages, so sending an empty RPC if there are unstable pages but no dirty pages.
+> "
+> 
+> That's what we have done in the current Lustre memcg, I think.
+> 
+> Upon the completion of a write RPC, it the write does not commit, we will mark the inode as dirty (__mark_inode_dirty) again and add it into @wb inode list. The purpose is to write back and sync the uncommitted unstable pages when the system is under memory pressure.
+> 
+> When the system or a certain memcg is under memory pressure or under rate limiting, it will trigger the write back of the @wb as following: 
+> ->balance_dirty_pages()
+>     ->wb_start_background_writeback()
+>    ...
+> or
+> ->shrink_inactive_list()
+>    ->wakeup_flusher_threads(WB_REASON_VMSCAN)
+>    ...
+> 
+> # trigger write back on a @wb:
+> -> wb_workfn()
+>      ->wb_do_writeback()
+>          ->__writeback_single_inode
+>             -> ll_writepages()
+> 
+> In ll_writepages, we will send a OST sync RPC to commit  the unstable pages and release the unstable pages when detect that it needs a OST sync RPC via wbc->for_background or wb->start_all_reason == WB_REASON_VMSCAN.
+
+Hmm, OK - I hadn't fully checked.
+
+Well, this doesn't seem to be working with dirty ratio set to 0, at least not in a timely manner.
+
+--- Message (Andreas Dilger, 2025-05-24 23:13:11.000000000) ---
+Patch Set 2: Code-Review+1
+
+--- Message (Qian Yingjin, 2025-05-25 01:08:03.000000000) ---
+Patch Set 2:
+
+Please note this patch is still in progress as it does not solve the hang totally. We are still improving it.
+
+--- Message (Qian Yingjin, 2025-05-26 08:05:06.000000000) ---
+Uploaded patch set 3.
+
+--- Message (wc-checkpatch, 2025-05-26 08:06:59.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2025-05-26 08:08:22.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2025-05-26 08:09:16.000000000) ---
+Patch Set 3:
+
+(12 comments)
+
+centos7: Compile failed
+
+
+ Job output URL: https://testing.whamcloud.com/gerrit-janitor/51961/results.html
+
+--- Message (Qian Yingjin, 2025-05-26 08:19:40.000000000) ---
+Uploaded patch set 4.
+
+--- Message (jenkins, 2025-05-26 08:19:43.000000000) ---
+Patch Set 3:
+
+No Builds Executed
+
+--- Message (jenkins, 2025-05-26 08:19:49.000000000) ---
+Patch Set 3: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/113716/ : ABORTED
+
+--- Message (wc-checkpatch, 2025-05-26 08:22:12.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2025-05-26 08:23:06.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2025-05-26 08:58:11.000000000) ---
+Patch Set 4: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/113717/ : FAILURE
+
+--- Message (Qian Yingjin, 2025-05-26 14:18:28.000000000) ---
+Uploaded patch set 5.
+
+--- Message (jenkins, 2025-05-26 14:18:30.000000000) ---
+Patch Set 4:
+
+No Builds Executed
+
+--- Message (wc-checkpatch, 2025-05-26 14:20:39.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2025-05-26 14:21:57.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2025-05-26 14:50:13.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/113734/ : SUCCESS
+
+--- Message (Zhenyu Xu, 2025-05-27 02:38:51.000000000) ---
+Patch Set 5: Code-Review+1
+
+--- Message (Qian Yingjin, 2025-05-27 03:17:25.000000000) ---
+Uploaded patch set 6.
+
+--- Message (jenkins, 2025-05-27 03:17:27.000000000) ---
+Patch Set 5:
+
+No Builds Executed
+
+--- Message (wc-checkpatch, 2025-05-27 03:18:53.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2025-05-27 03:21:59.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2025-05-27 03:45:05.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/113748/ : SUCCESS
+
+--- Message (Zhenyu Xu, 2025-05-27 09:58:26.000000000) ---
+Patch Set 6: Code-Review+1
+
+--- Message (Patrick Farrell, 2025-05-27 18:29:05.000000000) ---
+Patch Set 6: Code-Review+1
+
+This looks good to me, but is there some way to write a test for it?
+
+--- Message (Autotest, 2025-05-27 18:55:43.000000000) ---
+Patch Set 6:
+
+Onyx Autotest retesting enforced review-dne-zfs-part-4 session on el8.10-x86_64/zfs servers and clients for build 113748 patch 6. Requested by Peter Jones because of LU-17429.
+
+--- Message (Autotest, 2025-05-28 01:40:03.000000000) ---
+Patch Set 6:
+
+Onyx Autotest retesting enforced review-dne-zfs-part-4 session on el8.10-x86_64/zfs servers and clients for build 113748 patch 6. Requested by Charlie Olmstead because of DCO-10561.
+
+--- Message (Autotest, 2025-05-28 01:57:13.000000000) ---
+Patch Set 6:
+
+Trevis Autotest retesting enforced review-dne-zfs-part-4 session on el8.10-x86_64/zfs servers and clients for build 113748 patch 6. Requested by Charlie Olmstead because of DCO-10561.
+
+--- Message (Qian Yingjin, 2025-06-05 10:19:17.000000000) ---
+Uploaded patch set 7.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2025-06-05 10:23:00.000000000) ---
+Patch Set 7:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2025-06-05 10:23:31.000000000) ---
+Patch Set 7:
+
+Looks good to me.
+
+--- Message (jenkins, 2025-06-05 10:55:39.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/113956/ : SUCCESS
+
+--- Message (Oleg Drokin, 2025-06-05 20:21:10.000000000) ---
+Patch Set 7:
+
+(2 comments)
+
+--- Message (Oleg Drokin, 2025-06-06 16:40:48.000000000) ---
+Patch Set 7: Verified-1
+
+This now times out 100% of the time in conf-sanity 50b (across lst several iterations, I arrived at this via master-next testing first) but even the latest patch is affected.
+
+in the client console log we see that we hang waiting for completion:
+
+[ 2543.814069] Lustre: DEBUG MARKER: OSCs should all be DISCONN
+[ 2760.712021] INFO: task kworker/u8:0:5148 blocked for more than 120 seconds.
+[ 2760.714557] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[ 2760.717294] kworker/u8:0    D ffff880139bd5b48 12776  5148      2 0x00000000
+[ 2760.720433] Workqueue: writeback bdi_writeback_workfn (flush-lustre-ffff8800aa)
+[ 2760.723558] Call Trace:
+[ 2760.724681]  [<ffffffff817e65c9>] schedule+0x29/0x70
+[ 2760.726395]  [<ffffffff817e3269>] schedule_timeout+0x209/0x290
+[ 2760.728417]  [<ffffffffa0211779>] ? libcfs_debug_msg+0x4c9/0xc60 [libcfs]
+[ 2760.731785]  [<ffffffff817e698c>] wait_for_completion+0xfc/0x140
+[ 2760.733305]  [<ffffffff810d03e0>] ? wake_up_state+0x20/0x20
+[ 2760.734925]  [<ffffffffa04e5fbc>] osc_io_fsync_end+0x5c/0x90 [osc]
+[ 2760.736740]  [<ffffffffa05d5d5c>] cl_io_end+0x5c/0x150 [obdclass]
+[ 2760.739439]  [<ffffffffa0ac7edb>] lov_io_end_wrapper+0xeb/0xf0 [lov]
+[ 2760.741632]  [<ffffffffa0ac8ae0>] lov_io_fsync_end+0x80/0x1b0 [lov]
+[ 2760.744163]  [<ffffffffa05d5d5c>] cl_io_end+0x5c/0x150 [obdclass]
+[ 2760.746570]  [<ffffffffa05d9f7d>] cl_io_loop+0xad/0x230 [obdclass]
+[ 2760.749893]  [<ffffffffa10ac1cc>] cl_sync_file_range+0x30c/0x3b0 [lustre]
+[ 2760.753527]  [<ffffffffa10d64a1>] ll_writepages+0xf1/0x230 [lustre]
+[ 2760.755927]  [<ffffffff811c2c31>] do_writepages+0x21/0x50
+[ 2760.757910]  [<ffffffff81275480>] __writeback_single_inode+0x40/0x2a0
+[ 2760.759948]  [<ffffffff812765b6>] writeback_sb_inodes+0x2a6/0x480
+[ 2760.763597]  [<ffffffff81276bc2>] wb_writeback+0x102/0x340
+[ 2760.764886]  [<ffffffff81277461>] bdi_writeback_workfn+0x141/0x4e0
+[ 2760.767141]  [<ffffffff81415255>] ? debug_object_deactivate+0x145/0x190
+[ 2760.769610]  [<ffffffff810c834d>] ? finish_task_switch+0x5d/0x1b0
+[ 2760.772033]  [<ffffffff810b243d>] process_one_work+0x18d/0x4a0
+[ 2760.773995]  [<ffffffff810b3176>] worker_thread+0x126/0x3b0
+[ 2760.776254]  [<ffffffff810b3050>] ? manage_workers.isra.23+0x2a0/0x2a0
+[ 2760.778520]  [<ffffffff810ba114>] kthread+0xe4/0xf0
+[ 2760.780755]  [<ffffffff810ba030>] ? kthread_create_on_node+0x140/0x140
+[ 2760.783648]  [<ffffffff817f3e5d>] ret_from_fork_nospec_begin+0x7/0x21
+[ 2760.785963]  [<ffffffff810ba030>] ? kthread_create_on_node+0x140/0x140
+
+--- Message (Qian Yingjin, 2025-06-09 08:35:02.000000000) ---
+Uploaded patch set 8.
+
+--- Message (wc-checkpatch, 2025-06-09 08:36:00.000000000) ---
+Patch Set 8:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2025-06-09 08:37:48.000000000) ---
+Patch Set 8:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2025-06-09 09:09:21.000000000) ---
+Patch Set 8: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/114088/ : SUCCESS
+
+--- Message (Qian Yingjin, 2025-06-09 10:47:02.000000000) ---
+Patch Set 8:
+
+(1 comment)
+
+--- Message (Autotest, 2025-06-10 01:39:00.000000000) ---
+Patch Set 8:
+
+Onyx Autotest retesting enforced review-dne-part-5 session on el9.5-x86_64/ldiskfs servers and clients for build 114088 patch 8. Requested by Qian Yingjin because of LU-18499.
+
+--- Message (Autotest, 2025-06-10 01:39:21.000000000) ---
+Patch Set 8:
+
+Onyx Autotest retesting enforced review-dne-part-4 session on el9.5-x86_64/ldiskfs servers and clients for build 114088 patch 8. Requested by Qian Yingjin because of LU-18382.
+
+--- Message (Andreas Dilger, 2025-06-16 08:54:17.000000000) ---
+Patch Set 8:
+
+Ping reviewers
+
+--- Message (Qian Yingjin, 2025-06-18 09:23:47.000000000) ---
+Uploaded patch set 9.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2025-06-18 09:35:22.000000000) ---
+Patch Set 9:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2025-06-18 22:39:44.000000000) ---
+Patch Set 9: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/114428/ : SUCCESS
+
+--- Message (Andreas Dilger, 2025-06-22 07:27:47.000000000) ---
+Patch Set 9:
+
+Please review test failures
+
+--- Message (Qian Yingjin, 2025-06-30 07:13:52.000000000) ---
+Uploaded patch set 10.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2025-06-30 07:16:39.000000000) ---
+Patch Set 10:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2025-07-01 00:47:28.000000000) ---
+Patch Set 10:
+
+No Builds Executed
+
+--- Message (Qian Yingjin, 2025-07-01 08:30:16.000000000) ---
+Patch Set 10:
+
+BUILD
+
+--- Message (jenkins, 2025-07-01 09:20:15.000000000) ---
+Patch Set 10: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/114690/ : SUCCESS
+
+--- Message (Autotest, 2025-07-02 00:50:48.000000000) ---
+Patch Set 10:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-4 session on el8.10-x86_64/zfs servers and clients for build 114690 patch 10. Requested by Qian Yingjin because of LU-19096.
+
+--- Message (Qian Yingjin, 2025-07-03 09:17:42.000000000) ---
+Patch Set 10:
+
+ping reviewer.
+
+--- Message (Zhenyu Xu, 2025-07-03 12:27:32.000000000) ---
+Patch Set 10: Code-Review+1
+
+--- Message (Patrick Farrell, 2025-07-03 18:04:43.000000000) ---
+Patch Set 10: Code-Review+1
+
+--- Message (wc-checkpatch, 2025-07-07 20:18:08.000000000) ---
+Patch Set 10:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Oleg Drokin, 2025-07-08 03:50:11.000000000) ---
+Patch Set 10: Code-Review+2
+
+--- Message (Oleg Drokin, 2025-07-08 03:50:16.000000000) ---
+Change has been successfully cherry-picked as c413d2ede5dfe71a89878aed305a8d61f03a30a3 by Oleg Drokin
+
+--- Message (Shaun Tancheff, 2025-07-10 04:38:51.000000000) ---
+Patch Set 11:
+
+As of v6.12-rc1-25-g8182a8b39aa2 
+   ERROR: modpost: "__inode_attach_wb" [lustre/llite/lustre.ko] undefined!

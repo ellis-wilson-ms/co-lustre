@@ -1,0 +1,177 @@
+Change:     64472
+Subject:    LU-19956 osc: fix race from direct ops_transfer_pinned clear
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/64472
+Change-Id:  Ic20c79ed6a1a51d63c214b44f86150eea2a08f5e
+Project:    fs/lustre-release
+Branch:     master
+Status:     ABANDONED
+Owner:      Patrick Farrell
+Created:    2026-03-10 15:06:35.000000000
+Updated:    2026-03-11 04:14:31.000000000
+Patch Set:  4
+Insertions: +76
+Deletions:  -13
+Comments:   1 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1
+
+--- Reviewers ---
+  CC: Janitor Bot
+
+--- Commit Message ---
+LU-19956 osc: fix race from direct ops_transfer_pinned clear
+
+osc_completion() cleared ops_transfer_pinned directly
+and dropped the cl_page reference in a separate step.
+This decoupling allowed a race with osc_page_delete():
+
+  osc_completion:                osc_page_delete:
+    ops_transfer_pinned = 0
+                                 if (ops_transfer_pinned)
+                                   /* false, skip put */
+    cl_page_put() /* orphan */
+
+On aarch64 (weak memory ordering), the flag clear could
+become visible before the ref drop, causing
+osc_page_delete() to skip its cl_page_put() and leaving
+an orphaned transfer reference.  The final put in
+osc_completion() then hit the cl_batch_put assertion.
+
+The deeper problem is that ops_transfer_pinned was used
+as a flag to coordinate which of two code paths would
+drop a reference.  A reference should have a single
+owner responsible for releasing it -- using a flag to
+arbitrate between two paths that might release it is
+inherently fragile.
+
+Examining the cl_page state machine shows this two-path
+design was never necessary: the transition matrix
+forbids CPS_PAGEOUT/CPS_PAGEIN -> CPS_FREEING, so
+cl_page_complete() (which transitions to CPS_CACHED)
+always runs before cl_page_delete().  Completion is
+the sole owner of the transfer reference; delete never
+needs to release it.
+
+Fix by using osc_page_transfer_put() in osc_completion()
+which clears the flag and drops the ref together.
+Replace the osc_page_transfer_put() in osc_page_delete()
+with LASSERT(!ops_transfer_pinned) to enforce the state
+machine guarantee.
+
+Add sanity test_80a to stress the completion path with
+a fail_loc delay and concurrent lock cancellation.
+
+Test-Parameters: testlist=sanity env=ONLY=80a
+Signed-off-by: Patrick Farrell <pfarrell@whamcloud.com>
+Change-Id: Ic20c79ed6a1a51d63c214b44f86150eea2a08f5e
+
+--- Review History ---
+
+--- Message (Patrick Farrell, 2026-03-10 15:06:35.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Patrick Farrell, 2026-03-10 15:08:24.000000000) ---
+Uploaded patch set 2: Commit message was updated.
+
+--- Message (jenkins, 2026-03-10 15:08:26.000000000) ---
+Patch Set 1:
+
+No Builds Executed
+
+--- Message (Patrick Farrell, 2026-03-10 15:09:47.000000000) ---
+Uploaded patch set 3.
+
+--- Message (jenkins, 2026-03-10 15:09:49.000000000) ---
+Patch Set 2:
+
+No Builds Executed
+
+--- Message (wc-checkpatch, 2026-03-10 15:12:01.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-03-10 15:13:56.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+rocky8.10: Compile failed
+
+rocky9.6: Compile failed
+
+
+ Job output URL: https://testing.whamcloud.com/gerrit-janitor/61005/results.html
+
+--- Message (Janitor Bot, 2026-03-10 15:16:32.000000000) ---
+Patch Set 4: Published edit on patch set 3.
+
+--- Message (Janitor Bot, 2026-03-10 15:16:35.000000000) ---
+Patch Set 3:
+
+I attempted to fix the build errors present in this patch and succeeded. Yay! Now, keep in mind I barely have any idea what I am doing, so please doublecheck the changes I made to make sure they make sense.
+
+This service is only provided in hopes to be useful and reduce latency from push to getting actual results in the face of trivial code errors
+
+Here's summary of my changes:
+Excellent! The changes look good. Let me create a summary of what was fixed:
+
+## Fix Summary
+
+### Problem
+The patch introduced a compile error because `osc_page_transfer_put()` was being called from `lustre/osc/osc_cache.c` but the function was defined as `static` in `lustre/osc/osc_page.c`, making it invisible to other compilation units.
+
+The error was:
+```
+lustre/osc/osc_cache.c:1447:3: error: implicit declaration of function 'osc_page_transfer_put'
+```
+
+### Solution
+Made `osc_page_transfer_put()` a non-static (exported) function by:
+
+1. **Removed `static` keyword** from the function definition in `lustre/osc/osc_page.c` (line 45)
+   - Changed from: `static void osc_page_transfer_put(...)`
+   - Changed to: `void osc_page_transfer_put(...)`
+
+2. **Added function declaration** to the public header `lustre/include/lustre_osc.h` (line 538)
+   - Added: `void osc_page_transfer_put(const struct lu_env *env, struct osc_page *opg);`
+   - Placed it in the `/* osc_page.c */` section with other exported functions from that file
+
+### Rationale
+The patch's design requires `osc_page_transfer_put()` to be called from `osc_completion()` in `osc_cache.c` to atomically clear the `ops_transfer_pinned` flag and drop the cl_page reference together. This prevents the race condition described in LU-19956 where the flag could be cleared separately from the reference drop, allowing `osc_page_delete()` to see an inconsistent state on weakly-ordered architectures like aarch64.
+
+By making the function non-static and properly declaring it in the header, `osc_cache.c` can now call it, which is essential for the bug fix to work correctly.
+
+
+Request ID: 4ea44ff2-fcbe-4ab2-b20c-558e234ca96f
+
+--- Message (jenkins, 2026-03-10 15:16:47.000000000) ---
+Patch Set 3: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/122271/ : ABORTED
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-03-10 15:19:42.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-03-10 15:28:20.000000000) ---
+Patch Set 4:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-03-10 16:13:25.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/122273/ : SUCCESS
+
+--- Message (Patrick Farrell, 2026-03-11 01:46:00.000000000) ---
+Abandoned
+
+Abandoning - the LASSERT(!ops_transfer_pinned) approach in osc_page_delete is incorrect. Delete can race with completion between cl_page_complete() and osc_page_transfer_put(), causing the assert to fire. See 64440 for the correct idempotent approach.

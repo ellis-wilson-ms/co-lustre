@@ -17,6 +17,9 @@ When investigating a Lustre issue (crash, error, configuration question):
    options, and tuning guidance.
 4. **wiki/** — Community knowledge: architecture deep-dives, howtos,
    meeting notes, and supplementary guides.
+5. **gerrit/** — Code review history. Search when you have a lead
+   from another source, when other sources have come up empty, or
+   when looking for unlanded work. See gerrit section for details.
 
 ## Directory Contents
 
@@ -24,10 +27,16 @@ When investigating a Lustre issue (crash, error, configuration question):
 
 JIRA bug tracker issues from projects LU and LUDOC.
 
-- **index.tsv** — **Start here.** Tab-separated index of ~19,800 issues.
-  Columns: `key, status, resolution, priority, type, assignee, summary`.
-  Use this to quickly find issues by keyword, check status, or filter by
-  resolution before reading full issue files.
+- **index.tsv** — **Always search the index before reading individual
+  files.** Tab-separated index of all issues. Columns:
+  `key, status, resolution, priority, type, assignee, summary`.
+  Grep or filter this file to find relevant issue keys, then read only
+  those specific files. Common patterns:
+  - `grep -i "pcc" jira/index.tsv` — find all PCC-related issues
+  - `awk -F'\t' '$2=="Open"' jira/index.tsv` — list all open issues
+  - `grep -i "lnet.*timeout" jira/index.tsv` — keyword search
+  Do not scan `txt/` directories directly unless the index search
+  yields nothing.
 - **txt/LU/** — One plain-text file per LU issue (e.g., `LU-9962.txt`).
 - **txt/LUDOC/** — One plain-text file per LUDOC issue.
 
@@ -70,6 +79,38 @@ git history.
    ```
    If no version is specified, stay on `master`.
 
+#### Viewing Gerrit changes via the code repo
+
+The `code/lustre-release/` repo also has a `gerrit` remote pointing at
+`https://review.whamcloud.com/fs/lustre-release`. This allows viewing
+the actual code diff for any Gerrit change without additional API calls.
+
+**Merged changes** — The commit SHA is already in the local history
+(it came in via the GitHub mirror). The SHA is stored in each Gerrit
+JSON file under `revisions.<sha>`. To see the diff:
+```
+cd code/lustre-release
+git show <sha>               # full diff + commit message
+git diff --stat <sha>^..<sha>  # file list with line counts
+git show <sha> -- path/to/file.c  # diff for a single file
+```
+
+**Open or abandoned changes** — These live on special `refs/changes/*`
+refs that are not fetched by default. To make them available locally,
+do a one-time bulk fetch:
+```
+cd code/lustre-release
+git fetch gerrit 'refs/changes/*:refs/changes/*'
+```
+After that, every patch set is available locally. The ref for a
+specific patch set is in the Gerrit JSON (`revisions.<sha>.ref`,
+e.g. `refs/changes/79/64079/37`). To view it:
+```
+git show FETCH_HEAD           # if you just fetched one ref
+git log -1 refs/changes/79/64079/37  # specific patch set
+git diff refs/changes/79/64079/37^..refs/changes/79/64079/37  # diff
+```
+
 ### manual/
 
 Lustre Operations Manual, converted from DocBook XML to plain text.
@@ -111,6 +152,58 @@ directory to edit** when creating or modifying wiki page content.
 - **Write/edit** wiki content in `wiki_in_wikitext/txt/` (MediaWiki markup).
 - New pages should be created in `wiki_in_wikitext/txt/` only.
 
+### gerrit/
+
+Gerrit code review data from review.whamcloud.com (project
+fs/lustre-release). Change reviews spanning 2012 to present.
+
+- **index.tsv** — **Always search the index before reading individual
+  files.** Tab-separated index of all changes. Columns:
+  `number, status, branch, owner, patch_set, insertions, deletions, subject`.
+  Grep or filter this file to narrow down to specific change numbers,
+  then read only those files from `txt/`. Common patterns:
+  - `grep -i "pcc" gerrit/index.tsv` — find changes by subject keyword
+  - `awk -F'\t' '$2=="NEW"' gerrit/index.tsv | grep -i "ec"` — open
+    changes related to EC (erasure coding)
+  - `awk -F'\t' '$2=="MERGED" && $4=="Patrick Farrell"' gerrit/index.tsv`
+    — merged changes by a specific author
+  Do not grep across `txt/` or `txt_full/` without first narrowing
+  through the index.
+- **txt/** — One plain-text file per change (e.g., `5200.txt`). Contains
+  metadata, labels, reviewers, commit message, and human review
+  commentary. Verbose automated bot messages (Maloo test logs,
+  checkpatch warnings, jenkins build details) are filtered to short
+  status summaries.
+- **txt_full/** — Same as `txt/` but with **all** messages unfiltered,
+  including full bot output (test suite listings, build logs, style
+  warnings). Files are ~4x larger on average.
+
+#### When to search gerrit
+
+Gerrit is #5 in the search order. Do not reach for it as a first
+resort. Search gerrit when:
+
+1. **You have a specific lead from another source.** A JIRA issue
+   references a Gerrit change number, a commit message mentions a
+   Change-Id, or a wiki page links to a review. Look up the change
+   number in the index or read the file directly.
+2. **Other sources have come up empty.** You have searched jira/,
+   code/, manual/, and wiki/ and still cannot find the answer. Gerrit
+   review discussions often contain design rationale, workarounds, and
+   context not captured elsewhere.
+3. **You are hunting for unlanded code/changes.** For example: "What
+   PCC fixes exist that haven't been merged?" Filter `index.tsv` for
+   `status=NEW` or `status=ABANDONED` and grep subjects for keywords.
+
+#### Which gerrit directory to use
+
+- **Default to `txt/`** for all searches. The filtered version contains
+  all human review commentary and concise bot status summaries.
+- **Use `txt_full/` only** when you know the exact change number AND
+  you specifically need to see full automated commentary (e.g., the
+  complete Maloo test results, jenkins build output, or checkpatch
+  warnings for a particular patch set).
+
 ## Search Strategies
 
 - **Stack trace lookup:** Extract function names from the trace, grep
@@ -124,3 +217,9 @@ directory to edit** when creating or modifying wiki page content.
   details on the fix and any linked patches.
 - **Error message lookup:** Grep across all directories:
   `grep -rl "error string" jira/txt/ manual/txt/ wiki/txt/`
+- **Unlanded patch search:** Filter `gerrit/index.tsv` for `NEW` status
+  changes matching a keyword, then read matching `gerrit/txt/*.txt`
+  files. Only resort to this after checking jira/ and code/.
+- **Gerrit change lookup (known number):** Read
+  `gerrit/txt/<number>.txt` directly. Use `gerrit/txt_full/<number>.txt`
+  only if you need full bot output for that specific change.

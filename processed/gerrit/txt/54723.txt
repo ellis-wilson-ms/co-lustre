@@ -1,0 +1,828 @@
+Change:     54723
+Subject:    LU-17711 osd-ldiskfs: do not delete dotdot during rename
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/54723
+Change-Id:  I33e862739fa44f583aaa4369190d6d80271db13b
+Project:    fs/lustre-release
+Branch:     master
+Status:     MERGED
+Owner:      Li Dongyang
+Created:    2024-04-10 15:24:52.000000000
+Updated:    2024-06-10 06:08:53.000000000
+Patch Set:  10
+Insertions: +2551
+Deletions:  -1558
+Comments:   34 (2 unresolved)
+
+--- Labels ---
+  Code-Review: Shaun Tancheff: +1; Andreas Dilger: +1; Oleg Drokin: +2; Jian Yu: +1
+  Verified: jenkins: +1; Maloo: +1
+
+--- Reviewers ---
+  CC: Xing Huang
+  REVIEWER: Oleg Drokin, Andreas Dilger, Alex Zhuravlev, Jian Yu, Li Dongyang, Andrew Perepechko, Artem Blagodarenko, Dominique Martinet, Shaun Tancheff
+
+--- Commit Message ---
+LU-17711 osd-ldiskfs: do not delete dotdot during rename
+
+Since upstream kernel commit v5.12-rc4-32-g6c0912739699
+ext4_dir_entry_2 after rec_len will be wiped when deleting
+the entry.
+
+This creates a problem with rename, when we delete dotdot
+first and if it's a dx dir, kernel will wipe entire dx_root
+in the block after dotdot entry.
+
+We can just update the dotdot entry in-place without deleting.
+
+For dx dirs, ext4_update_dotdot() takes care of dotdot and
+inserting dotdot is an update, use it for linear dirs also.
+
+Rewrite ext4_update_dotdot() to get a few fixes:
+*use ext4_read_dirblock to get the first block.
+*do not assert on data read from disk, we check the dot and
+dotdot entry and if anything looks wrong, we return -EFSCORRUPTED.
+*make sure the change is journalled.
+*set metadata_csum correctly for dx dirs.
+
+Update ext4-data-in-dirent.patch, if dotdot entry has no space
+for dirdata, try to expand the dotdot entry by moving the
+entries behind it, or move the dx_root for dx dirs.
+
+Add conf-sanity/154 to verify that the ".." entry was updated
+properly after restore, including with an htree split directory
+with dx_root entry.
+
+Signed-off-by: Li Dongyang <dongyangli@ddn.com>
+Change-Id: I33e862739fa44f583aaa4369190d6d80271db13b
+Reviewed-on: https://review.whamcloud.com/c/fs/lustre-release/+/54723
+Tested-by: jenkins <devops@whamcloud.com>
+Tested-by: Maloo <maloo@whamcloud.com>
+Reviewed-by: Andreas Dilger <adilger@whamcloud.com>
+Reviewed-by: Shaun Tancheff <shaun.tancheff@hpe.com>
+Reviewed-by: Jian Yu <yujian@whamcloud.com>
+Reviewed-by: Oleg Drokin <green@whamcloud.com>
+
+--- Review History ---
+
+--- Message (Li Dongyang, 2024-04-10 15:24:52.000000000) ---
+Uploaded patch set 1.
+
+--- Message (jenkins, 2024-04-10 15:52:26.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/103997/ : SUCCESS
+
+--- Message (Andreas Dilger, 2024-04-11 02:24:50.000000000) ---
+Patch Set 1:
+
+I haven't looked into the details of the code yet, but this patch doesn't seem like "enough"?  If the ".." entry is not deleted, is there any problem to re-insert the ".." entry into the directory again, or is this internally handled with a special case as a no-op?
+
+--- Message (Dominique Martinet, 2024-04-11 02:40:35.000000000) ---
+Patch Set 1:
+
+(thanks for the Cc, I had planned on looking at this further tonight so didn't look at the code yet either; just replying now)
+
+
+> I haven't looked into the details of the code yet, but this patch doesn't seem like "enough"?  If the ".." entry is not deleted, is there any problem to re-insert the ".." entry into the directory again, or is this internally handled with a special case as a no-op?
+
+didn't check if the re-insertion of .. would be no-op'd, trusting the commit message it would overwrite it in place which makes sense to me (we can't actually delete '..' in a directory and its position is always known without checking the name of the 2nd directory entry)
+But anyway, this definitely isn't enough for me -- this is just papering over the reproducer I gave, but I'm sure I can come up with another reproducer that does a few carefully crafted create/rm/create instead.
+
+As I understand it basically entries are stored in an array-like structure (next element is previous's element + size), so removing anything in the middle isn't safe with el9's ldiskfs, I don't think this is something that can be handled at the lustre level in any way.
+
+(If this unlink is not necessary this commit could be a small optimization, but unrelated to LU-17711)
+
+
+I'll recheck later tonight after day work
+
+--- Message (Li Dongyang, 2024-04-11 04:14:25.000000000) ---
+Patch Set 1:
+
+The insert of dotdot without removing first is essentially a replace
+in ldiskfs.
+But yes from the Maloo test results this is probably not enough.
+
+LU-17711 actually has little to do with dir_data.
+If the dir is a indexed dir, the dx_root which is the root of the htree
+sits after the dot and dotdot entry, with the dotdot entry's record length
+set to cover till the end of the block.
+So removing the dotdot entry by calling ext4_delete_entry directly from lustre
+would wipe the htree root after that, corrupting the htree. Which is true even without dirdata.
+
+--- Message (Andreas Dilger, 2024-04-11 05:56:21.000000000) ---
+Patch Set 1:
+
+I agree with Dongyang that this is actually the "correct" fix and not just hiding the bug.  If any other entry is removed and re-added, then if it doesn't fit in the same space a different spot will be used.  It is only the "." and ".." entries at the start of the directory file that *have* to be replaced in-place (exactly because of their well-known location), and the fact that htree indexing "hacks" the ".." entry to store the index root after the directory entry.  Ext4 itself will never delete "..", and this was done in the MDT code for "correctness" but is probably also the wrong thing.
+
+Another option would be to change osd-ldiskfs to never actually delete "..", in case some other OSD back-end filesystem has a different opinion on whether deleting ".." should be done.
+
+--- Message (Dominique Martinet, 2024-04-11 12:30:18.000000000) ---
+Patch Set 1:
+
+tl;dr dirdata seems to only be used for this htree, so this patch is
+probably "OK" if no other code path tries to delete dotdot.
+
+> LU-17711 actually has little to do with dir_data.
+> If the dir is a indexed dir, the dx_root which is the root of the htree
+> sits after the dot and dotdot entry, with the dotdot entry's record length
+> set to cover till the end of the block.
+
+... except that the length isn't updated, and the htree is stored as a dir
+data "extension", and there's no "hole" to fit the htree without dirdata
+given the patch series?
+
+The way the patches are setup is a mess, applying patches in order
+partially doesn't even build (linux-5.14/ext4-kill-dx-root.patch
+introduces dx_get_dx_info() to look after dotdot for the htree,
+but that uses EXT4_DIR_REC_LEN which only gets introduced in
+rhel9.2/ext4-data-in-dirent.patch... patches don't even have any
+commit message, I'm not sure how they're supposed to be reviewed.
+Given we're patching various downstreams ext4 I guess there isn't
+much that can be done about it, but it really wasn't fun to dig
+into this)
+
+Anyway it doesn't matter what the culprit is at this point, it
+might have worked differently in the past, I'm not interested
+in archeology.
+
+
+> I agree with Dongyang that this is actually the "correct" fix and not
+> just hiding the bug.  If any other entry is removed and re-added, then
+> if it doesn't fit in the same space a different spot will be used.
+
+I disagree with this in theory.
+If any entry with dirdata is removed, then there is no "doesn't fit":
+we've lost track of the actual entry size.
+Taking a second look however what I didn't know is that there does not
+ever seem to be any dirdata attached except for the dotdot entry, so
+this will never happen in practice.
+
+In that case, I agree that as long as '..' is never "removed" and its
+type file_type keeps LDISKFS_DIRENT_LUFID (which ought to be the case
+if we're not going through generic_delete_entry()) then there are no
+other entries susceptible of losing their size, and thus new problems
+won't pop up and this patch is sufficient as of today.
+(I still wouldn't call it "correct", just that I can't see how to
+trigger the problem from a different angle)
+
+I have no idea if there are plans to use dir data elsewhere, I'll trust
+you on that.
+
+> Ext4 itself will never delete "..", and this was done in the MDT code
+> for "correctness" but is probably also the wrong thing.
+
+Yes, I agree we can't/shouldn't delete '..' anyway. I agree with this
+patch on principle, I just don't consider it to be future-proof.
+
+> Another option would be to change osd-ldiskfs to never actually delete
+> "..", in case some other OSD back-end filesystem has a different
+> opinion on whether deleting ".." should be done.
+
+I guess we should check if zfs expects .. to be deleted before
+re-inserting it, but assuming it's OK I'd be in favor of something
+like a warning in __ldiskfs_unlink if called with ".." in debu
+builds so as not to check in normal builds.
+Well, that's probably a premature optimization and it doesn't change
+much, happy either way on this end.
+
+--- Message (Dominique Martinet, 2024-04-11 12:54:59.000000000) ---
+Patch Set 1:
+
+> I'd be in favor of something
+> like a warning in __ldiskfs_unlink if called with ".." in debug
+> builds so as not to check in normal builds.
+
+better: a warning if `ldiskfs_delete_entry()` is called on something with `de_del->file_type & 0xf0` (there doesn't seem to be a mask for dirdata extension bits at this point)
+That's the same right now, but if dirdata evolves it's more likely to catch such a future problem.
+
+--- Message (Andreas Dilger, 2024-04-13 00:54:25.000000000) ---
+Patch Set 1:
+
+> ... except that the length isn't updated, and the htree is stored
+ > as a dirdata "extension", and there's no "hole" to fit the htree
+ > without dirdata given the patch series?
+
+Well, the htree_index isn't really "dirdata", it is an ancient hack to store the index in "empty" directory blocks, and is used for any ext4 directory that grows larger than 4KB in size.  That is why all directories grow from 4KB immediately to 12KB, because the 4KB is split into 2x 4KB new blocks and the new dx_root struct takes over the root directory block.
+
+ > The way the patches are setup is a mess, applying patches in order
+ > partially doesn't even build (linux-5.14/ext4-kill-dx-root.patch
+ > introduces dx_get_dx_info() to look after dotdot for the htree,
+ > but that uses EXT4_DIR_REC_LEN which only gets introduced in
+ > rhel9.2/ext4-data-in-dirent.patch...
+
+Yes, that is a bit of a mess, and should preferably be cleaned up, but I doubt (m)any people ever apply these patches separately.  Dongyang is working to clean up dirdata for upstream submission, so hopefully that will all be straightened out.
+
+ > patches don't even have any
+ > commit message, I'm not sure how they're supposed to be reviewed.
+
+This was very recently improved in master, to add commit messages to the patches.  Not perfect ones, but much better than nothing.
+
+ > I disagree with this in theory.
+ > If any entry with dirdata is removed, then there is no "doesn't
+ > fit": we've lost track of the actual entry size.
+
+I'm not sure what you mean?  Lustre definitely knows the entry size for the FID (1-byte len + 16-byte FID).  However, for a generic dirdata usage (e.g. if there are other dirdata fields) it might be possible that this is an issue?  The caller deleting and re-inserting the entry should preserve *all* of the dirdata instead of expecting it to stay in place.  Also, for the Lustre Metadata Replication project we will need to be able to store multiple FIDs into the same dirdata slot (one FID per MDT mirror of an inode), so this should be fixed to keep the full dirdata size stored in the first byte if it is not handled properly.
+
+ > Taking a second look however what I didn't know is that there does
+ > not ever seem to be any dirdata attached except for the dotdot
+ > entry, so this will never happen in practice.
+
+Not sure what you mean here?  Every filename in Lustre has a FID stored in the dirdata field.  You can see this with debugfs, like below from my current test filesystem:
+
+  # debugfs -c -R "ls -lD /ROOT" /dev/mds1_flakey
+  25046   40755  (2)      0      0    4096 12-Apr-2024 18:34 .
+      2   40755  (2)      0      0    4096  3-Apr-2024 21:57 ..
+  25047   40755 (18)      0      0    4096 31-Dec-1969 17:00 fid:[0x200000002:0x1:0x0] .lustre
+    179  100644 (17)      0      0       0 12-Apr-2024 18:29 fid:[0x200000404:0x9:0x0] 1M
+    176  100644 (17)      0      0       0 12-Apr-2024 18:29 fid:[0x200000404:0x5:0x0] hosts2
+    178  100644 (17)      0      0       0 12-Apr-2024 18:29 fid:[0x200000404:0x6:0x0] hosts3
+    175  100644 (17)      0      0       0 12-Apr-2024 18:29 fid:[0x200000404:0x7:0x0] hosts
+    180  100644 (17)      0      0       0 12-Apr-2024 18:29 fid:[0x200000404:0xe:0x0] big
+  25052   40755 (18)      0      0   16384 22-Mar-2024 15:08 fid:[0x200000404:0x15:0x0] etc
+   1687  100644 (17)      0      0       0 11-Apr-2024 13:40 fid:[0x200000404:0x7c2:0x0] foo
+  25568   40000 (18)      0      0    4096 31-Dec-1969 17:00 fid:[0x280000404:0xb5:0x0] many
+   1688  100644 (17)      0      0       0 12-Apr-2024 18:34 fid:[0x200000405:0x3:0x0] hosts4
+
+
+ > In that case, I agree that as long as '..' is never "removed" and
+ > its type file_type keeps LDISKFS_DIRENT_LUFID (which ought to be the
+ > case if we're not going through generic_delete_entry()) then there are
+ > no other entries susceptible of losing their size, and thus new
+ > problems won't pop up and this patch is sufficient as of today.
+ > (I still wouldn't call it "correct", just that I can't see how to
+ > trigger the problem from a different angle)
+ > 
+ > I have no idea if there are plans to use dirdata elsewhere, I'll
+ > trust you on that.
+
+Yes, Dongyang is currently working to push dirdata to upstream ext4 to
+use it for the fscrypt+casefold "hack" that was landed to store data
+after the direntry.  Unfortunately, that was landed for Android and
+pushed upstream before I found out about it.  Otherwise, it would have
+been a perfect opportunity and use case for dirdata to be accepted.
+ 
+ > I guess we should check if zfs expects .. to be deleted before
+ > re-inserting it, but assuming it's OK I'd be in favor of something
+ > like a warning in __ldiskfs_unlink if called with ".." in debu
+ > builds so as not to check in normal builds.
+
+Dongyang reported that for ZFS the "." and ".." entries are a no-op.
+It has a "parent_obj" slot in the inode where it stores ".." for a
+directory inode, and one parent for a regular file inode.
+
+--- Message (Dominique Martinet, 2024-04-13 12:53:20.000000000) ---
+Patch Set 1:
+
+>  > patches don't even have any
+>  > commit message, I'm not sure how they're supposed to be reviewed.
+>
+> This was very recently improved in master, to add commit messages to
+> the patches.  Not perfect ones, but much better than nothing.
+
+Thanks I've noticed that while rebasing something for Stéphane earlier,
+much appreciated!
+
+
+> > ... except that the length isn't updated, and the htree is stored
+>  > as a dirdata "extension", and there's no "hole" to fit the htree
+>  > without dirdata given the patch series?
+>
+> Well, the htree_index isn't really "dirdata", it is an ancient hack to
+> store the index in "empty" directory blocks, and is used for any ext4
+> directory that grows larger than 4KB in size.  That is why all
+> directories grow from 4KB immediately to 12KB, because the 4KB is
+> split into 2x 4KB new blocks and the new dx_root struct takes over the
+> root directory block.
+
+Okay, so that's something I had misunderstood upon reading the code the
+other day; I had (at least) two misunderstandings:
+ - I traced up LUFID being set only for dotdot for some reason...
+Looking again I'm not sure why I had assumed that :/
+ - I had missed the difference between ldiskfs_next_entry which uses the
+rec_len field of the dir entry, and LDISKFS_DIR_ENTRY_LEN() (used to get
+the htree) that computes the real length of the entry and which we use
+to get the htree position.
+And to make things even more confusing I was also thinking the dx_get_dx_info
+pointed to the first dirdata field of the dotdot entry instead of past it,
+which made me think it was the dirdata field instead of after it.
+
+I've checked the actual block on disk and that cleared things up quite a
+bit: the rec_len for '..' includes the data for the htree, which is
+placed after the FID at the position correctly computed from dir entry
+len.
+
+So, not replying to each points individually but yes this all makes much
+more sense: we mustn't clear '..', at least not the full rec_len of '..'.
+
+In theory we _could_ clear the actual '..' data, that is LDISKFS_DIR_ENTRY_LEN()
+bytes from the start of the entry, but not the full rec_len...
+(assuming entries are reliably cleared, it's wasteful to always clear
+the full rec_len, because if you e.g. have entries A B C and you delete
+C then B you'll clear C's memory twice)
+BUT in that case what I was saying about keeping track of the dir data length
+goes a full loop and makes sense: we still need to find the htree at namelen
++ fid size, so clearing '..' that way would yield an offset in the position
+and we actually need to be careful that if we are to replace .. it needs to
+have the same amount of dirdata, which is true for lustre (we'll add
+another dir with LUFID), but not in the general case.
+
+For other entries, we're losing the deleted entry's "actual size" but
+that doesn't matter because (I _finally_ understood what this pde was):
+1/ if there was another entry before in the block, we add the entry's
+rec_len to the previous entry, and this includes dir data size as well,
+so the previous entry correctly point to the next entry
+2/ if there wasn't we're clearing the inode number and that is
+properly skipped.
+
+(In practice, I've played with block_dump and it doesn't look like the
+memsets are actually respected? I'm not sure if that's because I played
+with these and messed up some update so am still running code without
+memsets, or if they're only done in memory and not flushed properly when
+I'm looking, but I did see the rec_len update).
+
+
+Anyway, it turns out there shouldn't be any problem with these memsets
+on non-dot/dotdot entries, sorry for the noise.
+
+
+>  > I disagree with this in theory.
+>  > If any entry with dirdata is removed, then there is no "doesn't
+>  > fit": we've lost track of the actual entry size.
+>
+> I'm not sure what you mean?  Lustre definitely knows the entry size
+> for the FID (1-byte len + 16-byte FID).  However, for a generic
+> dirdata usage (e.g. if there are other dirdata fields) it might be
+> possible that this is an issue?  The caller deleting and re-inserting
+> the entry should preserve *all* of the dirdata instead of expecting it
+> to stay in place.  Also, for the Lustre Metadata Replication project
+> we will need to be able to store multiple FIDs into the same dirdata
+> slot (one FID per MDT mirror of an inode), so this should be fixed to
+> keep the full dirdata size stored in the first byte if it is not
+> handled properly.
+
+This was also a result of my misunderstanding, we have the previous
+entry's size and the rec len to decide if the entry will fit, so this
+should be fine as far as I understand.
+
+If anything the code that checks the entry fits only checks for single
+`dlen = (*data) + 1` which doesn't handle chained dir data so there
+might be a bug there if the replication storing multiple fids chains
+data that way (using multiple extensions), but the current code only has
+one so there is no problem I can see right now.
+
+
+>  > I guess we should check if zfs expects .. to be deleted before
+>  > re-inserting it, but assuming it's OK I'd be in favor of something
+>  > like a warning in __ldiskfs_unlink if called with ".." in debu
+>  > builds so as not to check in normal builds.
+>
+> Dongyang reported that for ZFS the "." and ".." entries are a no-op.
+> It has a "parent_obj" slot in the inode where it stores ".." for a
+> directory inode, and one parent for a regular file inode.
+
+Thanks for checking that.
+
+Given the above I'm still in favor of adding a check to warn if someone
+tries to delete . or .. at ldiskfs level as well (possibly only in debug
+builds), but with that I agree we can keep the memsets.
+
+
+Sorry for the extra long reply, I think I got facts right this time but
+I'm a bit short on sleep so forgive me if I've said more gibberish somewhere :)
+
+--- Message (Andreas Dilger, 2024-04-13 23:57:32.000000000) ---
+Patch Set 1:
+
+> Sorry for the extra long reply, I think I got facts right
+ > this time but I'm a bit short on sleep so forgive me if
+ > I've said more gibberish somewhere :)
+
+No problem, glad we could come to an agreement.  Also glad
+to see you are back working on Lustre again.
+
+ > better: a warning if `ldiskfs_delete_entry()` is called on
+ > something with `de_del->file_type & 0xf0` (there doesn't seem
+ > to be a mask for dirdata extension bits at this point).
+
+Just FYI, there is a mask for the dirdata flags:
+
+ #define EXT4_FT_MAX          8
+ #define EXT4_FT_MASK         0xf
+
+but as you noticed, *every* dirent in a Lustre filesystem
+would have this flag set, so that check is not correct.
+
+However, if we change osd-ldiskfs/dirdata to handle the
+extra dirdata correctly and it cam avoidd deleting ".."
+anymore.  I definitely would *not* want to submit a patch
+upstream for this until after we have a Lustre release
+that is not doing this anymore.
+
+--- Message (Andreas Dilger, 2024-04-14 02:12:35.000000000) ---
+Patch Set 1:
+
+> The insert of dotdot without removing first is essentially a
+ > replace in ldiskfs.
+ > But yes from the Maloo test results this is probably not enough.
+ 
+There were actually a large number of unrelated test failures this week due to upgrading most of the patch review sessions to run el9.3 servers and MDSCOUNT=4 by default, so this patch may not be as broken as first thought.
+
+There are some related failures during rename in sanity test_24*:
+
+ mdd_rename()) lustre-MDD0000: spobj [0x200000401:0x68d:0x0] dotdot insert error: rc = -5
+
+This is the straight forward case because ".." is no longer removed by your patch, so re-inserting ".." with a new FID is failing.  It should be enough to overwrite it in place in ext4. 
+
+We _may_ need to modify ext4 in the dirdata patch to make ".." insertion shift the next entries/dx_root/fscrypt further down the block (assuming there is enough space, or split otherwise, ugh) and *then* overwrite ".." in place.  I think that would only need to be done for MDTs created by backup/restore, otherwise the FID would always be inserted with ".." when it is empty.
+
+For the fscrypt+casefold code, it is also never enables the fscrypt or casefold features "in place" for a directory, only on newly created directories and files, and it doesn't allow rename in/out of encrypted directories, so it may be that the ".." dirent will not "grow" due to a rename.  I don't know for sure what they are storing beyond name_len (fixed or variable?) but even so the ".." entry size should be fixed (if it is encrypted at all?).
+
+I agree with Dominique that we will likely need to be particularly careful to preserve more data once there is a second dirdata user to copy the whole "dirent" and not just "name_len" (e.g. non-osd-ldiskfs rename).  I don't think the code has ever been closely reviewed with an eye to what happens with multiple dirdata users at once.
+
+--- Message (Andreas Dilger, 2024-04-14 02:22:51.000000000) ---
+Patch Set 1: Code-Review-1
+
+Summary, -1 because the "rename fails '..' insertion" case, but I think it is actually reasonably close to what we want, but needs a fix in osd-ldiskfs or ldiskfs/dirdata patch (ext4_setent() appears to be the place where the ".." dirent parent inode number is overwritten:
+
+        ent->de->inode = cpu_to_le32(ino);
+        if (LDISKFS_HAS_INCOMPAT_FEATURE(ent->dir->i_sb,
+                                      LDISKFS_FEATURE_INCOMPAT_FILETYPE))
+                ent->de->file_type = file_type;
+
+--- Message (Li Dongyang, 2024-04-15 01:29:50.000000000) ---
+Patch Set 1:
+
+> Patch Set 1:
+> 
+> > The insert of dotdot without removing first is essentially a
+>  > replace in ldiskfs.
+>  > But yes from the Maloo test results this is probably not enough.
+>  
+> There were actually a large number of unrelated test failures this week due to upgrading most of the patch review sessions to run el9.3 servers and MDSCOUNT=4 by default, so this patch may not be as broken as first thought.
+> 
+> There are some related failures during rename in sanity test_24*:
+> 
+>  mdd_rename()) lustre-MDD0000: spobj [0x200000401:0x68d:0x0] dotdot insert error: rc = -5
+> 
+> This is the straight forward case because ".." is no longer removed by your patch, so re-inserting ".." with a new FID is failing.  It should be enough to overwrite it in place in ext4. 
+>
+Using the insert without delete first is a replace in ldiskfs level, the error here I think should be related to the remote agent inode.
+I had a chat with Alex and he said the deleting before insert is to maintain the remote agent inode for DNE.
+I think we could change osd-ldiskfs to still maintain the remote agent inode and just update dotdot in place.
+> We _may_ need to modify ext4 in the dirdata patch to make ".." insertion shift the next entries/dx_root/fscrypt further down the block (assuming there is enough space, or split otherwise, ugh) and *then* overwrite ".." in place.  I think that would only need to be done for MDTs created by backup/restore, otherwise the FID would always be inserted with ".." when it is empty.
+> 
+The current ldiskfs dirdata patch will choose to omit the dirdata if there's not enough space when updating dotdot, and we agreed osd-ldiskfs should be able to get FID from the parent inode.
+
+> For the fscrypt+casefold code, it is also never enables the fscrypt or casefold features "in place" for a directory, only on newly created directories and files, and it doesn't allow rename in/out of encrypted directories, so it may be that the ".." dirent will not "grow" due to a rename.  I don't know for sure what they are storing beyond name_len (fixed or variable?) but even so the ".." entry size should be fixed (if it is encrypted at all?).
+>
+That should be fine as we don't store the extra hash in dot or dotdot for fscrypt+casefold,
+see change https://review.whamcloud.com/c/fs/lustre-release/+/54724 and ext4_dir_rec_len().
+
+> I agree with Dominique that we will likely need to be particularly careful to preserve more data once there is a second dirdata user to copy the whole "dirent" and not just "name_len" (e.g. non-osd-ldiskfs rename).  I don't think the code has ever been closely reviewed with an eye to what happens with multiple dirdata users at once.
+
+--- Message (Li Dongyang, 2024-04-15 03:38:45.000000000) ---
+Uploaded patch set 2.
+
+--- Message (jenkins, 2024-04-15 04:03:48.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/104175/ : SUCCESS
+
+--- Message (Andreas Dilger, 2024-04-15 04:42:44.000000000) ---
+Patch Set 2:
+
+Is this the entire fix?  It is confusingly even smaller than the previous patch... :-)
+
+The mdd layer asks to remove "..", and the osd-ldiskfs layer ignores it, as does osd-zfs.
+
+--- Message (Li Dongyang, 2024-04-16 05:29:52.000000000) ---
+Patch Set 2:
+
+Many tests failing because for indexed dir, in ldiskfs we do a in place update.
+but for linear dir, without first deleting dotdot(which merges its rec_len to the dot entry before it), trying to insert dotdot would not find the space as we only check dot entry's rec_len.
+I think we also need to modify ldiskfs to make insert of dotdot seen as an update in place for linear dirs.
+
+--- Message (Li Dongyang, 2024-04-18 02:59:03.000000000) ---
+Uploaded patch set 3.
+
+--- Message (Andreas Dilger, 2024-04-18 03:07:14.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+I'm a bit concerned about removal of the sanity checks for updating ".." when the dirent has no space for the FID.  If the dirdata code fixes this by moving entries down, that would be great, but not required.  At a minimum it should not corrupt the dx_root info.
+
+--- Message (jenkins, 2024-04-18 03:27:02.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/104249/ : SUCCESS
+
+--- Message (Li Dongyang, 2024-04-18 03:52:18.000000000) ---
+Uploaded patch set 4.
+
+--- Message (jenkins, 2024-04-18 03:52:21.000000000) ---
+Patch Set 3:
+
+No Builds Executed
+
+--- Message (Li Dongyang, 2024-04-18 03:57:21.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+> Patch Set 3:
+> 
+> (1 comment)
+> 
+> I'm a bit concerned about removal of the sanity checks for updating ".." when the dirent has no space for the FID.  If the dirdata code fixes this by moving entries down, that would be great, but not required.  At a minimum it should not corrupt the dx_root info.
+
+The sanity checks in find_dest_de will raise EIO when we don't have space for just ".."
+If we don't have space for the dirdata only, it will let caller know so we don't insert the dirdata, just update the dotdot entry.
+
+The same sanity checks are already in ext4_update_dotdot(), so I think we are covered.
+
+--- Message (jenkins, 2024-04-18 04:17:26.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/104250/ : SUCCESS
+
+--- Message (Li Dongyang, 2024-04-18 05:38:53.000000000) ---
+Patch Set 4:
+
+The node-provisioning are failing, log says:
+nothing provides kernel(wake_up_process) = 0xd6050f27 needed by kmod-lustre-client-2.15.62_23_gc95152f-1.el9.x86_64 from lustre-build
+  - nothing provides kernel(__alloc_skb) = 0x285bee04 needed by kmod-lustre-client-2.15.62_23_gc95152f-1.el9.x86_64 from lustre-build
+  - nothing provides kernel(__ethtool_get_link_ksettings) = 0xf93708ff needed by kmod-lustre-client-2.15.62_23_gc95152f-1.el9.x86_64 from lustre-build
+
+Looks like the client package is requiring the symbols not provided by the current kernel package. I think this should not be related as this is a server patch?
+
+--- Message (Andreas Dilger, 2024-04-18 07:02:46.000000000) ---
+Patch Set 4:
+
+It looks like 100% failure on el9.2/el9.3 clients.  IIRC Minh was playing around with kernel module symbols (https://review.whamcloud.com/54711), so there may have been some effect on the packages installed on the nodes or the cached kernel used by LJB to install the clients?  Best to file an ATM Jira ticket for this, so that it can be looked at promptly.
+
+--- Message (Li Dongyang, 2024-04-22 04:25:24.000000000) ---
+Patch Set 4:
+
+BUILD
+
+--- Message (jenkins, 2024-04-22 04:50:15.000000000) ---
+Patch Set 4:
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/104299/ : SUCCESS
+
+--- Message (Andreas Dilger, 2024-04-22 22:09:56.000000000) ---
+Patch Set 4:
+
+Dongyang, any update on whether we have good tests for the "restore+rename" case?  It looks like conf-sanity.sh test_108b is testing filesystem conversion from ZFS to ldiskfs, but the t_108_check() code is not doing a rename.  At a minimum some directory (and file) renames should be done as part of those tests.
+
+Similarly, conf-sanity test_131 is doing an MDT backup+restore (to test projid restore) but it would be good to add a directory rename step into that test, to confirm that the rename is successful and the ".." entry is updated properly.
+
+--- Message (Andreas Dilger, 2024-04-23 09:06:00.000000000) ---
+Uploaded patch set 5.
+
+--- Message (jenkins, 2024-04-23 09:42:56.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/104320/ : SUCCESS
+
+--- Message (Charlie Olmstead, 2024-04-23 14:31:53.000000000) ---
+Patch Set 5:
+
+The test config was using el9.2 and sles15sp4 but was removed from the build matrix.  I updated the test config and restarted testing for this patch.
+
+--- Message (Andreas Dilger, 2024-04-23 18:24:59.000000000) ---
+Uploaded patch set 6.
+
+--- Message (jenkins, 2024-04-23 18:25:02.000000000) ---
+Patch Set 5:
+
+No Builds Executed
+
+--- Message (Andreas Dilger, 2024-04-23 18:29:27.000000000) ---
+Patch Set 6:
+
+Run debugfs checks after MDT is unmounted, in case of journal/cache preventing the on-disk ".." entry from showing the current state.
+
+That said, this modified test passed locally on an unpatched system, so it seems possible that the new code does not insert the ".." FID into the dirent after a rename even though there is nothing else in the block?
+
+Ideally, it would memmove() the remaining dirents down 16-ish bytes to make room for the dirdata in this case, but that is a secondary issue right now.
+
+--- Message (Alex Zhuravlev, 2024-04-23 18:46:03.000000000) ---
+Patch Set 6:
+
+do I understand correctly that we "fake" dotdot removal?
+
+--- Message (jenkins, 2024-04-23 18:50:03.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/104331/ : SUCCESS
+
+--- Message (Andreas Dilger, 2024-04-25 02:43:58.000000000) ---
+Patch Set 6:
+
+I've pushed https://review.whamcloud.com/54905 that contains only the test case from this patch, to confirm that this is working properly before the patch is applied.
+
+On the one hand, I think it is important to fix this crash on el9.3 servers (which we are running by default now), but on the other hand I'm reluctant to land a patch that is only a partial fix, since it will inevitably drop in priority and the proper ".." insertion that adds the FID will not be implemented.  On the third hand, backup/restore of the MDT is very uncommon and if this results in lower performance for restored directories, then this is less critical than correctness...
+
+--- Message (Andreas Dilger, 2024-04-25 05:03:10.000000000) ---
+Patch Set 6: Code-Review-1
+
+(2 comments)
+
+--- Message (Alex Zhuravlev, 2024-04-25 05:10:32.000000000) ---
+Patch Set 6:
+
+we still call insert(..) from MDD, right? so osd-ldiskfs can update fid at this point.
+
+--- Message (Andreas Dilger, 2024-04-25 05:19:30.000000000) ---
+Patch Set 7: Published edit on patch set 6.
+
+--- Message (Andreas Dilger, 2024-04-25 05:21:23.000000000) ---
+Patch Set 7:
+
+test case has been updated to at least verify that ".." FID is updated during normal operation.  That *has* to work, or LFSCK would be upset and code will be confused to find the ".." FID is not correct after rename.
+
+--- Message (Andreas Dilger, 2024-04-25 06:00:28.000000000) ---
+Removed reviewer Charlie Olmstead.
+
+--- Message (Andreas Dilger, 2024-04-25 06:14:57.000000000) ---
+Patch Set 7: Code-Review-1
+
+(1 comment)
+
+It looks like ".." is not being updated at all with this patch, not even the parent inode number, let alone the FID, so I don't think this patch is usable as-is.
+
+--- Message (jenkins, 2024-04-25 06:17:56.000000000) ---
+Patch Set 7: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/104374/ : FAILURE
+
+--- Message (wc-checkpatch, 2024-04-25 21:29:19.000000000) ---
+Patch Set 7:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2024-04-26 12:39:46.000000000) ---
+Patch Set 7:
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/104432/ : FAILURE
+
+--- Message (Li Dongyang, 2024-05-08 01:24:46.000000000) ---
+Patch Set 7:
+
+I'm back! I think I found out what's going on, will update the patch.
+
+--- Message (Li Dongyang, 2024-05-14 02:57:53.000000000) ---
+Uploaded patch set 8.
+
+--- Message (wc-checkpatch, 2024-05-14 03:00:26.000000000) ---
+Patch Set 8:
+
+(8 comments)
+
+8 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Li Dongyang, 2024-05-14 03:04:42.000000000) ---
+Patch Set 8:
+
+(3 comments)
+
+--- Message (jenkins, 2024-05-14 03:39:56.000000000) ---
+Patch Set 8: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/104758/ : SUCCESS
+
+--- Message (Li Dongyang, 2024-05-20 07:39:41.000000000) ---
+Patch Set 8:
+
+ping reviewers.
+
+--- Message (Andreas Dilger, 2024-05-20 20:20:06.000000000) ---
+Patch Set 8: Code-Review+1
+
+(3 comments)
+
+I think this looks good, and the test appears to cover all the cases.  Handling ".." expansion is an improvement over the previous code as well. 
+
+It's too bad that this needs to update every kernel patch version, which might cause a potential conflict with any patch series that is currently in flight, when it only really affects newer kernels. I'm not sure if that could be handled easily, or just something we have to live with?
+
+--- Message (Xing Huang, 2024-05-23 01:30:05.000000000) ---
+Patch Set 8:
+
+Hi Alex, Andrew and Dominique, can you please review this patch?
+
+--- Message (Dominique Martinet, 2024-05-23 02:36:39.000000000) ---
+Patch Set 8:
+
+(1 comment)
+
+> Hi Alex, Andrew and Dominique, can you please review this patch?
+
+Thanks for the ping, I actually just had started looking this morning, but the ldiskfs patches take a bit of time to check properly; I'll finish my review tomorrow or Saturday
+
+--- Message (Li Dongyang, 2024-05-23 03:32:36.000000000) ---
+Patch Set 8:
+
+(1 comment)
+
+--- Message (Dominique Martinet, 2024-05-27 12:55:28.000000000) ---
+Patch Set 8: Code-Review+1
+
+(2 comments)
+
+I can't say I've given the ldiskfs patches quite enough attention to actually vouch for them, but I've confirmed the corruption is gone (including our original reproducer) and I don't see anything obviously wrong.
+
+Thanks for all the work!
+
+--- Message (Li Dongyang, 2024-05-28 01:08:07.000000000) ---
+Patch Set 8:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2024-05-29 06:16:25.000000000) ---
+Patch Set 8: Code-Review-1
+
+This change cannot be cherry-picked to master.
+Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (Li Dongyang, 2024-05-29 12:48:11.000000000) ---
+Uploaded patch set 9.
+
+--- Message (wc-checkpatch, 2024-05-29 12:53:08.000000000) ---
+Patch Set 9:
+
+(8 comments)
+
+8 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Li Dongyang, 2024-05-29 12:53:12.000000000) ---
+Patch Set 9:
+
+Updated to include the fix for new linux6-0/ext4-data-in-dirent.patch introduced by
+https://review.whamcloud.com/c/fs/lustre-release/+/52260
+which landed earlier than this.
+
+--- Message (jenkins, 2024-05-29 13:27:49.000000000) ---
+Patch Set 9: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/105034/ : SUCCESS
+
+--- Message (Autotest, 2024-05-30 03:58:39.000000000) ---
+Patch Set 9:
+
+Onyx Autotest retesting enforced review-dne-part-8 session on el9.3-x86_64/ldiskfs servers and clients for build 105034 patch 9. Requested by Dongyang Li because of EX-7508.
+
+--- Message (Autotest, 2024-05-30 03:58:59.000000000) ---
+Patch Set 9:
+
+Onyx Autotest retesting enforced review-dne-part-1 session on el9.3-x86_64/ldiskfs servers and clients for build 105034 patch 9. Requested by Dongyang Li because of LU-7665.
+
+--- Message (Autotest, 2024-05-30 03:59:17.000000000) ---
+Patch Set 9:
+
+Trevis Autotest retesting enforced review-dne-part-5 session on el9.3-x86_64/ldiskfs servers and clients for build 105034 patch 9. Requested by Dongyang Li because of LU-15630.
+
+--- Message (Andreas Dilger, 2024-06-04 18:06:12.000000000) ---
+Patch Set 9: Code-Review+1
+
+There are far too many server kernel patch series, I'm sure many of them are no longer in use.
+
+--- Message (Shaun Tancheff, 2024-06-05 01:40:29.000000000) ---
+Patch Set 9: Code-Review+1
+
+--- Message (Jian Yu, 2024-06-07 18:14:52.000000000) ---
+Patch Set 9: Code-Review+1
+
+--- Message (Oleg Drokin, 2024-06-10 06:08:49.000000000) ---
+Patch Set 9: Code-Review+2
+
+--- Message (Oleg Drokin, 2024-06-10 06:08:53.000000000) ---
+Change has been successfully cherry-picked as 0536b2a26992f5d2ef9e3537a196afac81281f60 by Oleg Drokin

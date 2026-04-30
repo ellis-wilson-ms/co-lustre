@@ -1,0 +1,3795 @@
+Change:     36707
+Subject:    LU-8130 lu_object: convert lu_object cache to rhashtable
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/36707
+Change-Id:  I618dc2e2da003c240a887126f600e7eac5df951c
+Project:    fs/lustre-release
+Branch:     master
+Status:     MERGED
+Owner:      James Simmons
+Created:    2019-11-07 18:18:37.000000000
+Updated:    2020-06-28 02:47:34.000000000
+Patch Set:  32
+Insertions: +359
+Deletions:  -444
+Comments:   73 (0 unresolved)
+
+--- Labels ---
+  Code-Review: Shaun Tancheff: +1; Neil Brown: +1; James Simmons: +1; Oleg Drokin: +2
+  Verified: jenkins: +1; Maloo: +1
+
+--- Reviewers ---
+  REVIEWER: Oleg Drokin, Andreas Dilger, Mikhail Pershin, Alex Zhuravlev, James Simmons, Alexey Lyashkov, Shuichi Ihara, Neil Brown, Petros Koutoupis, Shaun Tancheff
+
+--- Commit Message ---
+LU-8130 lu_object: convert lu_object cache to rhashtable
+
+The lu_object cache is a little more complex than the other lustre
+hash tables for two reasons.
+1/ there is a debugfs file which displays the contents of the cache,
+  so we need to use rhashtable_walk in a way that works for seq_file.
+
+2/ There is a (sharded) lru list for objects which are no longer
+   referenced, so finding an object needs to consider races with the
+   lru as well as with the hash table.
+
+The debugfs file already manages walking the libcfs hash table keeping
+a current-position in the private data.  We can fairly easily convert
+that to a struct rhashtable_iter.  The debugfs file actually reports
+pages, and there are multiple pages per hashtable object.  So as well
+as rhashtable_iter, we need the current page index.
+
+For the double-locking, the current code uses direct-access to the
+bucket locks that libcfs_hash provides.  rhashtable doesn't provide
+that access - callers must provide their own locking or use rcu
+techniques.
+
+The lsb_waitq.lock is still used to manage the lru list, but with
+this patch it is no longer nested *inside* the hashtable locks, but
+instead is outside.  It is used to protect an object with a refcount
+of zero.
+
+When purging old objects from an lru, we first set
+LU_OBJECT_HEARD_BANSHEE while holding the lsb_waitq.lock,
+then remove all the entries from the hashtable separately.
+
+When removing the last reference from an object, we first take the
+lsb_waitq.lock, then decrement the reference and add to the lru list
+or discard it setting LU_OBJECT_UNHASHED.
+
+When we find an object in the hashtable with a refcount of zero, we
+take the corresponding lsb_waitq.lock and check that neither
+LU_OBJECT_HEARD_BANSHEE or LU_OBJECT_UNHASHED is set.  If neither is,
+we can safely increment the refcount.  If either are, the object is
+gone.
+
+This way, we only ever manipulate an object with a refcount of zero
+while holding the lsb_waitq.lock.
+
+As there is nothing to stop us using the resizing capabilities of
+rhashtable, the code to try to guess the perfect hash size has been
+removed.
+
+Also: the "is_dying" variable in lu_object_put() is racey - the value
+could change the moment it is sampled.  It is also not needed as it is
+only used to avoid a wakeup, which is not particularly expensive.
+In the same code as comment says that 'top' could not be accessed, but
+the code then immediately accesses 'top' to calculate 'bkt'.
+So move the initialization of 'bkt' to before 'top' becomes unsafe.
+
+Also: Change "wake_up_all()" to "wake_up()".  wake_up_all() is only
+relevant when an exclusive wait is used.
+
+Moving from the libcfs hashtable to rhashtable also gives the
+benefit of a very large performance boost.
+
+Before patch:
+
+SUMMARY rate: (of 5 iterations)
+   Operation                      Max            Min           Mean        Std Dev
+   ---------                      ---            ---           ----        -------
+   Directory creation:      12036.610      11091.880      11452.978        318.829
+   Directory stat:          25871.734      24232.310      24935.661        574.996
+   Directory removal:       12698.769      12239.685      12491.008        149.149
+   File creation:           11722.036      11673.961      11692.157         15.966
+   File stat:               62304.540      58237.124      60282.003       1479.103
+   File read:               24204.811      23889.091      24048.577        110.245
+   File removal:             9412.930       9111.828       9217.546        120.894
+   Tree creation:            3515.536       3195.627       3442.609        123.792
+   Tree removal:              433.917        418.935        428.038          5.545
+
+After patch:
+
+SUMMARY rate: (of 5 iterations)
+   Operation                      Max            Min           Mean        Std Dev
+   ---------                      ---            ---           ----        -------
+   Directory creation:      11873.308        303.626       9371.860       4539.539
+   Directory stat:          31116.512      30190.574      30568.091        335.545
+   Directory removal:       13082.121      12645.228      12943.239        157.695
+   File creation:           12607.135      12293.319      12466.647        138.307
+   File stat:              124419.347     105240.996     116919.977       7847.165
+   File read:               39707.270      36295.477      38266.011       1328.857
+   File removal:             9614.333       9273.931       9477.299        140.201
+   Tree creation:            3572.602       3017.580       3339.547        207.061
+   Tree removal:              487.687          0.004        282.188        230.659
+
+Change-Id: I618dc2e2da003c240a887126f600e7eac5df951c
+Signed-off-by: Mr NeilBrown <neilb@suse.de>
+Reviewed-on: https://review.whamcloud.com/36707
+Tested-by: jenkins <devops@whamcloud.com>
+Tested-by: Maloo <maloo@whamcloud.com>
+Reviewed-by: James Simmons <jsimmons@infradead.org>
+Reviewed-by: Shaun Tancheff <shaun.tancheff@hpe.com>
+Reviewed-by: Oleg Drokin <green@whamcloud.com>
+
+--- Review History ---
+
+--- Message (James Simmons, 2019-11-07 18:18:37.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2019-11-07 18:20:07.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2019-11-07 18:23:17.000000000) ---
+Patch Set 1:
+
+(5 comments)
+
+5 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2019-11-07 19:08:57.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/9792/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews/69580/ : SUCCESS
+
+--- Message (Autotest, 2019-11-07 19:10:10.000000000) ---
+Patch Set 1:
+
+Onyx Autotest started enforced review-dne-zfs-part-1 session for build 69580.
+
+--- Message (Autotest, 2019-11-07 19:10:10.000000000) ---
+Patch Set 1:
+
+Onyx Autotest started enforced review-dne-zfs-part-2 session for build 69580.
+
+--- Message (Autotest, 2019-11-07 19:10:10.000000000) ---
+Patch Set 1:
+
+Onyx Autotest started enforced review-ldiskfs session for build 69580.
+
+--- Message (Autotest, 2019-11-07 19:10:11.000000000) ---
+Patch Set 1:
+
+Onyx Autotest started enforced review-dne-part-1 session for build 69580.
+
+--- Message (Autotest, 2019-11-07 19:10:11.000000000) ---
+Patch Set 1:
+
+Onyx Autotest started enforced review-dne-part-2 session for build 69580.
+
+--- Message (Autotest, 2019-11-07 19:10:12.000000000) ---
+Patch Set 1:
+
+Onyx Autotest started enforced review-dne-part-3 session for build 69580.
+
+--- Message (Autotest, 2019-11-07 19:10:12.000000000) ---
+Patch Set 1:
+
+Onyx Autotest started enforced review-dne-part-4 session for build 69580.
+
+--- Message (Autotest, 2019-11-07 19:10:13.000000000) ---
+Patch Set 1:
+
+Onyx Autotest started enforced review-dne-zfs-part-4 session for build 69580.
+
+--- Message (Autotest, 2019-11-07 19:10:13.000000000) ---
+Patch Set 1:
+
+Onyx Autotest started enforced review-dne-zfs-part-3 session for build 69580.
+
+--- Message (Autotest, 2019-11-07 19:10:13.000000000) ---
+Patch Set 1:
+
+Onyx Autotest started enforced review-zfs session for build 69580.
+
+--- Message (Autotest, 2019-11-07 19:10:14.000000000) ---
+Patch Set 1:
+
+Onyx Autotest started enforced review-ldiskfs-arm session for build 69580.
+
+--- Message (Autotest, 2019-11-07 19:10:14.000000000) ---
+Patch Set 1:
+
+Onyx Autotest started optional review-dne-selinux session for build 69580.
+
+--- Message (Autotest, 2019-11-07 19:10:14.000000000) ---
+Patch Set 1:
+
+Onyx Autotest started optional review-dne-ssk session for build 69580.
+
+--- Message (Autotest, 2019-11-07 19:10:15.000000000) ---
+Patch Set 1:
+
+Onyx Autotest started optional review-dne-selinux-ssk session for build 69580.
+
+--- Message (Neil Brown, 2019-11-11 04:22:51.000000000) ---
+Patch Set 1: Code-Review-1
+
+(3 comments)
+
+I probably need to look over it again, it is a big patch.
+But I found a couple of problems.
+
+--- Message (James Simmons, 2019-11-13 16:36:17.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Neil Brown, 2019-11-13 22:08:08.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (James Simmons, 2019-12-06 23:31:01.000000000) ---
+Uploaded patch set 2.
+
+--- Message (wc-checkpatch, 2019-12-06 23:34:12.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2019-12-07 00:10:27.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/10455/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews/70250/ : SUCCESS
+
+--- Message (Autotest, 2019-12-07 00:12:30.000000000) ---
+Patch Set 2:
+
+Onyx Autotest started enforced review-ldiskfs session for build 70250.
+
+--- Message (Autotest, 2019-12-07 00:12:31.000000000) ---
+Patch Set 2:
+
+Onyx Autotest started enforced review-dne-zfs-part-1 session for build 70250.
+
+--- Message (Autotest, 2019-12-07 00:12:31.000000000) ---
+Patch Set 2:
+
+Onyx Autotest started enforced review-dne-zfs-part-2 session for build 70250.
+
+--- Message (Autotest, 2019-12-07 00:12:31.000000000) ---
+Patch Set 2:
+
+Onyx Autotest started enforced review-dne-part-1 session for build 70250.
+
+--- Message (Autotest, 2019-12-07 00:12:32.000000000) ---
+Patch Set 2:
+
+Onyx Autotest started enforced review-dne-part-2 session for build 70250.
+
+--- Message (Autotest, 2019-12-07 00:12:32.000000000) ---
+Patch Set 2:
+
+Onyx Autotest started enforced review-dne-part-3 session for build 70250.
+
+--- Message (Autotest, 2019-12-07 00:12:33.000000000) ---
+Patch Set 2:
+
+Onyx Autotest started enforced review-dne-part-4 session for build 70250.
+
+--- Message (Autotest, 2019-12-07 00:12:34.000000000) ---
+Patch Set 2:
+
+Onyx Autotest started enforced review-dne-zfs-part-3 session for build 70250.
+
+--- Message (Autotest, 2019-12-07 00:12:35.000000000) ---
+Patch Set 2:
+
+Onyx Autotest started enforced review-dne-zfs-part-4 session for build 70250.
+
+--- Message (Autotest, 2019-12-07 00:12:36.000000000) ---
+Patch Set 2:
+
+Onyx Autotest started enforced review-zfs session for build 70250.
+
+--- Message (Autotest, 2019-12-07 00:12:36.000000000) ---
+Patch Set 2:
+
+Onyx Autotest started enforced review-ldiskfs-arm session for build 70250.
+
+--- Message (Neil Brown, 2019-12-09 02:23:31.000000000) ---
+Patch Set 2: Code-Review-1
+
+(4 comments)
+
+--- Message (James Simmons, 2019-12-09 18:43:11.000000000) ---
+Patch Set 2:
+
+(2 comments)
+
+--- Message (Neil Brown, 2019-12-10 00:24:56.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (James Simmons, 2019-12-10 20:01:42.000000000) ---
+Patch Set 2:
+
+Applied the changes and now I see 
+
+2019-12-10T14:12:36.728427-05:00 ninja81.ccs.ornl.gov kernel: Lustre: DEBUG MARKER: == sanity test 63b: async write errors should be returned t
+o fsync =================================== 14:12:36 (1576005156)
+2019-12-10T14:12:37.096181-05:00 ninja81.ccs.ornl.gov kernel: Lustre: *** cfs_fail_loc=406, val=0***
+2019-12-10T14:12:37.096244-05:00 ninja81.ccs.ornl.gov kernel: LustreError: 26278:0:(osc_request.c:2290:osc_build_rpc()) prep_req failed: -12
+2019-12-10T14:12:37.096291-05:00 ninja81.ccs.ornl.gov kernel: LustreError: 26278:0:(osc_cache.c:2275:osc_check_rpcs()) Write request failed wit
+h -12
+2019-12-10T14:13:06.162588-05:00 ninja81.ccs.ornl.gov kernel: NMI watchdog: BUG: soft lockup - CPU#8 stuck for 22s! [lctl:26283]
+2019-12-10T14:13:06.162671-05:00 ninja81.ccs.ornl.gov kernel: Modules linked in: iptable_nat nf_nat_ipv4 nf_nat nfsv3 nfs_acl ext4 mbcache jbd2
+ loop lustre(OE) obdecho(OE) mgc(OE) lov(OE) mdc(OE) osc(OE) lmv(OE) fid(OE) fld(OE) ptlrpc(OE) obdclass(OE) ksocklnd(OE) lnet(OE) libcfs(OE) x
+t_comment xt_multiport ip6t_REJECT nf_reject_ipv6 nf_conntrack_ipv6 nf_defrag_ipv6 ip6table_filter ip6_tables ipt_REJECT nf_reject_ipv4 nf_conn
+track_ipv4 nf_defrag_ipv4 xt_conntrack nf_conntrack libcrc32c iptable_filter dm_mirror dm_region_hash dm_log dm_mod sd_mod sg iTCO_wdt iTCO_ven
+dor_support sb_edac intel_powerclamp coretemp intel_rapl iosf_mbi kvm_intel kvm ast ttm irqbypass drm_kms_helper crc32_pclmul syscopyarea ghash
+_clmulni_intel sysfillrect sysimgblt fb_sys_fops aesni_intel ahci lrw drm gf128mul libahci glue_helper ablk_helper drm_panel_orientation_quirks
+2019-12-10T14:13:06.164667-05:00 ninja81.ccs.ornl.gov kernel: libata mei_me cryptd pcspkr joydev mei lpc_ich i2c_i801 ioatdma wmi ipmi_si ipmi_
+devintf ipmi_msghandler acpi_power_meter acpi_pad ib_isert iscsi_target_mod target_core_mod rpcrdma crc_t10dif crct10dif_generic crct10dif_pclm
+ul crct10dif_common ib_iser libiscsi scsi_transport_iscsi ib_ipoib rdma_ucm ib_ucm ib_uverbs ib_umad rdma_cm binfmt_misc ib_cm iw_cm mlx4_en ml
+x4_ib ib_core ip_tables rpcsec_gss_krb5 auth_rpcgss nfsv4 dns_resolver nfs lockd grace fscache igb mlx4_core i2c_algo_bit dca ptp crc32c_intel
+devlink pps_core sunrpc
+2019-12-10T14:13:06.165384-05:00 ninja81.ccs.ornl.gov kernel: CPU: 8 PID: 26283 Comm: lctl Tainted: G           OE  ------------   3.10.0-957.2
+7.2.el7.x86_64 #1
+2019-12-10T14:13:06.165428-05:00 ninja81.ccs.ornl.gov kernel: Hardware name: Supermicro Super Server/To be filled by O.E.M., BIOS 2.0b 08/12/20
+16
+2019-12-10T14:13:06.165466-05:00 ninja81.ccs.ornl.gov kernel: task: ffff96ba10701040 ti: ffff96ba22234000 task.ti: ffff96ba22234000
+2019-12-10T14:13:06.165503-05:00 ninja81.ccs.ornl.gov kernel: RIP: 0010:[<ffffffffc0d73b4c>]  [<ffffffffc0d73b4c>] lu_object_put+0xdc/0x490 [ob
+dclass]
+2019-12-10T14:13:06.165539-05:00 ninja81.ccs.ornl.gov kernel: RSP: 0018:ffff96ba22237da0  EFLAGS: 00000246
+2019-12-10T14:13:06.165583-05:00 ninja81.ccs.ornl.gov kernel: RAX: 00000000cf81c4c9 RBX: 0000000000000000 RCX: 00000000cf81c4c8
+2019-12-10T14:13:06.165624-05:00 ninja81.ccs.ornl.gov kernel: RDX: 00000000cf81c4c9 RSI: ffff96ba84a69c90 RDI: ffff96c29a42f128
+2019-12-10T14:13:06.165675-05:00 ninja81.ccs.ornl.gov kernel: RBP: ffff96ba22237de8 R08: 0000000000000010 R09: 0000000000000000
+2019-12-10T14:13:06.165742-05:00 ninja81.ccs.ornl.gov kernel: R10: 0000000000000000 R11: 000000000000000f R12: 0000000000000010
+2019-12-10T14:13:06.165788-05:00 ninja81.ccs.ornl.gov kernel: R13: ffff96ba22237df8 R14: 0000000000000000 R15: 000000000000000f
+2019-12-10T14:13:06.165826-05:00 ninja81.ccs.ornl.gov kernel: FS:  00007facea8bd740(0000) GS:ffff96c2bfc80000(0000) knlGS:0000000000000000
+2019-12-10T14:13:06.165865-05:00 ninja81.ccs.ornl.gov kernel: CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+019-12-10T14:13:06.165924-05:00 ninja81.ccs.ornl.gov kernel: CR2: 00000000006a00f8 CR3: 000000100ea32000 CR4: 00000000001607e0
+2019-12-10T14:13:06.165966-05:00 ninja81.ccs.ornl.gov kernel: Call Trace:
+2019-12-10T14:13:06.166011-05:00 ninja81.ccs.ornl.gov kernel: [<ffffffffc0d7898e>] cl_object_put+0xe/0x10 [obdclass]
+2019-12-10T14:13:06.166077-05:00 ninja81.ccs.ornl.gov kernel: [<ffffffffc13e4ab6>] vvp_pgcache_current+0x86/0x170 [lustre]
+2019-12-10T14:13:06.166123-05:00 ninja81.ccs.ornl.gov kernel: [<ffffffffb9dd753d>] ? kvmalloc_node+0x8d/0xe0
+2019-12-10T14:13:06.166168-05:00 ninja81.ccs.ornl.gov kernel: [<ffffffffc13e4c45>] vvp_pgcache_start+0x45/0xc0 [lustre]
+2019-12-10T14:13:06.166244-05:00 ninja81.ccs.ornl.gov kernel: [<ffffffffb9e6a042>] seq_read+0x1c2/0x440
+2019-12-10T14:13:06.166303-05:00 ninja81.ccs.ornl.gov kernel: [<ffffffffb9e4256f>] vfs_read+0x9f/0x170
+2019-12-10T14:13:06.166352-05:00 ninja81.ccs.ornl.gov kernel: [<ffffffffb9e4342f>] SyS_read+0x7f/0xf0
+2019-12-10T14:13:06.166421-05:00 ninja81.ccs.ornl.gov kernel: [<ffffffffba376ddb>] system_call_fastpath+0x22/0x27
+
+Need to track it down.
+
+--- Message (Neil Brown, 2019-12-10 23:24:33.000000000) ---
+Patch Set 2:
+
+> Applied the changes and now I see 
+
+Nothing jumps out at me.  Was there are "Code:" line?  That might help.
+
+--- Message (James Simmons, 2020-01-09 17:36:07.000000000) ---
+Uploaded patch set 3.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2020-01-09 17:38:52.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2020-01-09 17:39:11.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2020-01-09 18:07:32.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/11061/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews/70879/ : SUCCESS
+
+--- Message (Autotest, 2020-01-09 18:07:51.000000000) ---
+Patch Set 3:
+
+Onyx Autotest started enforced review-ldiskfs session for build 70879.
+
+--- Message (Autotest, 2020-01-09 18:07:52.000000000) ---
+Patch Set 3:
+
+Onyx Autotest started enforced review-dne-zfs-part-2 session for build 70879.
+
+--- Message (Autotest, 2020-01-09 18:07:52.000000000) ---
+Patch Set 3:
+
+Onyx Autotest started enforced review-dne-part-1 session for build 70879.
+
+--- Message (Autotest, 2020-01-09 18:07:52.000000000) ---
+Patch Set 3:
+
+Onyx Autotest started enforced review-dne-zfs-part-1 session for build 70879.
+
+--- Message (Autotest, 2020-01-09 18:07:53.000000000) ---
+Patch Set 3:
+
+Onyx Autotest started enforced review-dne-part-2 session for build 70879.
+
+--- Message (Autotest, 2020-01-09 18:07:53.000000000) ---
+Patch Set 3:
+
+Onyx Autotest started enforced review-dne-part-3 session for build 70879.
+
+--- Message (Autotest, 2020-01-09 18:07:54.000000000) ---
+Patch Set 3:
+
+Onyx Autotest started enforced review-dne-zfs-part-3 session for build 70879.
+
+--- Message (Autotest, 2020-01-09 18:07:54.000000000) ---
+Patch Set 3:
+
+Onyx Autotest started enforced review-dne-part-4 session for build 70879.
+
+--- Message (Autotest, 2020-01-09 18:07:55.000000000) ---
+Patch Set 3:
+
+Onyx Autotest started enforced review-dne-zfs-part-4 session for build 70879.
+
+--- Message (Autotest, 2020-01-09 18:07:56.000000000) ---
+Patch Set 3:
+
+Onyx Autotest started enforced review-ldiskfs-arm session for build 70879.
+
+--- Message (Autotest, 2020-01-09 18:07:56.000000000) ---
+Patch Set 3:
+
+Onyx Autotest started enforced review-zfs session for build 70879.
+
+--- Message (James Simmons, 2020-01-31 01:38:56.000000000) ---
+Uploaded patch set 4.
+
+--- Message (wc-checkpatch, 2020-01-31 01:41:46.000000000) ---
+Patch Set 4:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2020-01-31 01:42:01.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2020-01-31 02:11:36.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/11596/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews/71426/ : SUCCESS
+
+--- Message (Autotest, 2020-01-31 02:12:52.000000000) ---
+Patch Set 4:
+
+Trevis Autotest2 started enforced review-ldiskfs session for build 71426.
+
+--- Message (Autotest, 2020-01-31 02:12:52.000000000) ---
+Patch Set 4:
+
+Trevis Autotest2 started enforced review-zfs session for build 71426.
+
+--- Message (Autotest, 2020-01-31 02:12:53.000000000) ---
+Patch Set 4:
+
+Trevis Autotest2 started enforced review-dne-part-1 session for build 71426.
+
+--- Message (Autotest, 2020-01-31 02:12:53.000000000) ---
+Patch Set 4:
+
+Trevis Autotest2 started enforced review-dne-part-2 session for build 71426.
+
+--- Message (Autotest, 2020-01-31 02:12:54.000000000) ---
+Patch Set 4:
+
+Trevis Autotest2 started enforced review-dne-part-3 session for build 71426.
+
+--- Message (Autotest, 2020-01-31 02:12:54.000000000) ---
+Patch Set 4:
+
+Trevis Autotest2 started enforced review-dne-part-4 session for build 71426.
+
+--- Message (Autotest, 2020-01-31 02:12:55.000000000) ---
+Patch Set 4:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-1 session for build 71426.
+
+--- Message (Autotest, 2020-01-31 02:12:55.000000000) ---
+Patch Set 4:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-2 session for build 71426.
+
+--- Message (Autotest, 2020-01-31 02:12:56.000000000) ---
+Patch Set 4:
+
+Trevis Autotest2 started enforced review-ldiskfs-arm session for build 71426.
+
+--- Message (Autotest, 2020-01-31 02:12:56.000000000) ---
+Patch Set 4:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-3 session for build 71426.
+
+--- Message (Autotest, 2020-01-31 02:12:56.000000000) ---
+Patch Set 4:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-4 session for build 71426.
+
+--- Message (James Simmons, 2020-01-31 16:23:10.000000000) ---
+Uploaded patch set 5.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2020-01-31 16:24:56.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2020-01-31 16:27:18.000000000) ---
+Patch Set 5:
+
+Looks good to me.
+
+--- Message (jenkins, 2020-01-31 16:56:04.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/11623/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews/71453/ : SUCCESS
+
+--- Message (Autotest, 2020-01-31 16:57:59.000000000) ---
+Patch Set 5:
+
+Onyx Autotest started enforced review-ldiskfs session for build 71453.
+
+--- Message (Autotest, 2020-01-31 16:58:19.000000000) ---
+Patch Set 5:
+
+Onyx Autotest started enforced review-zfs session for build 71453.
+
+--- Message (Autotest, 2020-01-31 16:58:39.000000000) ---
+Patch Set 5:
+
+Onyx Autotest started enforced review-dne-part-1 session for build 71453.
+
+--- Message (Autotest, 2020-01-31 16:59:00.000000000) ---
+Patch Set 5:
+
+Onyx Autotest started enforced review-dne-part-2 session for build 71453.
+
+--- Message (Autotest, 2020-01-31 16:59:25.000000000) ---
+Patch Set 5:
+
+Onyx Autotest started enforced review-dne-part-3 session for build 71453.
+
+--- Message (Autotest, 2020-01-31 16:59:40.000000000) ---
+Patch Set 5:
+
+Onyx Autotest started enforced review-dne-part-4 session for build 71453.
+
+--- Message (Autotest, 2020-01-31 17:00:00.000000000) ---
+Patch Set 5:
+
+Onyx Autotest started enforced review-dne-zfs-part-1 session for build 71453.
+
+--- Message (Autotest, 2020-01-31 17:00:20.000000000) ---
+Patch Set 5:
+
+Onyx Autotest started enforced review-dne-zfs-part-2 session for build 71453.
+
+--- Message (Autotest, 2020-01-31 17:00:40.000000000) ---
+Patch Set 5:
+
+Onyx Autotest started enforced review-dne-zfs-part-3 session for build 71453.
+
+--- Message (Autotest, 2020-01-31 17:01:00.000000000) ---
+Patch Set 5:
+
+Onyx Autotest started enforced review-dne-zfs-part-4 session for build 71453.
+
+--- Message (Autotest, 2020-01-31 17:01:21.000000000) ---
+Patch Set 5:
+
+Onyx Autotest started enforced review-ldiskfs-arm session for build 71453.
+
+--- Message (James Simmons, 2020-02-01 01:11:59.000000000) ---
+Patch Set 5:
+
+(2 comments)
+
+Down to the last failure:
+
+20584.867873] Lustre: DEBUG MARKER: == mds-survey test 1: Metadata survey with zero-stripe =============================================== 23:02:39 (1580511759)
+[20585.086017] Lustre: DEBUG MARKER: /usr/sbin/lctl dl
+[20586.301677] Lustre: Echo OBD driver; http://www.lustre.org/
+[20592.212669] LustreError: 8064:0:(echo_client.c:1844:echo_md_lookup()) lookup MDT0001-tests: rc = -2
+[20592.214334] LustreError: 8064:0:(echo_client.c:2078:echo_md_destroy_internal()) Can't find child MDT0001-tests: rc = -2
+[20593.746647] LustreError: 8225:0:(echo_client.c:1844:echo_md_lookup()) lookup MDT0003-tests: rc = -2
+[20593.748323] LustreError: 8225:0:(echo_client.c:1844:echo_md_lookup()) Skipped 1 previous similar message
+[20593.749904] LustreError: 8225:0:(echo_client.c:2078:echo_md_destroy_internal()) Can't find child MDT0003-tests: rc = -2
+[20593.751797] LustreError: 8225:0:(echo_client.c:2078:echo_md_destroy_internal()) Skipped 1 previous similar message
+[21104.174491] LustreError: 398:0:(lu_object.c:225:lu_object_put()) ASSERTION( list_empty(&top->loh_lru) ) failed: 
+[21104.176699] LustreError: 398:0:(lu_object.c:225:lu_object_put()) LBUG
+[21104.177811] Pid: 398, comm: lctl 3.10.0-1062.9.1.el7_lustre.x86_64 #1 SMP Sat Jan 18 22:53:06 UTC 2020
+[21104.179360] Call Trace:
+[21104.179813]  [<ffffffffc0b7607c>] libcfs_call_trace+0x8c/0xc0 [libcfs]
+[21104.180990]  [<ffffffffc0b7612c>] lbug_with_loc+0x4c/0xa0 [libcfs]
+[21104.182070]  [<ffffffffc0cd7278>] lu_object_put+0x4b8/0x4c0 [obdclass]
+[21104.183349]  [<ffffffffc0c9ac9a>] llog_osd_regular_fid_add_name_entry+0x27a/0x500 [obdclass]
+[21104.184876]  [<ffffffffc0c9bc6f>] llog_osd_declare_create+0x3af/0x710 [obdclass]
+[21104.186267]  [<ffffffffc0c879ab>] llog_declare_create+0x1bb/0x210 [obdclass]
+[21104.187497]  [<ffffffffc0c8e1cd>] llog_cat_prep_log+0x11d/0x360 [obdclass]
+[21104.188708]  [<ffffffffc0c8e489>] llog_cat_declare_add_rec+0x79/0x260 [obdclass]
+[21104.189989]  [<ffffffffc0c8524f>] llog_declare_add+0x14f/0x1c0 [obdclass]
+[21104.191171]  [<ffffffffc103701e>] top_trans_start+0x17e/0x940 [ptlrpc]
+[21104.192395]  [<ffffffffc146e2b4>] lod_trans_start+0x34/0x40 [lod]
+[21104.193471]  [<ffffffffc152ab1a>] mdd_trans_start+0x1a/0x20 [mdd]
+[21104.194554]  [<ffffffffc150e322>] mdd_create+0xbe2/0x1630 [mdd]
+[21104.195593]  [<ffffffffc1444b24>] echo_md_create_internal+0x244/0x5d0 [obdecho]
+[21104.196862]  [<ffffffffc1448951>] echo_md_handler.isra.41+0x24e1/0x2c60 [obdecho]
+[21104.198144]  [<ffffffffc144a0bf>] echo_client_iocontrol+0xfef/0x1d70 [obdecho]
+[21104.199385]  [<ffffffffc0ca0539>] class_handle_ioctl+0x1929/0x1e30 [obdclass]
+[21104.200659]  [<ffffffffc0ca0ab5>] obd_class_ioctl+0x75/0x170 [obdclass]
+
+--- Message (Neil Brown, 2020-02-03 02:07:50.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+> Down to the last failure:
+
+Love your optimism :-)
+
+I think this bug might be caused by the spinlock being dropped too soon as mentioned in separate note.
+
+--- Message (James Simmons, 2020-02-03 15:21:22.000000000) ---
+Patch Set 5:
+
+Yep moving the spin lock worked!!!
+
+--- Message (James Simmons, 2020-02-03 15:25:34.000000000) ---
+Uploaded patch set 6.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2020-02-03 15:26:49.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2020-02-03 15:29:47.000000000) ---
+Patch Set 6:
+
+Looks good to me.
+
+--- Message (jenkins, 2020-02-03 15:58:51.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/11674/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews/71504/ : SUCCESS
+
+--- Message (Autotest, 2020-02-03 16:00:24.000000000) ---
+Patch Set 6:
+
+Trevis Autotest2 started enforced review-ldiskfs session for build 71504.
+
+--- Message (Autotest, 2020-02-03 16:00:35.000000000) ---
+Patch Set 6:
+
+Trevis Autotest started enforced review-zfs session for build 71504.
+
+--- Message (Autotest, 2020-02-03 16:00:44.000000000) ---
+Patch Set 6:
+
+Trevis Autotest2 started enforced review-dne-part-1 session for build 71504.
+
+--- Message (Autotest, 2020-02-03 16:00:55.000000000) ---
+Patch Set 6:
+
+Trevis Autotest started enforced review-dne-part-2 session for build 71504.
+
+--- Message (Autotest, 2020-02-03 16:01:04.000000000) ---
+Patch Set 6:
+
+Trevis Autotest2 started enforced review-dne-part-3 session for build 71504.
+
+--- Message (Autotest, 2020-02-03 16:01:15.000000000) ---
+Patch Set 6:
+
+Trevis Autotest started enforced review-dne-part-4 session for build 71504.
+
+--- Message (Autotest, 2020-02-03 16:01:24.000000000) ---
+Patch Set 6:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-1 session for build 71504.
+
+--- Message (Autotest, 2020-02-03 16:01:35.000000000) ---
+Patch Set 6:
+
+Trevis Autotest started enforced review-dne-zfs-part-2 session for build 71504.
+
+--- Message (Autotest, 2020-02-03 16:01:45.000000000) ---
+Patch Set 6:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-3 session for build 71504.
+
+--- Message (Autotest, 2020-02-03 16:01:56.000000000) ---
+Patch Set 6:
+
+Trevis Autotest started enforced review-dne-zfs-part-4 session for build 71504.
+
+--- Message (Autotest, 2020-02-03 16:02:02.000000000) ---
+Patch Set 6:
+
+AT Release Candidate started enforced review-ldiskfs-arm session for build 71504.
+
+--- Message (Neil Brown, 2020-02-03 19:50:01.000000000) ---
+Patch Set 6: Code-Review+1
+
+--- Message (Autotest, 2020-02-03 23:45:12.000000000) ---
+Patch Set 6:
+
+Onyx Autotest started enforced review-dne-part-4 session for build 71504.
+
+--- Message (Autotest, 2020-02-03 23:45:17.000000000) ---
+Patch Set 6:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-2 session for build 71504.
+
+--- Message (Autotest, 2020-02-04 00:41:49.000000000) ---
+Patch Set 6:
+
+Trevis Autotest2 retesting enforced review-dne-part-1 session for build 71504. Requested by James Simmons because of LU-0000.
+
+--- Message (Autotest, 2020-02-04 00:42:23.000000000) ---
+Patch Set 6:
+
+Onyx Autotest retesting enforced review-dne-zfs-part-1 session for build 71504. Requested by James Simmons because of LU-12207.
+
+--- Message (James Simmons, 2020-02-04 22:40:52.000000000) ---
+Patch Set 6:
+
+ping
+
+--- Message (James Simmons, 2020-02-07 12:47:41.000000000) ---
+Patch Set 6:
+
+ping
+
+--- Message (Shaun Tancheff, 2020-02-07 22:13:50.000000000) ---
+Patch Set 6: Code-Review-1
+
+(2 comments)
+
+I think the rcu_lock needs to be fixed.
+
+--- Message (Neil Brown, 2020-02-08 10:54:27.000000000) ---
+Patch Set 6: Code-Review-1
+
+(3 comments)
+
+I gues my earlier review wasn't so good after all...
+
+--- Message (James Simmons, 2020-02-10 14:01:49.000000000) ---
+Uploaded patch set 7.
+
+--- Message (wc-checkpatch, 2020-02-10 14:02:24.000000000) ---
+Patch Set 7:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2020-02-10 14:04:41.000000000) ---
+Patch Set 7:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2020-02-10 15:46:23.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/11847/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews/71676/ : SUCCESS
+
+--- Message (Autotest, 2020-02-10 18:58:09.000000000) ---
+Patch Set 7:
+
+AT Release Candidate started enforced review-ldiskfs session for build 71676.
+
+--- Message (Autotest, 2020-02-10 19:12:36.000000000) ---
+Patch Set 7:
+
+Onyx Autotest started enforced review-zfs session for build 71676.
+
+--- Message (Autotest, 2020-02-10 19:30:24.000000000) ---
+Patch Set 7:
+
+Onyx Autotest started enforced review-dne-part-1 session for build 71676.
+
+--- Message (Shaun Tancheff, 2020-02-10 19:49:11.000000000) ---
+Patch Set 7: Code-Review+1
+
+--- Message (Autotest, 2020-02-10 20:03:09.000000000) ---
+Patch Set 7:
+
+Onyx Autotest started enforced review-dne-part-2 session for build 71676.
+
+--- Message (Autotest, 2020-02-10 20:04:10.000000000) ---
+Patch Set 7:
+
+Trevis Autotest started enforced review-dne-part-3 session for build 71676.
+
+--- Message (Autotest, 2020-02-10 20:04:30.000000000) ---
+Patch Set 7:
+
+Trevis Autotest started enforced review-dne-part-4 session for build 71676.
+
+--- Message (Autotest, 2020-02-10 20:04:47.000000000) ---
+Patch Set 7:
+
+Onyx Autotest started enforced review-dne-zfs-part-1 session for build 71676.
+
+--- Message (Autotest, 2020-02-10 20:04:50.000000000) ---
+Patch Set 7:
+
+Trevis Autotest started enforced review-dne-zfs-part-2 session for build 71676.
+
+--- Message (Autotest, 2020-02-10 20:05:08.000000000) ---
+Patch Set 7:
+
+Onyx Autotest started enforced review-dne-zfs-part-3 session for build 71676.
+
+--- Message (Autotest, 2020-02-10 20:05:10.000000000) ---
+Patch Set 7:
+
+Trevis Autotest started enforced review-dne-zfs-part-4 session for build 71676.
+
+--- Message (Autotest, 2020-02-10 20:05:28.000000000) ---
+Patch Set 7:
+
+Onyx Autotest started enforced review-ldiskfs-arm session for build 71676.
+
+--- Message (Autotest, 2020-02-12 01:07:55.000000000) ---
+Patch Set 7:
+
+Trevis Autotest retesting enforced review-dne-zfs-part-1 session for build 71676. Requested by James Simmons because of LU-13123.
+
+--- Message (Autotest, 2020-02-12 01:08:15.000000000) ---
+Patch Set 7:
+
+Trevis Autotest retesting enforced review-ldiskfs session for build 71676. Requested by James Simmons because of LU-0000.
+
+--- Message (James Simmons, 2020-02-12 12:36:19.000000000) ---
+Patch Set 8: Patch Set 7 was rebased
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2020-02-12 12:37:43.000000000) ---
+Patch Set 8:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2020-02-12 12:39:12.000000000) ---
+Patch Set 8:
+
+Looks good to me.
+
+--- Message (jenkins, 2020-02-12 13:16:45.000000000) ---
+Patch Set 8: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/11925/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews/71756/ : SUCCESS
+
+--- Message (Autotest, 2020-02-12 13:18:23.000000000) ---
+Patch Set 8:
+
+Onyx Autotest started enforced review-ldiskfs session for build 71756.
+
+--- Message (Autotest, 2020-02-12 13:18:35.000000000) ---
+Patch Set 8:
+
+Trevis Autotest started enforced review-zfs session for build 71756.
+
+--- Message (Autotest, 2020-02-12 13:18:53.000000000) ---
+Patch Set 8:
+
+Onyx Autotest started enforced review-dne-part-1 session for build 71756.
+
+--- Message (Autotest, 2020-02-12 13:18:55.000000000) ---
+Patch Set 8:
+
+Trevis Autotest started enforced review-dne-part-2 session for build 71756.
+
+--- Message (Autotest, 2020-02-12 13:19:04.000000000) ---
+Patch Set 8:
+
+Trevis Autotest2 started enforced review-dne-part-3 session for build 71756.
+
+--- Message (Autotest, 2020-02-12 13:19:05.000000000) ---
+Patch Set 8:
+
+AT Release Candidate started enforced review-dne-part-4 session for build 71756.
+
+--- Message (Autotest, 2020-02-12 13:19:14.000000000) ---
+Patch Set 8:
+
+Onyx Autotest started enforced review-dne-zfs-part-1 session for build 71756.
+
+--- Message (Autotest, 2020-02-12 13:19:15.000000000) ---
+Patch Set 8:
+
+Trevis Autotest started enforced review-dne-zfs-part-2 session for build 71756.
+
+--- Message (Autotest, 2020-02-12 13:19:24.000000000) ---
+Patch Set 8:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-3 session for build 71756.
+
+--- Message (Autotest, 2020-02-12 13:19:25.000000000) ---
+Patch Set 8:
+
+AT Release Candidate started enforced review-dne-zfs-part-4 session for build 71756.
+
+--- Message (Autotest, 2020-02-12 13:19:34.000000000) ---
+Patch Set 8:
+
+Onyx Autotest started enforced review-ldiskfs-arm session for build 71756.
+
+--- Message (Autotest, 2020-02-12 13:19:35.000000000) ---
+Patch Set 8:
+
+Trevis Autotest started optional review-dne-selinux session for build 71756.
+
+--- Message (Autotest, 2020-02-12 13:19:46.000000000) ---
+Patch Set 8:
+
+Trevis Autotest2 started optional review-dne-ssk session for build 71756.
+
+--- Message (Autotest, 2020-02-12 13:19:54.000000000) ---
+Patch Set 8:
+
+Onyx Autotest started optional review-ldiskfs-ubuntu session for build 71756.
+
+--- Message (Autotest, 2020-02-12 21:30:42.000000000) ---
+Patch Set 8:
+
+Trevis Autotest retesting enforced review-dne-zfs-part-1 session for build 71756. Requested by James Simmons because of LU-10753.
+
+--- Message (James Simmons, 2020-02-13 15:01:03.000000000) ---
+Patch Set 8:
+
+Neil can you take another look
+
+--- Message (Neil Brown, 2020-02-13 21:53:08.000000000) ---
+Patch Set 8:
+
+> Neil can you take another look
+
+I've got another priority I'm working on this week, but I'll definitely have a look Monday if not before.
+
+--- Message (Neil Brown, 2020-02-16 23:18:38.000000000) ---
+Patch Set 8:
+
+(1 comment)
+
+I cannot find any problems - just one inconsistency that is worth fixing.
+
+--- Message (James Simmons, 2020-02-20 16:36:16.000000000) ---
+Patch Set 8:
+
+(2 comments)
+
+--- Message (Neil Brown, 2020-02-20 22:41:11.000000000) ---
+Patch Set 8:
+
+(1 comment)
+
+--- Message (James Simmons, 2020-02-21 13:17:10.000000000) ---
+Uploaded patch set 9.
+
+--- Message (wc-checkpatch, 2020-02-21 13:18:36.000000000) ---
+Patch Set 9:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2020-02-21 13:20:09.000000000) ---
+Patch Set 9:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2020-02-21 13:55:37.000000000) ---
+Patch Set 9: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/12158/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews/72006/ : SUCCESS
+
+--- Message (Autotest, 2020-02-21 13:56:20.000000000) ---
+Patch Set 9:
+
+Onyx Autotest started enforced review-ldiskfs session for build 72006.
+
+--- Message (Autotest, 2020-02-21 13:56:31.000000000) ---
+Patch Set 9:
+
+Trevis Autotest started enforced review-zfs session for build 72006.
+
+--- Message (Autotest, 2020-02-21 13:56:36.000000000) ---
+Patch Set 9:
+
+Trevis Autotest2 started enforced review-dne-part-1 session for build 72006.
+
+--- Message (Autotest, 2020-02-21 13:56:40.000000000) ---
+Patch Set 9:
+
+Onyx Autotest started enforced review-dne-part-2 session for build 72006.
+
+--- Message (Autotest, 2020-02-21 13:56:51.000000000) ---
+Patch Set 9:
+
+Trevis Autotest started enforced review-dne-part-3 session for build 72006.
+
+--- Message (Autotest, 2020-02-21 13:56:56.000000000) ---
+Patch Set 9:
+
+Trevis Autotest2 started enforced review-dne-part-4 session for build 72006.
+
+--- Message (Autotest, 2020-02-21 13:57:00.000000000) ---
+Patch Set 9:
+
+Onyx Autotest started enforced review-dne-zfs-part-1 session for build 72006.
+
+--- Message (Autotest, 2020-02-21 13:57:11.000000000) ---
+Patch Set 9:
+
+Trevis Autotest started enforced review-dne-zfs-part-2 session for build 72006.
+
+--- Message (Autotest, 2020-02-21 13:57:16.000000000) ---
+Patch Set 9:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-3 session for build 72006.
+
+--- Message (Autotest, 2020-02-21 13:57:20.000000000) ---
+Patch Set 9:
+
+Onyx Autotest started enforced review-dne-zfs-part-4 session for build 72006.
+
+--- Message (Autotest, 2020-02-21 13:57:31.000000000) ---
+Patch Set 9:
+
+Trevis Autotest started enforced review-ldiskfs-arm session for build 72006.
+
+--- Message (Autotest, 2020-02-21 13:57:36.000000000) ---
+Patch Set 9:
+
+Trevis Autotest2 started optional review-dne-selinux session for build 72006.
+
+--- Message (Autotest, 2020-02-21 13:57:41.000000000) ---
+Patch Set 9:
+
+Onyx Autotest started optional review-dne-ssk session for build 72006.
+
+--- Message (Autotest, 2020-02-21 13:57:51.000000000) ---
+Patch Set 9:
+
+Trevis Autotest started optional review-dne-selinux-ssk session for build 72006.
+
+--- Message (Autotest, 2020-02-21 13:57:56.000000000) ---
+Patch Set 9:
+
+Trevis Autotest2 started optional review-ldiskfs-ubuntu session for build 72006.
+
+--- Message (Autotest, 2020-02-21 13:58:11.000000000) ---
+Patch Set 9:
+
+Onyx Autotest started optional review-ldiskfs session for build 72006.
+
+--- Message (Autotest, 2020-02-22 00:23:18.000000000) ---
+Patch Set 9:
+
+Onyx Autotest retesting enforced review-dne-zfs-part-1 session for build 72006. Requested by James Simmons because of LU-11993.
+
+--- Message (Shaun Tancheff, 2020-02-22 05:08:07.000000000) ---
+Patch Set 9: Code-Review+1
+
+--- Message (Neil Brown, 2020-02-22 08:43:28.000000000) ---
+Patch Set 9: Code-Review+1
+
+I think we have a winnder
+
+--- Message (Autotest, 2020-02-22 17:22:04.000000000) ---
+Patch Set 9:
+
+Trevis Autotest retesting enforced review-dne-zfs-part-1 session for build 72006. Requested by James Simmons because of LU-12207.
+
+--- Message (Oleg Drokin, 2020-02-28 04:48:06.000000000) ---
+Patch Set 9:
+
+I got a crash in this code in the boilpot it appears (racer)?
+
+ [40887.903898] Lustre: lustre-MDT0000: Client 2e913c44-d67b-4 (at 192.168.123.185@tcp) reconnecting
+[40887.906675] Lustre: Skipped 26 previous similar messages
+[40893.969415] BUG: unable to handle kernel paging request at ffff88028157de68
+[40893.969697] IP: [<ffffffffa09fc46a>] htable_lookup+0x45a/0x540 [obdclass]
+[40893.969697] PGD 241c067 PUD 33ebfa067 PMD 33ebef067 PTE 800000028157d060
+[40893.969697] Oops: 0000 [#1] SMP DEBUG_PAGEALLOC
+[40893.969697] Modules linked in: lustre(OE) ofd(OE) osp(OE) lod(OE) ost(OE) mdt(OE) mdd(OE) mgs(OE) osd_zfs(OE) lquota(OE) lfsck(OE) obdecho(OE) mgc(OE) lov(OE) mdc(OE) osc(OE) lmv(OE) fid(OE) fld(OE) ptlrpc_gss(OE) ptlrpc(OE) obdclass(OE) ksocklnd(OE) lnet(OE) libcfs(OE) pcc_cpufreq zfs(PO) zunicode(PO) zavl(PO) icp(PO) zcommon(PO) znvpair(PO) spl(O) crc_t10dif crct10dif_generic sb_edac edac_core iosf_mbi crc32_pclmul ghash_clmulni_intel aesni_intel lrw gf128mul glue_helper ablk_helper cryptd pcspkr i2c_piix4 virtio_console virtio_balloon ip_tables rpcsec_gss_krb5 drm_kms_helper ata_generic ttm pata_acpi drm crct10dif_pclmul crct10dif_common ata_piix drm_panel_orientation_quirks virtio_blk crc32c_intel serio_raw libata i2c_core floppy [last unloaded: libcfs]
+[40893.969697] CPU: 2 PID: 28394 Comm: mdt01_012 Kdump: loaded Tainted: P           OE  ------------   3.10.0-7.7-debug #1
+[40893.969697] Hardware name: Red Hat KVM, BIOS 0.5.1 01/01/2011
+[40893.969697] task: ffff8802f3528e40 ti: ffff8802f2974000 task.ti: ffff8802f2974000
+[40893.969697] RIP: 0010:[<ffffffffa09fc46a>]  [<ffffffffa09fc46a>] htable_lookup+0x45a/0x540 [obdclass]
+[40894.008551] RSP: 0018:ffff8802f2977968  EFLAGS: 00010282
+[40894.008551] RAX: ffff8802f3528e40 RBX: ffff8800b16302f8 RCX: 0000000000000001
+[40894.008551] RDX: 0000000000110001 RSI: 0000000000000000 RDI: ffff880234b39c80
+[40894.008551] RBP: ffff8802f29779e0 R08: 0000000000000000 R09: 0000000000000000
+[40894.008551] R10: ffff880271cbedc0 R11: 0000000000000020 R12: 0000000000000000
+[40894.008551] R13: ffff880234b39c80 R14: 0000000000000000 R15: ffff88028157de58
+[40894.008551] FS:  0000000000000000(0000) GS:ffff88033da80000(0000) knlGS:0000000000000000
+[40894.008551] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[40894.008551] CR2: ffff88028157de68 CR3: 0000000001c10000 CR4: 00000000001607e0
+[40894.008551] Call Trace:
+[40894.008551]  [<ffffffffa09fd848>] lu_object_find_at+0x1b8/0x970 [obdclass]
+[40894.008551]  [<ffffffffa0cb357a>] ? __req_capsule_get+0x2aa/0x7e0 [ptlrpc]
+[40894.008551]  [<ffffffffa09fe019>] lu_object_find+0x19/0x20 [obdclass]
+[40894.008551]  [<ffffffffa11c1e2b>] mdt_object_find+0x4b/0x170 [mdt]
+[40894.008551]  [<ffffffffa11c276b>] mdt_intent_opc+0x81b/0xb30 [mdt]
+[40894.008551]  [<ffffffffa11cce90>] ? mdt_intent_getattr+0x480/0x480 [mdt]
+[40894.008551]  [<ffffffffa11ca1a4>] mdt_intent_policy+0x1a4/0x360 [mdt]
+[40894.008551]  [<ffffffffa0c3ee97>] ldlm_lock_enqueue+0x3a7/0xac0 [ptlrpc]
+[40894.008551]  [<ffffffff817d67ce>] ? _raw_read_unlock+0xe/0x20
+[40894.008551]  [<ffffffffa084a6e5>] ? cfs_hash_rw_unlock+0x15/0x20 [libcfs]
+[40894.008551]  [<ffffffffa084d8e6>] ? cfs_hash_add+0xa6/0x180 [libcfs]
+[40894.008551]  [<ffffffffa0c667e6>] ldlm_handle_enqueue0+0xa46/0x15f0 [ptlrpc]
+[40894.008551]  [<ffffffffa0c8b130>] ? lustre_msg_buf_v2+0x1e0/0x1e0 [ptlrpc]
+[40894.008551]  [<ffffffffa0cee982>] tgt_enqueue+0x62/0x210 [ptlrpc]
+[40894.008551]  [<ffffffffa0cf7125>] tgt_request_handle+0x965/0x1650 [ptlrpc]
+[40894.008551]  [<ffffffffa0900c6e>] ? libcfs_nid2str_r+0xfe/0x130 [lnet]
+[40894.008551]  [<ffffffffa0c99f10>] ptlrpc_server_handle_request+0x250/0xb10 [ptlrpc]
+[40894.008551]  [<ffffffffa0c9e1f0>] ptlrpc_main+0xcb0/0x1cb0 [ptlrpc]
+[40894.008551]  [<ffffffffa0c9d540>] ? ptlrpc_register_service+0xff0/0xff0 [ptlrpc]
+[40894.008551]  [<ffffffff810b8254>] kthread+0xe4/0xf0
+[40894.008551]  [<ffffffff810b8170>] ? kthread_create_on_node+0x140/0x140
+[40894.008551]  [<ffffffff817e0ddd>] ret_from_fork_nospec_begin+0x7/0x21
+[40894.008551]  [<ffffffff810b8170>] ? kthread_create_on_node+0x140/0x140
+[40894.008551] Code: 39 c8 0f 84 8b fe ff ff 89 c1 eb e7 89 c6 4c 89 f7 e8 7b 9d a0 e0 e9 aa fd ff ff 4c 8b 6d 88 49 83 c5 10 4c 89 ef e8 66 a1 dd e0 <49> 8b 47 10 a8 01 0f 85 92 00 00 00 4d 8d 67 28 4d 3b 67 28 74 
+[40894.008551] RIP  [<ffffffffa09fc46a>] htable_lookup+0x45a/0x540 [obdclass]
+
+--- Message (Oleg Drokin, 2020-02-28 04:49:23.000000000) ---
+Patch Set 9:
+
+make that two
+
+ [31760.280438] BUG: unable to handle kernel paging request at ffff880279290e68
+[31760.280438] IP: [<ffffffffa0a0646a>] htable_lookup+0x45a/0x540 [obdclass]
+[31760.319806] PGD 241c067 PUD 33edfb067 PMD 33ec31067 PTE 8000000279290060
+[31760.319806] Oops: 0000 [#1] SMP DEBUG_PAGEALLOC
+[31760.319806] Modules linked in: lustre(OE) ofd(OE) osp(OE) lod(OE) ost(OE) mdt(OE) mdd(OE) mgs(OE) osd_zfs(OE) lquota(OE) lfsck(OE) obdecho(OE) mgc(OE) lov(OE) mdc(OE) osc(OE) lmv(OE) fid(OE) fld(OE) ptlrpc_gss(OE) ptlrpc(OE) obdclass(OE) ksocklnd(OE) lnet(OE) libcfs(OE) pcc_cpufreq zfs(PO) zunicode(PO) zavl(PO) icp(PO) zcommon(PO) znvpair(PO) spl(O) crc_t10dif crct10dif_generic sb_edac edac_core iosf_mbi crc32_pclmul ghash_clmulni_intel aesni_intel lrw gf128mul glue_helper ablk_helper cryptd pcspkr virtio_console virtio_balloon i2c_piix4 ip_tables rpcsec_gss_krb5 drm_kms_helper ttm ata_generic drm pata_acpi crct10dif_pclmul drm_panel_orientation_quirks ata_piix crct10dif_common serio_raw crc32c_intel libata floppy virtio_blk i2c_core [last unloaded: libcfs]
+[31760.485088] CPU: 7 PID: 27165 Comm: mdt03_009 Kdump: loaded Tainted: P           OE  ------------   3.10.0-7.7-debug #1
+[31760.522264] Hardware name: Red Hat KVM, BIOS 0.5.1 01/01/2011
+[31760.532237] task: ffff8802a929ad00 ti: ffff88008c8dc000 task.ti: ffff88008c8dc000
+[31760.532237] RIP: 0010:[<ffffffffa0a0646a>]  [<ffffffffa0a0646a>] htable_lookup+0x45a/0x540 [obdclass]
+[31760.532237] RSP: 0018:ffff88008c8dfa18  EFLAGS: 00010286
+[31760.532237] RAX: ffff8802a929ad00 RBX: ffff8802f976e2f8 RCX: 0000000000000001
+[31760.532237] RDX: 0000000000390001 RSI: 0000000000000000 RDI: ffff8801fdd5e7a8
+[31760.532237] RBP: ffff88008c8dfa90 R08: 0000000000000000 R09: 0000000000000000
+[31760.532237] R10: 0000000000000380 R11: ffff88008c8df906 R12: 0000000000000000
+[31760.532237] R13: ffff8801fdd5e7a8 R14: 0000000000000000 R15: ffff880279290e58
+[31760.532237] FS:  0000000000000000(0000) GS:ffff88033dbc0000(0000) knlGS:0000000000000000
+[31760.532237] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[31760.532237] CR2: ffff880279290e68 CR3: 0000000001c10000 CR4: 00000000001607e0
+[31760.597719] Call Trace:
+[31760.597719]  [<ffffffffa0a07848>] lu_object_find_at+0x1b8/0x970 [obdclass]
+[31760.597719]  [<ffffffffa0cbd57a>] ? __req_capsule_get+0x2aa/0x7e0 [ptlrpc]
+[31760.597719]  [<ffffffffa0a08019>] lu_object_find+0x19/0x20 [obdclass]
+[31760.597719]  [<ffffffffa11bfe2b>] mdt_object_find+0x4b/0x170 [mdt]
+[31760.597719]  [<ffffffffa11de961>] mdt_reint_setattr+0x161/0xf90 [mdt]
+[31760.597719]  [<ffffffff812159d2>] ? kfree_debugcheck+0x12/0x30
+[31760.672025]  [<ffffffffa11e2fc0>] mdt_reint_rec+0x80/0x210 [mdt]
+[31760.672025]  [<ffffffffa11bce70>] mdt_reint_internal+0x7b0/0xb90 [mdt]
+[31760.672025]  [<ffffffffa11c83c7>] mdt_reint+0x67/0x140 [mdt]
+[31760.672025]  [<ffffffffa0d01125>] tgt_request_handle+0x965/0x1650 [ptlrpc]
+[31760.672025]  [<ffffffffa090ac6e>] ? libcfs_nid2str_r+0xfe/0x130 [lnet]
+[31760.726916]  [<ffffffffa0ca3f10>] ptlrpc_server_handle_request+0x250/0xb10 [ptlrpc]
+[31760.726916]  [<ffffffffa0ca81f0>] ptlrpc_main+0xcb0/0x1cb0 [ptlrpc]
+[31760.726916]  [<ffffffff810c665d>] ? finish_task_switch+0x5d/0x1b0
+[31760.726916]  [<ffffffffa0ca7540>] ? ptlrpc_register_service+0xff0/0xff0 [ptlrpc]
+[31760.768398]  [<ffffffff810b8254>] kthread+0xe4/0xf0
+[31760.768398]  [<ffffffff810b8170>] ? kthread_create_on_node+0x140/0x140
+[31760.768398]  [<ffffffff817e0ddd>] ret_from_fork_nospec_begin+0x7/0x21
+[31760.768398]  [<ffffffff810b8170>] ? kthread_create_on_node+0x140/0x140
+[31760.768398] Code: 39 c8 0f 84 8b fe ff ff 89 c1 eb e7 89 c6 4c 89 f7 e8 7b fd 9f e0 e9 aa fd ff ff 4c 8b 6d 88 49 83 c5 10 4c 89 ef e8 66 01 dd e0 <49> 8b 47 10 a8 01 0f 85 92 00 00 00 4d 8d 67 28 4d 3b 67 28 74 
+[31760.768398] RIP  [<ffffffffa0a0646a>] htable_lookup+0x45a/0x540 [obdclass]
+
+--- Message (Oleg Drokin, 2020-02-28 04:50:24.000000000) ---
+Patch Set 9: Code-Review-1
+
+or even three
+
+ [26662.174193] BUG: unable to handle kernel paging request at ffff880297dcee59
+[26662.175079] IP: [<ffffffff813f7a80>] memcmp+0x20/0x50
+[26662.175079] PGD 241c067 PUD 33ebfa067 PMD 33eb3b067 PTE 8000000297dce060
+[26662.227743] Oops: 0000 [#1] SMP DEBUG_PAGEALLOC
+[26662.227743] Modules linked in: lustre(OE) ofd(OE) osp(OE) lod(OE) ost(OE) mdt(OE) mdd(OE) mgs(OE) osd_zfs(OE) lquota(OE) lfsck(OE) obdecho(OE) mgc(OE) lov(OE) mdc(OE) osc(OE) lmv(OE) fid(OE) fld(OE) ptlrpc_gss(OE) ptlrpc(OE) obdclass(OE) ksocklnd(OE) lnet(OE) libcfs(OE) pcc_cpufreq zfs(PO) zunicode(PO) zavl(PO) icp(PO) zcommon(PO) znvpair(PO) spl(O) crc_t10dif crct10dif_generic sb_edac edac_core iosf_mbi crc32_pclmul ghash_clmulni_intel aesni_intel lrw gf128mul glue_helper ablk_helper cryptd pcspkr virtio_balloon virtio_console i2c_piix4 ip_tables rpcsec_gss_krb5 drm_kms_helper ata_generic ttm pata_acpi drm crct10dif_pclmul drm_panel_orientation_quirks ata_piix crct10dif_common crc32c_intel i2c_core virtio_blk serio_raw libata floppy [last unloaded: libcfs]
+[26662.227743] CPU: 11 PID: 5382 Comm: mdt05_018 Kdump: loaded Tainted: P           OE  ------------   3.10.0-7.7-debug #1
+[26662.227743] Hardware name: Red Hat KVM, BIOS 0.5.1 01/01/2011
+[26662.227743] task: ffff8802a06be1c0 ti: ffff88008e8fc000 task.ti: ffff88008e8fc000
+[26662.227743] RIP: 0010:[<ffffffff813f7a80>]  [<ffffffff813f7a80>] memcmp+0x20/0x50
+[26662.227743] RSP: 0018:ffff88008e8ffa08  EFLAGS: 00010293
+[26662.227743] RAX: 0000000000000000 RBX: 0000000000000010 RCX: 0000000000000000
+[26662.227743] RDX: 000000000000000f RSI: ffff88009f6e4080 RDI: ffff880297dcee58
+[26662.227743] RBP: ffff88008e8ffa08 R08: 0000000000000010 R09: 00000000000000f0
+[26662.227743] R10: 0000000000000580 R11: 0000000000000001 R12: ffffffffffffffe0
+[26662.227743] R13: ffff880297dcee78 R14: 0000000000000000 R15: ffff880297dcee58
+[26662.227743] FS:  0000000000000000(0000) GS:ffff88033dcc0000(0000) knlGS:0000000000000000
+[26662.425412] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[26662.425412] CR2: ffff880297dcee59 CR3: 0000000001c10000 CR4: 00000000001607e0
+[26662.425412] Call Trace:
+[26662.573185]  [<ffffffffa0a09263>] htable_lookup+0x253/0x540 [obdclass]
+[26662.573185]  [<ffffffffa0a0a848>] lu_object_find_at+0x1b8/0x970 [obdclass]
+[26662.573185]  [<ffffffffa0cc057a>] ? __req_capsule_get+0x2aa/0x7e0 [ptlrpc]
+[26662.573185]  [<ffffffffa0a0b019>] lu_object_find+0x19/0x20 [obdclass]
+[26662.573185]  [<ffffffffa11c3e2b>] mdt_object_find+0x4b/0x170 [mdt]
+[26662.573185]  [<ffffffffa11e2961>] mdt_reint_setattr+0x161/0xf90 [mdt]
+[26662.573185]  [<ffffffffa0c98147>] ? lustre_msg_buf+0x17/0x60 [ptlrpc]
+[26662.573185]  [<ffffffffa11d2682>] ? ucred_set_audit_enabled.isra.11+0x22/0x60 [mdt]
+[26662.573185]  [<ffffffffa11e6fc0>] mdt_reint_rec+0x80/0x210 [mdt]
+[26662.573185]  [<ffffffffa11c0e70>] mdt_reint_internal+0x7b0/0xb90 [mdt]
+[26662.573185]  [<ffffffffa11cc3c7>] mdt_reint+0x67/0x140 [mdt]
+[26662.573185]  [<ffffffffa0d04125>] tgt_request_handle+0x965/0x1650 [ptlrpc]
+[26662.573185]  [<ffffffffa090dc6e>] ? libcfs_nid2str_r+0xfe/0x130 [lnet]
+[26662.573185]  [<ffffffffa0ca6f10>] ptlrpc_server_handle_request+0x250/0xb10 [ptlrpc]
+[26662.573185]  [<ffffffff810c6941>] ? __wake_up_common_lock+0x91/0xc0
+[26662.573185]  [<ffffffff810c6250>] ? sched_feat_set+0xf0/0xf0
+[26662.573185]  [<ffffffffa0cab1f0>] ptlrpc_main+0xcb0/0x1cb0 [ptlrpc]
+[26662.573185]  [<ffffffff810c665d>] ? finish_task_switch+0x5d/0x1b0
+[26662.573185]  [<ffffffffa0caa540>] ? ptlrpc_register_service+0xff0/0xff0 [ptlrpc]
+[26662.573185]  [<ffffffff810b8254>] kthread+0xe4/0xf0
+[26662.573185]  [<ffffffff810b8170>] ? kthread_create_on_node+0x140/0x140
+[26662.573185]  [<ffffffff817e0ddd>] ret_from_fork_nospec_begin+0x7/0x21
+[26662.573185]  [<ffffffff810b8170>] ? kthread_create_on_node+0x140/0x140
+[26662.573185] Code: 83 c1 01 48 39 d1 75 f3 5d c3 90 55 48 85 d2 48 89 e5 74 3c 0f b6 07 0f b6 0e 29 c8 75 27 48 83 ea 01 31 c9 eb 1a 0f 1f 44 00 00 <44> 0f b6 4c 0f 01 44 0f b6 44 0e 01 48 83 c1 01 45 29 c1 75 0b 
+[26662.573185] RIP  [<ffffffff813f7a80>] memcmp+0x20/0x50
+
+--- Message (Neil Brown, 2020-02-28 07:05:49.000000000) ---
+Patch Set 9: Code-Review-1
+
+Just putting it out there...
+I would very occasionally be very useful for the  RIP address (htable_lookup+0x45a/0x540 in the first case) to be mapped to a code line.
+The linux kernel has a script that does this, providing you have the (unstripped) binary.
+ ./scripts/faddr2line objectfile RIP-address.
+
+In this case, I *think* it is  the "lu_object_is_dying(h) test lin htable_lookup, implying that 'h' has been freed.
+The fact we got here means atomic_inc_not_zero failed so the object is being removed. 
+Ahhhh... we don't use rcu to free these objects, so it isn't safe to use rhashable_lookup() without some locking.  It looks like it might be awkward to use rcu to free the header here.
+So it is probably easiest to take lsb_waitq.lock before the rhashtable lookup, rather than after the atomic_inc_not_zero.
+
+--- Message (Neil Brown, 2020-02-28 07:13:08.000000000) ---
+Uploaded patch set 10.
+
+--- Message (Neil Brown, 2020-02-28 07:13:53.000000000) ---
+Patch Set 10:
+
+James: given the locking change, it would be worth re-testing the performance improvement.  Maybe it will be worth using RCU to free these objects.
+
+--- Message (wc-checkpatch, 2020-02-28 07:15:35.000000000) ---
+Patch Set 10:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2020-02-28 07:15:46.000000000) ---
+Patch Set 10:
+
+Code-wise looks good to me.
+
+--- Message (Autotest, 2020-02-28 08:56:46.000000000) ---
+Patch Set 10:
+
+Onyx Autotest started enforced review-zfs session for build 72262.
+
+--- Message (Autotest, 2020-02-28 08:56:51.000000000) ---
+Patch Set 10:
+
+Trevis Autotest2 started enforced review-ldiskfs session for build 72262.
+
+--- Message (Autotest, 2020-02-28 08:57:06.000000000) ---
+Patch Set 10:
+
+Onyx Autotest started enforced review-dne-part-1 session for build 72262.
+
+--- Message (Autotest, 2020-02-28 08:57:11.000000000) ---
+Patch Set 10:
+
+Trevis Autotest2 started enforced review-dne-part-2 session for build 72262.
+
+--- Message (Autotest, 2020-02-28 08:57:27.000000000) ---
+Patch Set 10:
+
+Onyx Autotest started enforced review-dne-part-3 session for build 72262.
+
+--- Message (Autotest, 2020-02-28 08:57:31.000000000) ---
+Patch Set 10:
+
+Trevis Autotest2 started enforced review-dne-part-4 session for build 72262.
+
+--- Message (Autotest, 2020-02-28 08:57:47.000000000) ---
+Patch Set 10:
+
+Onyx Autotest started enforced review-dne-zfs-part-1 session for build 72262.
+
+--- Message (Autotest, 2020-02-28 08:57:51.000000000) ---
+Patch Set 10:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-2 session for build 72262.
+
+--- Message (Autotest, 2020-02-28 08:58:07.000000000) ---
+Patch Set 10:
+
+Onyx Autotest started enforced review-dne-zfs-part-3 session for build 72262.
+
+--- Message (Autotest, 2020-02-28 08:58:12.000000000) ---
+Patch Set 10:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-4 session for build 72262.
+
+--- Message (Autotest, 2020-02-28 08:58:27.000000000) ---
+Patch Set 10:
+
+Onyx Autotest started enforced review-ldiskfs-arm session for build 72262.
+
+--- Message (Autotest, 2020-02-28 08:58:32.000000000) ---
+Patch Set 10:
+
+Trevis Autotest2 started optional review-dne-selinux session for build 72262.
+
+--- Message (Autotest, 2020-02-28 08:58:52.000000000) ---
+Patch Set 10:
+
+Trevis Autotest2 started optional review-dne-selinux-ssk session for build 72262.
+
+--- Message (Autotest, 2020-02-28 08:59:12.000000000) ---
+Patch Set 10:
+
+Trevis Autotest2 started optional review-ldiskfs session for build 72262.
+
+--- Message (jenkins, 2020-02-28 11:07:26.000000000) ---
+Patch Set 10: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/12383/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews/72262/ : SUCCESS
+
+--- Message (Autotest, 2020-02-28 17:28:46.000000000) ---
+Patch Set 10:
+
+Trevis Autotest2 retesting enforced review-ldiskfs-arm session for build 72262. Requested by James Simmons because of LU-0000.
+
+--- Message (James Simmons, 2020-03-03 01:29:49.000000000) ---
+Patch Set 10:
+
+Sorry we lost a drive in our file system.
+
+--- Message (James Simmons, 2020-03-05 15:44:18.000000000) ---
+Uploaded patch set 11.
+
+--- Message (James Simmons, 2020-03-05 15:46:46.000000000) ---
+Patch Set 11:
+
+I updated the numbers. The results are still pretty close to what was before :-)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2020-03-05 15:46:53.000000000) ---
+Patch Set 11:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2020-03-05 15:48:17.000000000) ---
+Patch Set 11:
+
+Looks good to me.
+
+--- Message (jenkins, 2020-03-05 16:13:57.000000000) ---
+Patch Set 11: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/12548/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews/72443/ : SUCCESS
+
+--- Message (Autotest, 2020-03-05 16:14:16.000000000) ---
+Patch Set 11:
+
+Trevis Autotest started enforced review-ldiskfs session for build 72443.
+
+--- Message (Autotest, 2020-03-05 16:14:36.000000000) ---
+Patch Set 11:
+
+Trevis Autotest started enforced review-dne-part-1 session for build 72443.
+
+--- Message (Autotest, 2020-03-05 16:14:40.000000000) ---
+Patch Set 11:
+
+Trevis Autotest2 started enforced review-zfs session for build 72443.
+
+--- Message (Autotest, 2020-03-05 16:14:57.000000000) ---
+Patch Set 11:
+
+Trevis Autotest started enforced review-dne-part-3 session for build 72443.
+
+--- Message (Autotest, 2020-03-05 16:15:01.000000000) ---
+Patch Set 11:
+
+Trevis Autotest2 started enforced review-dne-part-2 session for build 72443.
+
+--- Message (Autotest, 2020-03-05 16:15:21.000000000) ---
+Patch Set 11:
+
+Trevis Autotest2 started enforced review-dne-part-4 session for build 72443.
+
+--- Message (Autotest, 2020-03-05 16:15:27.000000000) ---
+Patch Set 11:
+
+Trevis Autotest started enforced review-dne-zfs-part-1 session for build 72443.
+
+--- Message (Autotest, 2020-03-05 16:15:41.000000000) ---
+Patch Set 11:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-2 session for build 72443.
+
+--- Message (Autotest, 2020-03-05 16:15:47.000000000) ---
+Patch Set 11:
+
+Trevis Autotest started enforced review-dne-zfs-part-3 session for build 72443.
+
+--- Message (Autotest, 2020-03-05 16:16:01.000000000) ---
+Patch Set 11:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-4 session for build 72443.
+
+--- Message (Autotest, 2020-03-05 16:16:07.000000000) ---
+Patch Set 11:
+
+Trevis Autotest started enforced review-ldiskfs-arm session for build 72443.
+
+--- Message (James Simmons, 2020-03-05 18:35:17.000000000) ---
+Patch Set 11: Code-Review+1
+
+I will need your review Neil.
+
+--- Message (James Simmons, 2020-03-06 12:24:09.000000000) ---
+Patch Set 11:
+
+ping
+
+--- Message (Shaun Tancheff, 2020-03-06 17:31:57.000000000) ---
+Patch Set 11: Code-Review+1
+
+--- Message (James Simmons, 2020-03-09 14:23:08.000000000) ---
+Patch Set 11:
+
+Neil can you take one last look
+
+--- Message (Neil Brown, 2020-03-09 22:09:26.000000000) ---
+Patch Set 11: Code-Review+1
+
+--- Message (Oleg Drokin, 2020-03-13 17:34:27.000000000) ---
+Patch Set 11: Verified-1
+
+Looks like the crash is still there, just a bit less frequent?
+
+ [17753.253030] BUG: unable to handle kernel paging request at ffff88008b0fde70
+[17753.278282] IP: [<ffffffffa0a03418>] htable_lookup+0x228/0x500 [obdclass]
+[17753.293965] PGD 241c067 PUD 33fa01067 PMD 33f9a8067 PTE 800000008b0fd060
+[17753.293965] Oops: 0000 [#1] SMP DEBUG_PAGEALLOC
+[17753.301813] Modules linked in: lustre(OE) ofd(OE) osp(OE) lod(OE) ost(OE) mdt(OE) mdd(OE) mgs(OE) osd_zfs(OE) lquota(OE) lfsck(OE) obdecho(OE) mgc(OE) lov(OE) mdc(OE) osc(OE) lmv(OE) fid(OE) fld(OE) ptlrpc_gss(OE) ptlrpc(OE) obdclass(OE) ksocklnd(OE) lnet(OE) libcfs(OE) pcc_cpufreq zfs(PO) zunicode(PO) zavl(PO) icp(PO) zcommon(PO) znvpair(PO) spl(O) crc_t10dif crct10dif_generic sb_edac edac_core iosf_mbi crc32_pclmul ghash_clmulni_intel aesni_intel lrw gf128mul glue_helper ablk_helper cryptd pcspkr virtio_balloon virtio_console i2c_piix4 ip_tables rpcsec_gss_krb5 ata_generic drm_kms_helper pata_acpi ttm crct10dif_pclmul drm crct10dif_common ata_piix drm_panel_orientation_quirks crc32c_intel virtio_blk serio_raw libata i2c_core floppy [last unloaded: libcfs]
+[17753.310125] CPU: 15 PID: 28329 Comm: mdt07_001 Kdump: loaded Tainted: P           OE  ------------   3.10.0-7.7-debug #1
+[17753.310125] Hardware name: Red Hat KVM, BIOS 0.5.1 01/01/2011
+[17753.310125] task: ffff880065a88a40 ti: ffff8802f0c38000 task.ti: ffff8802f0c38000
+[17753.310125] RIP: 0010:[<ffffffffa0a03418>]  [<ffffffffa0a03418>] htable_lookup+0x228/0x500 [obdclass]
+[17753.401765] RSP: 0018:ffff8802f0c3b7d0  EFLAGS: 00010286
+[17753.401765] RAX: 00000000ffffffff RBX: 0000000000000010 RCX: 0000000000000001
+[17753.401765] RDX: 0000000000000010 RSI: ffff88020cc45cc8 RDI: ffff88008b0fde50
+[17753.401765] RBP: ffff8802f0c3b840 R08: 00000000000000b8 R09: 0000000000000050
+[17753.401765] R10: ffff880000000aa0 R11: 0000000000000000 R12: ffff88008b0fde70
+[17753.401765] R13: ffff88008b0fde50 R14: ffffffffffffffe0 R15: 0000000000000000
+[17753.401765] FS:  0000000000000000(0000) GS:ffff88033ddc0000(0000) knlGS:0000000000000000
+[17753.456412] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[17753.456412] CR2: ffff88008b0fde70 CR3: 00000000ac4d8000 CR4: 00000000001607e0
+[17753.456412] Call Trace:
+[17753.460933]  [<ffffffffa0a05758>] lu_object_find_at+0x1b8/0x970 [obdclass]
+[17753.460933]  [<ffffffffa0c92137>] ? lustre_msg_buf+0x17/0x60 [ptlrpc]
+[17753.460933]  [<ffffffffa0a05f29>] lu_object_find+0x19/0x20 [obdclass]
+[17753.514652]  [<ffffffffa11f1efb>] mdt_object_find+0x4b/0x170 [mdt]
+[17753.514652]  [<ffffffffa1221528>] mdt_reint_open+0x1048/0x3420 [mdt]
+[17753.514652]  [<ffffffffa0a1ccc6>] ? upcall_cache_get_entry+0x3d6/0x8a0 [obdclass]
+[17753.514652]  [<ffffffffa1215130>] mdt_reint_rec+0x80/0x210 [mdt]
+[17753.530261]  [<ffffffffa11eef00>] mdt_reint_internal+0x7b0/0xb70 [mdt]
+[17753.530261]  [<ffffffffa11fb786>] ? mdt_intent_fixup_resent+0x36/0x220 [mdt]
+[17753.530261]  [<ffffffffa11fb9f2>] mdt_intent_open+0x82/0x3a0 [mdt]
+[17753.530261]  [<ffffffffa11f21d7>] mdt_intent_opc+0x1b7/0xb30 [mdt]
+[17753.530261]  [<ffffffffa0c92d00>] ? lustre_msg_get_versions+0x90/0xf0 [ptlrpc]
+[17753.530261]  [<ffffffffa11fb970>] ? mdt_intent_fixup_resent+0x220/0x220 [mdt]
+[17753.530261]  [<ffffffffa11fa254>] mdt_intent_policy+0x1a4/0x360 [mdt]
+[17753.530261]  [<ffffffffa0c45e87>] ldlm_lock_enqueue+0x3a7/0xac0 [ptlrpc]
+[17753.530261]  [<ffffffff817d67ce>] ? _raw_read_unlock+0xe/0x20
+[17753.530261]  [<ffffffffa02e7705>] ? cfs_hash_rw_unlock+0x15/0x20 [libcfs]
+[17753.530261]  [<ffffffffa02ea906>] ? cfs_hash_add+0xa6/0x180 [libcfs]
+[17753.530261]  [<ffffffffa0c6d7d6>] ldlm_handle_enqueue0+0xa46/0x15f0 [ptlrpc]
+[17753.530261]  [<ffffffffa0c92100>] ? lustre_msg_buf_v2+0x1c0/0x1e0 [ptlrpc]
+[17753.530261]  [<ffffffffa0cf57e2>] tgt_enqueue+0x62/0x210 [ptlrpc]
+[17753.530261]  [<ffffffffa0cfdf85>] tgt_request_handle+0x965/0x1650 [ptlrpc]
+[17753.530261]  [<ffffffffa08bce6e>] ? libcfs_nid2str_r+0xfe/0x130 [lnet]
+[17753.530261]  [<ffffffffa0ca0fe0>] ptlrpc_server_handle_request+0x250/0xb10 [ptlrpc]
+[17753.530261]  [<ffffffff810c6941>] ? __wake_up_common_lock+0x91/0xc0
+[17753.530261]  [<ffffffff810c6250>] ? sched_feat_set+0xf0/0xf0
+[17753.530261]  [<ffffffffa0ca52c0>] ptlrpc_main+0xcb0/0x1cb0 [ptlrpc]
+[17753.530261]  [<ffffffffa0ca4610>] ? ptlrpc_register_service+0xff0/0xff0 [ptlrpc]
+[17753.530261]  [<ffffffff810b8254>] kthread+0xe4/0xf0
+[17753.530261]  [<ffffffff810b8170>] ? kthread_create_on_node+0x140/0x140
+[17753.530261]  [<ffffffff817e0ddd>] ret_from_fork_nospec_begin+0x7/0x21
+[17753.530261]  [<ffffffff810b8170>] ? kthread_create_on_node+0x140/0x140
+[17753.530261] Code: f3 01 00 00 44 0f b7 6b 16 0f b7 4b 12 44 0f b7 7b 14 4c 89 75 a0 48 89 5d a8 49 f7 dd 48 89 cb 4d 89 ee eb 14 66 0f 1f 44 00 00 <4d> 8b 24 24 41 f6 c4 01 0f 85 b6 01 00 00 4f 8d 2c 34 48 8b 75 
+[17753.530261] RIP  [<ffffffffa0a03418>] htable_lookup+0x228/0x500 [obdclass]
+
+--- Message (Neil Brown, 2020-03-18 00:13:39.000000000) ---
+Patch Set 11: Code-Review-1
+
+I know what's wrong - I should have seen it before.
+
+Best practice is to use RCU to protect access to an rhashtable, and to use rcu_free (or similar) to free objects.  We don't do that here.
+
+You don't need to use RCU to protect the rhastable but if you don't, you need to use some lock - a spinlock or mutex or any other exclusive lock.  This will ensure that nothing in the table is freed while a lookup is happening.
+When I added locking in the most recent change, I didn't do it problem.
+I used a sharded lock.  There are multiple bkt->lsb_waitq.locks, one for each bucket.  These do not align with buckets in the rhashtable.  So holding one lock doesn't prevent something associated with a different bucket from being freed.
+
+We need to either use a single lock (which will likely hurt performance) to use RCU to free objects.  I will look into doing the latter (which I guess I should have done in the first place).
+
+--- Message (Neil Brown, 2020-03-18 03:02:38.000000000) ---
+Uploaded patch set 12.
+
+--- Message (wc-checkpatch, 2020-03-18 03:03:26.000000000) ---
+Patch Set 12:
+
+Looks good to me.
+
+--- Message (jenkins, 2020-03-18 03:44:49.000000000) ---
+Patch Set 12: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/72761/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/12850/ : SUCCESS
+
+--- Message (Autotest, 2020-03-18 03:45:45.000000000) ---
+Patch Set 12:
+
+Trevis Autotest started enforced review-ldiskfs session for build 72761.
+
+--- Message (Autotest, 2020-03-18 03:45:56.000000000) ---
+Patch Set 12:
+
+Onyx Autotest started enforced review-dne-part-1 session for build 72761.
+
+--- Message (Autotest, 2020-03-18 03:46:01.000000000) ---
+Patch Set 12:
+
+Trevis Autotest2 started enforced review-zfs session for build 72761.
+
+--- Message (Autotest, 2020-03-18 03:46:05.000000000) ---
+Patch Set 12:
+
+Trevis Autotest started enforced review-dne-part-2 session for build 72761.
+
+--- Message (Autotest, 2020-03-18 03:46:16.000000000) ---
+Patch Set 12:
+
+Onyx Autotest started enforced review-dne-part-4 session for build 72761.
+
+--- Message (Autotest, 2020-03-18 03:46:21.000000000) ---
+Patch Set 12:
+
+Trevis Autotest2 started enforced review-dne-part-3 session for build 72761.
+
+--- Message (Autotest, 2020-03-18 03:46:25.000000000) ---
+Patch Set 12:
+
+Trevis Autotest started enforced review-dne-zfs-part-1 session for build 72761.
+
+--- Message (Autotest, 2020-03-18 03:46:36.000000000) ---
+Patch Set 12:
+
+Onyx Autotest started enforced review-dne-zfs-part-3 session for build 72761.
+
+--- Message (Autotest, 2020-03-18 03:46:41.000000000) ---
+Patch Set 12:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-2 session for build 72761.
+
+--- Message (Autotest, 2020-03-18 03:46:45.000000000) ---
+Patch Set 12:
+
+Trevis Autotest started enforced review-dne-zfs-part-4 session for build 72761.
+
+--- Message (Autotest, 2020-03-18 03:46:56.000000000) ---
+Patch Set 12:
+
+Onyx Autotest started optional review-dne-selinux session for build 72761.
+
+--- Message (Autotest, 2020-03-18 03:47:01.000000000) ---
+Patch Set 12:
+
+Trevis Autotest2 started enforced review-ldiskfs-arm session for build 72761.
+
+--- Message (Autotest, 2020-03-18 03:47:06.000000000) ---
+Patch Set 12:
+
+Trevis Autotest started optional review-dne-ssk session for build 72761.
+
+--- Message (Autotest, 2020-03-18 03:47:16.000000000) ---
+Patch Set 12:
+
+Onyx Autotest started optional review-ldiskfs-ubuntu session for build 72761.
+
+--- Message (Autotest, 2020-03-18 03:47:21.000000000) ---
+Patch Set 12:
+
+Trevis Autotest2 started optional review-dne-selinux-ssk session for build 72761.
+
+--- Message (Autotest, 2020-03-18 03:47:25.000000000) ---
+Patch Set 12:
+
+Trevis Autotest started optional review-ldiskfs session for build 72761.
+
+--- Message (Autotest, 2020-03-18 23:23:16.000000000) ---
+Patch Set 12:
+
+Trevis Autotest2 retesting enforced review-dne-zfs-part-1 session for build 72761. Requested by Neil Brown because of LU-10753.
+
+--- Message (James Simmons, 2020-03-19 23:34:55.000000000) ---
+Patch Set 12: Code-Review+1
+
+The performance numbers still hold :-)
+
+--- Message (Shaun Tancheff, 2020-03-24 07:39:44.000000000) ---
+Patch Set 12: Code-Review+1
+
+(1 comment)
+
+--- Message (Neil Brown, 2020-03-24 22:03:46.000000000) ---
+Patch Set 12: Code-Review-1
+
+(1 comment)
+
+I'll resubmit...
+
+--- Message (Neil Brown, 2020-03-24 22:11:01.000000000) ---
+Patch Set 12:
+
+(1 comment)
+
+--- Message (Neil Brown, 2020-03-24 22:12:47.000000000) ---
+Uploaded patch set 13.
+
+--- Message (wc-checkpatch, 2020-03-24 22:13:12.000000000) ---
+Patch Set 13:
+
+Looks good to me.
+
+--- Message (Shaun Tancheff, 2020-03-24 22:45:21.000000000) ---
+Patch Set 13: Code-Review+1
+
+--- Message (Autotest, 2020-03-24 23:46:41.000000000) ---
+Patch Set 13:
+
+AT Release Candidate started enforced review-ldiskfs session for build 72912.
+
+--- Message (Autotest, 2020-03-24 23:47:01.000000000) ---
+Patch Set 13:
+
+AT Release Candidate started enforced review-zfs session for build 72912.
+
+--- Message (Autotest, 2020-03-24 23:47:40.000000000) ---
+Patch Set 13:
+
+Onyx Autotest started enforced review-dne-part-2 session for build 72912.
+
+--- Message (Autotest, 2020-03-24 23:47:57.000000000) ---
+Patch Set 13:
+
+Trevis Autotest2 started enforced review-dne-part-3 session for build 72912.
+
+--- Message (Autotest, 2020-03-24 23:48:00.000000000) ---
+Patch Set 13:
+
+Trevis Autotest started enforced review-dne-part-4 session for build 72912.
+
+--- Message (Autotest, 2020-03-24 23:48:01.000000000) ---
+Patch Set 13:
+
+Onyx Autotest started enforced review-dne-zfs-part-1 session for build 72912.
+
+--- Message (Autotest, 2020-03-24 23:48:17.000000000) ---
+Patch Set 13:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-2 session for build 72912.
+
+--- Message (Autotest, 2020-03-24 23:48:20.000000000) ---
+Patch Set 13:
+
+Onyx Autotest started enforced review-dne-zfs-part-4 session for build 72912.
+
+--- Message (Autotest, 2020-03-24 23:48:20.000000000) ---
+Patch Set 13:
+
+Trevis Autotest started enforced review-dne-zfs-part-3 session for build 72912.
+
+--- Message (Autotest, 2020-03-24 23:48:38.000000000) ---
+Patch Set 13:
+
+Trevis Autotest2 started enforced review-ldiskfs-arm session for build 72912.
+
+--- Message (Autotest, 2020-03-24 23:48:40.000000000) ---
+Patch Set 13:
+
+Onyx Autotest started optional review-dne-ssk session for build 72912.
+
+--- Message (Autotest, 2020-03-24 23:48:40.000000000) ---
+Patch Set 13:
+
+Trevis Autotest started optional review-dne-selinux session for build 72912.
+
+--- Message (Autotest, 2020-03-24 23:48:58.000000000) ---
+Patch Set 13:
+
+Trevis Autotest2 started optional review-ldiskfs-ubuntu session for build 72912.
+
+--- Message (Autotest, 2020-03-24 23:49:00.000000000) ---
+Patch Set 13:
+
+Trevis Autotest started optional review-dne-selinux-ssk session for build 72912.
+
+--- Message (Autotest, 2020-03-24 23:49:01.000000000) ---
+Patch Set 13:
+
+Onyx Autotest started optional review-ldiskfs session for build 72912.
+
+--- Message (Autotest, 2020-03-25 00:00:13.000000000) ---
+Patch Set 13:
+
+AT Release Candidate started enforced review-dne-part-1 session for build 72912.
+
+--- Message (jenkins, 2020-03-25 00:22:08.000000000) ---
+Patch Set 13: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/72912/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/13000/ : SUCCESS
+
+--- Message (James Simmons, 2020-03-25 12:27:38.000000000) ---
+Patch Set 13: Code-Review+1
+
+Neil you will need to review your own patch. Yeah its strange.
+
+--- Message (Neil Brown, 2020-03-25 23:00:08.000000000) ---
+Patch Set 13: Code-Review+1
+
+--- Message (wc-checkpatch, 2020-03-31 07:26:29.000000000) ---
+Patch Set 13: Code-Review-1
+
+This change cannot be cherry-picked to master.
+Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (James Simmons, 2020-03-31 12:07:53.000000000) ---
+Uploaded patch set 14.
+
+--- Message (wc-checkpatch, 2020-03-31 12:12:01.000000000) ---
+Patch Set 14:
+
+Looks good to me.
+
+--- Message (jenkins, 2020-03-31 12:37:39.000000000) ---
+Patch Set 14: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/73012/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/13093/ : SUCCESS
+
+--- Message (Autotest, 2020-03-31 12:39:36.000000000) ---
+Patch Set 14:
+
+Onyx Autotest started enforced review-ldiskfs session for build 73012.
+
+--- Message (Autotest, 2020-03-31 12:39:37.000000000) ---
+Patch Set 14:
+
+Trevis Autotest2 started enforced review-dne-part-1 session for build 73012.
+
+--- Message (Autotest, 2020-03-31 12:39:38.000000000) ---
+Patch Set 14:
+
+AT Release Candidate started enforced review-dne-part-2 session for build 73012.
+
+--- Message (Autotest, 2020-03-31 12:39:41.000000000) ---
+Patch Set 14:
+
+Trevis Autotest started enforced review-zfs session for build 73012.
+
+--- Message (Autotest, 2020-03-31 12:39:57.000000000) ---
+Patch Set 14:
+
+Onyx Autotest started enforced review-dne-part-4 session for build 73012.
+
+--- Message (Autotest, 2020-03-31 12:39:57.000000000) ---
+Patch Set 14:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-1 session for build 73012.
+
+--- Message (Autotest, 2020-03-31 12:40:01.000000000) ---
+Patch Set 14:
+
+Trevis Autotest started enforced review-dne-part-3 session for build 73012.
+
+--- Message (Autotest, 2020-03-31 12:40:17.000000000) ---
+Patch Set 14:
+
+Onyx Autotest started enforced review-dne-zfs-part-4 session for build 73012.
+
+--- Message (Autotest, 2020-03-31 12:40:17.000000000) ---
+Patch Set 14:
+
+Trevis Autotest2 started enforced review-ldiskfs-arm session for build 73012.
+
+--- Message (Autotest, 2020-03-31 12:40:21.000000000) ---
+Patch Set 14:
+
+Trevis Autotest started enforced review-dne-zfs-part-3 session for build 73012.
+
+--- Message (Autotest, 2020-03-31 12:40:37.000000000) ---
+Patch Set 14:
+
+Onyx Autotest started optional review-dne-selinux-ssk session for build 73012.
+
+--- Message (Autotest, 2020-03-31 12:40:37.000000000) ---
+Patch Set 14:
+
+Trevis Autotest2 started optional review-dne-ssk session for build 73012.
+
+--- Message (Autotest, 2020-03-31 12:40:41.000000000) ---
+Patch Set 14:
+
+Trevis Autotest started optional review-dne-selinux session for build 73012.
+
+--- Message (Autotest, 2020-03-31 12:40:57.000000000) ---
+Patch Set 14:
+
+Trevis Autotest2 started optional review-ldiskfs session for build 73012.
+
+--- Message (Autotest, 2020-03-31 12:41:01.000000000) ---
+Patch Set 14:
+
+Trevis Autotest started optional review-ldiskfs-ubuntu session for build 73012.
+
+--- Message (James Simmons, 2020-03-31 13:22:00.000000000) ---
+Patch Set 14: Code-Review+1
+
+--- Message (Autotest, 2020-03-31 15:42:10.000000000) ---
+Patch Set 14:
+
+AT Release Candidate started enforced review-dne-zfs-part-2 session for build 73012.
+
+--- Message (Autotest, 2020-03-31 17:34:21.000000000) ---
+Patch Set 14:
+
+AT Release Candidate started optional review-ldiskfs-ubuntu session for build 73012.
+
+--- Message (Autotest, 2020-03-31 17:40:51.000000000) ---
+Patch Set 14:
+
+AT Release Candidate started optional review-dne-selinux-ssk session for build 73012.
+
+--- Message (Neil Brown, 2020-03-31 21:31:46.000000000) ---
+Patch Set 14: Code-Review-1
+
+You lost my last change. From patchset 12 to 13 I moved the rcu_read_lock up before the list_empty() test and added a comment : /* Now protected by spinlock */
+
+--- Message (James Simmons, 2020-04-01 02:25:07.000000000) ---
+Patch Set 14:
+
+A diff against version 13 show no significant difference. Can you push a proper version then.
+
+--- Message (James Simmons, 2020-04-01 02:34:42.000000000) ---
+Patch Set 14:
+
+(1 comment)
+
+--- Message (Neil Brown, 2020-04-01 03:17:10.000000000) ---
+Patch Set 14: Code-Review+1
+
+Sorry - I diffed it against my version and misread the diff :-(
+It's good.
+
+--- Message (Autotest, 2020-04-01 11:24:39.000000000) ---
+Patch Set 14:
+
+Trevis Autotest2 retesting enforced review-dne-part-1 session for build 73012. Requested by James Simmons because of LU-13321.
+
+--- Message (Autotest, 2020-04-01 11:26:59.000000000) ---
+Patch Set 14:
+
+Trevis Autotest2 retesting enforced review-dne-part-2 session for build 73012. Requested by James Simmons because of LU-12688.
+
+--- Message (Autotest, 2020-04-02 13:17:17.000000000) ---
+Patch Set 14:
+
+Trevis Autotest2 retesting enforced review-zfs session for build 73012. Requested by James Simmons because of LU-12688.
+
+--- Message (Autotest, 2020-04-02 13:17:17.000000000) ---
+Patch Set 14:
+
+Trevis Autotest2 retesting enforced review-dne-part-1 session for build 73012. Requested by James Simmons because of LU-12688.
+
+--- Message (Autotest, 2020-04-02 13:17:18.000000000) ---
+Patch Set 14:
+
+Trevis Autotest2 retesting enforced review-dne-part-3 session for build 73012. Requested by James Simmons because of LU-12688.
+
+--- Message (Autotest, 2020-04-02 13:17:18.000000000) ---
+Patch Set 14:
+
+Trevis Autotest2 retesting enforced review-dne-part-2 session for build 73012. Requested by James Simmons because of LU-12688.
+
+--- Message (Autotest, 2020-04-02 13:17:19.000000000) ---
+Patch Set 14:
+
+Trevis Autotest2 retesting enforced review-dne-zfs-part-1 session for build 73012. Requested by James Simmons because of LU-12688.
+
+--- Message (Autotest, 2020-04-02 13:17:19.000000000) ---
+Patch Set 14:
+
+Trevis Autotest2 retesting enforced review-dne-part-4 session for build 73012. Requested by James Simmons because of LU-12688.
+
+--- Message (Autotest, 2020-04-02 13:17:20.000000000) ---
+Patch Set 14:
+
+Trevis Autotest2 retesting enforced review-dne-zfs-part-2 session for build 73012. Requested by James Simmons because of LU-12688.
+
+--- Message (Autotest, 2020-04-02 13:17:20.000000000) ---
+Patch Set 14:
+
+Trevis Autotest2 retesting enforced review-dne-zfs-part-4 session for build 73012. Requested by James Simmons because of LU-12688.
+
+--- Message (Autotest, 2020-04-02 13:17:21.000000000) ---
+Patch Set 14:
+
+Trevis Autotest2 retesting enforced review-dne-zfs-part-3 session for build 73012. Requested by James Simmons because of LU-12688.
+
+--- Message (Autotest, 2020-04-02 13:17:22.000000000) ---
+Patch Set 14:
+
+Trevis Autotest2 retesting enforced review-ldiskfs-arm session for build 73012. Requested by James Simmons because of LU-12688.
+
+--- Message (Autotest, 2020-04-02 13:17:22.000000000) ---
+Patch Set 14:
+
+Trevis Autotest2 retesting enforced review-ldiskfs session for build 73012. Requested by James Simmons because of LU-12688.
+
+--- Message (Autotest, 2020-04-02 13:17:24.000000000) ---
+Patch Set 14:
+
+Trevis Autotest2 retesting optional review-dne-selinux session for build 73012. Requested by James Simmons because of LU-12688.
+
+--- Message (Autotest, 2020-04-02 13:17:24.000000000) ---
+Patch Set 14:
+
+Trevis Autotest2 retesting optional review-dne-selinux-ssk session for build 73012. Requested by James Simmons because of LU-12688.
+
+--- Message (Autotest, 2020-04-02 13:17:25.000000000) ---
+Patch Set 14:
+
+Trevis Autotest2 retesting optional review-dne-ssk session for build 73012. Requested by James Simmons because of LU-12688.
+
+--- Message (Autotest, 2020-04-02 13:17:25.000000000) ---
+Patch Set 14:
+
+Trevis Autotest2 retesting optional review-ldiskfs-ubuntu session for build 73012. Requested by James Simmons because of LU-12688.
+
+--- Message (Maloo, 2020-04-02 18:19:04.000000000) ---
+Patch Set 14:
+
+Test session lustre-reviews_73012_0_26 failed to test, max tries exceeded
+
+--- Message (Autotest, 2020-04-02 18:27:09.000000000) ---
+Patch Set 14:
+
+Onyx Autotest started optional review-ldiskfs-ubuntu session for build 73012.
+
+--- Message (James Simmons, 2020-04-03 03:21:24.000000000) ---
+Patch Set 15: Patch Set 14 was rebased
+
+--- Message (wc-checkpatch, 2020-04-03 03:21:46.000000000) ---
+Patch Set 15:
+
+Looks good to me.
+
+--- Message (Autotest, 2020-04-03 04:15:34.000000000) ---
+Patch Set 15:
+
+Trevis Autotest started enforced review-zfs session for build 73064.
+
+--- Message (Autotest, 2020-04-03 04:15:39.000000000) ---
+Patch Set 15:
+
+Onyx Autotest started enforced review-ldiskfs session for build 73064.
+
+--- Message (Autotest, 2020-04-03 04:15:53.000000000) ---
+Patch Set 15:
+
+Trevis Autotest started enforced review-dne-part-2 session for build 73064.
+
+--- Message (Autotest, 2020-04-03 04:15:59.000000000) ---
+Patch Set 15:
+
+Onyx Autotest started enforced review-dne-part-1 session for build 73064.
+
+--- Message (Autotest, 2020-04-03 04:16:14.000000000) ---
+Patch Set 15:
+
+Trevis Autotest started enforced review-dne-part-4 session for build 73064.
+
+--- Message (Autotest, 2020-04-03 04:16:20.000000000) ---
+Patch Set 15:
+
+Onyx Autotest started enforced review-dne-part-3 session for build 73064.
+
+--- Message (Autotest, 2020-04-03 04:16:40.000000000) ---
+Patch Set 15:
+
+Onyx Autotest started enforced review-dne-zfs-part-1 session for build 73064.
+
+--- Message (Autotest, 2020-04-03 04:16:44.000000000) ---
+Patch Set 15:
+
+Trevis Autotest started enforced review-dne-zfs-part-2 session for build 73064.
+
+--- Message (Autotest, 2020-04-03 04:17:00.000000000) ---
+Patch Set 15:
+
+Onyx Autotest started enforced review-dne-zfs-part-3 session for build 73064.
+
+--- Message (Autotest, 2020-04-03 04:17:04.000000000) ---
+Patch Set 15:
+
+Trevis Autotest started enforced review-dne-zfs-part-4 session for build 73064.
+
+--- Message (Autotest, 2020-04-03 04:17:20.000000000) ---
+Patch Set 15:
+
+Onyx Autotest started enforced review-ldiskfs-arm session for build 73064.
+
+--- Message (jenkins, 2020-04-03 04:26:32.000000000) ---
+Patch Set 15: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/13145/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews/73064/ : SUCCESS
+
+--- Message (Autotest, 2020-04-03 12:41:57.000000000) ---
+Patch Set 15:
+
+AT Release Candidate retesting enforced review-dne-zfs-part-1 session for build 73064. Requested by James Simmons because of LU-11993.
+
+--- Message (James Simmons, 2020-04-05 13:16:02.000000000) ---
+Patch Set 16: Patch Set 15 was rebased
+
+--- Message (wc-checkpatch, 2020-04-05 13:17:28.000000000) ---
+Patch Set 16:
+
+Looks good to me.
+
+--- Message (Autotest, 2020-04-05 14:07:57.000000000) ---
+Patch Set 16:
+
+Trevis Autotest started enforced review-ldiskfs session for build 73106.
+
+--- Message (Autotest, 2020-04-05 14:08:18.000000000) ---
+Patch Set 16:
+
+Trevis Autotest started enforced review-zfs session for build 73106.
+
+--- Message (Autotest, 2020-04-05 14:08:38.000000000) ---
+Patch Set 16:
+
+Trevis Autotest started enforced review-dne-part-1 session for build 73106.
+
+--- Message (Autotest, 2020-04-05 14:08:45.000000000) ---
+Patch Set 16:
+
+Trevis Autotest2 started enforced review-dne-part-2 session for build 73106.
+
+--- Message (Autotest, 2020-04-05 14:08:54.000000000) ---
+Patch Set 16:
+
+Onyx Autotest started enforced review-dne-part-3 session for build 73106.
+
+--- Message (Autotest, 2020-04-05 14:08:58.000000000) ---
+Patch Set 16:
+
+Trevis Autotest started enforced review-dne-part-4 session for build 73106.
+
+--- Message (Autotest, 2020-04-05 14:09:05.000000000) ---
+Patch Set 16:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-1 session for build 73106.
+
+--- Message (Autotest, 2020-04-05 14:09:14.000000000) ---
+Patch Set 16:
+
+Onyx Autotest started enforced review-dne-zfs-part-2 session for build 73106.
+
+--- Message (Autotest, 2020-04-05 14:09:18.000000000) ---
+Patch Set 16:
+
+Trevis Autotest started enforced review-dne-zfs-part-3 session for build 73106.
+
+--- Message (Autotest, 2020-04-05 14:09:25.000000000) ---
+Patch Set 16:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-4 session for build 73106.
+
+--- Message (Autotest, 2020-04-05 14:09:34.000000000) ---
+Patch Set 16:
+
+Onyx Autotest started enforced review-ldiskfs-arm session for build 73106.
+
+--- Message (Autotest, 2020-04-05 14:09:38.000000000) ---
+Patch Set 16:
+
+Trevis Autotest started optional review-dne-selinux session for build 73106.
+
+--- Message (Autotest, 2020-04-05 14:09:45.000000000) ---
+Patch Set 16:
+
+Trevis Autotest2 started optional review-dne-ssk session for build 73106.
+
+--- Message (Autotest, 2020-04-05 14:09:54.000000000) ---
+Patch Set 16:
+
+Onyx Autotest started optional review-dne-selinux-ssk session for build 73106.
+
+--- Message (Autotest, 2020-04-05 14:09:58.000000000) ---
+Patch Set 16:
+
+Trevis Autotest started optional review-ldiskfs-ubuntu session for build 73106.
+
+--- Message (Autotest, 2020-04-05 14:10:05.000000000) ---
+Patch Set 16:
+
+Trevis Autotest2 started optional review-ldiskfs session for build 73106.
+
+--- Message (jenkins, 2020-04-05 14:29:11.000000000) ---
+Patch Set 16: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/13187/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews/73106/ : SUCCESS
+
+--- Message (Autotest, 2020-04-06 02:37:37.000000000) ---
+Patch Set 16:
+
+Trevis Autotest2 retesting enforced review-dne-zfs-part-2 session for build 73106. Requested by James Simmons because of LU-12632.
+
+--- Message (Autotest, 2020-04-06 12:57:04.000000000) ---
+Patch Set 16:
+
+Trevis Autotest2 retesting enforced review-dne-part-1 session for build 73106. Requested by James Simmons because of LU-13187.
+
+--- Message (James Simmons, 2020-04-06 16:05:44.000000000) ---
+Patch Set 16:
+
+Shaun can you review again
+
+--- Message (Shaun Tancheff, 2020-04-06 16:42:41.000000000) ---
+Patch Set 16: Code-Review+1
+
+--- Message (Oleg Drokin, 2020-04-09 17:48:22.000000000) ---
+Patch Set 16: Verified-1
+
+latest report from the master-next boiling pot:
+
+ [  431.642797] LustreError: 11167:0:(lu_object.h:733:lu_object_top()) ASSERTION( !list_empty(&h->loh_layers) ) failed: 
+[  431.679223] LustreError: 11167:0:(lu_object.h:733:lu_object_top()) LBUG
+[  431.681302] Pid: 11167, comm: ll_ost_out03_00 3.10.0-7.7-debug #1 SMP Wed Oct 30 08:47:36 EDT 2019
+[  431.685079] Call Trace:
+[  431.696071]  [<ffffffffa02d7e2c>] libcfs_call_trace+0x8c/0xc0 [libcfs]
+[  431.698356]  [<ffffffffa02d7edc>] lbug_with_loc+0x4c/0xa0 [libcfs]
+[  431.700434]  [<ffffffffa050cacf>] lu_context_key_get.part.20+0x0/0x3b [obdclass]
+[  431.705716]  [<ffffffffa04dba25>] htable_lookup+0x4d5/0x540 [obdclass]
+[  431.708139]  [<ffffffffa04dda8a>] lu_object_find_at+0x14a/0x9f0 [obdclass]
+[  431.710391]  [<ffffffffa04deecd>] dt_locate_at+0x1d/0xb0 [obdclass]
+[  431.713014]  [<ffffffffa07dc2ba>] out_handle+0x126a/0x1b50 [ptlrpc]
+[  431.716097]  [<ffffffffa07d4a35>] tgt_request_handle+0x965/0x1650 [ptlrpc]
+[  431.718394]  [<ffffffffa0777210>] ptlrpc_server_handle_request+0x250/0xb10 [ptlrpc]
+[  431.722104]  [<ffffffffa077b521>] ptlrpc_main+0xcd1/0x2670 [ptlrpc]
+[  431.725088]  [<ffffffff810b8254>] kthread+0xe4/0xf0
+[  431.727999]  [<ffffffff817e0ddd>] ret_from_fork_nospec_begin+0x7/0x21
+[  431.731227]  [<ffffffffffffffff>] 0xffffffffffffffff
+[  431.735355] Kernel panic - not syncing: LBUG
+
+--- Message (Neil Brown, 2020-04-14 05:10:39.000000000) ---
+Uploaded patch set 17.
+
+--- Message (Neil Brown, 2020-04-14 05:12:16.000000000) ---
+Patch Set 17: Code-Review+1
+
+It turns out there are two flags we need to check, either of which indicates that the object is  no longer usable.
+HEARD_BANSHEE and UNHASHED are set in different circumstances but both are set under the lock and mean "even after the lock is released, don't take a new reference"
+
+--- Message (Neil Brown, 2020-04-14 05:13:56.000000000) ---
+Uploaded patch set 18.
+
+--- Message (jenkins, 2020-04-14 05:14:02.000000000) ---
+Patch Set 17: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/73275/ : ABORTED
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/13352/ : ABORTED
+
+--- Message (wc-checkpatch, 2020-04-14 05:14:05.000000000) ---
+Patch Set 18:
+
+Looks good to me.
+
+--- Message (jenkins, 2020-04-14 05:43:26.000000000) ---
+Patch Set 18: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/73276/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/13353/ : SUCCESS
+
+--- Message (Autotest, 2020-04-14 05:44:52.000000000) ---
+Patch Set 18:
+
+Trevis Autotest started enforced review-ldiskfs session for build 73276.
+
+--- Message (Autotest, 2020-04-14 05:45:00.000000000) ---
+Patch Set 18:
+
+Onyx Autotest started enforced review-zfs session for build 73276.
+
+--- Message (Autotest, 2020-04-14 05:45:12.000000000) ---
+Patch Set 18:
+
+Trevis Autotest started enforced review-dne-part-1 session for build 73276.
+
+--- Message (Autotest, 2020-04-14 05:45:21.000000000) ---
+Patch Set 18:
+
+Onyx Autotest started enforced review-dne-part-2 session for build 73276.
+
+--- Message (Autotest, 2020-04-14 05:45:32.000000000) ---
+Patch Set 18:
+
+Trevis Autotest started enforced review-dne-part-3 session for build 73276.
+
+--- Message (Autotest, 2020-04-14 05:45:41.000000000) ---
+Patch Set 18:
+
+Onyx Autotest started enforced review-dne-part-4 session for build 73276.
+
+--- Message (Autotest, 2020-04-14 05:45:52.000000000) ---
+Patch Set 18:
+
+Trevis Autotest started enforced review-dne-zfs-part-1 session for build 73276.
+
+--- Message (Autotest, 2020-04-14 05:46:01.000000000) ---
+Patch Set 18:
+
+Onyx Autotest started enforced review-dne-zfs-part-2 session for build 73276.
+
+--- Message (Autotest, 2020-04-14 05:46:12.000000000) ---
+Patch Set 18:
+
+Trevis Autotest started enforced review-dne-zfs-part-3 session for build 73276.
+
+--- Message (Autotest, 2020-04-14 05:46:21.000000000) ---
+Patch Set 18:
+
+Onyx Autotest started enforced review-dne-zfs-part-4 session for build 73276.
+
+--- Message (Autotest, 2020-04-14 05:46:32.000000000) ---
+Patch Set 18:
+
+Trevis Autotest started enforced review-ldiskfs-arm session for build 73276.
+
+--- Message (Autotest, 2020-04-14 05:46:41.000000000) ---
+Patch Set 18:
+
+Onyx Autotest started optional review-dne-selinux session for build 73276.
+
+--- Message (Autotest, 2020-04-14 05:46:52.000000000) ---
+Patch Set 18:
+
+Trevis Autotest started optional review-dne-ssk session for build 73276.
+
+--- Message (Autotest, 2020-04-14 05:47:01.000000000) ---
+Patch Set 18:
+
+Onyx Autotest started optional review-dne-selinux-ssk session for build 73276.
+
+--- Message (Autotest, 2020-04-14 05:47:12.000000000) ---
+Patch Set 18:
+
+Trevis Autotest started optional review-ldiskfs-ubuntu session for build 73276.
+
+--- Message (Autotest, 2020-04-14 05:47:21.000000000) ---
+Patch Set 18:
+
+Onyx Autotest started optional review-ldiskfs session for build 73276.
+
+--- Message (James Simmons, 2020-04-15 01:08:20.000000000) ---
+Patch Set 18: Code-Review+1
+
+--- Message (James Simmons, 2020-04-15 23:21:07.000000000) ---
+Patch Set 18:
+
+ping
+
+--- Message (James Simmons, 2020-04-17 14:31:53.000000000) ---
+Patch Set 18:
+
+Shaun can you review again.
+
+--- Message (Shaun Tancheff, 2020-04-17 14:58:25.000000000) ---
+Patch Set 18: Code-Review+1
+
+--- Message (James Simmons, 2020-04-19 13:41:10.000000000) ---
+Patch Set 18:
+
+Petro can you review again
+
+--- Message (Alexey Lyashkov, 2020-04-20 10:46:44.000000000) ---
+Patch Set 18: Code-Review-1
+
+(2 comments)
+
+--- Message (James Simmons, 2020-04-20 16:30:57.000000000) ---
+Patch Set 18:
+
+(1 comment)
+
+--- Message (James Simmons, 2020-04-22 19:42:15.000000000) ---
+Patch Set 18:
+
+(1 comment)
+
+--- Message (James Simmons, 2020-04-23 17:34:05.000000000) ---
+Uploaded patch set 19.
+
+--- Message (wc-checkpatch, 2020-04-23 17:37:19.000000000) ---
+Patch Set 19:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Autotest, 2020-04-23 18:11:13.000000000) ---
+Patch Set 19:
+
+Trevis Autotest started enforced review-ldiskfs session for build 73597.
+
+--- Message (Autotest, 2020-04-23 18:11:26.000000000) ---
+Patch Set 19:
+
+Onyx Autotest started enforced review-zfs session for build 73597.
+
+--- Message (Autotest, 2020-04-23 18:11:33.000000000) ---
+Patch Set 19:
+
+Trevis Autotest started enforced review-dne-part-1 session for build 73597.
+
+--- Message (jenkins, 2020-04-23 18:11:44.000000000) ---
+Patch Set 19: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/13652/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews/73597/ : SUCCESS
+
+--- Message (Autotest, 2020-04-23 18:11:47.000000000) ---
+Patch Set 19:
+
+Trevis Autotest2 started enforced review-dne-part-2 session for build 73597.
+
+--- Message (Autotest, 2020-04-23 18:11:53.000000000) ---
+Patch Set 19:
+
+Trevis Autotest started enforced review-dne-part-4 session for build 73597.
+
+--- Message (Autotest, 2020-04-23 18:11:56.000000000) ---
+Patch Set 19:
+
+Onyx Autotest started enforced review-dne-part-3 session for build 73597.
+
+--- Message (Autotest, 2020-04-23 18:12:07.000000000) ---
+Patch Set 19:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-1 session for build 73597.
+
+--- Message (Autotest, 2020-04-23 18:12:13.000000000) ---
+Patch Set 19:
+
+Trevis Autotest started enforced review-dne-zfs-part-3 session for build 73597.
+
+--- Message (Autotest, 2020-04-23 18:12:16.000000000) ---
+Patch Set 19:
+
+Onyx Autotest started enforced review-dne-zfs-part-2 session for build 73597.
+
+--- Message (Autotest, 2020-04-23 18:12:27.000000000) ---
+Patch Set 19:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-4 session for build 73597.
+
+--- Message (Autotest, 2020-04-23 18:12:36.000000000) ---
+Patch Set 19:
+
+Onyx Autotest started enforced review-ldiskfs-arm session for build 73597.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2020-04-24 04:06:34.000000000) ---
+Patch Set 19:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (James Simmons, 2020-04-27 21:46:04.000000000) ---
+Uploaded patch set 20.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2020-04-27 21:49:22.000000000) ---
+Patch Set 20:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2020-04-27 21:50:10.000000000) ---
+Patch Set 20:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2020-04-27 22:25:44.000000000) ---
+Patch Set 20: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/13756/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews/73701/ : SUCCESS
+
+--- Message (Autotest, 2020-04-27 22:26:24.000000000) ---
+Patch Set 20:
+
+Trevis Autotest started enforced review-ldiskfs session for build 73701.
+
+--- Message (Autotest, 2020-04-27 22:26:37.000000000) ---
+Patch Set 20:
+
+AT Release Candidate started enforced review-zfs session for build 73701.
+
+--- Message (Autotest, 2020-04-27 22:26:44.000000000) ---
+Patch Set 20:
+
+Trevis Autotest started enforced review-dne-part-1 session for build 73701.
+
+--- Message (Autotest, 2020-04-27 22:26:57.000000000) ---
+Patch Set 20:
+
+AT Release Candidate started enforced review-dne-part-2 session for build 73701.
+
+--- Message (Autotest, 2020-04-27 22:27:04.000000000) ---
+Patch Set 20:
+
+Trevis Autotest started enforced review-dne-part-3 session for build 73701.
+
+--- Message (Autotest, 2020-04-27 22:27:17.000000000) ---
+Patch Set 20:
+
+AT Release Candidate started enforced review-dne-part-4 session for build 73701.
+
+--- Message (Autotest, 2020-04-27 22:27:24.000000000) ---
+Patch Set 20:
+
+Trevis Autotest started enforced review-dne-zfs-part-1 session for build 73701.
+
+--- Message (Autotest, 2020-04-27 22:27:31.000000000) ---
+Patch Set 20:
+
+Onyx Autotest started enforced review-dne-zfs-part-2 session for build 73701.
+
+--- Message (Autotest, 2020-04-27 22:27:37.000000000) ---
+Patch Set 20:
+
+AT Release Candidate started enforced review-dne-zfs-part-3 session for build 73701.
+
+--- Message (Autotest, 2020-04-27 22:27:44.000000000) ---
+Patch Set 20:
+
+Trevis Autotest started enforced review-dne-zfs-part-4 session for build 73701.
+
+--- Message (Autotest, 2020-04-27 22:27:51.000000000) ---
+Patch Set 20:
+
+Onyx Autotest started enforced review-ldiskfs-arm session for build 73701.
+
+--- Message (Autotest, 2020-04-27 22:28:04.000000000) ---
+Patch Set 20:
+
+Trevis Autotest started optional review-dne-ssk session for build 73701.
+
+--- Message (Neil Brown, 2020-04-27 23:17:12.000000000) ---
+Patch Set 20: Code-Review-1
+
+(2 comments)
+
+--- Message (James Simmons, 2020-05-01 02:50:54.000000000) ---
+Patch Set 20:
+
+LU_CACHE_NR_MIN isn't really the lower upper bound since you have LU_CACHE_NR_ZFS_LIMIT which is a larger value. When we hit the LU_CACHE_NR_ZFS_LIMIT the hash table starts to be purged to limit its size.
+
+So what happen is when I set the max_size of the rhashtable based on the ZFS limits it crashed the nodes since lu_site_purge() doesn't really work. What I found is that in lu_assigned_fid() in the cfs hash case ALWAYS added a lu_objects to the hash independent of any limits. So this problem was never really seen.
+
+I have been thinking the best solution would be to remove all rhashtable limits but test the hash size after an object is inserted and start purging instead. This way lu_object_nr can be a changeable tunable instead of something static like a fix rhashtable size. It could be adjustable without taking down the file system. What do you think?
+
+--- Message (James Simmons, 2020-05-02 01:00:44.000000000) ---
+Uploaded patch set 21.
+
+--- Message (wc-checkpatch, 2020-05-02 01:02:22.000000000) ---
+Patch Set 21:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2020-05-02 01:03:59.000000000) ---
+Patch Set 21:
+
+Code-wise looks good to me.
+
+--- Message (Autotest, 2020-05-02 01:51:46.000000000) ---
+Patch Set 21:
+
+Trevis Autotest started enforced review-ldiskfs session for build 73829.
+
+--- Message (Autotest, 2020-05-02 01:52:06.000000000) ---
+Patch Set 21:
+
+Trevis Autotest started enforced review-zfs session for build 73829.
+
+--- Message (Autotest, 2020-05-02 01:52:09.000000000) ---
+Patch Set 21:
+
+Trevis Autotest2 started enforced review-dne-part-1 session for build 73829.
+
+--- Message (Autotest, 2020-05-02 01:52:29.000000000) ---
+Patch Set 21:
+
+Trevis Autotest2 started enforced review-dne-part-3 session for build 73829.
+
+--- Message (Autotest, 2020-05-02 01:52:59.000000000) ---
+Patch Set 21:
+
+Trevis Autotest2 started enforced review-dne-part-4 session for build 73829.
+
+--- Message (Autotest, 2020-05-02 01:53:19.000000000) ---
+Patch Set 21:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-1 session for build 73829.
+
+--- Message (Autotest, 2020-05-02 01:53:39.000000000) ---
+Patch Set 21:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-2 session for build 73829.
+
+--- Message (Autotest, 2020-05-02 01:53:59.000000000) ---
+Patch Set 21:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-3 session for build 73829.
+
+--- Message (Autotest, 2020-05-02 01:54:19.000000000) ---
+Patch Set 21:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-4 session for build 73829.
+
+--- Message (Autotest, 2020-05-02 01:54:22.000000000) ---
+Patch Set 21:
+
+AT Release Candidate started enforced review-ldiskfs-arm session for build 73829.
+
+--- Message (Autotest, 2020-05-02 01:54:34.000000000) ---
+Patch Set 21:
+
+Onyx Autotest started enforced review-dne-selinux session for build 73829.
+
+--- Message (jenkins, 2020-05-02 02:00:07.000000000) ---
+Patch Set 21: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/73829/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/13881/ : SUCCESS
+
+--- Message (Autotest, 2020-05-02 02:14:58.000000000) ---
+Patch Set 21:
+
+Trevis Autotest started enforced review-dne-part-2 session for build 73829.
+
+--- Message (Autotest, 2020-05-02 12:42:20.000000000) ---
+Patch Set 21:
+
+Trevis Autotest retesting enforced review-ldiskfs-arm session for build 73829. Requested by James Simmons because of DCO-8456.
+
+--- Message (Autotest, 2020-05-02 12:42:51.000000000) ---
+Patch Set 21:
+
+Onyx Autotest retesting enforced review-dne-zfs-part-4 session for build 73829. Requested by James Simmons because of LU-11544.
+
+--- Message (James Simmons, 2020-05-05 16:39:16.000000000) ---
+Patch Set 21:
+
+ping
+
+--- Message (James Simmons, 2020-05-06 18:38:32.000000000) ---
+Patch Set 21:
+
+ping
+
+--- Message (Shaun Tancheff, 2020-05-07 12:12:54.000000000) ---
+Patch Set 21: Code-Review+1
+
+--- Message (James Simmons, 2020-05-12 13:24:38.000000000) ---
+Patch Set 21:
+
+Neil can you take another look?
+
+--- Message (wc-checkpatch, 2020-05-14 07:25:41.000000000) ---
+Patch Set 21: Code-Review-1
+
+This change cannot be cherry-picked to master.
+Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (James Simmons, 2020-05-14 12:18:35.000000000) ---
+Uploaded patch set 22.
+
+--- Message (wc-checkpatch, 2020-05-14 12:21:14.000000000) ---
+Patch Set 22:
+
+(4 comments)
+
+4 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (James Simmons, 2020-05-14 12:26:12.000000000) ---
+Uploaded patch set 23.
+
+--- Message (jenkins, 2020-05-14 12:26:13.000000000) ---
+Patch Set 22:
+
+No Builds Executed
+
+--- Message (wc-checkpatch, 2020-05-14 12:26:25.000000000) ---
+Patch Set 23:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre Gerrit Janitor, 2020-05-14 12:30:37.000000000) ---
+Patch Set 23:
+
+git checkout error error: 
+
+
+ Job output URL: https://testing-archive.whamcloud.com/gerrit-janitor/8917/results.html
+
+--- Message (jenkins, 2020-05-14 13:50:15.000000000) ---
+Patch Set 23: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/14234/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews/74186/ : SUCCESS
+
+--- Message (Autotest, 2020-05-14 18:23:46.000000000) ---
+Patch Set 23:
+
+Trevis Autotest started enforced review-ldiskfs session for build 74186.
+
+--- Message (Autotest, 2020-05-14 18:26:37.000000000) ---
+Patch Set 23:
+
+Trevis Autotest started enforced review-zfs session for build 74186.
+
+--- Message (Autotest, 2020-05-14 18:31:37.000000000) ---
+Patch Set 23:
+
+Trevis Autotest started enforced review-dne-part-1 session for build 74186.
+
+--- Message (Autotest, 2020-05-14 18:36:57.000000000) ---
+Patch Set 23:
+
+Trevis Autotest started enforced review-dne-part-3 session for build 74186.
+
+--- Message (Autotest, 2020-05-14 18:43:01.000000000) ---
+Patch Set 23:
+
+AT Release Candidate started enforced review-dne-zfs-part-1 session for build 74186.
+
+--- Message (Autotest, 2020-05-14 18:45:37.000000000) ---
+Patch Set 23:
+
+Trevis Autotest started enforced review-dne-part-4 session for build 74186.
+
+--- Message (Autotest, 2020-05-14 18:49:37.000000000) ---
+Patch Set 23:
+
+Trevis Autotest started enforced review-dne-zfs-part-2 session for build 74186.
+
+--- Message (Autotest, 2020-05-14 18:53:37.000000000) ---
+Patch Set 23:
+
+Trevis Autotest started enforced review-dne-zfs-part-3 session for build 74186.
+
+--- Message (Autotest, 2020-05-14 18:55:29.000000000) ---
+Patch Set 23:
+
+Trevis Autotest started enforced review-ldiskfs-arm session for build 74186.
+
+--- Message (Autotest, 2020-05-14 19:00:10.000000000) ---
+Patch Set 23:
+
+Trevis Autotest started enforced review-dne-selinux session for build 74186.
+
+--- Message (Autotest, 2020-05-14 19:11:35.000000000) ---
+Patch Set 23:
+
+Onyx Autotest started enforced review-dne-part-2 session for build 74186.
+
+--- Message (Autotest, 2020-05-14 20:02:33.000000000) ---
+Patch Set 23:
+
+AT Release Candidate started enforced review-dne-zfs-part-4 session for build 74186.
+
+--- Message (Shaun Tancheff, 2020-05-15 00:41:43.000000000) ---
+Patch Set 23: Code-Review+1
+
+--- Message (Neil Brown, 2020-05-15 01:03:31.000000000) ---
+Patch Set 23: Code-Review+1
+
+--- Message (Autotest, 2020-05-15 11:21:04.000000000) ---
+Patch Set 23:
+
+Trevis Autotest2 retesting enforced review-dne-part-3 session for build 74186. Requested by James Simmons because of LU-13514.
+
+--- Message (Autotest, 2020-05-15 11:21:24.000000000) ---
+Patch Set 23:
+
+Trevis Autotest2 retesting enforced review-dne-zfs-part-1 session for build 74186. Requested by James Simmons because of LU-10632.
+
+--- Message (James Simmons, 2020-05-17 11:48:35.000000000) ---
+Patch Set 24: Patch Set 23 was rebased
+
+--- Message (wc-checkpatch, 2020-05-17 11:53:31.000000000) ---
+Patch Set 24:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2020-05-17 12:19:20.000000000) ---
+Patch Set 24: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/14334/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews/74301/ : SUCCESS
+
+--- Message (Autotest, 2020-05-17 12:21:01.000000000) ---
+Patch Set 24:
+
+AT Release Candidate started enforced review-ldiskfs session for build 74301.
+
+--- Message (Autotest, 2020-05-17 12:21:21.000000000) ---
+Patch Set 24:
+
+AT Release Candidate started enforced review-zfs session for build 74301.
+
+--- Message (Autotest, 2020-05-17 12:21:41.000000000) ---
+Patch Set 24:
+
+Trevis Autotest2 started enforced review-dne-part-2 session for build 74301.
+
+--- Message (Autotest, 2020-05-17 12:21:41.000000000) ---
+Patch Set 24:
+
+AT Release Candidate started enforced review-dne-part-1 session for build 74301.
+
+--- Message (Autotest, 2020-05-17 12:21:52.000000000) ---
+Patch Set 24:
+
+Trevis Autotest started enforced review-dne-part-3 session for build 74301.
+
+--- Message (Autotest, 2020-05-17 12:22:01.000000000) ---
+Patch Set 24:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-1 session for build 74301.
+
+--- Message (Autotest, 2020-05-17 12:22:01.000000000) ---
+Patch Set 24:
+
+AT Release Candidate started enforced review-dne-part-4 session for build 74301.
+
+--- Message (Autotest, 2020-05-17 12:22:12.000000000) ---
+Patch Set 24:
+
+Trevis Autotest started enforced review-dne-zfs-part-2 session for build 74301.
+
+--- Message (Autotest, 2020-05-17 12:22:21.000000000) ---
+Patch Set 24:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-4 session for build 74301.
+
+--- Message (Autotest, 2020-05-17 12:22:21.000000000) ---
+Patch Set 24:
+
+AT Release Candidate started enforced review-dne-zfs-part-3 session for build 74301.
+
+--- Message (Autotest, 2020-05-17 12:22:32.000000000) ---
+Patch Set 24:
+
+Trevis Autotest started enforced review-ldiskfs-arm session for build 74301.
+
+--- Message (Autotest, 2020-05-17 12:22:41.000000000) ---
+Patch Set 24:
+
+AT Release Candidate started enforced review-dne-selinux session for build 74301.
+
+--- Message (Autotest, 2020-05-17 12:22:51.000000000) ---
+Patch Set 24:
+
+Trevis Autotest2 started optional review-dne-ssk session for build 74301.
+
+--- Message (Autotest, 2020-05-17 12:22:52.000000000) ---
+Patch Set 24:
+
+Trevis Autotest started optional review-dne-selinux-ssk session for build 74301.
+
+--- Message (Autotest, 2020-05-17 12:23:01.000000000) ---
+Patch Set 24:
+
+AT Release Candidate started optional review-ldiskfs-ubuntu session for build 74301.
+
+--- Message (Autotest, 2020-05-17 12:23:12.000000000) ---
+Patch Set 24:
+
+Trevis Autotest2 started optional review-ldiskfs session for build 74301.
+
+--- Message (Autotest, 2020-05-17 21:59:30.000000000) ---
+Patch Set 24:
+
+Trevis Autotest2 retesting enforced review-dne-zfs-part-1 session for build 74301. Requested by James Simmons because of LU-10753.
+
+--- Message (Oleg Drokin, 2020-05-21 19:28:16.000000000) ---
+Patch Set 24:
+
+overnight in my boilpot I am starting to see this sort of crashes.
+
+I think this patch is to blame?
+
+ [12813.731429] Lustre: DEBUG MARKER: == sanity test 135: Race catalog processing ========================================================== 06:27:43 (1590056863)
+[17632.065050] LustreError: 20911:0:(lu_object.h:762:lu_object_top()) ASSERTION( !list_empty(&h->loh_layers) ) failed: 
+[17632.088065] LustreError: 20911:0:(lu_object.h:762:lu_object_top()) LBUG
+[17632.091671] Pid: 20911, comm: mdt07_000 3.10.0-7.7-debug #1 SMP Wed Oct 30 08:47:36 EDT 2019
+[17632.118734] Call Trace:
+[17632.124997]  [<ffffffffa08c812c>] libcfs_call_trace+0x8c/0xc0 [libcfs]
+[17632.130032]  [<ffffffffa08c81dc>] lbug_with_loc+0x4c/0xa0 [libcfs]
+[17632.144274]  [<ffffffffa0a4f43f>] lu_context_key_get.part.20+0x0/0x3b [obdclass]
+[17632.162803]  [<ffffffffa0a1e3aa>] htable_lookup+0x4fa/0x570 [obdclass]
+[17632.214272]  [<ffffffffa0a203a5>] lu_object_find_at+0x1e5/0xa40 [obdclass]
+[17632.223682]  [<ffffffffa0a20c19>] lu_object_find+0x19/0x20 [obdclass]
+[17632.230420]  [<ffffffffa1200fbb>] mdt_object_find+0x4b/0x170 [mdt]
+[17632.243348]  [<ffffffffa1231ddf>] mdt_reint_open+0xd4f/0x30d0 [mdt]
+[17632.250798]  [<ffffffffa1225430>] mdt_reint_rec+0x80/0x210 [mdt]
+[17632.260689]  [<ffffffffa11fdfc0>] mdt_reint_internal+0x710/0xad0 [mdt]
+[17632.262873]  [<ffffffffa120b492>] mdt_intent_open+0x82/0x3a0 [mdt]
+[17632.268055]  [<ffffffffa1201297>] mdt_intent_opc+0x1b7/0xb30 [mdt]
+[17632.311587]  [<ffffffffa1209624>] mdt_intent_policy+0x1a4/0x360 [mdt]
+[17632.313918]  [<ffffffffa0c5fec7>] ldlm_lock_enqueue+0x3a7/0xac0 [ptlrpc]
+[17632.317689]  [<ffffffffa0c876a6>] ldlm_handle_enqueue0+0xa46/0x15f0 [ptlrpc]
+[17632.346346]  [<ffffffffa0d0f622>] tgt_enqueue+0x62/0x210 [ptlrpc]
+[17632.360193]  [<ffffffffa0d142f5>] tgt_request_handle+0x975/0x1660 [ptlrpc]
+[17632.366519]  [<ffffffffa0cba6b0>] ptlrpc_server_handle_request+0x250/0xb10 [ptlrpc]
+[17632.400498]  [<ffffffffa0cbea51>] ptlrpc_main+0xcd1/0x2670 [ptlrpc]
+[17632.402848]  [<ffffffff810b8254>] kthread+0xe4/0xf0
+[17632.404976]  [<ffffffff817e0ddd>] ret_from_fork_nospec_begin+0x7/0x21
+[17632.407032]  [<ffffffffffffffff>] 0xffffffffffffffff
+[17632.409181] Kernel panic - not syncing: LBUG
+
+--- Message (Neil Brown, 2020-05-25 01:47:40.000000000) ---
+Patch Set 24:
+
+> overnight in my boilpot I am starting to see this sort of crashes.
+
+We arn't having a lot of luck with this patch... on the other hand, the boilpot is really showing its worth!
+
+I think the problem is that lu_site_purge_objects() can remove objects from the hash without setting a flag to say it has been removed.
+So htable_lookup() can find the same object locklessly before it is removed, notice the refcount is zero, wait to get the lock, the increment the refcount even though it shouldm't.
+I checks both LU_OBJECT_HEARD_BANSHEE and LU_OBJECT_UNHASHED before incrementing the refcount, but neither is set by lu_site_purge_objects().
+We just need to set one, and I think LU_OBJECT_UNHASHED makes most sense.  I'll submit an update.
+
+--- Message (Neil Brown, 2020-05-25 01:57:49.000000000) ---
+Uploaded patch set 25.
+
+--- Message (Neil Brown, 2020-05-25 02:00:03.000000000) ---
+Patch Set 25: Code-Review+1
+
+--- Message (wc-checkpatch, 2020-05-25 02:01:25.000000000) ---
+Patch Set 25:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2020-05-26 17:54:11.000000000) ---
+Patch Set 25: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/14543/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews/74514/ : SUCCESS
+
+--- Message (Autotest, 2020-05-26 17:54:51.000000000) ---
+Patch Set 25:
+
+AT Release Candidate started enforced review-ldiskfs session for build 74514.
+
+--- Message (Autotest, 2020-05-26 17:55:11.000000000) ---
+Patch Set 25:
+
+AT Release Candidate started enforced review-zfs session for build 74514.
+
+--- Message (Autotest, 2020-05-26 17:55:31.000000000) ---
+Patch Set 25:
+
+AT Release Candidate started enforced review-dne-part-1 session for build 74514.
+
+--- Message (Autotest, 2020-05-26 17:55:36.000000000) ---
+Patch Set 25:
+
+Trevis Autotest started enforced review-dne-part-2 session for build 74514.
+
+--- Message (Autotest, 2020-05-26 17:55:41.000000000) ---
+Patch Set 25:
+
+Onyx Autotest started enforced review-dne-part-3 session for build 74514.
+
+--- Message (Autotest, 2020-05-26 17:55:51.000000000) ---
+Patch Set 25:
+
+AT Release Candidate started enforced review-dne-part-4 session for build 74514.
+
+--- Message (Autotest, 2020-05-26 17:55:56.000000000) ---
+Patch Set 25:
+
+Trevis Autotest started enforced review-dne-zfs-part-1 session for build 74514.
+
+--- Message (Autotest, 2020-05-26 17:56:01.000000000) ---
+Patch Set 25:
+
+Onyx Autotest started enforced review-dne-zfs-part-2 session for build 74514.
+
+--- Message (Autotest, 2020-05-26 17:56:11.000000000) ---
+Patch Set 25:
+
+AT Release Candidate started enforced review-dne-zfs-part-3 session for build 74514.
+
+--- Message (Autotest, 2020-05-26 17:56:16.000000000) ---
+Patch Set 25:
+
+Trevis Autotest started enforced review-dne-zfs-part-4 session for build 74514.
+
+--- Message (Autotest, 2020-05-26 17:56:22.000000000) ---
+Patch Set 25:
+
+Onyx Autotest started enforced review-ldiskfs-arm session for build 74514.
+
+--- Message (Autotest, 2020-05-26 17:56:32.000000000) ---
+Patch Set 25:
+
+AT Release Candidate started enforced review-dne-selinux session for build 74514.
+
+--- Message (Autotest, 2020-05-26 17:56:36.000000000) ---
+Patch Set 25:
+
+Trevis Autotest started optional review-dne-ssk session for build 74514.
+
+--- Message (Autotest, 2020-05-26 17:56:41.000000000) ---
+Patch Set 25:
+
+Trevis Autotest2 started optional review-dne-selinux-ssk session for build 74514.
+
+--- Message (Autotest, 2020-05-26 17:56:42.000000000) ---
+Patch Set 25:
+
+Onyx Autotest started optional review-ldiskfs-ubuntu session for build 74514.
+
+--- Message (Autotest, 2020-05-26 17:56:56.000000000) ---
+Patch Set 25:
+
+Trevis Autotest started optional review-ldiskfs session for build 74514.
+
+--- Message (Shaun Tancheff, 2020-05-26 19:42:26.000000000) ---
+Patch Set 25: Code-Review+1
+
+--- Message (James Simmons, 2020-05-26 19:52:13.000000000) ---
+Patch Set 25: Code-Review+1
+
+Thanks for the potential fix. While working on this I discovered that the code to limit the amount of lu_objects in memory never was executed except at shutdown.
+So it didn't surprise me that lu_site_purge() broke things.
+
+--- Message (Autotest, 2020-05-27 11:31:52.000000000) ---
+Patch Set 25:
+
+Trevis Autotest retesting enforced review-ldiskfs-arm session for build 74514. Requested by James Simmons because of LU-10401.
+
+--- Message (Autotest, 2020-05-27 11:32:12.000000000) ---
+Patch Set 25:
+
+Onyx Autotest retesting enforced review-dne-zfs-part-1 session for build 74514. Requested by James Simmons because of LU-12985.
+
+--- Message (Autotest, 2020-05-27 11:33:22.000000000) ---
+Patch Set 25:
+
+Trevis Autotest retesting enforced review-dne-part-4 session for build 74514. Requested by James Simmons because of LU-0000.
+
+--- Message (Autotest, 2020-05-27 19:54:40.000000000) ---
+Patch Set 25:
+
+Trevis Autotest2 retesting enforced review-ldiskfs-arm session for build 74514. Requested by James Simmons because of LU-10401.
+
+--- Message (Autotest, 2020-05-28 02:50:57.000000000) ---
+Patch Set 25:
+
+Trevis Autotest retesting enforced review-ldiskfs-arm session for build 74514. Requested by James Simmons because of LU-10401.
+
+--- Message (James Simmons, 2020-05-28 11:37:32.000000000) ---
+Patch Set 26: Patch Set 25 was rebased
+
+--- Message (wc-checkpatch, 2020-05-28 11:39:30.000000000) ---
+Patch Set 26:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Autotest, 2020-05-28 12:13:11.000000000) ---
+Patch Set 26:
+
+AT Release Candidate started enforced review-ldiskfs session for build 74576.
+
+--- Message (Autotest, 2020-05-28 12:13:15.000000000) ---
+Patch Set 26:
+
+Onyx Autotest started enforced review-zfs session for build 74576.
+
+--- Message (Autotest, 2020-05-28 12:13:31.000000000) ---
+Patch Set 26:
+
+AT Release Candidate started enforced review-dne-part-2 session for build 74576.
+
+--- Message (Autotest, 2020-05-28 12:13:35.000000000) ---
+Patch Set 26:
+
+Onyx Autotest started enforced review-dne-part-4 session for build 74576.
+
+--- Message (Autotest, 2020-05-28 12:13:39.000000000) ---
+Patch Set 26:
+
+Trevis Autotest2 started enforced review-dne-part-1 session for build 74576.
+
+--- Message (Autotest, 2020-05-28 12:13:39.000000000) ---
+Patch Set 26:
+
+Trevis Autotest started enforced review-dne-part-3 session for build 74576.
+
+--- Message (Autotest, 2020-05-28 12:13:51.000000000) ---
+Patch Set 26:
+
+AT Release Candidate started enforced review-dne-zfs-part-1 session for build 74576.
+
+--- Message (Autotest, 2020-05-28 12:13:55.000000000) ---
+Patch Set 26:
+
+Onyx Autotest started enforced review-dne-zfs-part-4 session for build 74576.
+
+--- Message (Autotest, 2020-05-28 12:13:59.000000000) ---
+Patch Set 26:
+
+Trevis Autotest started enforced review-dne-zfs-part-3 session for build 74576.
+
+--- Message (Autotest, 2020-05-28 12:13:59.000000000) ---
+Patch Set 26:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-2 session for build 74576.
+
+--- Message (Autotest, 2020-05-28 12:14:11.000000000) ---
+Patch Set 26:
+
+AT Release Candidate started enforced review-ldiskfs-arm session for build 74576.
+
+--- Message (Autotest, 2020-05-28 12:14:15.000000000) ---
+Patch Set 26:
+
+Onyx Autotest started optional review-dne-selinux-ssk session for build 74576.
+
+--- Message (Autotest, 2020-05-28 12:14:19.000000000) ---
+Patch Set 26:
+
+Trevis Autotest2 started enforced review-dne-selinux session for build 74576.
+
+--- Message (Autotest, 2020-05-28 12:14:19.000000000) ---
+Patch Set 26:
+
+Trevis Autotest started optional review-dne-ssk session for build 74576.
+
+--- Message (Autotest, 2020-05-28 12:14:35.000000000) ---
+Patch Set 26:
+
+Onyx Autotest started optional review-ldiskfs session for build 74576.
+
+--- Message (Autotest, 2020-05-28 12:14:39.000000000) ---
+Patch Set 26:
+
+Trevis Autotest started optional review-ldiskfs-ubuntu session for build 74576.
+
+--- Message (jenkins, 2020-05-28 12:14:52.000000000) ---
+Patch Set 26: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/14607/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews/74576/ : SUCCESS
+
+--- Message (Shuichi Ihara, 2020-05-28 23:59:05.000000000) ---
+Patch Set 26: Verified-1
+
+James, Thank you for this interesting patch.
+I'm running performance testing with this patch (against comit:9487fc6), but, my mdetst on DOM is always failing after this patch.
+Here is my test configuration and mdtest option to DoM.
+
+1 x MDS, 2 x OSS/4 x OST, 40 clients
+
+# lfs setstripe -L mdt -E 1M /ai400/dom/
+# salloc -p 40n --nodes=40 --ntasks-per-node=16 mpirun --allow-run-as-root /work/tools/bin/mdtest -t -F -P -w 3901 -e 3901 -d /ai400/dom/mdt_hard -n 10000 -a POSIX -N 1 -i 3 -p 10
+
+Then, I got below error at 'unlink' operation of mdtest.
+
+ior ERROR: open64("/ai400/dom/mdt_hard/test-dir.0-0/mdtest_tree.0/file.mdtest.102.9197", 66, 0664) failed, errno 16, Device or resource busy (aiori-POSIX.c:413)
+
+When I reverted patch and back to master commit 9487fc6, and ran same mdtest again, but it completed without problem.
+Have you tested with DoM? I would give -1 to verify until confirms this problem.
+
+The other thing, would you share exact mdtest options and configuration in detail (number of process/client) you ran so that people can replicate?
+
+--- Message (James Simmons, 2020-05-30 14:36:27.000000000) ---
+Patch Set 27: Patch Set 26 was rebased
+
+--- Message (wc-checkpatch, 2020-05-30 14:36:52.000000000) ---
+Patch Set 27:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2020-05-30 15:14:05.000000000) ---
+Patch Set 27: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/14681/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews/74650/ : SUCCESS
+
+--- Message (Autotest, 2020-05-30 15:15:30.000000000) ---
+Patch Set 27:
+
+Onyx Autotest started enforced review-ldiskfs session for build 74650.
+
+--- Message (Autotest, 2020-05-30 15:15:46.000000000) ---
+Patch Set 27:
+
+Trevis Autotest2 started enforced review-zfs session for build 74650.
+
+--- Message (Autotest, 2020-05-30 15:15:50.000000000) ---
+Patch Set 27:
+
+Onyx Autotest started enforced review-dne-part-1 session for build 74650.
+
+--- Message (Autotest, 2020-05-30 15:16:06.000000000) ---
+Patch Set 27:
+
+Trevis Autotest2 started enforced review-dne-part-2 session for build 74650.
+
+--- Message (Autotest, 2020-05-30 15:16:10.000000000) ---
+Patch Set 27:
+
+Onyx Autotest started enforced review-dne-part-3 session for build 74650.
+
+--- Message (Autotest, 2020-05-30 15:16:14.000000000) ---
+Patch Set 27:
+
+AT Release Candidate started enforced review-dne-part-4 session for build 74650.
+
+--- Message (Autotest, 2020-05-30 15:16:26.000000000) ---
+Patch Set 27:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-1 session for build 74650.
+
+--- Message (Autotest, 2020-05-30 15:16:30.000000000) ---
+Patch Set 27:
+
+Onyx Autotest started enforced review-dne-zfs-part-2 session for build 74650.
+
+--- Message (Autotest, 2020-05-30 15:16:34.000000000) ---
+Patch Set 27:
+
+AT Release Candidate started enforced review-dne-zfs-part-3 session for build 74650.
+
+--- Message (Autotest, 2020-05-30 15:16:46.000000000) ---
+Patch Set 27:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-4 session for build 74650.
+
+--- Message (Autotest, 2020-05-30 15:16:50.000000000) ---
+Patch Set 27:
+
+Onyx Autotest started enforced review-ldiskfs-arm session for build 74650.
+
+--- Message (Autotest, 2020-05-30 15:16:54.000000000) ---
+Patch Set 27:
+
+AT Release Candidate started enforced review-dne-selinux session for build 74650.
+
+--- Message (Autotest, 2020-05-30 15:17:06.000000000) ---
+Patch Set 27:
+
+Trevis Autotest2 started optional review-dne-ssk session for build 74650.
+
+--- Message (Autotest, 2020-05-30 15:17:10.000000000) ---
+Patch Set 27:
+
+Onyx Autotest started optional review-dne-selinux-ssk session for build 74650.
+
+--- Message (Autotest, 2020-05-31 12:26:39.000000000) ---
+Patch Set 27:
+
+Trevis Autotest2 retesting enforced review-dne-zfs-part-1 session for build 74650. Requested by James Simmons because of LU-10753.
+
+--- Message (Shuichi Ihara, 2020-06-03 05:06:26.000000000) ---
+Patch Set 27: Verified-1
+
+patch still might have a regression in DOM configuration. mdtest is still failing after this patch (patch set 27)
+# lfs setstripe -L mdt -E 1M /ai400/dom/
+# salloc -p 40n --nodes=40 --ntasks-per-node=16 mpirun --allow-run-as-root /work/tools/bin/mdtest -t -F -P -w 3901 -e 3901 -d /ai400/dom/mdt_hard -n 10000 -a POSIX -N 1 -i 3 -p 10
+
+ior ERROR: open64("/ai400/dom/mdt_hard/test-dir.1-0/mdtest_tree.0/file.mdtest.24.9377", 66, 0664) failed, errno 16, Device or resource busy (aiori-POSIX.c:413)
+
+with patch Non-DOM configuration is fine. And it also worked even in DoM configuration if it reverted this patch.
+
+--- Message (Neil Brown, 2020-06-04 06:38:39.000000000) ---
+Patch Set 27: Code-Review-1
+
+(1 comment)
+
+Give the number of problems we've had with this, I think I'd better go over it all again very carefully - not today though.
+
+--- Message (wc-checkpatch, 2020-06-10 21:25:27.000000000) ---
+Patch Set 27: Code-Review-1
+
+This change cannot be cherry-picked to master.
+Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (Neil Brown, 2020-06-15 04:25:28.000000000) ---
+Uploaded patch set 28.
+
+--- Message (Neil Brown, 2020-06-15 04:26:38.000000000) ---
+Patch Set 28:
+
+I found a couple of bugs and some opportunity for tidying up code and comments.
+
+Shuichi: could you please run your test again and see if the problem still occurs?  Thanks.
+
+--- Message (wc-checkpatch, 2020-06-15 04:30:18.000000000) ---
+Patch Set 28:
+
+(3 comments)
+
+3 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2020-06-15 04:55:48.000000000) ---
+Patch Set 28: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/15019/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews/74992/ : SUCCESS
+
+--- Message (Autotest, 2020-06-15 04:57:07.000000000) ---
+Patch Set 28:
+
+Trevis Autotest started enforced review-ldiskfs session for build 74992.
+
+--- Message (Autotest, 2020-06-15 04:57:08.000000000) ---
+Patch Set 28:
+
+Onyx Autotest started enforced review-zfs session for build 74992.
+
+--- Message (Autotest, 2020-06-15 04:57:27.000000000) ---
+Patch Set 28:
+
+Trevis Autotest started enforced review-dne-part-1 session for build 74992.
+
+--- Message (Autotest, 2020-06-15 04:57:28.000000000) ---
+Patch Set 28:
+
+Onyx Autotest started enforced review-dne-part-2 session for build 74992.
+
+--- Message (Autotest, 2020-06-15 04:57:45.000000000) ---
+Patch Set 28:
+
+Trevis Autotest2 started enforced review-dne-part-3 session for build 74992.
+
+--- Message (Autotest, 2020-06-15 04:57:47.000000000) ---
+Patch Set 28:
+
+Trevis Autotest started enforced review-dne-part-4 session for build 74992.
+
+--- Message (Autotest, 2020-06-15 04:57:48.000000000) ---
+Patch Set 28:
+
+Onyx Autotest started enforced review-dne-zfs-part-1 session for build 74992.
+
+--- Message (Autotest, 2020-06-15 04:58:05.000000000) ---
+Patch Set 28:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-2 session for build 74992.
+
+--- Message (Autotest, 2020-06-15 04:58:07.000000000) ---
+Patch Set 28:
+
+Trevis Autotest started enforced review-dne-zfs-part-3 session for build 74992.
+
+--- Message (Autotest, 2020-06-15 04:58:08.000000000) ---
+Patch Set 28:
+
+Onyx Autotest started enforced review-dne-zfs-part-4 session for build 74992.
+
+--- Message (Autotest, 2020-06-15 04:58:25.000000000) ---
+Patch Set 28:
+
+Trevis Autotest2 started enforced review-ldiskfs-arm session for build 74992.
+
+--- Message (Autotest, 2020-06-15 04:58:27.000000000) ---
+Patch Set 28:
+
+Trevis Autotest started enforced review-dne-selinux session for build 74992.
+
+--- Message (Autotest, 2020-06-15 04:58:28.000000000) ---
+Patch Set 28:
+
+Onyx Autotest started optional review-dne-ssk session for build 74992.
+
+--- Message (Autotest, 2020-06-15 04:58:45.000000000) ---
+Patch Set 28:
+
+Trevis Autotest2 started optional review-dne-selinux-ssk session for build 74992.
+
+--- Message (Autotest, 2020-06-15 04:58:49.000000000) ---
+Patch Set 28:
+
+Onyx Autotest started optional review-ldiskfs session for build 74992.
+
+--- Message (Autotest, 2020-06-15 05:03:05.000000000) ---
+Patch Set 28:
+
+Trevis Autotest2 started optional review-ldiskfs session for build 74992.
+
+--- Message (wc-checkpatch, 2020-06-15 05:25:35.000000000) ---
+Patch Set 28: Code-Review-1
+
+This change cannot be cherry-picked to master.
+Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (James Simmons, 2020-06-15 14:45:37.000000000) ---
+Uploaded patch set 29.
+
+--- Message (wc-checkpatch, 2020-06-15 15:04:04.000000000) ---
+Patch Set 29:
+
+(3 comments)
+
+3 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Autotest, 2020-06-15 15:18:21.000000000) ---
+Patch Set 29:
+
+Trevis Autotest2 started enforced review-ldiskfs session for build 75011.
+
+--- Message (Autotest, 2020-06-15 15:18:41.000000000) ---
+Patch Set 29:
+
+Trevis Autotest2 started enforced review-zfs session for build 75011.
+
+--- Message (Autotest, 2020-06-15 15:19:01.000000000) ---
+Patch Set 29:
+
+Trevis Autotest2 started enforced review-dne-part-1 session for build 75011.
+
+--- Message (Autotest, 2020-06-15 15:19:21.000000000) ---
+Patch Set 29:
+
+Trevis Autotest2 started enforced review-dne-part-2 session for build 75011.
+
+--- Message (Autotest, 2020-06-15 15:19:52.000000000) ---
+Patch Set 29:
+
+Trevis Autotest2 started enforced review-dne-part-3 session for build 75011.
+
+--- Message (Autotest, 2020-06-15 15:20:11.000000000) ---
+Patch Set 29:
+
+Trevis Autotest2 started enforced review-dne-part-4 session for build 75011.
+
+--- Message (jenkins, 2020-06-15 15:20:31.000000000) ---
+Patch Set 29: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/15038/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews/75011/ : SUCCESS
+
+--- Message (Autotest, 2020-06-15 15:20:32.000000000) ---
+Patch Set 29:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-1 session for build 75011.
+
+--- Message (Autotest, 2020-06-15 15:21:32.000000000) ---
+Patch Set 29:
+
+Onyx Autotest started enforced review-dne-zfs-part-2 session for build 75011.
+
+--- Message (Autotest, 2020-06-15 15:21:37.000000000) ---
+Patch Set 29:
+
+Trevis Autotest started enforced review-dne-zfs-part-3 session for build 75011.
+
+--- Message (Autotest, 2020-06-15 15:21:52.000000000) ---
+Patch Set 29:
+
+Onyx Autotest started enforced review-dne-zfs-part-4 session for build 75011.
+
+--- Message (Autotest, 2020-06-15 15:21:56.000000000) ---
+Patch Set 29:
+
+Trevis Autotest started enforced review-ldiskfs-arm session for build 75011.
+
+--- Message (Autotest, 2020-06-15 15:22:16.000000000) ---
+Patch Set 29:
+
+Trevis Autotest started enforced review-dne-selinux session for build 75011.
+
+--- Message (James Simmons, 2020-06-16 11:49:22.000000000) ---
+Patch Set 30: Patch Set 29 was rebased
+
+--- Message (wc-checkpatch, 2020-06-16 11:53:25.000000000) ---
+Patch Set 30:
+
+(3 comments)
+
+3 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2020-06-16 12:20:18.000000000) ---
+Patch Set 30: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/15056/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews/75029/ : SUCCESS
+
+--- Message (Autotest, 2020-06-16 12:24:38.000000000) ---
+Patch Set 30:
+
+Trevis Autotest started enforced review-ldiskfs session for build 75029.
+
+--- Message (Autotest, 2020-06-16 12:24:46.000000000) ---
+Patch Set 30:
+
+Onyx Autotest started enforced review-zfs session for build 75029.
+
+--- Message (Autotest, 2020-06-16 12:24:58.000000000) ---
+Patch Set 30:
+
+Trevis Autotest started enforced review-dne-part-1 session for build 75029.
+
+--- Message (Autotest, 2020-06-16 12:25:06.000000000) ---
+Patch Set 30:
+
+Onyx Autotest started enforced review-dne-part-2 session for build 75029.
+
+--- Message (Autotest, 2020-06-16 12:25:18.000000000) ---
+Patch Set 30:
+
+Trevis Autotest started enforced review-dne-part-3 session for build 75029.
+
+--- Message (Autotest, 2020-06-16 12:25:26.000000000) ---
+Patch Set 30:
+
+Onyx Autotest started enforced review-dne-part-4 session for build 75029.
+
+--- Message (Autotest, 2020-06-16 12:25:38.000000000) ---
+Patch Set 30:
+
+Trevis Autotest started enforced review-dne-zfs-part-1 session for build 75029.
+
+--- Message (Autotest, 2020-06-16 12:25:46.000000000) ---
+Patch Set 30:
+
+Onyx Autotest started enforced review-dne-zfs-part-2 session for build 75029.
+
+--- Message (Autotest, 2020-06-16 12:25:58.000000000) ---
+Patch Set 30:
+
+Trevis Autotest started enforced review-dne-zfs-part-3 session for build 75029.
+
+--- Message (Autotest, 2020-06-16 12:26:00.000000000) ---
+Patch Set 30:
+
+Trevis Autotest2 started enforced review-dne-zfs-part-4 session for build 75029.
+
+--- Message (Autotest, 2020-06-16 12:26:06.000000000) ---
+Patch Set 30:
+
+Onyx Autotest started enforced review-ldiskfs-arm session for build 75029.
+
+--- Message (Autotest, 2020-06-16 12:26:18.000000000) ---
+Patch Set 30:
+
+Trevis Autotest started enforced review-dne-selinux session for build 75029.
+
+--- Message (Autotest, 2020-06-16 22:32:16.000000000) ---
+Patch Set 30:
+
+Trevis Autotest2 retesting enforced review-dne-zfs-part-1 session for build 75029. Requested by Neil Brown because of LU-11487.
+
+--- Message (Autotest, 2020-06-17 12:02:11.000000000) ---
+Patch Set 30:
+
+Trevis Autotest retesting enforced review-dne-part-3 session for build 75029. Requested by James Simmons because of LU-13514.
+
+--- Message (James Simmons, 2020-06-17 21:52:00.000000000) ---
+Patch Set 31: Patch Set 30 was rebased
+
+--- Message (wc-checkpatch, 2020-06-17 21:56:19.000000000) ---
+Patch Set 31:
+
+(3 comments)
+
+3 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Autotest, 2020-06-17 23:06:37.000000000) ---
+Patch Set 31:
+
+Trevis Autotest2 started enforced review-ldiskfs session for build 75081.
+
+--- Message (Autotest, 2020-06-17 23:06:57.000000000) ---
+Patch Set 31:
+
+Trevis Autotest2 started enforced review-zfs session for build 75081.
+
+--- Message (Autotest, 2020-06-17 23:07:17.000000000) ---
+Patch Set 31:
+
+Trevis Autotest2 started enforced review-dne-part-1 session for build 75081.
+
+--- Message (jenkins, 2020-06-17 23:07:27.000000000) ---
+Patch Set 31: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/15107/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews/75081/ : SUCCESS
+
+--- Message (Autotest, 2020-06-17 23:07:37.000000000) ---
+Patch Set 31:
+
+Trevis Autotest2 started enforced review-dne-part-2 session for build 75081.
+
+--- Message (Autotest, 2020-06-17 23:07:57.000000000) ---
+Patch Set 31:
+
+Trevis Autotest2 started enforced review-dne-part-3 session for build 75081.
+
+--- Message (Autotest, 2020-06-17 23:08:17.000000000) ---
+Patch Set 31:
+
+Trevis Autotest2 started enforced review-dne-part-4 session for build 75081.
+
+--- Message (Autotest, 2020-06-17 23:09:46.000000000) ---
+Patch Set 31:
+
+AT Release Candidate started enforced review-dne-zfs-part-1 session for build 75081.
+
+--- Message (Autotest, 2020-06-17 23:09:57.000000000) ---
+Patch Set 31:
+
+Trevis Autotest started enforced review-dne-zfs-part-2 session for build 75081.
+
+--- Message (Autotest, 2020-06-17 23:10:17.000000000) ---
+Patch Set 31:
+
+Trevis Autotest started enforced review-dne-zfs-part-4 session for build 75081.
+
+--- Message (Autotest, 2020-06-17 23:10:37.000000000) ---
+Patch Set 31:
+
+Trevis Autotest started enforced review-ldiskfs-arm session for build 75081.
+
+--- Message (Autotest, 2020-06-17 23:10:57.000000000) ---
+Patch Set 31:
+
+Trevis Autotest started enforced review-dne-selinux session for build 75081.
+
+--- Message (Autotest, 2020-06-17 23:17:58.000000000) ---
+Patch Set 31:
+
+AT Release Candidate started enforced review-dne-zfs-part-3 session for build 75081.
+
+--- Message (Autotest, 2020-06-18 00:16:42.000000000) ---
+Patch Set 31:
+
+Trevis Autotest2 started enforced review-ldiskfs-arm session for build 75081.
+
+--- Message (Autotest, 2020-06-18 14:24:41.000000000) ---
+Patch Set 31:
+
+Trevis Autotest started enforced review-ldiskfs-arm session for build 75081.
+
+--- Message (James Simmons, 2020-06-18 19:09:30.000000000) ---
+Patch Set 31:
+
+I tested the DOM setup and it works now. Doing general testing now.
+
+--- Message (Autotest, 2020-06-18 19:12:30.000000000) ---
+Patch Set 31:
+
+Onyx Autotest retesting enforced review-ldiskfs-arm session for build 75081. Requested by James Simmons because of ATM-1770.
+
+--- Message (Autotest, 2020-06-18 19:20:20.000000000) ---
+Patch Set 31:
+
+Onyx Autotest retesting enforced review-dne-part-3 session for build 75081. Requested by James Simmons because of LU-13514.
+
+--- Message (Autotest, 2020-06-18 19:32:52.000000000) ---
+Patch Set 31:
+
+Trevis Autotest2 retesting enforced review-dne-zfs-part-1 session for build 75081. Requested by James Simmons because of LU-12186.
+
+--- Message (Autotest, 2020-06-18 19:33:51.000000000) ---
+Patch Set 31:
+
+Trevis Autotest retesting enforced review-dne-zfs-part-4 session for build 75081. Requested by James Simmons because of LU-13195.
+
+--- Message (Shuichi Ihara, 2020-06-18 21:15:54.000000000) ---
+Patch Set 31:
+
+> I found a couple of bugs and some opportunity for tidying up code
+ > and comments.
+ > 
+ > Shuichi: could you please run your test again and see if the
+ > problem still occurs?  Thanks.
+
+I've tested the latest patch (patch set31) and ran same workloads on DoM, but didn't see same problem so far. 
+I repeated several times, but no regression reproduced. In previous patch(patch set27), it used to be almost 100% failures in my case.
+
+--- Message (Neil Brown, 2020-06-18 23:40:13.000000000) ---
+Patch Set 31: Code-Review+1
+
+> I repeated several times, but no regression reproduced.
+
+That's great news.  Thanks so much for testing!
+
+--- Message (James Simmons, 2020-06-19 12:28:13.000000000) ---
+Patch Set 31: Code-Review+1
+
+--- Message (James Simmons, 2020-06-19 12:29:38.000000000) ---
+Patch Set 31:
+
+Deployed this on our test bed and its working well. Now to get Oleg to try to break it.
+
+--- Message (Shaun Tancheff, 2020-06-23 05:58:53.000000000) ---
+Patch Set 31: Code-Review+1
+
+--- Message (Oleg Drokin, 2020-06-28 02:29:28.000000000) ---
+Patch Set 31: Code-Review+2
+
+(1 comment)
+
+--- Message (unknown, 2020-06-28 02:47:34.000000000) ---
+Change has been successfully cherry-picked as aff14dbc522e140945f9207d4e9bbd27d0326819 by Oleg Drokin

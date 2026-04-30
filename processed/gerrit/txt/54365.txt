@@ -1,0 +1,535 @@
+Change:     54365
+Subject:    LU-17504 build: fix array-index-out-of-bounds warning
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/54365
+Change-Id:  Ic461c4b30317bfd2b1e9f5b6be84c4a7fb4e3eb9
+Project:    fs/lustre-release
+Branch:     master
+Status:     MERGED
+Owner:      Jian Yu
+Created:    2024-03-12 18:37:24.000000000
+Updated:    2024-04-15 16:52:49.000000000
+Patch Set:  9
+Insertions: +70
+Deletions:  -136
+Comments:   58 (7 unresolved)
+
+--- Labels ---
+  Code-Review: James Simmons: +1; Andreas Dilger: +1; Oleg Drokin: +2
+  Verified: jenkins: +1; Maloo: +1
+
+--- Reviewers ---
+  CC: Peter Jones
+  REVIEWER: Oleg Drokin, Andreas Dilger, James Simmons, Jian Yu, Neil Brown
+
+--- Commit Message ---
+LU-17504 build: fix array-index-out-of-bounds warning
+
+On Linux kernel 6.5, due to commit 2d47c6956ab3
+("ubsan: Tighten UBSAN_BOUNDS on GCC"), flexible
+trailing arrays declared like 'lc_array_sum[1];'
+will generate warnings when CONFIG_UBSAN & co. is
+enabled:
+
+  UBSAN: array-index-out-of-bounds in lprocfs_status.c:1609:17
+  index 1 is out of range for type '__s64 [1]'
+
+Since LPROCFS_STATS_FLAG_IRQ_SAFE flag is only used
+in one place - obd_memory() counter, we can just
+remove it and change obd_memory over to a regular
+percpu_counter. This would both simplify the
+lprocfs_counter() code, move over to using more
+kernel functionality instead of libcfs, as well as
+reduce overhead slightly for the memory accounting code.
+
+Change-Id: Ic461c4b30317bfd2b1e9f5b6be84c4a7fb4e3eb9
+Signed-off-by: Jian Yu <yujian@whamcloud.com>
+Reviewed-on: https://review.whamcloud.com/c/fs/lustre-release/+/54365
+Tested-by: jenkins <devops@whamcloud.com>
+Tested-by: Maloo <maloo@whamcloud.com>
+Reviewed-by: Andreas Dilger <adilger@whamcloud.com>
+Reviewed-by: James Simmons <jsimmons@infradead.org>
+Reviewed-by: Oleg Drokin <green@whamcloud.com>
+
+--- Review History ---
+
+--- Message (Jian Yu, 2024-03-12 18:37:24.000000000) ---
+Uploaded patch set 1.
+
+--- Message (wc-checkpatch, 2024-03-12 18:40:14.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (jenkins, 2024-03-12 19:13:57.000000000) ---
+Patch Set 1: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/103032/ : FAILURE
+
+--- Message (Jian Yu, 2024-03-13 06:24:59.000000000) ---
+Uploaded patch set 2.
+
+--- Message (wc-checkpatch, 2024-03-13 06:28:05.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (jenkins, 2024-03-13 06:50:25.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/103044/ : SUCCESS
+
+--- Message (Andreas Dilger, 2024-03-13 19:13:23.000000000) ---
+Patch Set 2: Code-Review-1
+
+While the addition of 8 bytes to the lprocfs_stats counter is not a big deal, I think there is a better fix for this.
+
+It looks like LPROCFS_STATS_FLAG_IRQ_SAFE is only used in one place - obd_memory() counter, and it doesn't need most of the overhead of lprocfs_stats (min/max/average/etc).
+
+It would be better to just remove LPROCFS_STATS_FLAG_IRQ_SAFE and change obd_memory over to a regular percpu_counter.  This would both simplify the lprocfs_counter() code, move over to using more kernel functionality instead of libcfs, as well as reduce overhead slightly for the memory accounting code.
+
+It looks like that would be relatively little effort, just change the accounting macros:
+
+ /* OBD_MEMORY_BATCH is the maximum error allowed per CPU core.  Since
+  * obd_memory_sum() is calling percpu_counter_sum_positive(), it adds
+  * up the per-core local delta anyway, so the per-core batch size is
+  * can be large.  This could be percpu_counter_add_local(), but that
+  * only exists in kernel 6.0 and later, and just uses a larger batch.
+  */
+ #define OBD_MEMORY_BATCH (16 * 1024 * 1024)
+ #define obd_memory_add(size) percpu_counter_add_batch(obd_memory, (size), \
+                                                       OBD_MEMORY_BATCH)
+ #define obd_memory_sub(size) percpu_counter_sub_batch(obd_memory, (size), \
+                                                       OBD_MEMORY_BATCH)
+ #define obd_memory_sum()     percpu_counter_sum_positive(obd_memory)
+
+I only see obd_update_maxusage() called in the pinger thread on the clients, but I don't see obd_update_maxusage() on the servers.  It might make sense to change this to call obd_update_maxusage() once every 5 seconds as a work item instead of the pinger, so that it always runs on all nodes?  However, that could be a separate patch in case it has some issues and shouldn't delay this cleanup.
+ 
+
+The "#else /* CONFIG_PROC_FS */" block could also be removed since this no longer depends on lprocfs_counter.
+
+--- Message (Jian Yu, 2024-03-14 19:39:46.000000000) ---
+Patch Set 2:
+
+Hi Andreas,
+I just found if we changed "struct lprocfs_stats *obd_memory" to "struct percpu_counter *obd_memory", then all of the lprocfs_* operations on obd_memory in obdclass_init() need to be changed to use percpu_counter_* functions. I'm not sure if there is a proper way to change the following one:
+
+        lprocfs_counter_init(obd_memory, OBD_MEMORY_STAT,
+                             LPROCFS_CNTR_AVGMINMAX | LPROCFS_TYPE_BYTES,
+                             "memused");
+
+--- Message (Andreas Dilger, 2024-03-14 21:07:09.000000000) ---
+Patch Set 2:
+
+> Hi Andreas,
+ > I just found if we changed "struct lprocfs_stats *obd_memory" to
+ > "struct percpu_counter *obd_memory", then all of the lprocfs_*
+ > operations on obd_memory in obdclass_init() need to be changed to
+ > use percpu_counter_* functions. I'm not sure if there is a proper
+ > way to change the following one:
+ > 
+ > lprocfs_counter_init(obd_memory, OBD_MEMORY_STAT,
+ > LPROCFS_CNTR_AVGMINMAX | LPROCFS_TYPE_BYTES,
+ > "memused");
+
+The percpu_counter is allocated statically 
+
+ struct percpu_counter obd_memory;
+ EXPORT_SYMBOL(obd_memory);
+
+then to initialize this memory before use:
+
+ #ifdef HAVE_PERCPU_COUNTER_INIT_GFP_FLAG
+        rc = percpu_counter_init(&obd_memory, 0, GFP_KERNEL);
+ #else
+        rc = return percpu_counter_init(&obd_memory, 0);
+ #endif
+        if (rc < 0) {
+                CERROR("obdclass: initializing 'obd_memory' failed: rc = %d\n", rc);
+                return rc;
+
+and to free it later:
+
+         percpu_counter_destroy(&obd_memory);                   
+
+We might want to make a wrapper for percpu_counter_init() if
+
+--- Message (Andreas Dilger, 2024-03-14 21:17:25.000000000) ---
+Patch Set 2:
+
+> We might want to make a wrapper for percpu_counter_init() if
+
+... this is going to be widely used.
+
+*However*, I also see that the el7.9 3.10 kernel already has the 3-argument percpu_counter_init() and there are places where we are already using percpu_counter_init() and not checking "#ifdef HAVE_PERCPU_COUNTER_INIT_GFP_FLAG", so I think #ifdef complexity and configure check could just be removed entirely.
+
+--- Message (Jian Yu, 2024-03-14 23:00:01.000000000) ---
+Patch Set 2:
+
+Thank you, Andreas.
+I saw "memused" was specified in lprocfs_counter_init(obd_memory,...,"memused"). However, it seems there is no proper way to specify this in percpu_counter functions.
+
+--- Message (Andreas Dilger, 2024-03-14 23:10:19.000000000) ---
+Patch Set 2:
+
+> Thank you, Andreas.
+ > I saw "memused" was specified in lprocfs_counter_init(obd_memory,...,"memused").
+ > However, it seems there is no proper way to specify this in
+ > percpu_counter functions.
+
+I thought this "memused" argument might relate to registering this as a statistic in procfs, but it looks like there is already LUSTRE_RO_ATTR(memused) to create the sysfs file, so that should be enough.  I think the "memused" argument is only if the lprocfs_counter() is used for a multi-stat file (e.g. "osc.*.stats"), so I think that can be ignored in this case.
+
+--- Message (Jian Yu, 2024-03-14 23:17:46.000000000) ---
+Patch Set 2:
+
+Got it, thank you, Andreas.
+
+--- Message (Jian Yu, 2024-03-15 18:54:31.000000000) ---
+Uploaded patch set 3.
+
+--- Message (wc-checkpatch, 2024-03-15 18:57:12.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+2 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2024-03-15 19:19:03.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/103166/ : SUCCESS
+
+--- Message (Jian Yu, 2024-03-15 21:04:34.000000000) ---
+Patch Set 3:
+
+> Patch Set 3:
+> 
+> Failed enforced test review-dne-part-2 on RHEL 8.9/x86_64 uploaded by Trevis Autotest from trevis-78vm1: https://testing.whamcloud.com/test_sessions/a1dd6dfa-9477-458e-96a7-5b603b4f3124 ran 7 tests.  2 tests failed: sanity-sec, sanity-lfsck.
+
+[ 4170.541053] LustreError: 192485:0:(class_obd.c:897:obdclass_exit()) obd_memory max: 7055540345727930, leaked: 7055540345727930
+mv: cannot stat '/tmp/debug': No such file or directory
+Memory leaks detected
+
+--- Message (Andreas Dilger, 2024-03-16 09:13:44.000000000) ---
+Patch Set 3:
+
+(7 comments)
+
+The percpu_counter usage *looks* OK, but clearly the testing shows otherwise.  Are you able to run a small test (e.g. just mount/unmount/rmmod) to see if this passes, or only has a "small" leak, or is the max/leaked amount also large (and maybe a random/corrupted number)?
+
+I think if you insert libcfs by itself then you could enable "debug=+malloc" and then track total memory usage in the debug log?
+
+--- Message (Jian Yu, 2024-03-19 17:50:50.000000000) ---
+Patch Set 3:
+
+(7 comments)
+
+> Patch Set 3:
+> 
+> (7 comments)
+> 
+> The percpu_counter usage *looks* OK, but clearly the testing shows otherwise.  Are you able to run a small test (e.g. just mount/unmount/rmmod) to see if this passes, or only has a "small" leak, or is the max/leaked amount also large (and maybe a random/corrupted number)?
+> 
+> I think if you insert libcfs by itself then you could enable "debug=+malloc" and then track total memory usage in the debug log?
+
+# dmesg -c
+[190915.119660] Key type .llcrypt unregistered
+[190915.119669] Key type ._llcrypt unregistered
+# lustre_rmmod
+# dmesg -c
+# modprobe libcfs
+# lctl set_param debug=+malloc debug_mb=1024
+debug=+malloc
+debug_mb=1024
+# lctl get_param debug
+debug=malloc ioctl neterror warning error emerg ha config console lfsck
+# lctl dk > /dev/null
+# modprobe obdclass
+# lctl dk > /tmp/debug.log.1
+# dmesg -c
+[191379.607272] Key type ._llcrypt registered
+[191379.607277] Key type .llcrypt registered
+[191430.574937] libcfs: HW NUMA nodes: 1, HW CPU cores: 1, npartitions: 1
+[191431.363822] Lustre: Lustre: Build Version: 2.15.61_120_g91f9f3d_dirty
+# lctl dk > /dev/null
+# modprobe -r obdclass
+# lctl dk > /tmp/debug.log.2
+# dmesg -c
+[191484.771208] LustreError: 171086:0:(class_obd.c:879:obdclass_exit()) obd_memory max: 137438953472, leaked: 137438953472
+
+I can consistently reproduce the failure by just loading/unloading the obdclass module. The max and leaked amount is the same and large.
+
+--- Message (Jian Yu, 2024-03-19 18:07:15.000000000) ---
+Patch Set 3:
+
+> Patch Set 3:
+> # dmesg -c
+> [191484.771208] LustreError: 171086:0:(class_obd.c:879:obdclass_exit()) obd_memory max: 137438953472, leaked: 137438953472
+> 
+> I can consistently reproduce the failure by just loading/unloading the obdclass module. The max and leaked amount is the same and large.
+
+The actual memory usage is:
+# cat /tmp/debug.log.1 | awk -F: '/ at / {print $11}' | awk '{sum += $1} END { print sum }'
+1052676
+
+--- Message (Andreas Dilger, 2024-03-19 18:07:31.000000000) ---
+Patch Set 3:
+
+> I can consistently reproduce the failure by just loading/unloading the obdclass module.
+ > The max and leaked amount is the same and large.
+
+Then it looks like the percpu counters are not being initialized properly, or maybe see an underflow?
+
+--- Message (Andreas Dilger, 2024-03-19 18:12:32.000000000) ---
+Patch Set 3:
+
+> > I can consistently reproduce the failure by just
+ > > loading/unloading the obdclass module. The max and leaked amount is
+ > > the same and large.
+ > 
+ > The actual memory usage is:
+ > # cat /tmp/debug.log.1 | awk -F: '/ at / {print $11}' | awk '{sum
+ > += $1} END { print sum }'
+ > 1052676
+
+Can you add temporary CDEBUG(D_ALLOC) right after init and in for each alloc and free to find where it is going wrong.
+
+--- Message (Jian Yu, 2024-03-20 06:29:56.000000000) ---
+Patch Set 3:
+
+(6 comments)
+
+--- Message (Jian Yu, 2024-03-20 06:41:41.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2024-03-20 09:36:48.000000000) ---
+Patch Set 3:
+
+It looks like the memory counter is never being reduced?
+
+--- Message (Jian Yu, 2024-03-20 21:14:31.000000000) ---
+Patch Set 3:
+
+The abnormal increase is caused by OBD_FREE_PTR_ARRAY(cl_envs, num_possible_cpus()) in cl_global_fini(). The num_possible_cpus() is defined as:
+
+  #define num_possible_cpus()	1U
+
+--- Message (Jian Yu, 2024-03-20 21:52:59.000000000) ---
+Uploaded patch set 4.
+
+--- Message (wc-checkpatch, 2024-03-20 21:57:49.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+2 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (wc-checkpatch, 2024-03-20 22:12:24.000000000) ---
+Patch Set 4: Code-Review-1
+
+This change cannot be cherry-picked to master.
+Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (jenkins, 2024-03-20 22:17:42.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/103268/ : SUCCESS
+
+--- Message (wc-checkpatch, 2024-03-20 23:06:53.000000000) ---
+Patch Set 4: -Code-Review
+
+previous -1 sent incorrectly
+
+--- Message (Jian Yu, 2024-03-21 07:23:13.000000000) ---
+Uploaded patch set 5.
+
+--- Message (wc-checkpatch, 2024-03-21 07:27:02.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+2 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2024-03-21 07:48:00.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/103286/ : SUCCESS
+
+--- Message (Jian Yu, 2024-03-22 18:38:40.000000000) ---
+Patch Set 5: Verified-1
+
+The failure can be reproduced by:
+# mount -t lustre -o user_xattr,flock vm88@tcp:/lustre /mnt/lustre
+# umount /mnt/lustre
+# modprobe -r lustre mdc lov lmv osc mgc fid fld
+# dmesg -c
+...
+[357976.350151] Lustre: Mounted lustre-client
+[357983.681056] Lustre: Unmounted lustre-client
+[357988.879266] LNet: 616204:0:(lib-ptl.c:990:lnet_clear_lazy_portal()) Active lazy portal 0 on exit
+[357988.880963] LNet: Removed LNI 192.168.56.113@tcp
+# modprobe -r obdecho
+# dmesg -c
+[358000.235032] LustreError: 616208:0:(class_obd.c:880:obdclass_exit()) obd_memory max: 6564232, leaked: 180
+
+Without mounting and unmounting /mnt/lustre, the memory leak error didn't occur.
+I'm investigating further.
+
+--- Message (Jian Yu, 2024-03-25 17:34:53.000000000) ---
+Uploaded patch set 6.
+
+--- Message (wc-checkpatch, 2024-03-25 17:38:28.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+2 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2024-03-25 18:00:18.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/103478/ : SUCCESS
+
+--- Message (Autotest, 2024-03-26 04:02:01.000000000) ---
+Patch Set 6:
+
+Onyx Autotest 2 retesting enforced review-dne-selinux-ssk-part-2 session on el8.9-x86_64/ldiskfs servers and clients for build 103478 patch 6. Requested by jianyu because of LU-17056.
+
+--- Message (Autotest, 2024-03-26 15:45:13.000000000) ---
+Patch Set 6:
+
+Onyx Autotest 2 retesting enforced review-dne-selinux-ssk-part-2 session on el8.9-x86_64/ldiskfs servers and clients for build 103478 patch 6. Requested by jianyu because of LU-17057.
+
+--- Message (James Simmons, 2024-03-27 17:43:31.000000000) ---
+Patch Set 6: Code-Review+1
+
+Nice improvement
+
+--- Message (Jian Yu, 2024-03-27 18:23:06.000000000) ---
+Patch Set 6:
+
+> Patch Set 6:
+> 
+> Failed enforced test review-dne-part-4 on RHEL 8.9/x86_64, RHEL 9.3/x86_64 uploaded by Onyx Autotest 2 from onyx-119vm1: https://testing.whamcloud.com/test_sessions/df53f7d6-d5f9-43fc-8be7-669aa559b568 ran 9 tests.  1 tests failed: sanity-flr.
+
+Blocked by LU-17675.
+
+--- Message (Andreas Dilger, 2024-03-27 23:33:15.000000000) ---
+Patch Set 6: Code-Review-1
+
+(4 comments)
+
+--- Message (Jian Yu, 2024-04-01 07:52:34.000000000) ---
+Uploaded patch set 7.
+
+--- Message (Jian Yu, 2024-04-01 07:52:48.000000000) ---
+Patch Set 7:
+
+(4 comments)
+
+--- Message (Lustre Gerrit Janitor, 2024-04-01 07:55:23.000000000) ---
+Patch Set 7:
+
+(18 comments)
+
+centos7: Compile failed
+
+
+ Job output URL: https://testing.whamcloud.com/gerrit-janitor/41491/results.html
+
+--- Message (jenkins, 2024-04-01 08:29:03.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/103718/ : SUCCESS
+
+--- Message (Andreas Dilger, 2024-04-02 06:41:06.000000000) ---
+Patch Set 7: Code-Review-1
+
+(1 comment)
+
+It is a bit annoying that the static inline functions generate compile warnings, better to revert to the macros again. Sorry about the churn.
+
+--- Message (James Simmons, 2024-04-02 23:51:04.000000000) ---
+Patch Set 7:
+
+The problem is percpu_counter_add_batch() doesn't exist for RHEL7.
+
+--- Message (James Simmons, 2024-04-02 23:53:38.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2024-04-03 00:49:32.000000000) ---
+Patch Set 7:
+
+(2 comments)
+
+--- Message (Peter Jones, 2024-04-03 00:51:42.000000000) ---
+Patch Set 7:
+
+Why are we still making our lives more complicated due to RHEL7? The primary distro for this release in RHEL9 and the secondary (which is useful for back porting things to b2_15) is RHEL8. Yay! No RHEL7! :-)
+
+--- Message (Andreas Dilger, 2024-04-03 04:01:21.000000000) ---
+Patch Set 7:
+
+Because Oleg's Janitor is still building and testing el7.9, so if we break the build there we will no longer get static code analysis and crash dump annotations in Gerrit. We've just removed the el7.4-7.8 and el8.0-8.3 ldiskfs patch series, but can't move on beyond that until Oleg replaces el7.9 with el9.3.
+
+It should be a relatively small change to implement a compatibility fallback for el7.9.
+
+--- Message (Jian Yu, 2024-04-03 04:25:50.000000000) ---
+Patch Set 7:
+
+Sure, Andreas. Let me update the patch.
+
+--- Message (Jian Yu, 2024-04-03 08:06:51.000000000) ---
+Uploaded patch set 8.
+
+--- Message (Jian Yu, 2024-04-03 08:07:11.000000000) ---
+Patch Set 8:
+
+(2 comments)
+
+--- Message (jenkins, 2024-04-03 08:32:52.000000000) ---
+Patch Set 8: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/103814/ : SUCCESS
+
+--- Message (Andreas Dilger, 2024-04-03 16:46:51.000000000) ---
+Patch Set 8: Code-Review+1
+
+Thanks for the update. Hopefully soon we can drop el7.9 client support, but luckily this patch only needed a small fix. It looks like this would also have broken SLES12 (4.4 kernel) so it is good that it was caught.
+
+--- Message (Jian Yu, 2024-04-03 17:08:37.000000000) ---
+Patch Set 8:
+
+Thank you for the guidance.
+
+--- Message (James Simmons, 2024-04-03 23:02:32.000000000) ---
+Patch Set 8: Code-Review+1
+
+--- Message (Oleg Drokin, 2024-04-15 16:52:46.000000000) ---
+Patch Set 8: Code-Review+2
+
+--- Message (Oleg Drokin, 2024-04-15 16:52:49.000000000) ---
+Change has been successfully cherry-picked as b698abd415bc4a810f307611fe984e50e007581e by Oleg Drokin

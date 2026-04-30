@@ -1,0 +1,507 @@
+Change:     50451
+Subject:    LU-16671 osc: fix unstable pages for short IO
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/50451
+Change-Id:  I34b09f8324424c3ff0b0c09c86f01c938b643e37
+Project:    fs/lustre-release
+Branch:     master
+Status:     MERGED
+Owner:      Patrick Farrell
+Created:    2023-03-28 15:05:40.000000000
+Updated:    2023-09-23 06:04:14.000000000
+Patch Set:  13
+Insertions: +29
+Deletions:  -29
+Comments:   11 (3 unresolved)
+Topic:      cg
+
+--- Labels ---
+  Code-Review: Qian Yingjin: +1; Shaun Tancheff: +1; Andreas Dilger: +1; Oleg Drokin: +2
+  Verified: jenkins: +1; Maloo: +1
+
+--- Reviewers ---
+  REVIEWER: Oleg Drokin, Andreas Dilger, Alex Zhuravlev, James Simmons, Qian Yingjin, Shaun Tancheff, Patrick Farrell
+
+--- Commit Message ---
+LU-16671 osc: fix unstable pages for short IO
+
+Unstable pages was written with theoretical support for
+short IO (ie, no bulk, data-in-rpc, LU-1757), but since the
+short IO code wasn't merged until years later, they were
+probably never tested together.  And when you do, it
+crashes.
+
+In truth, short IO has no separate pages to be tracked,
+which is why this is crashing.  This means that small write
+RPCs won't be tracked in unstable pages, but that's a very
+minor limitation and unlikely to cause trouble.  (and since
+RPC allocations are not 'pages', they're just malloc'ed,
+there's no good way to track them anyway)
+
+Fixes: 70f092a ("LU-1757 brw: add short io osc/ost transfer.")
+Signed-off-by: Patrick Farrell <pfarrell@whamcloud.com>
+Change-Id: I34b09f8324424c3ff0b0c09c86f01c938b643e37
+Reviewed-on: https://review.whamcloud.com/c/fs/lustre-release/+/50451
+Tested-by: jenkins <devops@whamcloud.com>
+Tested-by: Maloo <maloo@whamcloud.com>
+Reviewed-by: Andreas Dilger <adilger@whamcloud.com>
+Reviewed-by: Qian Yingjin <qian@ddn.com>
+Reviewed-by: Shaun Tancheff <shaun.tancheff@hpe.com>
+Reviewed-by: Oleg Drokin <green@whamcloud.com>
+
+--- Review History ---
+
+--- Message (Patrick Farrell, 2023-03-28 15:05:40.000000000) ---
+Uploaded patch set 1.
+
+--- Message (wc-checkpatch, 2023-03-28 15:06:16.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see http://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2023-03-28 15:37:16.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/93324/ : SUCCESS
+
+--- Message (Andreas Dilger, 2023-03-28 16:51:21.000000000) ---
+Patch Set 1: Code-Review-1
+
+(3 comments)
+
+-1 just for style.
+
+The short IO question makes me wonder if there is a data integrity issue lurking somewhere, or if the pages still go into page cache (for read consistency), but they are not pinned by the RPC itself?
+
+--- Message (Patrick Farrell, 2023-03-28 17:36:18.000000000) ---
+Patch Set 1:
+
+Ugh, you raise some excellent questions about uncommitted pages and pinning.  This may be a horrible mess.
+
+So, to start off, shortio doesn't look to change anything.  It's true we only pin bulk pages, but we can flush pinned pages *from the page cache* if there's a dlmlock cancellation.  They are not freed because they're pinned, but they do leave the page cache.  Otherwise dlmlock cancellations would always have to wait for writes to *commit* on the client, which can be a multi-second affair while the client waits to find out.  I just double-checked this on a test system, we will cancel a dlmlock with uncommitted pages under it, but they're not unpinned until the commit occrs.
+
+But that means we can have stale uncommited pages, and so on a replay we could push them to the server, potentially overwriting a later write...  Correct?
+
+This actually seems like a huge hole in our consistency, I think implausibly huge, since the window for client notification of commit is routinely in seconds.
+
+What about dlmlock replay, etc?  Does that save us?  The node which could try to replay the write doesn't have the dlmlock any more, would that cause the write to be discarded?  That seems like it would save us, maybe we do that?  I don't know the recovery code well.
+
+So, anyway, I see a hole with uncommitted pages, but I find it hard to believe it's really there, since it's not a small hole and it would have been there forever if it's there at all.
+
+--- Message (Patrick Farrell, 2023-03-28 17:36:32.000000000) ---
+Patch Set 1:
+
+(re: the rest of your review, OK, I'll hit those. :) )
+
+--- Message (Andreas Dilger, 2023-03-28 18:32:09.000000000) ---
+Patch Set 1:
+
+Hmm, what about DLM lock cancellation forcing sync on the filesystem *before* it sends the cancel to the client, and then the blocking callback RPC itself would contain the last_committed update that allows the client to drop the pages?
+
+That would be better for the client (especially since it gets an RPC with a new last_committed when it may otherwise not have any RPCs in flight), but I guess worse from the POV that lock cancels would be bounded by disk IO speed and commit...  This is what sync_on_cancel already does, but I don't know if it is guaranteed to get the last_committed update to the client before the RPC is sent.
+
+--- Message (Patrick Farrell, 2023-03-28 18:59:10.000000000) ---
+Patch Set 1:
+
+Ah, but I think there you're assuming the pages under the lock have already been sent when the server requests the cancel.  There's no reason that has to be true, they could still be sitting around dirty on the client.  Also, the server doesn't know if there are dirty pages, so a 'sync' first could be pretty expensive for not much, right?
+
+Rolling this back:
+I still feel like either we don't have this gap, or it's somehow very small.  This feels like a gap we could drive a truck through if it's really there.
+
+--- Message (Andreas Dilger, 2023-03-29 00:14:18.000000000) ---
+Patch Set 1:
+
+> But that means we can have stale uncommited pages, and so on a
+ > replay we could push them to the server, potentially overwriting
+ > a later write...  Correct?
+
+The client's pages don't have to be *clean* at the time of the blocking callback.  However, they *do* have to be at least sent to the OST by the time the client sends the lock cancel.  The "obdfilter.*.sync_lock_cancel" parameter decides whether the OST should do a sync before the DLM lock is granted to another client.  If sync_on_cancel=enabled/blocking then the reply to the client's cancel *should* contain an updated last_committed, and the client could immediately drop the RPCs pinning the pages at that point.
+
+Unfortunately, obdfilter.*.sync_lock_cancel=never is the default.  It isn't clear if that can lead to an actual recovery error *if all clients participate in recovery*.  The former client's write RPCs sent before the cancel will have a lower transno and be replayed in order before any write RPCs from the new client holding that extent lock.
+
+Yes, the old RPCs might overwrite newer data on disk *temporarily* from stale pages, but the second client's RPC replay would overwrite with newer data again.  Note that the "new data on disk" would be (mostly) inaccessible since the block pointers would not even be in the inode, because (for extending writes at least) they would have been lost when the OSS crashed.  If, at any time, a journal commit happened on the OST to save the block pointers, then last_committed would also be atomically increased, and both client's write RPCs would be dropped before overwrite due to having a lower transno, and all is well.
+
+The case for overwrites in the middle of a file for previously-allocated blocks is more precarious, in that if the new client does not participate in recovery (crash/eviction), then the old client may overwrite new data with stale data from cache.  However, this is a bit of Schrödinger's writes, since no fsync must have happened from the new client before crash/eviction (or last_committed would have increased), so there is no way to really know externally if those writes made it to the OST and were overwritten, or they never made it at all.
+
+ > What about dlmlock replay, etc?  Does that save us?  The node
+ > which could try to replay the write doesn't have the dlmlock
+ > any more, would that cause the write to be discarded?
+
+No, the RPCs will be replayed in transno order for that target, regardless of DLM lock state, but per my comments above I think this is handled properly.
+
+ > Rolling this back:
+ > I still feel like either we don't have this gap, or it's somehow
+ > very small.  This feels like a gap we could drive a truck through
+ > if it's really there.
+
+My main concern was when you mentioned that short write pages are not pinned, but I now *think* that is OK and was just a misunderstanding on my part:
+- for short DIO writes, the short write data is copied into the RPC buffer and is available for replay until OST commit, *regardless of whether the write is sync on the OST or not*.  That is good because it means the ior-hard-write optimization to make short writes buffered on the server will not break anything.
+- for short buffered writes, the data is copied into the RPC buffer *at the time of write* and is usable for replay until commit, but it should *also* be copied into the page cache for reads.  I haven't confirmed this (I think that is more in your area), but it makes sense otherwise it isn't really a "buffered" write at all.
+
+I thought "unpinned short BIO pages" == "no other copy of the data on the client", but I don't think that is correct.
+
+--- Message (Patrick Farrell, 2023-03-30 16:23:17.000000000) ---
+Patch Set 1:
+
+Thanks for the clear walkthrough on the consistency stuff - I believe I follow.
+
+-------
+"for short buffered writes, the data is copied into the RPC buffer *at the time of write* and is usable for replay until commit, but it should *also* be copied into the page cache for reads.  I haven't confirmed this (I think that is more in your area), but it makes sense otherwise it isn't really a "buffered" write at all."
+
+Yes, it's actually more like this - for buffered IO, everything goes in the page cache *first*.
+
+For writes, the data is copied to the page cache, then we make RPCs from it.
+
+For short IOs, the data is copied again - in to the RPC body - but for regular bulk IOs, we do RDMA from the page cache pages, which are already in the cache at that time.  The page cache pages are available for *read* on the client after the data from userspace has been copied in to them (making them dirty).  This is separate from any RPC formation and sending to the server we might do.
+
+Reads proceed identically, in that page cache pages are inserted and allocated, then we build the RPCs.  It's just that those pages are locked and are not marked uptodate until the RPCs occur and the data is copied to those pages.
+
+That explanation feels a little muddy to me; hopefully it's clear.  Here's another pass at it, without only limited simplifying omissions...
+
+The first step for buffered IO is always inserting pages in to the page cache.  For writes, the pages are locked when we start, but they're unlocked once we've dirtied them with the user data, so they can be read.  RPC formation happens at some other time - maybe immediately, maybe a bit later, but it's not really connected.  For reads, the pages are also locked on creation, but they're not unlocked until we've actually done the reads from the server and the data is in the pages.  (I'm sure this explanation raises questions, but hopefully it answers some too. ;))
+
+--- Message (Patrick Farrell, 2023-03-30 16:34:31.000000000) ---
+Uploaded patch set 2.
+
+--- Message (Patrick Farrell, 2023-03-30 16:35:31.000000000) ---
+Uploaded patch set 3.
+
+--- Message (jenkins, 2023-03-30 16:35:33.000000000) ---
+Patch Set 2:
+
+No Builds Executed
+
+--- Message (wc-checkpatch, 2023-03-30 16:37:04.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (Patrick Farrell, 2023-03-30 16:39:33.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+A general comment on unstable pages:
+It doesn't look like we need them to fix our cgroups issues, but I'd like to keep them around rather than remove them.  They're not very complicated and being able to turn them on helped understand the memory issue.
+
+Ideally, I'd take the time to check the performance implications of leaving them on by default so we could keep them regularly exercised - Jinshan supposedly fixed the main issues with the kernel rate limiting us by not making them NFS unstable pages any more - but that's a time investment that would have 0 obvious return, so I'm just going to leave them in and off.
+
+--- Message (jenkins, 2023-03-30 17:03:19.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/93421/ : SUCCESS
+
+--- Message (Andreas Dilger, 2023-03-31 09:06:14.000000000) ---
+Patch Set 3: Code-Review+1
+
+(4 comments)
+
+Looks functionally OK.  Could use slightly better naming, but not the end of the world.
+
+Should this get a test to at least turn it on and do some IO?
+
+--- Message (Patrick Farrell, 2023-03-31 14:24:25.000000000) ---
+Patch Set 3:
+
+Yes, I'll add one - even a small test will help reduce problems if we need this in the future.
+
+--- Message (Shaun Tancheff, 2023-04-02 05:45:36.000000000) ---
+Patch Set 3:
+
+(2 comments)
+
+Aside from s/NR_WRITEBACK/NR_ZONE_WRITE_PENDING/ this looks fine.
+
+--- Message (Patrick Farrell, 2023-04-02 15:10:59.000000000) ---
+Patch Set 3:
+
+Shaun,
+
+I'm game for us fixing those, but I think that belongs in another patch, since I think it's a semantic change?  This is just fixing a coding error that makes short_io blow up and doing a few style things on the way through.
+
+--- Message (Shaun Tancheff, 2023-04-02 15:28:32.000000000) ---
+Patch Set 3:
+
+> Patch Set 3:
+> 
+> Shaun,
+> 
+> I'm game for us fixing those, but I think that belongs in another patch, since I think it's a semantic change?  This is just fixing a coding error that makes short_io blow up and doing a few style things on the way through.
+
+NR_WRITEBACK is something like 18 or 19, a member of enum node_stat_item (of ~40 items)
+NR_ZONE_WRITE_PENDING is 6, a member of enum zone_stat_item (of ~11 items)
+
+mod_zone_page_state() -> mod_zone_state() -> zone_page_state_add() ->
+   &zone->vm_stat[item == NR_WRITEBACK]
+
+Note that vm_stat is an array of enum zone_stat_item items ... so this actually modify something else.
+
+And again the second entry in is also an array in global memory so it probably is actually modifying a value in vm_node_stat[] and not in vm_zone_stat as was intended.
+
+Yes, we can probably fix these in a separate patch, but these seem like real bugs to me (even if they did exist before your change).
+
+--- Message (Patrick Farrell, 2023-04-02 15:32:48.000000000) ---
+Patch Set 3:
+
+OK, I completely agree they're likely real bugs - I just don't think those fixes belong in this patch.  (This patch also needs a few tests, which I have on my to-do list...)
+
+Happy to review a separate patch with those fixes.
+
+--- Message (Patrick Farrell, 2023-04-12 15:01:58.000000000) ---
+Patch Set 4: Patch Set 3 was rebased
+
+--- Message (wc-checkpatch, 2023-04-12 15:03:28.000000000) ---
+Patch Set 4:
+
+Looks good to me.
+
+--- Message (jenkins, 2023-04-12 16:51:03.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/93859/ : SUCCESS
+
+--- Message (Shaun Tancheff, 2023-05-08 03:38:56.000000000) ---
+Patch Set 4: Code-Review+1
+
+--- Message (Shaun Tancheff, 2023-06-07 05:18:56.000000000) ---
+Uploaded patch set 5: Patch Set 4 was rebased.
+
+--- Message (wc-checkpatch, 2023-06-07 05:23:10.000000000) ---
+Patch Set 5:
+
+Looks good to me.
+
+--- Message (jenkins, 2023-06-07 05:54:31.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/95404/ : SUCCESS
+
+--- Message (Shaun Tancheff, 2023-06-13 08:26:54.000000000) ---
+Uploaded patch set 6: Patch Set 5 was rebased.
+
+--- Message (wc-checkpatch, 2023-06-13 08:28:04.000000000) ---
+Patch Set 6:
+
+Looks good to me.
+
+--- Message (jenkins, 2023-06-13 09:12:10.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/95550/ : SUCCESS
+
+--- Message (wc-checkpatch, 2023-06-28 23:37:38.000000000) ---
+Patch Set 6: Code-Review-1
+
+This change cannot be cherry-picked to master.
+Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (Shaun Tancheff, 2023-07-14 11:55:02.000000000) ---
+Uploaded patch set 7.
+
+--- Message (wc-checkpatch, 2023-07-14 12:00:14.000000000) ---
+Patch Set 7:
+
+Looks good to me.
+
+--- Message (jenkins, 2023-07-14 12:19:18.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/96286/ : SUCCESS
+
+--- Message (Qian Yingjin, 2023-08-09 08:45:18.000000000) ---
+Uploaded patch set 8: Patch Set 7 was rebased.
+
+--- Message (wc-checkpatch, 2023-08-09 08:47:41.000000000) ---
+Patch Set 8:
+
+Looks good to me.
+
+--- Message (jenkins, 2023-08-09 09:13:01.000000000) ---
+Patch Set 8: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/96745/ : SUCCESS
+
+--- Message (Qian Yingjin, 2023-08-17 01:28:50.000000000) ---
+Uploaded patch set 9: Patch Set 8 was rebased.
+
+--- Message (wc-checkpatch, 2023-08-17 01:32:44.000000000) ---
+Patch Set 9:
+
+Looks good to me.
+
+--- Message (jenkins, 2023-08-17 01:52:25.000000000) ---
+Patch Set 9: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/96999/ : SUCCESS
+
+--- Message (Autotest, 2023-08-17 17:33:35.000000000) ---
+Patch Set 9:
+
+Onyx Autotest retesting enforced review-dne-part-1 session on el8.8-x86_64/ldiskfs servers and clients for build 96999 patch 9. Requested by James Simmons because of LU-16541.
+
+--- Message (Autotest, 2023-08-17 17:33:41.000000000) ---
+Patch Set 9:
+
+Trevis Autotest retesting enforced review-ldiskfs session on el8.8-x86_64/ldiskfs servers and clients for build 96999 patch 9. Requested by James Simmons because of LU-16541.
+
+--- Message (Autotest, 2023-08-17 17:33:56.000000000) ---
+Patch Set 9:
+
+Onyx Autotest retesting enforced review-dne-zfs-part-1 session on el8.8-x86_64/zfs servers and clients for build 96999 patch 9. Requested by James Simmons because of LU-16541.
+
+--- Message (Autotest, 2023-08-17 17:34:01.000000000) ---
+Patch Set 9:
+
+Trevis Autotest retesting enforced review-dne-part-5 session on el8.8-x86_64/ldiskfs servers and clients for build 96999 patch 9. Requested by James Simmons because of LU-16635.
+
+--- Message (Autotest, 2023-08-18 03:32:11.000000000) ---
+Patch Set 9:
+
+Onyx Autotest retesting enforced review-dne-zfs-part-1 session on el8.8-x86_64/zfs servers and clients for build 96999 patch 9. Requested by Qian Yingjin because of LU-16541.
+
+--- Message (Qian Yingjin, 2023-08-22 09:33:23.000000000) ---
+Uploaded patch set 10: Patch Set 9 was rebased.
+
+--- Message (wc-checkpatch, 2023-08-22 09:37:26.000000000) ---
+Patch Set 10:
+
+Looks good to me.
+
+--- Message (jenkins, 2023-08-22 09:58:40.000000000) ---
+Patch Set 10: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/97091/ : SUCCESS
+
+--- Message (Patrick Farrell, 2023-08-28 16:46:50.000000000) ---
+Uploaded patch set 11: Patch Set 10 was rebased.
+
+--- Message (Patrick Farrell, 2023-08-28 16:48:02.000000000) ---
+Patch Set 11:
+
+Ping for review for this one
+
+--- Message (wc-checkpatch, 2023-08-28 16:50:22.000000000) ---
+Patch Set 11:
+
+Looks good to me.
+
+--- Message (Peter Jones, 2023-08-28 19:25:35.000000000) ---
+Topic set to cg
+
+--- Message (jenkins, 2023-08-28 22:50:31.000000000) ---
+Patch Set 11: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/97326/ : SUCCESS
+
+--- Message (Shaun Tancheff, 2023-08-29 12:40:25.000000000) ---
+Patch Set 11: Code-Review+1
+
+--- Message (Autotest, 2023-08-31 07:19:20.000000000) ---
+Patch Set 11:
+
+Onyx Autotest retesting enforced review-zfs session on el8.8-x86_64/zfs servers and clients for build 97326 patch 11. Requested by Qian Yingjin because of LU-15461.
+
+--- Message (Patrick Farrell, 2023-08-31 15:46:51.000000000) ---
+Patch Set 11:
+
+Ping for review from not-Shaun
+
+--- Message (Andreas Dilger, 2023-09-01 01:37:21.000000000) ---
+Patch Set 11: Code-Review+1
+
+--- Message (Qian Yingjin, 2023-09-01 02:07:48.000000000) ---
+Patch Set 11:
+
+I think this patch can be landed separately  from this patch series.
+As we do not enable unstable write accounting when cli->cl_cache->ccc_unstable_check is disabled.
+
+--- Message (Patrick Farrell, 2023-09-01 02:10:37.000000000) ---
+Patch Set 11:
+
+That's true, but the series is not safe to use without this patch.  If unstable pages are used without this patch, it will crash.  If unstable pages can't be enabled, the other patches aren't useful.
+
+So...  It seems like it should stay?
+
+--- Message (Andreas Dilger, 2023-09-01 02:41:59.000000000) ---
+Patch Set 11:
+
+This patch could be landed first?  It doesn't look like it has any conflicts, just need to ask Oleg to include it in master-next.
+
+--- Message (Qian Yingjin, 2023-09-01 02:52:05.000000000) ---
+Patch Set 11:
+
+okey, Just retrigger the failure test case in https://review.whamcloud.com/#/c/fs/lustre-release/+/51955/
+and rebase the patch: 
+LU-16713 llite: writeback/commit pages under memory pressure
+
+--- Message (James Simmons, 2023-09-03 13:24:07.000000000) ---
+Patch Set 11: Code-Review+1
+
+--- Message (Qian Yingjin, 2023-09-15 07:12:02.000000000) ---
+Uploaded patch set 12.
+
+--- Message (wc-checkpatch, 2023-09-15 07:13:13.000000000) ---
+Patch Set 12:
+
+Looks good to me.
+
+--- Message (jenkins, 2023-09-15 07:35:59.000000000) ---
+Patch Set 12: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/98490/ : SUCCESS
+
+--- Message (Andreas Dilger, 2023-09-15 10:36:17.000000000) ---
+Patch Set 12: Code-Review+1
+
+Yingjin, since Patrick is the owner of this patch, you can also +1 it to help get it landed.
+
+--- Message (Qian Yingjin, 2023-09-15 10:37:44.000000000) ---
+Patch Set 12: Code-Review+1
+
+--- Message (Autotest, 2023-09-16 04:35:48.000000000) ---
+Patch Set 12:
+
+Onyx Autotest retesting enforced review-dne-selinux-ssk-part-2 session on el8.8-x86_64/ldiskfs servers and clients for build 98490 patch 12. Requested by paf because of LU-17056.
+
+--- Message (Autotest, 2023-09-16 04:36:02.000000000) ---
+Patch Set 12:
+
+Trevis Autotest retesting enforced review-dne-zfs-part-5 session on el8.8-x86_64/zfs servers and clients for build 98490 patch 12. Requested by paf because of LU-17056.
+
+--- Message (Autotest, 2023-09-18 14:15:52.000000000) ---
+Patch Set 12:
+
+Onyx Autotest retesting enforced review-dne-zfs-part-5 session on el8.8-x86_64/zfs servers and clients for build 98490 patch 12. Requested by Charlie Olmstead because of DCO-9449.
+
+--- Message (Shaun Tancheff, 2023-09-20 06:03:26.000000000) ---
+Patch Set 12: Code-Review+1
+
+--- Message (Oleg Drokin, 2023-09-23 06:04:11.000000000) ---
+Patch Set 12: Code-Review+2
+
+--- Message (Oleg Drokin, 2023-09-23 06:04:14.000000000) ---
+Change has been successfully cherry-picked as 4ba4976f525e957ef4c3ca7981bea01f72109ed6 by Oleg Drokin

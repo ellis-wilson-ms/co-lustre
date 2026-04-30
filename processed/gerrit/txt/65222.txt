@@ -1,0 +1,124 @@
+Change:     65222
+Subject:    LU-20112 llite: drop vmpage ref in do_release_page
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/65222
+Change-Id:  I1316aa604e6e60c38897244349040395a9854474
+Project:    fs/lustre-release
+Branch:     master
+Status:     ABANDONED
+Owner:      Patrick Farrell
+Created:    2026-04-10 16:28:37.000000000
+Updated:    2026-04-11 01:35:23.000000000
+Patch Set:  1
+Insertions: +29
+Deletions:  -8
+Comments:   3 (0 unresolved)
+
+--- Labels ---
+  Code-Review: Patrick Farrell: -1
+  Verified: jenkins: +1
+
+--- Reviewers ---
+  CC: Timothy Day
+  REVIEWER: Patrick Farrell
+
+--- Commit Message ---
+LU-20112 llite: drop vmpage ref in do_release_page
+
+drop_caches has no effect on Lustre client page cache pages.
+vvp_page_init() takes an extra vmpage reference via get_page()
+that is only released in cl_page_free().  But during
+do_release_page() (the kernel's release_folio callback),
+cp_ref never reaches zero -- it goes from 2 to 1 (the alloc
+ref remains).  cl_page_free() therefore never runs, the
+vmpage ref is never dropped, and the kernel's remove_mapping()
+fails because page_count is too high.  The page stays cached.
+
+Fix: in do_release_page(), after cl_page_delete() succeeds,
+explicitly put_page(vmpage) to release the vvp_page_init ref
+so remove_mapping() sees the correct refcount.  Set a new
+cp_vmpage_ref_released flag on the cl_page so cl_page_free()
+does not double-put when it eventually runs.
+
+Other delete paths (lock cancellation via osc_discard_cb,
+truncate via ll_invalidate_folio) cannot drop the vmpage ref
+in vvp_page_delete() itself: those callers continue to
+dereference cp->cp_vmpage and rely on the page remaining
+locked and live across cl_page_delete().  Only the
+do_release_page() path is safe to drop the ref early -- the
+vmpage is locked by the kernel caller and still in the page
+cache, so it cannot be freed before we return.
+
+Verified via TLA+ formal model extension of the ClPage
+lifecycle.  Manual reproducer:
+
+  cancel_lru_locks osc
+  echo 3 > /proc/sys/vm/drop_caches
+  lfs setstripe -c 1 /mnt/lustre/f
+  dd if=/dev/urandom of=/mnt/lustre/f bs=1M count=1
+  sync; sleep 1
+  lctl set_param osc.*.stats=clear
+  echo 3 > /proc/sys/vm/drop_caches
+  dd if=/mnt/lustre/f of=/dev/null bs=1M
+  lctl get_param -n osc.*.stats | grep ost_read
+  # Without fix: no ost_read (read served from cache)
+  # With fix:    ost_read=1   (page evicted, re-read from OST)
+
+Generated with Claude Code + Tools
+
+Fixes: 9045894fe0 ("LU-10994 clio: remove cpo_assume, cpo_unassume, cpo_fini")
+Test-Parameters: trivial
+Signed-off-by: Patrick Farrell <pfarrell@whamcloud.com>
+Change-Id: I1316aa604e6e60c38897244349040395a9854474
+
+--- Review History ---
+
+--- Message (Patrick Farrell, 2026-04-10 16:28:37.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Timothy Day, 2026-04-10 16:34:28.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-04-10 16:40:24.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (Patrick Farrell, 2026-04-10 16:54:32.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (jenkins, 2026-04-10 16:55:43.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/123709/ : SUCCESS
+
+--- Message (Patrick Farrell, 2026-04-10 19:09:29.000000000) ---
+Patch Set 1: Code-Review-1
+
+Self-1: this patch is a no-op for the drop_caches path it was meant to fix.
+
+Verified with mincore() that pages remain 2048/2048 in cache after drop_caches both with and without this patch. bpftrace confirms ll_release_folio and do_release_page are called zero times during drop_caches; the kernels mapping_evict_folio refcount check (>nr_pages+has_private+1 = >3) rejects Lustre folios at refcount=4 before ever reaching release_folio. So the put_page added here lives in dead code for this path.
+
+Real refcount breakdown observed at mapping_evict_folio entry on Lustre folios:
+  1. page cache
+  2. vvp_page_init get_page (this patch tried to address this one)
+  3. find_lock_entries elevation
+  4. one unidentified extra ref
+
+Investigating ref #4 now. Will rework or abandon once we understand the full picture.
+
+--- Message (Patrick Farrell, 2026-04-10 22:50:21.000000000) ---
+Abandoned
+
+Sorry, false alarm - this is just a problem for pages pinned for replay, which is intended.
+
+Investigation summary: drop_caches works correctly for Lustre client pages. The kernel's mapping_evict_folio refcount check passes for normal cached pages. What was confusing was that pages from a freshly-written file remain pinned by ptlrpc_bulk_kiov_pin_ops until the OST commits the write -- this is the bulk descriptor's intentional pin for write replay during recovery, and the window between completion and commit can be arbitrarily long. Read pages and committed write pages all evict normally.
+
+The patch added put_page in do_release_page, but ll_release_folio is never called during drop_caches in the broken case (the kernel's refcount check rejects the folio at refcount=4 before reaching release_folio), so the put_page lived in dead code.
+
+Reframing LU-20112 as 'add a sanity test that verifies drop_caches works for non-pinned pages' instead of 'fix drop_caches'.

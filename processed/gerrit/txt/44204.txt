@@ -1,0 +1,294 @@
+Change:     44204
+Subject:    LU-14838 osc: Remove lockless truncate
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/44204
+Change-Id:  Ia2979fb6b31a61da6d4833e9f463fcd5b6dbd718
+Project:    fs/lustre-release
+Branch:     master
+Status:     MERGED
+Owner:      Patrick Farrell
+Created:    2021-07-09 20:05:40.000000000
+Updated:    2021-07-28 02:30:06.000000000
+Patch Set:  5
+Insertions: +9
+Deletions:  -134
+Comments:   3 (0 unresolved)
+
+--- Labels ---
+  Code-Review: Wang Shilong: +1; Andreas Dilger: +1; Zhenyu Xu: +1; Oleg Drokin: +2
+  Verified: jenkins: +1; Maloo: +1
+
+--- Reviewers ---
+  REVIEWER: Zhenyu Xu, Oleg Drokin, Andreas Dilger, Wang Shilong, Patrick Farrell
+
+--- Commit Message ---
+LU-14838 osc: Remove lockless truncate
+
+Lockless truncate does not work and cannot be made to work.
+
+Fundamentally, it has no means of ensuring consistency
+across clients because it can't force them all to drop
+cached data without locking.
+
+It's been off for years - let's just get rid of it.
+
+Signed-off-by: Patrick Farrell <pfarrell@whamcloud.com>
+Change-Id: Ia2979fb6b31a61da6d4833e9f463fcd5b6dbd718
+Reviewed-on: https://review.whamcloud.com/44204
+Tested-by: jenkins <devops@whamcloud.com>
+Reviewed-by: Wang Shilong <wshilong@whamcloud.com>
+Tested-by: Maloo <maloo@whamcloud.com>
+Reviewed-by: Andreas Dilger <adilger@whamcloud.com>
+Reviewed-by: Bobi Jam <bobijam@hotmail.com>
+Reviewed-by: Oleg Drokin <green@whamcloud.com>
+
+--- Review History ---
+
+--- Message (Patrick Farrell, 2021-07-09 20:05:40.000000000) ---
+Uploaded patch set 1.
+
+--- Message (wc-checkpatch, 2021-07-09 20:08:17.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2021-07-09 20:10:09.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+centos7: Compile failed
+
+rhel8.3: Compile failed
+
+
+ Job output URL: https://testing-archive.whamcloud.com/gerrit-janitor/17025/results.html
+
+--- Message (Patrick Farrell, 2021-07-09 20:14:09.000000000) ---
+Uploaded patch set 2.
+
+--- Message (jenkins, 2021-07-09 20:14:10.000000000) ---
+Patch Set 1: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/81849/ : ABORTED
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/21770/ : ABORTED
+
+--- Message (wc-checkpatch, 2021-07-09 20:18:49.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (Andreas Dilger, 2021-07-09 20:32:18.000000000) ---
+Patch Set 2:
+
+Maybe I'm missing something here, but the premise of "lockless truncate" was *not* that no locks are taken anywhere, but rather that no locks are fetched by the client, *just* to do the truncate.
+
+There still needs to be a lock on the OST to invalidate the client caches, but this avoids the extra 2x round-trips for the client to lock + truncate + unlock the file under contention.
+
+The workload that triggered the development of lockless truncate was some huge MPI program that was using open(O_TRUNC) on a single file shared across all of the ranks.  Since this was done inside a library, it couldn't be avoided by the application.
+
+--- Message (jenkins, 2021-07-09 21:17:19.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/81852/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/21773/ : SUCCESS
+
+--- Message (Patrick Farrell, 2021-07-10 18:36:21.000000000) ---
+Patch Set 2:
+
+Yeah, I understand now that you say that, I did not write this up well.  Thanks for making me think about this more.
+
+Lockless truncate asks the servers to do it, so there's no central coordination - there's nothing that forces all the locks to be held at once.
+
+The issue is two racing truncates to different sizes.  If they do not hold all the locks at some point, they can interleave across stripes, so you can get a truncate to *different sizes on different OSTs*.
+
+This can lead to a size which is not the size requested by either truncate.
+
+Consider a two stripe file with 1 MiB stripes, racing truncates to 3.5 MiB and 7.5 MiB.
+
+The truncates are just sent to the servers, so they can arrive in different orders at different servers.
+
+Viz, a possible ordering:
+Truncate to 3.5 MiB, then 7.5 MiB on stripe 1
+Truncate to 7.5 MiB, then to 3.5 MiB on stripe 2
+
+And Stripe 1 holds 0-1 MiB, 2-3, 4-5, 6-7, etc…
+Stripe 2 holds 1-2 MiB, 3-4, 5-6, 7-8, etc…
+
+So truncate to 7.5 MiB on stripe 1 is the same on that stripe as truncate to 7 MiB (so, after truncate, the size according to stripe 1 is 7 MiB - 1 byte - since it doesn’t hold the 7.5 MiB offset, that’s on stripe 2)
+
+But stripe 2 has been truncated down to 3.5 MiB, that’s the last operation there, so that’s the size there.  It doesn’t really matter exactly what that does on stripe 2 except that it’s lower than the size on stripe 1.
+
+So when Lustre determines the file size, it uses the “furthest”, which is that 7 MiB - 1 byte from stripe 1.
+
+So the size is 7 MiB - 1 byte, because the truncates interleaved.
+
+So we can’t allow that interleaving, and the only way to do it is through serialization across all the stripes.  So, holding all the locks, somewhere, which should probably be the client.
+
+--- Message (Patrick Farrell, 2021-07-10 18:37:38.000000000) ---
+Patch Set 2:
+
+I don't know if there was some other theory for how this would work...  But I can't see it.  And it has never worked correctly.  (It was disabled by default shortly after being added because it wasn't safe, and has never been reenabled.)
+
+--- Message (Wang Shilong, 2021-07-12 02:29:23.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+> Yeah, I understand now that you say that, I did not write this up
+ > well.  Thanks for making me think about this more.
+ > 
+ > Lockless truncate asks the servers to do it, so there's no central
+ > coordination - there's nothing that forces all the locks to be held
+ > at once.
+ > 
+ > The issue is two racing truncates to different sizes.  If they do
+ > not hold all the locks at some point, they can interleave across
+ > stripes, so you can get a truncate to *different sizes on different
+ > OSTs*.
+ > 
+ > This can lead to a size which is not the size requested by either
+ > truncate.
+ > 
+ > Consider a two stripe file with 1 MiB stripes, racing truncates to
+ > 3.5 MiB and 7.5 MiB.
+ > 
+ > The truncates are just sent to the servers, so they can arrive in
+ > different orders at different servers.
+ > 
+ > Viz, a possible ordering:
+ > Truncate to 3.5 MiB, then 7.5 MiB on stripe 1
+ > Truncate to 7.5 MiB, then to 3.5 MiB on stripe 2
+ > 
+ > And Stripe 1 holds 0-1 MiB, 2-3, 4-5, 6-7, etc…
+ > Stripe 2 holds 1-2 MiB, 3-4, 5-6, 7-8, etc…
+ > 
+ > So truncate to 7.5 MiB on stripe 1 is the same on that stripe as
+ > truncate to 7 MiB (so, after truncate, the size according to stripe
+ > 1 is 7 MiB - 1 byte - since it doesn’t hold the 7.5 MiB offset,
+ > that’s on stripe 2)
+ > 
+ > But stripe 2 has been truncated down to 3.5 MiB, that’s the last
+ > operation there, so that’s the size there.  It doesn’t really
+ > matter exactly what that does on stripe 2 except that it’s lower
+ > than the size on stripe 1.
+ > 
+ > So when Lustre determines the file size, it uses the “furthest”,
+ > which is that 7 MiB - 1 byte from stripe 1.
+ > 
+ > So the size is 7 MiB - 1 byte, because the truncates interleaved.
+ > 
+ > So we can’t allow that interleaving, and the only way to do it is
+ > through serialization across all the stripes.  So, holding all the
+ > locks, somewhere, which should probably be the client.
+
+I think i get the point why lockless truncate could not work, if it is never used and could not be easily fixed, it probably make sense to remove codes.
+
+--- Message (Patrick Farrell, 2021-07-12 17:57:26.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+I do not think that lockless truncate can be fixed - I think the problem I highlighted is fundamental.
+
+--- Message (Andreas Dilger, 2021-07-12 18:10:16.000000000) ---
+Patch Set 2:
+
+Strictly speaking, lockless truncate works properly in the (common) case of 1-stripe files. The main question would be whether 1-stripe files will remain the common case, or will filesystems move to use PFL by default or not?  Even with PFL, the common case will still likely be the 1-stripe component at the start, but it does become racy if the other components are initialized. 
+
+Oleg, do you have any strong opinion on this?  I think you implemented this originally.
+
+--- Message (Patrick Farrell, 2021-07-12 18:44:17.000000000) ---
+Patch Set 2:
+
+That's true about single stripe files.  It could still be useful there if there were many competing truncates.
+
+For PFL files, we'd have to hold the layout lock to prevent the other parts being initialized, so that seems like a non-starter.
+
+FWIW, the MPI I/O library- which I think was the guilty party, it's what was highlighted to me years and years ago at Cray - has been fixed and I have not heard of this happening since.  But it might still be nice to have, if limited to single stripe files
+
+--- Message (Oleg Drokin, 2021-07-12 18:55:33.000000000) ---
+Patch Set 2:
+
+I think there's a bit of a misconception about what lockless truncate is?
+
+Contrary to the name it is not lockless, it just means all locking happens on the server. It's similar in concept to lockless IO where the client does not do ldlm locking (and can retain no cache) but server grabs the locks for every IO.
+
+As such it CAN work. But the semantics wrt parallel modifications are "interesting" I guess?
+
+Like when there's an active writer that instantiates another stripe as we are doing a glimpse and getting an old max offset and truncate the old stripes - that might show up as posix-noncompliant partial write I guess. But ignoring such complex layouts - simple striping should be working fine right?
+
+Either way I don't have a strong opinion on this matter and we think it's harder to maintain than just drop - I won't object.
+
+--- Message (Patrick Farrell, 2021-07-12 19:48:02.000000000) ---
+Patch Set 2:
+
+No, I don't think it can work - not with multiple stripes.  Check out my previous comment, I detail how racing truncates to different sizes can result in an incorrect size.  (ie, after both commands complete, the size is not the size requested by *either* truncate)  No other modifications required - just racing truncates.
+
+My preference is to drop it.  I think it could be made to work with 1 stripe files, but I'm not sure what exactly we'd need to fix.
+
+--- Message (Oleg Drokin, 2021-07-13 01:08:11.000000000) ---
+Patch Set 2:
+
+I see, yes, interleaved truncate is certainly a concern that would need something like a layout lock being held to prevent which might be too much effort to do.
+
+Of course holding multiple locks from different OSTs is bad too (if one of them is down the others would cause the client to be evicted) so it's a bit of a catch 22 either way
+
+--- Message (Patrick Farrell, 2021-07-15 14:47:13.000000000) ---
+Uploaded patch set 3: Patch Set 2 was rebased.
+
+--- Message (wc-checkpatch, 2021-07-15 14:47:30.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (jenkins, 2021-07-15 15:25:36.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/81963/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/21877/ : SUCCESS
+
+--- Message (Patrick Farrell, 2021-07-15 19:33:20.000000000) ---
+Uploaded patch set 4.
+
+--- Message (Patrick Farrell, 2021-07-15 19:33:50.000000000) ---
+Patch Set 4:
+
+Missed a test for lockless_truncate in sanity-sec
+
+--- Message (wc-checkpatch, 2021-07-15 19:34:50.000000000) ---
+Patch Set 4:
+
+Looks good to me.
+
+--- Message (jenkins, 2021-07-15 20:35:46.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/81975/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/21888/ : SUCCESS
+
+--- Message (Wang Shilong, 2021-07-16 00:13:00.000000000) ---
+Patch Set 4: Code-Review+1
+
+--- Message (Andreas Dilger, 2021-07-23 05:41:47.000000000) ---
+Patch Set 4: Code-Review+1
+
+--- Message (Zhenyu Xu, 2021-07-26 16:03:08.000000000) ---
+Patch Set 4: Code-Review+1
+
+--- Message (Oleg Drokin, 2021-07-28 02:30:02.000000000) ---
+Patch Set 4: Code-Review+2
+
+--- Message (unknown, 2021-07-28 02:30:06.000000000) ---
+Change has been successfully cherry-picked as 6335dba83995765c1ffcd7993eb8958c162913e1 by Oleg Drokin

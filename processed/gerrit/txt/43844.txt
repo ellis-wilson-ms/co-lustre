@@ -1,0 +1,381 @@
+Change:     43844
+Subject:    LU-14713 llite: mend the trunc_sem_up_write()
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/43844
+Change-Id:  Ifdda2c1c8a4171466be1723923c136e84de8ce0e
+Project:    fs/lustre-release
+Branch:     master
+Status:     MERGED
+Owner:      Zhenyu Xu
+Created:    2021-05-27 09:00:51.000000000
+Updated:    2021-11-20 06:30:56.000000000
+Patch Set:  11
+Insertions: +2
+Deletions:  -0
+Comments:   0 (0 unresolved)
+
+--- Labels ---
+  Code-Review: Neil Brown: +1; Andreas Dilger: +1; Oleg Drokin: +2; Patrick Farrell: +1
+  Verified: Andreas Dilger: +1; Maloo: +1
+
+--- Reviewers ---
+  REVIEWER: Zhenyu Xu, Oleg Drokin, Andreas Dilger, Qian Yingjin, Neil Brown, Patrick Farrell
+
+--- Commit Message ---
+LU-14713 llite: mend the trunc_sem_up_write()
+
+The original lli_trunc_sem replace change (commit e5914a61ac) fixed a
+lock scenario:
+
+t1 (page fault)          t2 (dio read)              t3 (truncate)
+|- vm_mmap_pgoff()       |- vvp_io_read_start()     |- vvp_io_setattr
+|- down_write(mmap_sem)  |- down_read(trunc_sem)            _start()
+|- do_map()              |- ll_direct_IO_impl()
+|- vvp_io_fault_start    |- ll_get_user_pages()
+
+						 |- down_write(
+			 |- down_read(mmap_sem)        trunc_sem)
+|- down_read(trunc_sem)
+
+t1 waits for read semaphore of trunc_sem which is hindered by t3,
+since t3 is waiting for the write semaphore while t2 take its read
+semaphore,and t2 is waiting for mmap_sem which has been taken by t1,
+and a deadlock ensues.
+
+commit e5914a61ac changes the down_read(trunc_sem) to
+trunc_sem_down_read_nowait() in page fault path, to make it ignore
+that there is a down_write(trunc_sem) waiting, just takes the read
+semaphore if no writer has taken the semaphore, and breaks the
+deadlock.
+
+But there is a delicacy in using wake_up_var(), wake_up_var()->
+__wake_up_bit()->waitqueue_active() locklessly test for waiters on the
+queue, and if it's called without explicit smp_mb() it's possible for
+the waitqueue_active() to ge hoisted before the condition store such
+that we'll observe an empty wait list and the waiter might not
+observe the condition, and the waiter won't get woke up whereafter.
+
+Fixes: e5914a61ac ("LU-12460 llite: replace lli_trunc_sem")
+Change-Id: Ifdda2c1c8a4171466be1723923c136e84de8ce0e
+Signed-off-by: Bobi Jam <bobijam@whamcloud.com>
+Reviewed-on: https://review.whamcloud.com/43844
+Reviewed-by: Andreas Dilger <adilger@whamcloud.com>
+Reviewed-by: Neil Brown <neilb@suse.de>
+Reviewed-by: Patrick Farrell <pfarrell@whamcloud.com>
+Tested-by: Maloo <maloo@whamcloud.com>
+Tested-by: Andreas Dilger <adilger@whamcloud.com>
+Reviewed-by: Oleg Drokin <green@whamcloud.com>
+
+--- Review History ---
+
+--- Message (Zhenyu Xu, 2021-05-27 09:00:51.000000000) ---
+Uploaded patch set 1.
+
+--- Message (wc-checkpatch, 2021-05-27 09:05:31.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (Andreas Dilger, 2021-05-27 09:07:33.000000000) ---
+Patch Set 1: Code-Review+1
+
+--- Message (jenkins, 2021-05-27 09:44:30.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/20929/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews/81000/ : SUCCESS
+
+--- Message (Neil Brown, 2021-05-27 23:24:51.000000000) ---
+Patch Set 1: Code-Review-1
+
+This patch makes no sense to me.
+
+If the problem showed a task waiting TASK_INTERRUPTIBLE, then it wasn't waiting on this semaphore.  Or was that a typo for TASK_UNINTERUPTIBLE.
+
+Calling wake_up_var without actually changing the variable is pointless.
+So the calls in trunc_sem_down_read* should be removed, and the call in trunc_sem_down_write should be *after* ll_trunc_waiters is decremented.
+
+If an sem_down request fails then it ABSOLUTELY MUST return an error which will ensure that the matching sem_up is never called.  Otherwise you get a lock imbalance and havoc will result.
+
+I need more details of the problem scenario:  what had been killed, was the killed process hanging or had it exited?  Exactly what was blocking and where was it blocking?
+
+--- Message (Zhenyu Xu, 2021-05-28 03:30:27.000000000) ---
+Uploaded patch set 2.
+
+--- Message (wc-checkpatch, 2021-05-28 03:32:39.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (Zhenyu Xu, 2021-05-28 03:35:26.000000000) ---
+Patch Set 1:
+
+> This patch makes no sense to me.
+ > 
+ > If the problem showed a task waiting TASK_INTERRUPTIBLE, then it
+ > wasn't waiting on this semaphore.  Or was that a typo for
+ > TASK_UNINTERUPTIBLE.
+ yes, it's a typo.
+
+ > Calling wake_up_var without actually changing the variable is
+ > pointless.
+ > So the calls in trunc_sem_down_read* should be removed, and the
+ > call in trunc_sem_down_write should be *after* ll_trunc_waiters is
+ > decremented.
+You are right, waking up without changing the condition is pointless, the woken processes will sleep again.
+
+ > 
+ > If an sem_down request fails then it ABSOLUTELY MUST return an
+ > error which will ensure that the matching sem_up is never called. 
+ > Otherwise you get a lock imbalance and havoc will result.
+right. 
+
+ > I need more details of the problem scenario:  what had been killed,
+ > was the killed process hanging or had it exited?  Exactly what was
+ > blocking and where was it blocking?
+Some IO jobs were cancelled (I guess by killing them), and some other jobs got stuck waiting for the ll_trunc_sem and cannot be killed until the node got reboot, so this patch just tries to make those victim processes be killable.
+
+--- Message (Neil Brown, 2021-05-28 04:13:27.000000000) ---
+Patch Set 2: Code-Review-1
+
+Thanks for attempting to improve the patch, but it still isn't satisfactory.
+There is no credible explanation of what the problem is, and no precise detail of symptoms.
+
+If a process is killed, it won't (or shouldn't) leave any lock locked.  If it was holding lli_trunc_sem when it was signalled, it WILL release it before exiting.
+
+You patch appear to attack the symptoms rather than the cause.  It may well allow processes to be fill that were deadlocked without this patch.  But it doesn't address the underlying flaw, so quite probably more processes will get deadlocked.
+
+Do we have a stack trace of the hanging processes?
+
+--- Message (jenkins, 2021-05-28 04:19:15.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/20936/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews/81007/ : SUCCESS
+
+--- Message (Andreas Dilger, 2021-05-28 04:43:58.000000000) ---
+Patch Set 2:
+
+I added a stack trace to LU-14713.  However, nothing in the logs indicates what else might be holding the lock (no other traces), or what might have leaked it.
+
+I agree that there _shouldn't_ be a lock holder left behind if a process is killed, so that is definitely a problem in itself.
+
+However, allowing a waiter to be killed is also useful in case of contention/RPC timeout, even if there is no lock leak.
+
+--- Message (Zhenyu Xu, 2021-07-21 11:55:33.000000000) ---
+Uploaded patch set 3.
+
+--- Message (wc-checkpatch, 2021-07-21 11:59:49.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (jenkins, 2021-07-21 12:31:23.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/82056/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/21964/ : SUCCESS
+
+--- Message (Andreas Dilger, 2021-07-21 16:38:41.000000000) ---
+Patch Set 3: Code-Review+1
+
+--- Message (Zhenyu Xu, 2021-07-26 06:33:48.000000000) ---
+Uploaded patch set 4.
+
+--- Message (wc-checkpatch, 2021-07-26 06:37:27.000000000) ---
+Patch Set 4:
+
+Looks good to me.
+
+--- Message (jenkins, 2021-07-26 07:09:40.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/82150/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/22054/ : SUCCESS
+
+--- Message (Andreas Dilger, 2021-07-26 11:33:45.000000000) ---
+Patch Set 4: Code-Review+1
+
+--- Message (Neil Brown, 2021-08-02 23:52:08.000000000) ---
+Patch Set 4: Code-Review+1
+
+Thanks.
+
+--- Message (Peter Jones, 2021-09-03 22:45:58.000000000) ---
+Patch Set 5: Patch Set 4 was rebased
+
+--- Message (wc-checkpatch, 2021-09-03 22:46:50.000000000) ---
+Patch Set 5:
+
+Looks good to me.
+
+--- Message (jenkins, 2021-09-03 23:22:36.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/22853/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews/82938/ : SUCCESS
+
+--- Message (Peter Jones, 2021-09-17 22:17:11.000000000) ---
+Patch Set 6: Patch Set 5 was rebased
+
+--- Message (wc-checkpatch, 2021-09-17 22:20:12.000000000) ---
+Patch Set 6:
+
+Looks good to me.
+
+--- Message (jenkins, 2021-09-17 23:09:50.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/23114/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews/83203/ : SUCCESS
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2021-09-18 02:26:22.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2021-09-18 16:02:28.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (Peter Jones, 2021-09-28 03:25:48.000000000) ---
+Patch Set 7: Patch Set 6 was rebased
+
+--- Message (wc-checkpatch, 2021-09-28 03:26:27.000000000) ---
+Patch Set 7:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2021-09-28 03:31:25.000000000) ---
+Patch Set 7:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2021-09-28 04:03:15.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/23240/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews/83326/ : SUCCESS
+
+--- Message (Zhenyu Xu, 2021-10-11 12:01:22.000000000) ---
+Uploaded patch set 8: Commit message was updated.
+
+--- Message (wc-checkpatch, 2021-10-11 12:03:01.000000000) ---
+Patch Set 8:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2021-10-11 12:06:40.000000000) ---
+Patch Set 8:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2021-10-11 13:01:07.000000000) ---
+Patch Set 8:
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/83546/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/23456/ : SUCCESS
+
+--- Message (Zhenyu Xu, 2021-10-12 12:14:03.000000000) ---
+Uploaded patch set 9: Patch Set 8 was rebased.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2021-10-12 12:18:13.000000000) ---
+Patch Set 9:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2021-10-12 12:18:40.000000000) ---
+Patch Set 9:
+
+Looks good to me.
+
+--- Message (jenkins, 2021-10-12 13:17:50.000000000) ---
+Patch Set 9: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/83567/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/23477/ : SUCCESS
+
+--- Message (Andreas Dilger, 2021-10-28 00:04:52.000000000) ---
+Patch Set 10: Patch Set 9 was rebased
+
+--- Message (wc-checkpatch, 2021-10-28 00:06:48.000000000) ---
+Patch Set 10:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2021-10-28 00:10:07.000000000) ---
+Patch Set 10:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2021-10-28 00:54:43.000000000) ---
+Patch Set 10: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/23880/ : SUCCESS
+
+https://build.whamcloud.com/job/lustre-reviews/83970/ : SUCCESS
+
+--- Message (Patrick Farrell, 2021-10-28 00:57:16.000000000) ---
+Patch Set 10: Code-Review+1
+
+--- Message (Autotest, 2021-10-28 16:45:33.000000000) ---
+Patch Set 10:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-6 session on el8.3-x86_64/zfs servers and clients for build 83970 patch 10. Requested by Andreas Dilger because of LU-12818.
+
+--- Message (jenkins, 2021-10-29 15:14:48.000000000) ---
+Patch Set 10: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews-patchless/23942/ : FAILURE
+
+--- Message (jenkins, 2021-10-29 16:15:21.000000000) ---
+Patch Set 10:
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/84044/ : FAILURE
+
+--- Message (Andreas Dilger, 2021-10-29 21:41:11.000000000) ---
+Removed Verified-1 by jenkins <devops@whamcloud.com>
+
+--- Message (Andreas Dilger, 2021-10-29 21:41:45.000000000) ---
+Patch Set 10: Verified+1
+
+Fix erroneous Jenkins -1 due to test builder.
+
+--- Message (Oleg Drokin, 2021-11-20 06:30:54.000000000) ---
+Patch Set 10: Code-Review+2
+
+--- Message (Oleg Drokin, 2021-11-20 06:30:56.000000000) ---
+Change has been successfully cherry-picked as 39745c8b5493159bbca62add54ca9be7cac6564f by Oleg Drokin

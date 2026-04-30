@@ -1,0 +1,268 @@
+Change:     5911
+Subject:    LU-2807 mdt: Solve a race between getattr and unlink
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/5911
+Change-Id:  I4623f3effc18804e2dfce05696f61fdf72a2b506
+Project:    fs/lustre-release
+Branch:     master
+Status:     ABANDONED
+Owner:      Jinshan Xiong
+Created:    2013-04-01 21:36:16.000000000
+Updated:    2013-12-21 01:06:01.000000000
+Patch Set:  2
+Insertions: +45
+Deletions:  -31
+Comments:   0 (0 unresolved)
+
+--- Reviewers ---
+  REVIEWER: Jenkins, Jinshan Xiong, wangdi, Alex Zhuravlev, Commit Reviewer
+
+--- Commit Message ---
+LU-2807 mdt: Solve a race between getattr and unlink
+
+This will cause completion ast of getattr to hang forever if unlink
+RPC happens on the same time, as follows:
+
+1. thread1 unlink reaches the MDT;
+2. before unlink enqueues lock, thread2 does getattr intent req to
+   find and hold object;
+3. unlink acquires inodebits dlm lock;
+4. thread3 enqueues LAYOUT lock, blocked;
+4. thread2 blocked at acquiring dlm lock as well;
+5. unlink finishes and releases the lock(the object becomes dying),
+   LAYOUT lock's completion_ast will be invoked;
+6. mdt_lvbo_fill() calls mdt_object_find() and waits for dying object,
+   this will never succeed because thread2 is being blocked at
+   completion AST with object held. live locked.
+
+In this patch, a new interface mdt_object_find_nowait() is defined and
+invoked in mdt_lvbo_fill() so that it won't sleep for dying object.
+
+Signed-off-by: Jinshan Xiong <jinshan.xiong@intel.com>
+Change-Id: I4623f3effc18804e2dfce05696f61fdf72a2b506
+
+--- Review History ---
+
+--- Message (Jenkins, 2013-04-02 07:16:34.000000000) ---
+Patch Set 1:
+
+Build Started http://build.whamcloud.com/job/lustre-reviews/14493/
+
+--- Message (Jenkins, 2013-04-02 07:43:27.000000000) ---
+Patch Set 1: Verified
+
+Build Successful 
+ 
+http://build.whamcloud.com/job/lustre-reviews/14493/ : SUCCESS
+
+--- Message (Maloo, 2013-04-02 07:50:36.000000000) ---
+Patch Set 1:
+
+Toro has started the test process
+
+--- Message (wangdi, 2013-04-03 05:36:39.000000000) ---
+Patch Set 1:
+
+It seems to me mdt_lvbo_fill break the rule "get object, then enqueue lock" on MDT. Personally, I do not like adding more stuff into object find, which make things even more complicate. (though not strongly against)
+
+Is that possible to move object finding ahead of enqueue lock in this case?
+
+--- Message (Alex Zhuravlev, 2013-04-03 06:34:19.000000000) ---
+Patch Set 1: I would prefer that you didn't submit this
+
+I find the solution incorrect - taking a reference on an object being died is wrong and may result in issues later. once decision to remove the object is taken, it should be followed with no exception. otherwise it'll be more tricks to recognize "double die", etc.
+
+for the number of reasons (including DNE) we should be taking LDLM lock *before* accessing the object. IOW, the correct ordering is the right solution, imo.
+
+as a side note, I think that mixing LDLM with storage in the first place isn't a good idea which leads to complications and issues like this. similarly using LVB to maintain layout on the client side puts a lot of constraints.
+
+--- Message (Alex Zhuravlev, 2013-04-03 08:48:11.000000000) ---
+Patch Set 1:
+
+well, given we're about to make the release I tend to agree with Di. except that taking object before enqueue won't help much - LDLM will still be trying to get the object in own context holding a reference of the object being destroyed.
+
+I'd say that we just shouldn't be using current schema with LVB initialization from within LDLM. instead, this should be done explicitly by getattr thread.
+
+--- Message (Jinshan Xiong, 2013-04-03 17:27:44.000000000) ---
+Patch Set 1:
+
+"I find the solution incorrect - taking a reference on an object being died is wrong and may result in issues later."
+
+Not sure I understand this. All this patch is doing is to avoid holding reference of dead obj ;-)
+
+"as a side note, I think that mixing LDLM with storage in the first place isn't a good idea which leads to complications and issues like this. similarly using LVB to maintain layout on the client side puts a lot of constraints."
+
+The whole idea is to save RPC, I think. The data is there which has to be brought back to the client, by LVB or other kind of RPC. But yes, I've already seen a couple of problem with this.
+
+"I'd say that we just shouldn't be using current schema with LVB initialization from within LDLM. instead, this should be done explicitly by getattr thread."
+
+Exactly. This is the root cause. However, I don't think we can afford to have an extra getattr RPC to fetch layout, otherwise stat performance would become funny ;-)
+
+===================================
+"It seems to me mdt_lvbo_fill break the rule get object, then enqueue lock on MDT"
+
+Actually this is not that kind of problem. The problem is that:
+
+thread1: get object; sleep;
+thread2: kill object;
+thread3: get object again to wake up thread1
+
+The attempt in thread3 to get object again will hang forever, because it has to wait for the object to go away and that's impossible since thread1 already held a reference. This being said, I think to have mdt_object_lookup() is a good solution for this problem.
+
+--- Message (Maloo, 2013-04-03 17:46:14.000000000) ---
+Patch Set 1: Fails
+
+Tests received by maloo, run on CentOS release 6.4/x86_64: (https://maloo.whamcloud.com/test_sessions/ab1b9948-9c81-11e2-b52c-52540035b04c).  Ran 12 tests.  1 tests failed: sanity.
+
+--- Message (Alex Zhuravlev, 2013-04-03 17:46:48.000000000) ---
+Patch Set 1:
+
+> Not sure I understand this. All this patch is doing is to avoid holding reference of dead obj ;-)
+
+dead object doesn't mean non-existing object. it might be an object just leaving the cache. so will enqueue be returning -ENOENT just because the object is leaving the cache ?
+
+> Exactly. This is the root cause. However, I don't think we can afford to have an extra getattr RPC to fetch layout, otherwise stat performance would become funny ;-)
+
+we do regular enqueue/getattr returning attributes along with a lock, using a single RPC and not using LVB.
+
+--- Message (Jinshan Xiong, 2013-04-03 18:18:29.000000000) ---
+Patch Set 1:
+
+> dead object doesn't mean non-existing object. it might be an object just leaving the cache. so will enqueue be returning -ENOENT just because the object is leaving the cache ?
+
+ah usually mdt_object_lookup() should be used if it's known the object has been held a reference by somebody else. See comment in LOC_F_LOOKUP.
+
+> we do regular enqueue/getattr returning attributes along with a lock, using a single RPC and not using LVB.
+
+There are some special handling for layout lock, say it can be held for quite a long time, so we can't use this way. This is why layout lock enqueue is handled as normal enqueue instead of intent request.
+
+I think this is a common problem in current lock model which is out of scope for this ticket.
+
+--- Message (Alex Zhuravlev, 2013-04-03 18:26:27.000000000) ---
+Patch Set 1:
+
+> ah usually mdt_object_lookup() should be used if it's known the object has been held a reference by somebody else. See comment in LOC_F_LOOKUP.
+
+if the lock is enqueued not via intent,  then you don't hold another reference on the object, so how do you know that ?
+
+> There are some special handling for layout lock, say it can be held for quite a long time, so we can't use this way. This is why layout lock enqueue is handled as normal enqueue instead of intent request.
+I think this is a common problem in current lock model which is out of scope for this ticket.
+
+still don't follow. regular UPDATE can be held for quite time as well. what's the difference in enqueue process?
+this is exactly in the scope because if we can make it as an intent, then the problem is solved.
+
+--- Message (Jinshan Xiong, 2013-04-03 19:27:31.000000000) ---
+Patch Set 1:
+
+> if the lock is enqueued not via intent, then you don't hold another reference on the object, so how do you know that ?
+
+This is okay for now because only explicit layout lock will have to find object to read layout in mdt_lvbo_fill(), which feather means this file must be opening right now.
+
+--- Message (Jinshan Xiong, 2013-04-03 19:33:36.000000000) ---
+Patch Set 1:
+
+> still don't follow. regular UPDATE can be held for quite time as well. what's the difference in enqueue process? this is exactly in the scope because if we can make it as an intent, then the problem is solved.
+
+THe problem is to restore a released file. When the clients are to read or write a released file, it will enqueue layout lock to restore the file, the lock can't be granted until HSM agent client finishes copying the file back to Lustre. This may last hours.
+
+If we implemented the above process as intent, we would have to occupy one mdt thread for hours, I don't think this is good.
+
+--- Message (Jinshan Xiong, 2013-04-03 19:34:27.000000000) ---
+Patch Set 1:
+
+Can you please take a look at patch 5874, thanks.
+
+--- Message (Alex Zhuravlev, 2013-04-05 10:45:45.000000000) ---
+Patch Set 1:
+
+> This is okay for now because only explicit layout lock will have to find object to read layout in mdt_lvbo_fill(), which feather means this file must be opening right now.
+
+what about truncate(2) ?
+
+--- Message (Jinshan Xiong, 2013-04-05 16:20:56.000000000) ---
+Patch Set 1:
+
+I will work out a new patch.
+
+--- Message (Alex Zhuravlev, 2013-04-05 16:22:03.000000000) ---
+Patch Set 1:
+
+let's discuss your idea first?
+
+--- Message (Jinshan Xiong, 2013-04-05 16:26:34.000000000) ---
+Patch Set 1:
+
+Sure, I will write on the ticket.
+
+--- Message (Jinshan Xiong, 2013-04-11 02:05:22.000000000) ---
+Uploaded patch set 2.
+
+--- Message (Alex Zhuravlev, 2013-04-11 08:57:54.000000000) ---
+Patch Set 2:
+
+I'm not sure why do you keep pushing this workaround given there is another problem which resolution may solve this problem as well.
+
+--- Message (Jinshan Xiong, 2013-04-11 16:42:06.000000000) ---
+Patch Set 2:
+
+Because this patch can fix the problem. Well, if we're going to make that change, everything about layout lock will have to be changed and we won't make it happen by 2.4.
+
+--- Message (Alex Zhuravlev, 2013-04-11 17:57:31.000000000) ---
+Patch Set 2:
+
+it sounds like you're saying "we do not support layout changes on the files with very many stripes" ?
+if it's the decision made already, then I'd prefer to have one more wrapper around lu_object_find_try() which returns NULL if -EAGAIN is returned. so that all the regular paths are not affected by mistake and by extra branch.
+
+--- Message (Jinshan Xiong, 2013-04-11 20:08:50.000000000) ---
+Patch Set 2:
+
+it's too early to say that. I'm thinking about it.
+
+--- Message (Alex Zhuravlev, 2013-04-11 20:10:16.000000000) ---
+Patch Set 2:
+
+sure, we can discuss this at LUG..
+
+--- Message (Jenkins, 2013-04-11 22:44:19.000000000) ---
+Patch Set 2:
+
+Build Started http://build.whamcloud.com/job/lustre-reviews/14828/
+
+--- Message (Jinshan Xiong, 2013-04-11 23:16:07.000000000) ---
+Patch Set 2: I would prefer that you didn't submit this
+
+I realize this is not that difficult. Will write a patch for this.
+
+--- Message (Jinshan Xiong, 2013-04-11 23:16:11.000000000) ---
+Patch Set 2: Abandoned
+
+--- Message (Jenkins, 2013-04-11 23:28:55.000000000) ---
+Patch Set 2:
+
+Build Successful 
+ 
+http://build.whamcloud.com/job/lustre-reviews/14828/ : SUCCESS
+
+--- Message (Maloo, 2013-04-11 23:30:10.000000000) ---
+Patch Set 2:
+
+Rosso Autotest has started the test process
+
+--- Message (Maloo, 2013-04-11 23:30:15.000000000) ---
+Patch Set 2:
+
+Rosso Autotest has started the test process
+
+--- Message (Maloo, 2013-04-11 23:30:20.000000000) ---
+Patch Set 2:
+
+Rosso Autotest has started the test process
+
+--- Message (Maloo, 2013-04-12 18:39:25.000000000) ---
+Patch Set 2:
+
+Rosso Autotest has started the test process
+
+--- Message (Maloo, 2013-04-13 09:27:32.000000000) ---
+Patch Set 2:
+
+Tests received by maloo, run on CentOS release 6.3/x86_64: (https://maloo.whamcloud.com/test_sessions/1c336e26-a416-11e2-80ee-52540035b04c).  Ran 16 tests.  1 tests failed: replay-ost-single.
