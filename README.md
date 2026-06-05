@@ -40,6 +40,58 @@ co-lustre/
 
 ## Scripts
 
+### `update_corpus.sh` — one-command update (recommended)
+
+Refreshes the entire corpus end to end with **no arguments**, so it can be run
+by hand or from cron. It fetches new/changed JIRA issues and Gerrit changes,
+then re-runs every converter, in the correct order:
+
+```bash
+./scripts/update_corpus.sh                  # full update (leaves changes in the working tree)
+./scripts/update_corpus.sh --commit         # full update, then commit raw/ + processed/
+./scripts/update_corpus.sh --commit --push  # same as ^ but also pushes updates
+./scripts/update_corpus.sh --dry-run        # verify wiring + JIRA endpoint, fetch nothing
+./scripts/update_corpus.sh --max-issues 5   # cap JIRA fetch (smoke test)
+./scripts/update_corpus.sh --skip-jira      # also: --skip-gerrit
+```
+
+- **DoS-safe by design.** A `flock` single-instance lock means a second
+  invocation (e.g. an overlapping cron fire) exits immediately instead of
+  doubling load on the shared servers. The fetchers are sequential and
+  rate-limited (0.5 s between requests, exponential backoff on 429/5xx).
+- **Does not commit by default.** It updates the working tree and prints a
+  summary of what changed — review and commit yourself. Pass `--commit` to opt
+  in to an automatic `git commit` of `raw/` + `processed/` on the current branch
+  (message `Update Corpus <date>`. It stages only those two directories, skips a
+  commit that would merely bump the `.last_update` markers, optionally pushes
+  with `--push`.
+- **Picks a suitable Python automatically** (the scripts need 3.10+; override
+  with `CO_LUSTRE_PYTHON=/path/to/python3.x` if needed).
+
+Cron example (logs kept *outside* the repo so they never dirty git):
+
+```cron
+17 4 * * *  /path/to/co-lustre/scripts/update_corpus.sh >> "$HOME/co-lustre-logs/update_corpus_$(date +\%Y\%m\%d).log" 2>&1
+```
+
+### `download_jira_incremental.py`
+
+Polite, incremental JIRA fetcher used by `update_corpus.sh`. Uses JIRA's
+search-XML view with a JQL `updated >= <date>` query to fetch issues that are
+**new *or have changed*** since the last run (unlike `download_jira_xml.sh`,
+which only ever adds new issues and never refreshes existing ones). A marker at
+`raw/jira/.last_update` tracks the last successful run and is advanced only on
+success, with a one-day query overlap so nothing is missed.
+
+```bash
+./scripts/download_jira_incremental.py            # incremental refresh
+./scripts/download_jira_incremental.py --dry-run  # preflight + print plan only
+./scripts/download_jira_incremental.py --full --bootstrap-date 2026-04-01
+```
+
+If the search endpoint is ever unavailable, it falls back to a bounded
+upward-ID probe that discovers new issues only.
+
 ### `download_jira_xml.sh`
 
 Downloads JIRA issues as XML from Whamcloud's JIRA server using parallel `curl` requests.
@@ -76,9 +128,11 @@ Splits a full MediaWiki XML export into individual pages and converts each to pl
 
 ## Prerequisites
 
-- **Python 3**
+- **Python 3.10+** (the fetch/convert scripts use 3.10+ syntax; `update_corpus.sh`
+  auto-selects a suitable interpreter, or set `CO_LUSTRE_PYTHON`)
 - **[pandoc](https://pandoc.org/)** — required for manual conversion (`apt install pandoc` / `brew install pandoc`)
 - **curl** — used by the JIRA download script
+- **flock** — used by `update_corpus.sh` for its single-instance lock (standard on Linux)
 
 ## Processed Data Format
 
