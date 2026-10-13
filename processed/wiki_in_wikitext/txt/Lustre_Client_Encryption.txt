@@ -1,6 +1,6 @@
 Title:        Lustre Client Encryption
 URL:          https://wiki.lustre.org/Lustre_Client_Encryption
-Last Updated: 2026-04-29
+Last Updated: 2026-10-12
 
 --- Content (MediaWiki markup) ---
 
@@ -8,176 +8,192 @@ __TOC__
 
 == Overview ==
 
-Starting with '''Lustre 2.14''', client-side encryption is supported using the Linux '''fscrypt''' framework. Files are encrypted and decrypted transparently on the client — data stored on OSTs and metadata stored on MDTs is encrypted at rest. Servers never see plaintext data.
+Lustre supports '''client-side encryption''' of file data, built on the Linux '''fscrypt''' framework. Encryption and decryption happen only on Lustre clients. Keys are never sent to servers, servers never encrypt or decrypt, and bulk RPCs carry ciphertext that servers write to disk as-is. File contents are therefore protected both '''in transit''' between clients and servers and '''at rest''' on the OSTs.
 
-This feature provides data confidentiality without requiring any changes to the Lustre server infrastructure.
+The feature is designed to give users a private directory for sensitive files. Users manage it per directory with the standard fscrypt tools; no server-side configuration or key material is needed.
 
-'''Note:''' Client-side encryption is a relatively recent feature. Always refer to the Lustre Operations Manual and release notes for your specific version for authoritative guidance.
+{| class="wikitable"
+! Release !! Change
+|-
+| 2.14 || Client-side encryption introduced ([https://jira.whamcloud.com/browse/LU-12275 LU-12275]). File '''contents''' only; file and directory names stay in clear text.
+|-
+| 2.15 || Filename encryption added ([https://jira.whamcloud.com/browse/LU-13717 LU-13717]). See [[#Filename Encryption|Filename Encryption]] for when names are actually encrypted.
+|}
 
-For broader security topics, see [[Setting up Lustre Security]].
+The authoritative references are the ''Managing Security'' chapter of the [https://doc.lustre.org/lustre_manual.xhtml Lustre Operations Manual] and the <code>Documentation/client_side_encryption/</code> directory in the Lustre source tree. For other security features, see [[Setting up Lustre Security]].
 
-== How It Works ==
+== What Is and Is Not Protected ==
 
-* Encryption and decryption happen entirely on the '''client''' side.
-* Each encrypted directory has an '''encryption policy''' that specifies the encryption algorithm and a reference to the encryption key.
-* Files within an encrypted directory inherit the policy — all file data and filenames are encrypted.
-* Servers (MDS and OSS) store only ciphertext. They do not need access to encryption keys.
-* Clients without the correct key can see that files exist but see '''ciphertext filenames''' (encoded, unreadable names) and cannot read file contents.
+{| class="wikitable"
+! Protected !! Not protected
+|-
+|
+* File contents, on the wire and on disk
+* File and directory names, and symlink targets (2.15+, see [[#Filename Encryption|Filename Encryption]])
+|
+* File sizes, permissions, ownership, and timestamps
+* Extended attributes
+* The existence and location of holes in sparse files
+* Plaintext on a client while the key is loaded. Other users on that client are kept out only by normal permissions, ACLs, and LSMs.
+|}
+
+Because servers never hold keys, an attacker who compromises a Lustre server, even to the point of reading arbitrary memory, cannot recover file contents. An attacker who compromises a '''client''' while a key is loaded can.
 
 == Requirements ==
 
 {| class="wikitable"
-! Requirement
-! Details
+! Component !! Requirement
 |-
-| Lustre version
-| 2.14 or later
+| Client Lustre version || 2.14 or later
 |-
-| Kernel config
-| <code>CONFIG_FS_ENCRYPTION=y</code> (or <code>=m</code>) in the client kernel
+| Client kernel || Linux 5.4 or later uses the in-kernel fscrypt library. Older distribution kernels with basic encryption support use an fscrypt library embedded in Lustre: RHEL/CentOS 8.1 and later, Ubuntu 18.04 and later, SLES 15 SP2 and later.
 |-
-| fscrypt userspace tool
-| <code>fscrypt</code> CLI (v0.3.0+) or <code>fscryptctl</code>
+| Client build || Encryption support is built by default. Clients built with <code>--enable-crypto=no</code> are ''encryption-unaware'' (see [[#Limitations|Limitations]]).
 |-
-| Server support
-| Lustre 2.14+ servers (they store ciphertext transparently)
+| Userspace tool || <code>fscrypt</code> ([https://github.com/google/fscrypt github.com/google/fscrypt]) on every client that will manage or unlock encrypted directories
 |-
-| Filesystem feature flag
-| <code>encrypt</code> feature must be enabled on MDT and OSTs (enabled by default on 2.14+ with ldiskfs or zfs)
+| Servers || No configuration and no keys. Servers store and serve ciphertext.
 |}
 
-Verify kernel support:
+Encryption is '''enabled by default''' on Lustre clients. There is no server-side feature flag to turn on.
 
- grep -i encryption /boot/config-$(uname -r)
+== Setting Up fscrypt ==
 
-Check that the Lustre filesystem supports encryption:
+Two one-time steps need root.
 
- lctl get_param mdt.*.enable_encryption
- # Should return 1
+'''On every client that will use encryption''', create the global fscrypt configuration:
 
-== Key Management ==
+ # fscrypt setup
+ Customizing passphrase hashing difficulty for this system...
+ Created global config file at "/etc/fscrypt.conf".
+ Metadata directories created at "/.fscrypt".
 
-Encryption keys are managed through the Linux kernel keyring subsystem. Two common approaches:
+Then edit <code>/etc/fscrypt.conf</code> and set <code>policy_version</code> to <code>2</code>. With version 2 policies, locking a directory also wipes its cached plaintext from memory.
 
-=== Using the fscrypt Tool ===
+'''On one client only''', create the fscrypt metadata directory on the Lustre filesystem:
 
-The <code>fscrypt</code> tool (https://github.com/google/fscrypt) provides a user-friendly interface:
+ # fscrypt setup /mnt/lustre
+ Metadata directories created at "/mnt/lustre/.fscrypt"
 
- # Initialize fscrypt metadata on the filesystem (one-time setup)
- fscrypt setup /mnt/lustre
+== Encrypting a Directory ==
+
+Any user can then encrypt an '''empty''' directory that they own:
+
+ $ mkdir /mnt/lustre/vault
+ $ fscrypt encrypt /mnt/lustre/vault
+ The following protector sources are available:
+ 1 - Your login passphrase (pam_passphrase)
+ 2 - A custom passphrase (custom_passphrase)
+ 3 - A raw 256-bit key (raw_key)
+ Enter the source number for the new protector [2 - custom_passphrase]: 2
+ Enter a name for the new protector: shield
+ Enter custom passphrase for protector "shield":
+ Confirm passphrase:
+ "/mnt/lustre/vault" is now encrypted, unlocked, and ready for use.
+
+Every file, directory, and symlink created under <code>/mnt/lustre/vault</code> afterwards inherits the encryption policy. The policy cannot be changed for a subdirectory, and it cannot be removed once set. To decrypt data, copy it out to an unencrypted directory while the directory is unlocked.
+
+=== Locking and Unlocking ===
+
+ $ fscrypt lock /mnt/lustre/vault
+ "/mnt/lustre/vault" is now locked.
  
- # Create a protector (passphrase-based)
- fscrypt encrypt /mnt/lustre/encrypted_dir
+ $ fscrypt unlock /mnt/lustre/vault
+ Enter custom passphrase for protector "shield":
+ "/mnt/lustre/vault" is now unlocked and ready for use.
 
-This will prompt for a passphrase and set up the encryption policy on the directory.
+Locking removes the master key from kernel memory. With version 2 policies it also evicts cached inodes, so files that are not open revert to their locked, encrypted form. Non-root users can remove their own keys.
 
-=== Using fscryptctl ===
+Keys are loaded '''per client'''. Unlocking a directory on one client does not unlock it anywhere else; each client that needs the data must unlock it.
 
-The lower-level <code>fscryptctl</code> tool provides more direct control:
+=== Protectors and Sharing ===
 
- # Generate a new key
- fscryptctl add_key /mnt/lustre
+fscrypt never exposes the master key directly. Each policy's master key is wrapped by one or more ''protectors'' (a custom passphrase, a login passphrase, or a raw key). This lets a passphrase change without re-encrypting any data, and lets several users share an encrypted directory without sharing a secret:
+
+ # Change a protector's passphrase
+ $ fscrypt metadata change-passphrase --protector=/mnt/lustre:deacab807bf0e788
  
- # Set encryption policy on a directory (must be empty)
- fscryptctl set_policy <key_descriptor> /mnt/lustre/encrypted_dir
+ # Create a second protector and attach it to an existing policy
+ $ fscrypt metadata create protector /mnt/lustre
+ $ fscrypt metadata add-protector-to-policy \
+       --protector=/mnt/lustre:f3cc1b5cf9b8f41c \
+       --policy=/mnt/lustre:52b2b5aff0e59d8e0d58f962e715862e
 
-=== Using the Kernel Keyring Directly ===
+<code>fscrypt status /mnt/lustre</code> lists all protectors and policies. <code>fscrypt status /mnt/lustre/vault</code> shows a directory's policy, its options, and whether it is unlocked.
 
-For automated or scripted workflows:
+'''Keep protector secrets safe.''' If every protector for a policy is lost, the data under it cannot be recovered.
 
- # Add a key to the filesystem keyring
- keyctl add logon fscrypt:<descriptor> <raw_key> @s
- 
- # Or use the kernel's add_key system call programmatically
+== Encryption Modes ==
 
-== Setting Up an Encrypted Directory ==
+fscrypt uses one mode for file contents and one for filenames. Lustre supports:
 
-Step-by-step process:
+* AES-256-XTS for contents with AES-256-CTS-CBC for filenames (recommended)
+* AES-128-CBC for contents with AES-128-CTS-CBC for filenames
 
- # 1. Create the directory (must be empty to set a policy)
- mkdir /mnt/lustre/secure_data
- 
- # 2. Set up encryption using fscrypt
- fscrypt encrypt /mnt/lustre/secure_data
- # Follow the prompts to choose a protector (passphrase, PAM, etc.)
- 
- # 3. Files created in this directory are now automatically encrypted
- echo "sensitive data" > /mnt/lustre/secure_data/secret.txt
- 
- # 4. Verify encryption is active
- fscrypt status /mnt/lustre/secure_data
+== Filename Encryption ==
 
-== Access Semantics ==
+Whether names are encrypted depends on how the client was built and which Lustre version created the directory:
 
-=== With the Key ===
+{| class="wikitable"
+! Situation !! Names encrypted?
+|-
+| Directory created by a 2.14 client || '''No''', contents only. Files and directories created under it later, by any version, also keep clear-text names.
+|-
+| 2.15+ client using the in-kernel fscrypt library || '''Yes''', always. These clients do not have the <code>enable_filename_encryption</code> parameter.
+|-
+| 2.15+ client using the embedded fscrypt library || Only if <code>llite.*.enable_filename_encryption=1</code> when the directory is created. '''Defaults to 0''' (contents only).
+|}
 
-Clients that have the encryption key loaded in their kernel keyring see files normally:
+To turn on filename encryption for every client that uses the embedded library, run on the MGS:
 
- $ ls /mnt/lustre/secure_data/
- secret.txt
- $ cat /mnt/lustre/secure_data/secret.txt
- sensitive data
+ mgs# lctl set_param -P llite.*.enable_filename_encryption=1
 
-=== Without the Key ===
+This applies to '''new''' encrypted directories only. To get encrypted names for an existing directory: create a new encrypted directory (it can reuse an existing protector), unlock the old one, copy everything across, then remove the old directory.
 
-Clients without the key (or after the key is removed) see encrypted filenames:
+== Access Without the Key ==
 
- $ ls /mnt/lustre/secure_data/
- ,cVx3kR2mE8p4nQ7...    # ciphertext filename
- $ cat /mnt/lustre/secure_data/,cVx3kR2mE8p4nQ7...
- # Returns -ENOKEY
+With the key loaded, encrypted files behave like ordinary files. On a client where the key is '''not''' loaded:
 
-Servers also see only ciphertext:
+* <code>stat()</code> works, and directories can be listed. Encrypted names appear in an encoded form that is at most <code>NAME_MAX</code> bytes and never contains <code>/</code> or NUL.
+* Files and empty directories can be deleted, so <code>rm -r</code> works.
+* Opening or truncating a regular file fails with <code>ENOKEY</code> ("Required key not available"). So does creating, linking, or renaming anything inside an encrypted directory.
 
- # On the MDS
- debugfs /dev/sda1 -R "ls /ROOT/secure_data"
- # Shows encrypted filename entries
+== Striping and Layouts ==
 
-=== Locking the Directory ===
+The client encrypts file pages before sending them in bulk RPCs, so encryption is independent of the file layout. Striping, PFL, and OST pools work normally on encrypted files:
 
-To remove the key and lock the directory on a client:
+ lfs setstripe -c 4 -S 4M /mnt/lustre/vault
 
- fscrypt lock /mnt/lustre/secure_data
+== Administrative Controls ==
 
-After locking, the directory reverts to showing ciphertext filenames until the key is provided again.
+{| class="wikitable"
+! Control !! Effect
+|-
+| <code>noencrypt</code> client mount option || Prevents that mount from using encryption.
+|-
+| Nodemap property <code>forbid_encryption=1</code> || Enforced from the server side: clients in the nodemap cannot use encryption. See [[Lustre Multi Tenancy]].
+|-
+| Nodemap <code>rbac</code> role <code>fscrypt_admin</code> || Needed to create or modify fscrypt protectors and policies. Without it, users can still lock and unlock existing encrypted directories.
+|}
 
-== Encryption with Lustre Striping ==
+ mgs# lctl nodemap_modify --name tenantA --property forbid_encryption --value 1
 
-Encryption works transparently with Lustre striping. When a file is striped across multiple OSTs:
+== Limitations ==
 
-* Each stripe is independently encrypted with the same key.
-* The encryption is applied at the client level before data is sent to OSTs.
-* Stripe size, stripe count, and OST pool settings are unaffected.
-
- # Setting striping on an encrypted directory works normally
- lfs setstripe -c 4 -S 4M /mnt/lustre/secure_data/
-
-== Limitations and Considerations ==
-
-* '''Filename length''' — encrypted filenames are longer than plaintext names due to encoding. This may affect the maximum filename length (typically 255 bytes). Very long filenames may fail with <code>-ENAMETOOLONG</code>.
-* '''CPU overhead''' — encryption and decryption consume CPU cycles on the client. AES-NI hardware acceleration (available on modern x86 CPUs) significantly reduces this overhead.
-* '''No server-side search''' — since filenames and data are encrypted, server-side operations like <code>lfs find</code> by name will not match plaintext names.
-* '''Backup considerations''' — backups of encrypted data capture ciphertext. Restoring requires the same encryption key. Ensure keys are backed up securely and independently of the data.
-* '''Cross-client access''' — all clients that need to read encrypted files must have access to the same encryption key. Key distribution is the administrator's responsibility.
-* '''Immutable policy''' — once an encryption policy is set on a directory, it cannot be removed. Files must be copied out, the directory removed, and recreated without encryption.
-* '''Empty directory requirement''' — the encryption policy can only be set on an empty directory.
-
-== Checking Encryption Status ==
-
- # Check if a directory is encrypted
- fscrypt status /mnt/lustre/secure_data
- 
- # Check filesystem-level encryption support
- fscrypt status /mnt/lustre
- 
- # Check server-side feature flag
- lctl get_param mdt.*.enable_encryption
+* '''No backup or restore without the key.''' No API yet exists to back up or restore ciphertext. Back up from a client where the directory is unlocked, and protect those backups, because they contain plaintext.
+* '''Encryption-unaware clients''' are clients older than 2.14, clients built with <code>--enable-crypto=no</code>, and clients on kernels without the needed support. To prevent corruption, they get <code>ENOKEY</code> when they try to open, create, link, rename, or migrate encrypted files. They can still list, stat, and remove them, using the encoded names.
+* '''Moving data in.''' Unencrypted files, and files under a different policy, cannot be renamed or hard-linked into an encrypted directory. <code>mv</code> falls back to copy-and-delete, and the original plaintext may stay recoverable from free space on the OSTs. Encrypt directories before you put data in them.
+* '''fallocate()''' modes <code>FALLOC_FL_COLLAPSE_RANGE</code>, <code>FALLOC_FL_INSERT_RANGE</code>, and <code>FALLOC_FL_ZERO_RANGE</code> fail with <code>EOPNOTSUPP</code>.
+* '''DAX''' is not supported. Direct I/O and <code>mmap</code> are supported.
+* '''Symlinks.''' <code>st_size</code> reports the ciphertext length, and the maximum target length is 2 bytes shorter than for an unencrypted symlink.
+* '''Special files''' (named pipes, device nodes, and UNIX sockets) are not encrypted.
+* '''CPU cost.''' Encryption runs on client CPUs. Hardware AES acceleration (for example, AES-NI) greatly reduces the overhead; benchmark your own workload.
 
 == See Also ==
 
 * [[Setting up Lustre Security]]
-* [[Shared Secret Key Authentication And Encryption]]
-* [[Lustre Health Checks]]
+* [[Lustre Multi Tenancy]] — nodemaps, including <code>forbid_encryption</code>
+* [[Lustre Kerberos SSK Authentication]] — encrypting all RPC traffic on the wire
 
 [[Category:Administration]]
 [[Category:Security]]

@@ -1,6 +1,6 @@
-Title:        Lustre Multi-Tenancy
+Title:        Lustre Multi Tenancy
 URL:          https://wiki.lustre.org/Lustre_Multi_Tenancy
-Last Updated: 2026-04-29
+Last Updated: 2026-10-12
 
 --- Content (MediaWiki markup) ---
 
@@ -8,226 +8,233 @@ __TOC__
 
 == Overview ==
 
-Lustre supports multi-tenancy — isolating multiple user groups or organizations on a single filesystem — through two complementary mechanisms:
+Multi-tenancy lets separate groups of users share one Lustre filesystem without being able to see or reach each other's data, even when they have root on their own clients. It is built from three pieces:
 
-* '''Nodemaps''' — map client UIDs/GIDs to server-side values, apply per-group security policies (root squash, read-only, audit, encryption).
-* '''Filesets''' (subdirectory mounts) — restrict clients to see only a subdirectory of the filesystem as their mount root.
+* '''Nodemaps''' group clients by NID. Each group gets its own identity mapping (UID/GID/PROJID), root squash, and policy (read-only mounts, encryption, which admin operations are allowed, and more).
+* '''Filesets''' confine a nodemap's clients to one or more subdirectories, which those clients see as the filesystem root.
+* '''Client identification''' ensures a client really is the node it claims to be. Nodemaps trust NIDs, so isolation is only as strong as your guarantee that one tenant cannot use another tenant's NID. Use a trusted network design, or strong authentication with [[Lustre Kerberos SSK Authentication|Kerberos or Shared-Secret Key]]. SSK keys can be bound to a specific nodemap.
 
-When combined, nodemaps and filesets provide strong tenant isolation: each tenant has its own UID/GID space, its own root squash policy, and can only access its own portion of the filesystem.
+For the full nodemap reference, see [[UID/GID_Mapping|UID/GID Mapping]] and the ''Mapping UIDs and GIDs with Nodemap'' chapter of the [https://doc.lustre.org/lustre_manual.xhtml Lustre Operations Manual]. For the broader security picture, see [[Setting up Lustre Security]].
 
-For detailed nodemap reference, see [[UID GID Mapping]]. For general security setup, see [[Setting up Lustre Security]].
+'''Run all <code>lctl nodemap_*</code> commands on the MGS.''' Since Lustre 2.9 the configuration is stored on the MGS and propagated to all servers automatically, usually within about ten seconds. During that window, clients may be served under either the old or the new settings, so make changes in a maintenance window, or while the affected clients are not writing.
+
+== Before You Start: A Nodemap for the Servers ==
+
+'''Do this first.''' Once nodemaps are active, any node that matches no nodemap falls into the <code>default</code> nodemap, which squashes root and maps every user to <code>nobody</code>. That includes Lustre servers, which act as clients when they talk to each other. The manual requires a nodemap that covers '''all Lustre server nodes''', with both <code>admin</code> and <code>trusted</code> set:
+
+ mgs# lctl nodemap_add TrustedSystems
+ mgs# lctl nodemap_add_range --name TrustedSystems --range 10.0.0.[1-20]@tcp
+ mgs# lctl nodemap_modify --name TrustedSystems --property admin --value 1
+ mgs# lctl nodemap_modify --name TrustedSystems --property trusted --value 1
+
+Put administrative clients (backup nodes, data movers, and the nodes you run <code>chown</code> from) in this nodemap or a similar one. You need at least one group with full access for maintenance.
 
 == Nodemaps ==
 
-Nodemaps group clients by network address and apply identity mapping and security policies to each group.
+=== Creating a Nodemap and Assigning Clients ===
 
-=== Creating a Nodemap ===
+ mgs# lctl nodemap_add tenantA
+ mgs# lctl nodemap_add_range --name tenantA --range 10.0.1.[0-255]@tcp
+ mgs# lctl nodemap_add_range --name tenantA --range 10.0.2.[0-255]@tcp
 
- lctl nodemap_add tenantA
+Clients whose NIDs fall in these ranges belong to <code>tenantA</code>. To remove a range with <code>nodemap_del_range</code>, give exactly the range you added. You cannot remove a sub-range or a partly overlapping range.
 
-This creates a new nodemap named <code>tenantA</code>.
+=== The default Nodemap ===
 
-=== Adding Client Ranges ===
+Clients that match no nodemap belong to the built-in <code>default</code> nodemap, which cannot be deleted. Only some properties can be set on it (<code>admin</code>, <code>trusted</code>, <code>squash_uid</code>, <code>squash_gid</code>, <code>fileset</code>, <code>audit_mode</code>, and <code>rbac</code>), and '''no ID mappings''' can be defined on it. With its default values (<code>admin=0</code>, <code>trusted=0</code>), clients that match no other nodemap have root squashed and every other user squashed to <code>nobody</code>.
 
-Associate client NID ranges with the nodemap:
+Be careful changing <code>admin</code> or <code>trusted</code> on <code>default</code>. Every unlisted node inherits the change, possibly including your servers.
 
- lctl nodemap_add_range --name tenantA --range 10.0.1.[0-255]@tcp
+=== Properties ===
 
-Multiple ranges can be added:
-
- lctl nodemap_add_range --name tenantA --range 10.0.1.[0-255]@tcp
- lctl nodemap_add_range --name tenantA --range 10.0.2.[0-255]@tcp
-
-Clients connecting from these NIDs are automatically assigned to the <code>tenantA</code> nodemap.
-
-=== Configuring Security Properties ===
-
-Each nodemap has several configurable properties:
+Set properties with <code>lctl nodemap_modify --name NAME --property PROPERTY --value VALUE</code>. The ones that matter most for tenancy:
 
 {| class="wikitable"
-! Property
-! Description
-! Example
+! Property !! Default !! Meaning
 |-
-| <code>admin</code>
-| Allow client root to have root privileges on the server (0 = squash root, 1 = allow)
-| <code>lctl nodemap_modify --name tenantA --property admin --value 0</code>
+| <code>admin</code> || 0 || 1 = do '''not''' squash root. 0 = map root to <code>squash_uid</code>/<code>squash_gid</code>.
 |-
-| <code>trusted</code>
-| Trust client-supplied UID/GID without mapping (0 = map, 1 = trust)
-| <code>lctl nodemap_modify --name tenantA --property trusted --value 0</code>
+| <code>trusted</code> || 0 || 1 = use client IDs as-is (no mapping) for non-root users. 0 = map users through the nodemap's idmaps or offset, and '''squash unmapped users'''.
 |-
-| <code>squash_uid</code>
-| UID to map root (uid 0) to when admin=0
-| <code>lctl nodemap_modify --name tenantA --property squash_uid --value 99</code>
+| <code>squash_uid</code>, <code>squash_gid</code>, <code>squash_projid</code> || 65534 (<code>nobody</code>) || The ID that root (when <code>admin=0</code>) and unmapped IDs (when <code>trusted=0</code>) are mapped to. Cannot be 0. <code>squash_projid</code> exists since 2.15.
 |-
-| <code>squash_gid</code>
-| GID to map root (gid 0) to when admin=0
-| <code>lctl nodemap_modify --name tenantA --property squash_gid --value 99</code>
+| <code>deny_unknown</code> || 0 || 1 = deny unmapped users entirely instead of squashing them. This includes root, when <code>admin=0</code> and root is not mapped.
 |-
-| <code>readonly_mount</code>
-| Force clients to mount read-only
-| <code>lctl nodemap_modify --name tenantA --property readonly_mount --value 1</code>
+| <code>map_mode</code> || <code>all</code> || Which ID types are mapped: one or more of <code>uid</code>, <code>gid</code>, <code>projid</code>, <code>both</code> (UIDs and GIDs), or <code>all</code>.
 |-
-| <code>audit_mode</code>
-| Enable or disable audit logging for clients in this nodemap
-| <code>lctl nodemap_modify --name tenantA --property audit_mode --value 1</code>
+| <code>readonly_mount</code> || 0 || 1 = clients are forced to a read-only mount unless they explicitly specify otherwise.
 |-
-| <code>forbid_encryption</code>
-| Prevent clients from using client-side encryption
-| <code>lctl nodemap_modify --name tenantA --property forbid_encryption --value 0</code>
+| <code>deny_mount</code> || 0 || 1 = refuse new client mounts from this nodemap. Existing mounts keep working until a remount is attempted.
+|-
+| <code>forbid_encryption</code> || 0 || 1 = prevent clients from using [[Lustre Client Encryption|client-side encryption]].
+|-
+| <code>audit_mode</code> || 1 || 0 = do not record this nodemap's access events in Changelogs. Useful for backup or HSM agent nodes that would otherwise flood them.
+|-
+| <code>rbac</code> || <code>all</code> || Admin operations the nodemap's clients may perform, such as <code>quota_ops</code>, <code>chlg_ops</code>, <code>dne_ops</code>, <code>file_perms</code>, <code>fscrypt_admin</code>, <code>hsm_ops</code>, and <code>byfid_ops</code>. Roles not listed are forbidden. Accepts <code>+role</code>/<code>-role</code> to add or remove a single role.
+|-
+| <code>gssonly_identification</code> || 0 || 1 = identify clients by the GSS token they authenticate with instead of by NID. Such a nodemap cannot have NID ranges.
 |}
 
-A typical multi-tenant configuration disables admin and trusted:
+Not every property exists in every release. Check <code>lctl-nodemap-modify(8)</code> on your version, or run <code>lctl nodemap_info --list</code> (2.16.52 and later).
 
- lctl nodemap_modify --name tenantA --property admin --value 0
- lctl nodemap_modify --name tenantA --property trusted --value 0
- lctl nodemap_modify --name tenantA --property squash_uid --value 99
- lctl nodemap_modify --name tenantA --property squash_gid --value 99
+How <code>admin</code> and <code>trusted</code> combine:
 
-=== UID/GID Mapping ===
+* '''Both 0''' (the defaults): root is squashed, mapped users get their mapped IDs, and everyone else is squashed. This is the normal setting for a tenant.
+* '''admin=1, trusted=0''': root stays root, explicit idmaps are honored, and everyone else is squashed.
+* '''admin=0, trusted=1''': full access to canonical IDs, but root is squashed.
+* '''Both 1''': unrestricted, as if nodemaps were off. Use this only for servers and administrative nodes.
 
-Nodemaps can translate UIDs and GIDs between client-side and server-side values. This allows different tenants to use overlapping UID spaces without conflict:
+=== Mapping IDs ===
 
- # Map client UID 500 to server UID 1000
- lctl nodemap_add_idmap --name tenantA --idtype uid --idmap 500:1000
- 
- # Map client GID 500 to server GID 1000
- lctl nodemap_add_idmap --name tenantA --idtype gid --idmap 500:1000
+With <code>trusted=0</code>, only mapped IDs keep a distinct identity. Everything else is squashed, or denied if <code>deny_unknown=1</code>. There are two mapping mechanisms.
 
-Range mappings apply an offset to a block of IDs:
+'''Explicit idmaps''' map a client ID to a filesystem ID:
 
- # Map client UIDs 1000-1999 to server UIDs 10000-10999
- lctl nodemap_add_idmap --name tenantA --idtype uid --idmap 1000:10000
+ mgs# lctl nodemap_add_idmap --name tenantA --idtype uid --idmap 500:10500
+ mgs# lctl nodemap_add_idmap --name tenantA --idtype gid --idmap 500:10500
+ mgs# lctl nodemap_add_idmap --name tenantA --idtype projid --idmap 33:1
 
-To remove a mapping:
+UID and GID maps are independent of each other. Lustre 2.16 and later also accept a range:
 
- lctl nodemap_del_idmap --name tenantA --idtype uid --idmap 500:1000
+ mgs# lctl nodemap_add_idmap --name tenantA --idtype uid --idmap 1000-1999:11000-11999
 
-=== Viewing Nodemap Configuration ===
+On earlier releases, each ID must be mapped one at a time. To remove a mapping, run <code>lctl nodemap_del_idmap</code> with the same arguments.
 
- # List all nodemaps
- lctl nodemap_info
- 
- # Show details for a specific nodemap
- lctl get_param nodemap.tenantA.*
+'''Offsets''' (Lustre 2.16 and later) shift a tenant's whole ID space for UIDs, GIDs, and PROJIDs at once: <code>fs_id = client_id + offset</code>, for client IDs <code>0</code> through <code>limit-1</code>. This is the simplest way to give each tenant a non-overlapping ID range:
+
+ mgs# lctl nodemap_add_offset --name tenantA --offset 100000 --limit 100000
+ mgs# lctl nodemap_add_offset --name tenantB --offset 200000 --limit 100000
+
+Offset rules:
+
+* Offset ranges of different nodemaps cannot overlap, and a nodemap can have only one offset.
+* The offset is applied '''last''', after any explicit idmap. Keep idmap targets and <code>squash_*</code> values within <code>0</code> to <code>limit-1</code>, or the resulting IDs fall outside the tenant's range.
+* Choose a <code>limit</code> large enough to include <code>nobody</code> (65534).
+* '''Choose the offset once.''' Changing or deleting it does not remap existing files; they must be fixed with <code>chown</code> and <code>lfs project</code> from a trusted client.
+
+Make sure the resulting filesystem IDs resolve on the MDS (through LDAP or another identity source), or set the MDS <code>identity_upcall</code> to <code>NONE</code>.
 
 === Activating Nodemaps ===
 
-Nodemaps must be activated to take effect:
+Nodemaps have no effect until the feature is activated, globally, on the MGS:
 
- lctl set_param nodemap.active=1
+ mgs# lctl nodemap_activate 1
 
-Check activation status:
+<code>lctl nodemap_activate 0</code> turns it off again. Check the current state with <code>lctl get_param nodemap.active</code>. After activating, check that the mappings are correct before letting tenants mount.
 
- lctl get_param nodemap.active
+=== Viewing the Configuration ===
 
-== Filesets (Subdirectory Mounts) ==
-
-Filesets allow clients to mount a subdirectory of the filesystem as their root. The client cannot see or access anything above the mounted subdirectory.
-
-=== Mounting a Fileset ===
-
- mount -t lustre mgs@tcp:/fsname/tenantA_data /mnt/tenant
-
-The client sees <code>/mnt/tenant</code> as the filesystem root. Paths like <code>../../</code> cannot escape the fileset boundary.
-
-=== Creating the Subdirectory ===
-
-The subdirectory must exist before clients can mount it:
-
- # On a client with full filesystem access
- mkdir -p /mnt/lustre/tenantA_data
- chown root:root /mnt/lustre/tenantA_data
- chmod 755 /mnt/lustre/tenantA_data
-
-=== Fileset with Nodemap ===
-
-For stronger isolation, configure the nodemap to enforce a specific fileset:
-
- lctl nodemap_set_fileset --name tenantA --fileset /tenantA_data
-
-When this is set, clients in the <code>tenantA</code> nodemap automatically mount the specified subdirectory, even if they attempt to mount the full filesystem:
-
- # Client in tenantA nodemap mounts:
- mount -t lustre mgs@tcp:/fsname /mnt/tenant
- # Effective mount point is /fsname/tenantA_data
-
-This prevents tenants from bypassing the fileset restriction.
-
-== Combining Nodemaps and Filesets ==
-
-A complete multi-tenant setup:
-
- # 1. Create nodemaps for each tenant
- lctl nodemap_add tenantA
- lctl nodemap_add tenantB
+ # Lustre 2.16.52 and later
+ mgs# lctl nodemap_info --list             # global state, nodemap names, property names
+ mgs# lctl nodemap_info --name tenantA     # every property of one nodemap
+ mgs# lctl nodemap_info --property ranges  # one property across all nodemaps
  
- # 2. Assign network ranges
- lctl nodemap_add_range --name tenantA --range 10.0.1.[0-255]@tcp
- lctl nodemap_add_range --name tenantB --range 10.0.2.[0-255]@tcp
+ # Any version
+ mgs# lctl get_param nodemap.tenantA.*
+
+== Filesets ==
+
+A fileset confines a nodemap's clients to a subdirectory. They mount it as their filesystem root and cannot see or reach anything outside it, including through <code>..</code>.
+
+'''Create the directory first''', from a client in a trusted nodemap. If a nodemap's primary fileset does not exist, no client in that nodemap can mount at all.
+
+ trusted-client# mkdir /mnt/lustre/tenantA
+
+Then set its owner and permissions to match the tenant's '''mapped''' filesystem IDs.
+
+=== Lustre 2.17 and Later: nodemap_fileset_add ===
+
+ mgs# lctl nodemap_fileset_add --name tenantA --fileset /tenantA
+
+Each nodemap can have:
+
+* One '''primary''' fileset, used as the root when a client mounts without naming a subdirectory.
+* Up to 255 '''alternate''' filesets (<code>--alt</code>). Clients mount these by naming them explicitly; an alternate never becomes the default.
+* A '''read-only''' flag on any fileset (<code>--ro</code>). Mounts that resolve to that fileset are forced read-only.
+
+ mgs# lctl nodemap_fileset_add --name tenantA --fileset /tenantA_scratch --alt
+ mgs# lctl nodemap_fileset_add --name tenantA --fileset /reference --alt --ro
+
+Use <code>lctl nodemap_fileset_modify</code> to change a fileset (rename it, switch it between primary and alternate, or toggle <code>--ro</code>/<code>--rw</code>), and <code>lctl nodemap_fileset_del</code> to remove one (<code>--fileset PATH</code>) or all of them (<code>--all</code>). The nodemap's <code>readonly_mount</code> property overrides a read-write fileset.
+
+=== Before Lustre 2.17: nodemap_set_fileset ===
+
+Earlier releases support only one fileset per nodemap:
+
+ mgs# lctl nodemap_set_fileset --name tenantA --fileset /tenantA
+ mgs# lctl nodemap_set_fileset --name tenantA --fileset ""     # remove it
+
+Running <code>nodemap_set_fileset</code> again '''replaces''' the fileset; it does not add a second one. Before 2.17, also store the fileset persistently, so that servers still enforce it after a restart:
+
+ mgs# lctl set_param -P nodemap.tenantA.fileset=/tenantA
+
+<code>nodemap_set_fileset</code> is deprecated in newer releases and affects only the primary fileset. Use <code>nodemap_fileset_add</code>, <code>nodemap_fileset_del</code>, and <code>nodemap_fileset_modify</code> where they are available.
+
+=== How Clients Mount ===
+
+With a primary fileset of <code>/tenantA</code>, a tenantA client's ordinary mount is silently redirected:
+
+ tenantA-client# mount -t lustre mgs@tcp:/testfs /mnt/lustre
+ # /mnt/lustre now shows /tenantA
+
+Clients can also mount an explicit subdirectory that matches one of their filesets. The full precedence rules, including how a requested path combines with the primary fileset, are in <code>lctl-nodemap-fileset-add(8)</code>. Test the exact mounts your tenants will use before going live.
+
+== Complete Example: Two Tenants ==
+
+This sets up two isolated tenants on Lustre 2.17 or later. On older releases, use <code>nodemap_set_fileset</code> plus <code>set_param -P</code> instead of <code>nodemap_fileset_add</code>; before 2.16, use explicit idmaps instead of offsets.
+
+ # 0. Servers and admin nodes get full access (see "Before You Start")
+ mgs# lctl nodemap_add TrustedSystems
+ mgs# lctl nodemap_add_range --name TrustedSystems --range 10.0.0.[1-20]@tcp
+ mgs# lctl nodemap_modify --name TrustedSystems --property admin --value 1
+ mgs# lctl nodemap_modify --name TrustedSystems --property trusted --value 1
  
- # 3. Disable admin/trusted for both
- lctl nodemap_modify --name tenantA --property admin --value 0
- lctl nodemap_modify --name tenantA --property trusted --value 0
- lctl nodemap_modify --name tenantB --property admin --value 0
- lctl nodemap_modify --name tenantB --property trusted --value 0
+ # 1. Tenant nodemaps and their client NIDs
+ mgs# lctl nodemap_add tenantA
+ mgs# lctl nodemap_add tenantB
+ mgs# lctl nodemap_add_range --name tenantA --range 10.0.1.[0-255]@tcp
+ mgs# lctl nodemap_add_range --name tenantB --range 10.0.2.[0-255]@tcp
  
- # 4. Set root squash
- lctl nodemap_modify --name tenantA --property squash_uid --value 99
- lctl nodemap_modify --name tenantA --property squash_gid --value 99
- lctl nodemap_modify --name tenantB --property squash_uid --value 99
- lctl nodemap_modify --name tenantB --property squash_gid --value 99
+ # 2. Non-overlapping ID spaces
+ mgs# lctl nodemap_add_offset --name tenantA --offset 100000 --limit 100000
+ mgs# lctl nodemap_add_offset --name tenantB --offset 200000 --limit 100000
  
- # 5. Map UIDs to non-overlapping server ranges
- lctl nodemap_add_idmap --name tenantA --idtype uid --idmap 1000:10000
- lctl nodemap_add_idmap --name tenantB --idtype uid --idmap 1000:20000
+ # 3. Nothing to do: admin=0 and trusted=0 are the defaults, so root is squashed and IDs are mapped
  
- # 6. Assign filesets
- lctl nodemap_set_fileset --name tenantA --fileset /tenantA_data
- lctl nodemap_set_fileset --name tenantB --fileset /tenantB_data
+ # 4. Tenant directories, owned by each tenant's mapped ID (client UID/GID 1000 here)
+ trusted-client# mkdir /mnt/lustre/tenantA /mnt/lustre/tenantB
+ trusted-client# chown 101000:101000 /mnt/lustre/tenantA
+ trusted-client# chown 201000:201000 /mnt/lustre/tenantB
  
- # 7. Activate nodemaps
- lctl set_param nodemap.active=1
-
-With this configuration:
-* TenantA clients (10.0.1.x) can only see <code>/tenantA_data</code> and their UID 1000 maps to server UID 10000.
-* TenantB clients (10.0.2.x) can only see <code>/tenantB_data</code> and their UID 1000 maps to server UID 20000.
-* Neither tenant's root user has admin privileges.
-
-== Multiple Filesets per Nodemap (Lustre 2.17+) ==
-
-Starting with Lustre 2.17, a single nodemap can be associated with multiple filesets. This allows a tenant to have access to several isolated directory trees:
-
- lctl nodemap_set_fileset --name tenantA --fileset /tenantA_data
- lctl nodemap_set_fileset --name tenantA --fileset /tenantA_scratch
-
-Clients can then mount either fileset:
-
- mount -t lustre mgs@tcp:/fsname/tenantA_data /mnt/data
- mount -t lustre mgs@tcp:/fsname/tenantA_scratch /mnt/scratch
-
-== Making Configuration Persistent ==
-
-Nodemap configuration is stored on the MGS and persists across server restarts. However, ensure the MGS is updated:
-
- # Verify persistent configuration
- lctl get_param nodemap.tenantA.*
+ # 5. Filesets
+ mgs# lctl nodemap_fileset_add --name tenantA --fileset /tenantA
+ mgs# lctl nodemap_fileset_add --name tenantB --fileset /tenantB
  
- # Changes made with lctl nodemap_* commands are automatically
- # persisted to the MGS configuration log.
+ # 6. Activate, then check before tenants mount
+ mgs# lctl nodemap_activate 1
+ mgs# lctl nodemap_info
 
-To verify on restart:
+Result:
 
- lctl get_param nodemap.active
+* tenantA clients see only <code>/tenantA</code>. Their UID 1000 is stored on disk as 101000, and their root is squashed.
+* tenantB clients see only <code>/tenantB</code>. Their UID 1000 is stored as 201000.
+* The two tenants can use the same client UIDs without colliding on disk.
+* Nodes in none of the three nodemaps fall into <code>default</code>: root squashed, every user mapped to <code>nobody</code>.
+
+To stop a tenant from impersonating another by spoofing a NID, also issue each tenant an SSK key bound to its nodemap. See [[Lustre Kerberos SSK Authentication#Binding Keys to Nodemaps|Binding Keys to Nodemaps]].
+
+== Removing a Tenant ==
+
+ mgs# lctl nodemap_del tenantA
+
+Deleting a nodemap removes its ranges, mappings, and properties, and its clients fall back to the <code>default</code> nodemap. Files keep the filesystem IDs they were written with.
 
 == See Also ==
 
-* [[UID GID Mapping]]
-* [[Setting up Lustre Security]]
+* [[UID/GID_Mapping|UID/GID Mapping]]
+* [[Lustre Kerberos SSK Authentication]] — strong client identification, including SSK keys bound to nodemaps
 * [[Lustre Client Encryption]]
-* [[Lustre Health Checks]]
+* [[Setting up Lustre Security]]
 
 [[Category:Administration]]
 [[Category:Security]]
-[[Category:Multi-tenancy]]

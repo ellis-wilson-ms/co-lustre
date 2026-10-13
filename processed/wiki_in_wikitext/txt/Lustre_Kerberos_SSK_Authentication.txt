@@ -1,154 +1,390 @@
 Title:        Lustre Kerberos SSK Authentication
 URL:          https://wiki.lustre.org/Lustre_Kerberos_SSK_Authentication
-Last Updated: 2026-04-29T00:00:00Z
-Last Editor:  CopilotBot
-Edit Comment: New page: Shared-Secret Key authentication guide
+Last Updated: 2026-10-12T00:00:00Z
+Last Editor:  WikiModernization
+Edit Comment: Correct SSK flavors, lgss_sk options, and rule syntax; add Kerberos setup, lsvcgssd, request-key, MGS and server-to-server sections; verified against Operations Manual and source
 
 --- Content (MediaWiki markup) ---
+__TOC__
+
 == Overview ==
 
-Lustre Shared-Secret Key (SSK) authentication provides Kerberos-like node authentication '''without''' requiring a centralized Key Distribution Center (KDC). Instead of relying on Kerberos infrastructure, SSK uses pre-shared key files distributed to participating nodes. This makes it well suited for clusters where deploying and maintaining a KDC is impractical.
+Lustre can authenticate nodes and protect PtlRPC traffic through GSSAPI, using one of two mechanisms:
 
-SSK was introduced in Lustre 2.9 and builds on the Generic Security Services API (GSSAPI) framework already used by Lustre's Kerberos support. It uses HMAC-based integrity checking and optional AES encryption to protect RPC traffic between nodes.
+{| class="wikitable"
+! !! Kerberos (krb5) !! Shared-Secret Key (SSK)
+|-
+| Infrastructure || MIT Kerberos 5 KDC || None; the administrator distributes key files
+|-
+| Authenticates || Nodes, '''and''' individual users via <code>kinit</code> || Nodes only (a single root context per connection)
+|-
+| Binds a client to its identity by || A per-host principal and keytab || A key file bound to a [[Lustre Multi Tenancy|nodemap]]
+|-
+| Can encrypt traffic || Yes (<code>krb5p</code>) || Yes (<code>skpi</code>)
+|}
 
-For the authoritative reference, see the ''Lustre Operations Manual'' chapter on [[Setting up Lustre Security|Shared-Secret Key Security]].
+SSK was added in Lustre 2.9 ([https://jira.whamcloud.com/browse/LU-3289 LU-3289]). It suits sites that want node authentication and wire encryption without running a KDC.
+
+Both mechanisms need Lustre built with GSS support, the <code>lsvcgssd</code> daemon on servers, and the <code>lgss_keyring</code> request-key upcall on every node. The authoritative references are the ''Configuring Shared-Secret Key (SSK) Security'' and ''Managing Security'' chapters of the [https://doc.lustre.org/lustre_manual.xhtml Lustre Operations Manual].
+
+This page covers '''transport''' security. It does not encrypt data at rest; for that, see [[Lustre Client Encryption]].
 
 == Security Flavors ==
 
-SSK offers three security flavors that can be configured independently per file system, per service, or per [[Lustre_Multi_Tenancy|nodemap]].
+A ''security flavor'' sets the authentication and protection applied to a connection, covering both RPC messages and bulk data.
 
 {| class="wikitable"
-! Flavor !! Authentication !! Integrity !! Privacy (Encryption) !! Use Case
+! Flavor !! Mechanism !! RPC message !! Bulk data !! Notes
 |-
-| <code>null</code> || None || None || None || Trusted networks with no security requirements
+| <code>null</code> || — || None || None || '''Default''' for all connections
 |-
-| <code>skn</code> || HMAC shared key || HMAC on every RPC || No || Authenticate nodes and prevent tampering; minimal CPU overhead
+| <code>plain</code> || — || colspan="2" | Plaintext with a hash on each RPC || No authentication
 |-
-| <code>ska</code> || HMAC shared key || HMAC on every RPC || AES-256-CTR || Full protection including bulk data encryption; higher CPU cost
+| <code>krb5n</code> || Kerberos || None || Checksum || Lightest Kerberos flavor
+|-
+| <code>krb5a</code> || Kerberos || Header integrity only || Checksum ||
+|-
+| <code>krb5i</code> || Kerberos || Integrity || Integrity || Heavy overhead
+|-
+| <code>krb5p</code> || Kerberos || '''Privacy''' || '''Privacy''' || Heaviest overhead
+|-
+| <code>skn</code> || SSK || None || None || Authentication only: a valid key is required to mount
+|-
+| <code>ska</code> || SSK || Integrity || None || Integrity for non-bulk RPCs only
+|-
+| <code>ski</code> || SSK || Integrity || Integrity ||
+|-
+| <code>skpi</code> || SSK || '''Privacy''' and integrity || '''Privacy''' and integrity || The only SSK flavor that encrypts
+|-
+| <code>gssnull</code> || GSS || None || None || Testing only
 |}
 
-'''Recommendation:''' Use <code>skn</code> when you need to verify that only authorized nodes mount the file system. Use <code>ska</code> when data confidentiality on the wire is also required (e.g., traffic crosses untrusted network segments).
+'''Only <code>krb5p</code> and <code>skpi</code> encrypt traffic.''' The other flavors authenticate nodes and/or detect tampering, but send data in the clear. Every SSK flavor requires a valid key to mount.
 
-== Generating Key Files ==
+== Setting Flavors with sptlrpc Rules ==
 
-Key files are created with the <code>lgss_sk</code> utility. Each key file embeds the shared secret, the security flavor, an expiry timestamp, and HMAC/encryption parameters.
+Flavors are set by persistent rules defined on the MGS with <code>lctl conf_param</code>:
 
-Generate a key for file system <code>testfs</code>:
+ <target>.srpc.flavor.<network>[.<direction>]=<flavor>
 
- lgss_sk -t mgs -f testfs -w /etc/lustre/ssk/testfs.key
+* <code><target></code> is a filesystem name (<code>testfs</code>) or a specific target (<code>testfs-MDT0000</code>, <code>testfs-OST0001</code>).
+* <code><network></code> is the LNet network of the RPC '''initiator''' (<code>tcp0</code>, <code>o2ib0</code>), or <code>default</code> for any network without a more specific rule.
+* <code><direction></code> is optional: <code>cli2mdt</code>, <code>cli2ost</code>, <code>mdt2mdt</code>, or <code>mdt2ost</code>.
 
-Common <code>lgss_sk</code> options:
+The most specific matching rule wins. Examples:
+
+ # Authenticate and encrypt everything by default
+ mgs# lctl conf_param testfs.srpc.flavor.default=skpi
+ 
+ # ...but on physically secure, high-performance networks, authenticate and check integrity only
+ mgs# lctl conf_param testfs.srpc.flavor.tcp1=ska
+ mgs# lctl conf_param testfs.srpc.flavor.o2ib0=ska
+ 
+ # List the rules
+ mgs# lctl get_param mgs.*.live.testfs | grep srpc.flavor
+ 
+ # Delete a rule
+ mgs# lctl conf_param -d testfs.srpc.flavor.o2ib0
+
+Important behavior:
+
+* Rule changes reach '''existing as well as new''' connections, typically within seconds to a few minutes depending on system load.
+* '''Make sure every affected node is ready before you change a rule.''' A node that cannot negotiate the new flavor (missing key, daemon not running, Kerberos misconfigured) can be evicted.
+* <code>lctl set_param -P</code> does '''not''' work for sptlrpc rules. Use <code>lctl conf_param</code>.
+* Rules do not cover the MGS connection itself, because a node only learns the rules after it connects to the MGS. See [[#Securing the MGS Connection|Securing the MGS Connection]].
+
+== SSK Setup ==
+
+This walkthrough follows the example in the Operations Manual: filesystem <code>testfs</code>, a combined MGS/MDS at <code>172.16.0.1@tcp</code>, one OSS, and two clients. It protects client-to-server traffic with <code>skpi</code>.
+
+=== Step 1: Confirm the GSS Components Are Installed ===
+
+When Lustre is built with GSS keyring support, its packages install:
+
+* <code>/etc/request-key.d/lgssc.conf</code> on every node, containing this single line:
+ create lgssc * * /usr/sbin/lgss_keyring %o %k %t %d %c %u %g %T %P %S
+* <code>lsvcgss.service</code> and <code>/etc/sysconfig/lsvcgss</code> on servers.
+
+Check that the request-key file exists on '''every''' node, clients included. Without it, nodes cannot establish security contexts.
+
+=== Step 2: Create a Key Directory on Every Node ===
+
+ # mkdir /secure_directory
+ # chmod 600 /secure_directory
+
+=== Step 3: Generate the Server Key ===
+
+ mds# lgss_sk -t server -f testfs -w /secure_directory/testfs.server.key
+
+<code>lgss_sk</code> reads <code>/dev/random</code> by default. On a system without a hardware random number generator, it can block until enough entropy is available.
+
+=== Step 4: Distribute the Key ===
+
+Copy the key to every other server, and to every client under a client filename, over a secure channel:
+
+ mds# scp /secure_directory/testfs.server.key oss:/secure_directory/
+ mds# scp /secure_directory/testfs.server.key client1:/secure_directory/testfs.client.key
+
+Never put key files on a shared filesystem.
+
+=== Step 5: Convert Each Client Copy to a Client Key ===
+
+On '''each client''':
+
+ client1# lgss_sk -t client -m /secure_directory/testfs.client.key
+
+This sets the key type to <code>client</code> and generates the Diffie-Hellman prime that only client keys carry. Generating the prime can take a while.
+
+=== Step 6: Start lsvcgssd on the Servers ===
+
+Set <code>LSVCGSSDARGS</code> in <code>/etc/sysconfig/lsvcgss</code>. <code>-s</code> enables SSK; <code>-m</code>, <code>-o</code>, and <code>-g</code> select the MDS, OSS, and MGS services the daemon handles.
+
+ # /etc/sysconfig/lsvcgss on the MDS
+ LSVCGSSDARGS="-s -m"
+ 
+ # /etc/sysconfig/lsvcgss on the OSS
+ LSVCGSSDARGS="-s -o"
+
+ mds# systemctl start lsvcgss.service
+ oss# systemctl start lsvcgss.service
+
+=== Step 7: Mount the Targets with skpath ===
+
+ mds# mount -t lustre -o skpath=/secure_directory /dev/mdt_device /mnt/mdt
+ oss# mount -t lustre -o skpath=/secure_directory /dev/ost_device /mnt/ost0
+
+<code>skpath</code> loads '''every''' key file in the directory into the kernel keyring. A world-writable key file fails to load.
+
+=== Step 8: Set the Flavor ===
+
+ mgs# lctl conf_param testfs.srpc.flavor.tcp.cli2mdt=skpi
+ mgs# lctl conf_param testfs.srpc.flavor.tcp.cli2ost=skpi
+
+Server-to-server connections keep the default <code>null</code> flavor. See [[#Securing Server-to-Server Traffic|Securing Server-to-Server Traffic]].
+
+=== Step 9: Mount the Clients ===
+
+ client1# mount -t lustre -o skpath=/secure_directory 172.16.0.1@tcp:/testfs /mnt/testfs
+
+A client without a valid key is refused:
+
+ mount.lustre: mount 172.16.0.1@tcp:/testfs at /mnt/testfs failed: Connection refused
+
+Then [[#Verifying Security Contexts|verify the contexts]].
+
+=== lgss_sk Reference ===
 
 {| class="wikitable"
 ! Option !! Description
 |-
-| <code>-t mgs&#124;server&#124;client</code> || Key type: MGS, server (MDS/OSS), or client
+| <code>-w, --write ''FILE''</code> || Generate a new key file. Will not overwrite an existing file.
 |-
-| <code>-f ''fsname''</code> || File system name the key is valid for
+| <code>-m, --modify ''FILE''</code> || Change only the attributes given on the command line
 |-
-| <code>-w ''path''</code> || Write the generated key to this file
+| <code>-r, --read ''FILE''</code> || Show a key file's attributes (<code>-</code> reads standard input)
 |-
-| <code>-e ''seconds''</code> || Key expiration time (default: no expiry)
+| <code>-l, --load ''FILE''</code> || Load one key file into the session keyring. Must be run as root.
 |-
-| <code>-d ''prime_size''</code> || Diffie-Hellman prime size in bits (default: 2048)
+| <code>-t, --type ''TYPE''</code> || <code>mgs</code>, <code>server</code>, or <code>client</code>; combine with a comma (e.g. <code>mgs,server</code>). Required when writing.
+|-
+| <code>-f, --fsname ''NAME''</code> || Filesystem the key is for. Writing requires <code>-f</code> or <code>-g</code>.
+|-
+| <code>-g, --mgsnids ''NIDS''</code> || Comma-separated MGS NIDs. Needed only when <code>mgssec</code> is used.
+|-
+| <code>-n, --nodemap ''NAME''</code> || Nodemap the key is bound to (default: <code>default</code>)
+|-
+| <code>-e, --expire ''SECONDS''</code> || How long session contexts created from this key last before they are renegotiated (default 604800, 7 days). This is '''not''' an expiry date for the key file.
+|-
+| <code>-i, --hmac ''ALG''</code> || Integrity hash: <code>SHA256</code> (default) or <code>SHA512</code>
+|-
+| <code>-c, --crypt ''ALG''</code> || Cipher for privacy: <code>AES-256-CTR</code> (the default and only choice)
+|-
+| <code>-p, --prime-bits ''BITS''</code> || Diffie-Hellman prime length (default 2048). On server and MGS keys, this is also the minimum prime length accepted from clients.
+|-
+| <code>-k, --key-bits ''BITS''</code> || Shared key length (default 256)
+|-
+| <code>-d, --data ''FILE''</code> || Entropy source for the shared key (default <code>/dev/random</code>). Use <code>/dev/urandom</code> for testing only.
+|-
+| <code>-v, --verbose</code> || More detailed error messages
 |}
 
-To inspect an existing key file:
+=== Binding Keys to Nodemaps ===
 
- lgss_sk -r /etc/lustre/ssk/testfs.key
+Every SSK key names a nodemap (<code>-n</code>, default <code>default</code>). When a client connects, it sends a hash of the nodemap name from its key. The server looks up which nodemap the client's NID belongs to, and <code>lsvcgssd</code> checks that the two match. A key used from a NID outside that nodemap's ranges is therefore rejected.
 
-== Distributing Keys ==
+This is what stops one tenant from impersonating another with a copied key. Issue a separate key for each nodemap:
 
-After generating a key file, copy it to '''every''' node that should communicate using SSK. All nodes in the same trust domain must share the same key.
+ mgs# lgss_sk -t server -f testfs -n biology -w /secure_directory/testfs.server.biology.key
 
- scp /etc/lustre/ssk/testfs.key root@oss1:/etc/lustre/ssk/
- scp /etc/lustre/ssk/testfs.key root@client1:/etc/lustre/ssk/
+The NID-to-nodemap lookup works whether or not nodemaps have been activated with <code>lctl nodemap_activate</code>.
 
-'''Security note:''' Key files must be readable only by root (<code>chmod 0600</code>). Distribute them over a trusted channel (e.g., <code>scp</code>, configuration management). Never place key files on a shared file system that clients without SSK could read.
+Alternatively, the nodemap property <code>gssonly_identification=1</code> identifies clients by the GSS token they authenticate with, rather than by NID; such a nodemap cannot have NID ranges. See [[Lustre Multi Tenancy]].
 
-== Server-Side Configuration ==
+=== Securing the MGS Connection ===
 
-=== Setting the Default Flavor at mkfs Time ===
+Each node chooses the flavor for its MGS connection with the <code>mgssec</code> mount option. A node has only one MGS connection, so every target and client on that node uses the flavor set when the first connection was made, and it cannot change until remount.
 
-To require SSK for all connections by default:
+# On the MGS, add <code>-g</code> to <code>LSVCGSSDARGS</code> and restart <code>lsvcgss.service</code>.
+# Add the <code>mgs</code> type and the MGS NIDs to the server key, and load it:
+#: <code>mgs# lgss_sk -t mgs,server -g 172.16.0.1@tcp,172.16.0.2@tcp -m /secure_directory/testfs.server.key</code>
+#: <code>mgs# lgss_sk -l /secure_directory/testfs.server.key</code>
+# Add the MGS NIDs to each client key:
+#: <code>client1# lgss_sk -g 172.16.0.1@tcp,172.16.0.2@tcp -m /secure_directory/testfs.client.key</code>
+# Remount each client with <code>mgssec</code>:
+#: <code>client1# mount -t lustre -o mgssec=skpi,skpath=/secure_directory 172.16.0.1@tcp:/testfs /mnt/testfs</code>
 
- mkfs.lustre --mgs --param=mgsnode.srpc.flavor.default=skn /dev/sda1
- mkfs.lustre --mdt --fsname=testfs --param=srpc.flavor.default=skn /dev/sdb1
- mkfs.lustre --ost --fsname=testfs --param=srpc.flavor.default=skn /dev/sdc1
+By default the MGS accepts any flavor. To require a particular one, add a rule on the special target <code>_mgs</code>:
 
-Replace <code>skn</code> with <code>ska</code> if encryption is required.
+ mgs# lctl conf_param _mgs.srpc.flavor.tcp=skpi
 
-=== Enabling SSK on an Existing File System ===
+=== Securing Server-to-Server Traffic ===
 
-Set the SRPC flavor at runtime:
+When servers talk to each other (for example, MDT to OST), they act as clients, so they need a '''client'''-type key too. To apply <code>ski</code> to MDT-to-OST traffic:
 
- lctl conf_param testfs.srpc.flavor.default=skn
+# Put the servers in their own nodemap:
+#: <code>mgs# lctl nodemap_add LustreServers</code>
+#: <code>mgs# lctl nodemap_add_range --name LustreServers --range 172.16.0.[1-3]@tcp</code>
+# Create an <code>mgs,server</code> key for that nodemap and copy it to every server:
+#: <code>mds# lgss_sk -t mgs,server -f testfs -g 172.16.0.1@tcp,172.16.0.2@tcp -n LustreServers -w /secure_directory/testfs.LustreServers.key</code>
+# On each server, copy that key to <code>testfs.LustreServers.client.key</code> and convert the copy with <code>lgss_sk -t client -m</code>.
+# On each server, load both keys with <code>lgss_sk -l</code>.
+# Set the rule:
+#: <code>mgs# lctl conf_param testfs.srpc.flavor.tcp.mdt2ost=ski</code>
 
-This takes effect on new connections. Existing clients must remount to negotiate the new flavor.
+If nodemaps are active, the servers' nodemap must also have <code>admin=1</code> and <code>trusted=1</code>. See [[Lustre Multi Tenancy]].
 
-== Mounting with SSK ==
+=== Revoking and Rotating Keys ===
 
-=== Server Mount ===
+SSK keys cannot be revoked as such, and Lustre has no way to flush established contexts. To lock out a compromised key, do one of the following:
 
-When mounting an SSK-enabled target, specify the key file path:
+* Unload the key from the keyring on the servers (with <code>keyctl</code>). New connections that use it then fail.
+* Move the affected NIDs to a nodemap with a different name. Keys that name the old nodemap can no longer establish contexts.
 
- mount -t lustre -o skpath=/etc/lustre/ssk/testfs.key /dev/sdb1 /mnt/testfs-MDT0000
+Contexts that already exist last until they expire (<code>-e</code>, 7 days by default) or the targets are unmounted. If you need revocation to take effect quickly, create keys with a shorter expiry; the manual suggests 3600 seconds as reasonable for some sites.
 
-=== Client Mount ===
+To rotate keys: generate new key files, distribute and load them, and remove the old files from every <code>skpath</code> directory so they are not reloaded at the next mount.
 
- mount -t lustre -o skpath=/etc/lustre/ssk/testfs.key mgs@tcp:/testfs /mnt/testfs
+== Kerberos Setup ==
 
-If <code>skpath</code> points to a directory, Lustre searches for a key file matching the file system name inside that directory.
+Lustre supports MIT Kerberos 5, version 1.3 or later, with the <code>aes128-cts</code> and <code>aes256-cts</code> enctypes. Clocks must be synchronized across all nodes and the KDC.
 
-== Nodemap Integration ==
+=== Packages and Build ===
 
-SSK flavors can be enforced per [[Lustre_Multi_Tenancy|nodemap]], allowing different trust levels for different groups of nodes:
+Install on every node:
 
- lctl nodemap_modify --name restricted --property srpc_flavor --value ska
+* <code>krb5-workstation</code>, <code>krb5-libs</code>
+* <code>keyutils</code>, <code>keyutils-libs</code>
 
-This forces all nodes in the <code>restricted</code> nodemap to use <code>ska</code>. Nodes that connect without the correct key or with a weaker flavor are rejected.
+Lustre must be built with GSS support. On the build host, install <code>krb5-devel</code> and <code>keyutils-libs-devel</code>, then configure with:
 
-== Key Rotation ==
+ ./configure --enable-gss
 
-To rotate keys without downtime:
+=== Principals and Keytabs ===
 
-# Generate a new key with <code>lgss_sk</code>.
-# Distribute the new key to all nodes.
-# Update the <code>skpath</code> mount option or replace the key file in place.
-# Remount clients (or wait for reconnect) to pick up the new key.
+Create a principal for each node, using that node's '''fully qualified''' hostname, and install its keytab on that node:
 
-'''Note:''' There is no automatic key rotation mechanism. Key rotation requires manual distribution or integration with a configuration management tool (Ansible, Puppet, etc.).
+{| class="wikitable"
+! Node role !! Principal
+|-
+| Client || <code>lustre_root/client_host.domain@REALM</code>
+|-
+| MGS || <code>lustre_mgs/mgs_host.domain@REALM</code>
+|-
+| MDS || <code>lustre_mds/mds_host.domain@REALM</code>
+|-
+| OSS || <code>lustre_oss/oss_host.domain@REALM</code>
+|}
 
-== Performance Considerations ==
+ kadmin> addprinc -randkey lustre_mds/mds_host.domain@REALM
+ kadmin> ktadd lustre_mds/mds_host.domain@REALM
 
-* <code>skn</code> adds HMAC computation to every RPC but does '''not''' encrypt bulk data. The CPU overhead is typically negligible on modern hardware.
-* <code>ska</code> encrypts all bulk data transfers using AES-256-CTR. On CPUs with AES-NI instructions the throughput impact is roughly 5–15%, but can be higher on older hardware without hardware acceleration.
-* For large clusters, benchmark with <code>ska</code> before committing to encryption system-wide.
+Notes:
 
-== Limitations ==
+* The hostname in each principal must be the one that resolves to the IP address in that node's Lustre NID. Otherwise the servers do not recognize its GSS requests.
+* To avoid a keytab per client, you can create a single <code>lustre_root@REALM</code> principal and install its keytab on every client. The cost is that '''one compromised client compromises them all'''.
+* On networks without hostname resolution (anything other than TCP or InfiniBand), each node needs an executable <code>/etc/lustre/nid2hostname</code> script that translates a NID into a hostname. The ''Configuring Kerberos (KRB) Security'' section of the manual includes an example.
 
-* SSK does '''not''' provide user-level authentication — it authenticates ''nodes'', not individual users. Combine with [[Lustre_Multi_Tenancy|nodemaps]] and UID/GID squashing for multi-tenant isolation.
-* Key files are static secrets. Compromise of a key file requires regenerating and redistributing keys to all nodes.
-* SSK is not compatible with Kerberos on the same connection — choose one mechanism per file system or per nodemap.
+=== Start lsvcgssd ===
+
+On each server, run <code>lsvcgssd</code> with <code>-k</code>, plus the services that node runs (<code>-g</code> MGS, <code>-m</code> MDS, <code>-o</code> OSS), '''before''' starting Lustre:
+
+ # /etc/sysconfig/lsvcgss on a combined MGS/MDS
+ LSVCGSSDARGS="-k -g -m"
+
+ # systemctl start lsvcgss.service
+
+Clients use the same request-key upcall as SSK; check that <code>/etc/request-key.d/lgssc.conf</code> exists on every client.
+
+=== Set the Flavor ===
+
+Use [[#Setting Flavors with sptlrpc Rules|sptlrpc rules]] with a <code>krb5</code> flavor, for example:
+
+ mgs# lctl conf_param testfs.srpc.flavor.default=krb5i
+
+=== User Authentication ===
+
+With Kerberos, '''users''' authenticate as well as nodes. Non-root users must run <code>kinit</code> before accessing Lustre, as with any Kerberized application.
+
+* Each user's principal (<code>username@REALM</code>) must exist in the KDC.
+* Clients and MDS nodes must share the same user database for name and UID/GID translation.
+
+Users can destroy their security contexts before logging out:
+
+ $ lfs flushctx -k -r /mnt/testfs
+
+<code>-k</code> also destroys the on-disk Kerberos credential cache (like <code>kdestroy</code>), and <code>-r</code> reaps revoked keys from the keyring.
+
+== Verifying Security Contexts ==
+
+On a client (or on a server, for its own outgoing connections), check the flavor each import is using:
+
+ client1# lctl get_param *.*.srpc_info
+ mdc.testfs-MDT0000-mdc-ffff8800da9f0800.srpc_info=
+ rpc flavor:     skpi
+ bulk flavor:    skpi
+ ...
+
+<code>srpc_contexts</code> shows each established context and its mechanism (<code>mech: sk</code> or <code>krb5</code>). SSK supports only a single root context per import, so there should be exactly one.
+
+ client1# lctl get_param *.*.srpc_contexts
+
+An <code>mgc</code> import without a secure context means the MGS connection is not protected; see [[#Securing the MGS Connection|Securing the MGS Connection]].
 
 == Troubleshooting ==
 
-Common errors:
+* '''Mount fails with "Connection refused"''': the client has no valid key for this filesystem and nodemap, or the key did not load. Check the <code>skpath</code> directory, and use <code>lgss_sk -r</code> to confirm the key's type (<code>client</code>), filesystem name, and nodemap.
+* '''A key file fails to load''': the file is world-writable.
+* '''Nodes are evicted after a rule change''': a node could not negotiate the new flavor. Check that <code>lsvcgssd</code> is running with the right options, that the request-key file exists, and that the keys or keytabs are in place.
 
-* <code>EACCES</code> on mount — key file permissions are too open or the key does not match the server's key.
-* <code>GSS negotiation failed</code> — verify that the same key file is present on both sides and that the security flavor matches.
-* Check the kernel log (<code>dmesg</code>) for detailed GSSAPI error messages.
+'''Client-side logging.''' <code>lgss_keyring</code> runs from the request-key upcall, which has no standard output, so it logs to syslog. Raise its level (0 error, 1 warn, 2 info, 3 debug, 4 trace):
 
-Enable GSSAPI debug logging:
+ client# lctl set_param sptlrpc.gss.lgss_keyring.debug_level=4
 
- lctl set_param sptlrpc.gss.lgss_keyring.debug_level=1
+'''Server-side logging.''' Run the daemon in the foreground with extra <code>-v</code> flags. It logs to standard output in the foreground and to syslog as a daemon:
+
+ server# lsvcgssd -f -vvv -s
+
+To inspect the keys in a keyring:
+
+ # keyctl show
+ # keyctl pipe <key_id> | lgss_sk -r -
+
+== Performance ==
+
+Overhead grows with the level of protection. Authentication-only flavors (<code>skn</code>, <code>krb5n</code>) are light, integrity flavors cost more, and the privacy flavors (<code>skpi</code>, <code>krb5p</code>) cost the most, because they encrypt bulk data. CPUs with hardware AES acceleration reduce the cost of <code>skpi</code>. Benchmark your workload before enabling privacy system-wide, and consider rules that apply privacy only on untrusted networks.
+
+== Limitations ==
+
+* '''SSK authenticates nodes, not users.''' For multi-tenant isolation, combine it with nodemaps (UID/GID mapping and root squash). Use Kerberos if you need per-user authentication.
+* '''A key file is a shared secret.''' Anyone who obtains it can authenticate as a member of its nodemap, from a NID in that nodemap. Use separate keys per nodemap, keep them off shared filesystems, and protect them like passwords.
+* '''Each connection uses one flavor''', so Kerberos and SSK cannot both apply to the same connection. Rules can still give different networks, directions, or targets different mechanisms.
+* Transport security does not protect data at rest. See [[Lustre Client Encryption]].
 
 == See Also ==
 
-* [[Setting up Lustre Security]] — Operations Manual chapter on security configuration
-* [[Lustre Multi Tenancy]] — Nodemap-based multi-tenant isolation
-* [[Lustre_Shared_Secret_Key|Shared-Secret Key]] — Additional SSK reference material
+* [[Setting up Lustre Security]] — overview of Lustre security features
+* [[Lustre Multi Tenancy]] — nodemaps, filesets, and tenant isolation
+* [[Shared Secret Key Authentication And Encryption]] — background and original design references for SSK
+* [[Lustre Client Encryption]] — encryption of data at rest
 
 [[Category:Security]]
-[[Category:Configuration]]
-[[Category:Authentication]]
