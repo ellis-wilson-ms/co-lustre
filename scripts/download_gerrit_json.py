@@ -139,10 +139,6 @@ def fetch_and_save_all_changes(query: str, output_dir: Path) -> int:
             if updated and (latest_updated is None or updated > latest_updated):
                 latest_updated = updated
 
-        # Update marker after each batch so we can resume
-        if latest_updated:
-            write_marker(output_dir, latest_updated)
-
         total += len(batch)
         log(f"  got {len(batch)} changes, saved (total: {total})")
 
@@ -153,7 +149,11 @@ def fetch_and_save_all_changes(query: str, output_dir: Path) -> int:
         else:
             break
 
+    # Results arrive newest-first, so the marker is only safe to advance
+    # once every page has been saved; an interrupted run must re-query
+    # from the previous marker rather than skip the unfetched older pages.
     if latest_updated:
+        write_marker(output_dir, latest_updated)
         log(f"Final marker: {latest_updated}")
 
     return total

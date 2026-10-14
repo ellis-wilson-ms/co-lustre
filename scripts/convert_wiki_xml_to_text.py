@@ -7,6 +7,13 @@ Takes the full MediaWiki XML export (full_xml_download.xml) and:
   2. Converts each page to clean plaintext in wiki/txt/<Title>.txt
 
 The wikitext markup is stripped to produce readable, greppable text.
+It also writes the original markup to wiki_in_wikitext/txt/<Title>.txt.
+
+wiki_in_wikitext/ is where local page edits are made before they are
+uploaded to the wiki.  Before writing anything, this script lists every
+local wikitext page whose content would be replaced by the export and
+requires interactive confirmation.  It refuses to run non-interactively
+if any local page would change.
 
 Usage:
     python3 convert_wiki_xml_to_text.py [RAW_DIR [PROCESSED_DIR]]
@@ -117,6 +124,130 @@ def strip_wikitext(text: str) -> str:
     return s.strip()
 
 
+def build_page(page_el):
+    """Extract a page's metadata and render its plaintext and wikitext files.
+
+    Returns None for pages without a title.
+    """
+    title_el = page_el.find(f"{MW_NS}title")
+    if title_el is None or not title_el.text:
+        return None
+    title = title_el.text
+    safe_name = sanitize_filename(title)
+
+    page_id_el = page_el.find(f"{MW_NS}id")
+    revision = page_el.find(f"{MW_NS}revision")
+
+    timestamp = ""
+    contributor = ""
+    wikitext = ""
+    comment = ""
+
+    if revision is not None:
+        ts_el = revision.find(f"{MW_NS}timestamp")
+        timestamp = ts_el.text if ts_el is not None and ts_el.text else ""
+
+        contrib_el = revision.find(f"{MW_NS}contributor")
+        if contrib_el is not None:
+            uname_el = contrib_el.find(f"{MW_NS}username")
+            contributor = uname_el.text if uname_el is not None and uname_el.text else ""
+
+        text_el = revision.find(f"{MW_NS}text")
+        wikitext = text_el.text if text_el is not None and text_el.text else ""
+
+        comment_el = revision.find(f"{MW_NS}comment")
+        comment = comment_el.text if comment_el is not None and comment_el.text else ""
+
+    header = []
+    header.append(f"Title:        {title}")
+    header.append(f"URL:          https://wiki.lustre.org/{safe_name.replace(' ', '_')}")
+    if page_id_el is not None and page_id_el.text:
+        header.append(f"Page ID:      {page_id_el.text}")
+    header.append(f"Last Updated: {timestamp}")
+    header.append(f"Last Editor:  {contributor}")
+    if comment:
+        header.append(f"Edit Comment: {comment}")
+    header.append("")
+
+    plaintext = "\n".join(header + ["--- Content ---", strip_wikitext(wikitext), ""])
+    markup = "\n".join(header + ["--- Content (MediaWiki markup) ---", wikitext, ""])
+
+    return {
+        "title": title,
+        "safe_name": safe_name,
+        "plaintext": plaintext,
+        "wikitext": markup,
+    }
+
+
+def read_header_field(path: Path, field: str) -> str:
+    """Return a 'Field: value' header value from a page file, or ''."""
+    prefix = f"{field}:"
+    try:
+        with path.open(encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("---"):
+                    break
+                if line.startswith(prefix):
+                    return line[len(prefix):].strip()
+    except OSError:
+        pass
+    return ""
+
+
+def confirm_wikitext_overwrite(built_pages, wikitext_dir: Path):
+    """List local wikitext pages the export would replace and require confirmation.
+
+    Exits the program unless the user explicitly confirms.
+    """
+    changed = []
+    for page in built_pages:
+        path = wikitext_dir / f"{page['safe_name']}.txt"
+        if path.exists() and path.read_text(encoding="utf-8") != page["wikitext"]:
+            changed.append(path)
+
+    export_names = {f"{p['safe_name']}.txt" for p in built_pages}
+    local_only = sorted(p for p in wikitext_dir.glob("*.txt") if p.name not in export_names)
+
+    if local_only:
+        print(f"{len(local_only)} local wikitext page(s) are not in this export and "
+              f"will be left untouched (no plaintext will be generated for them):")
+        for path in local_only:
+            print(f"    {path.name}")
+        print()
+
+    if not changed:
+        print("No existing wikitext pages differ from the export; nothing local will be overwritten.\n")
+        return
+
+    print("=" * 78)
+    print(f"WARNING: {len(changed)} page(s) in {wikitext_dir}")
+    print("differ from the export and will be OVERWRITTEN with the exported version.")
+    print("Any local edits not yet uploaded to the wiki will be lost.")
+    print("=" * 78)
+    for path in sorted(changed):
+        editor = read_header_field(path, "Last Editor") or "?"
+        updated = read_header_field(path, "Last Updated") or "?"
+        print(f"    {path.name:<70}  {updated}  {editor}")
+    print()
+    print("Commit wiki_in_wikitext/ first so the overwritten content can be recovered with git.")
+
+    if not sys.stdin.isatty():
+        sys.stdout.flush()
+        print("Refusing to overwrite without interactive confirmation (stdin is not a terminal).",
+              file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        answer = input(f"Type 'overwrite' to replace these {len(changed)} page(s), anything else to abort: ")
+    except EOFError:
+        answer = ""
+    if answer.strip() != "overwrite":
+        print("Aborted; no files were written.")
+        sys.exit(1)
+    print()
+
+
 def process_full_export(raw_dir: Path, processed_dir: Path):
     """Parse the full export and write individual XML + text files."""
     full_xml = raw_dir / "full_xml_download.xml"
@@ -127,10 +258,6 @@ def process_full_export(raw_dir: Path, processed_dir: Path):
     if not full_xml.exists():
         print(f"Error: {full_xml} not found", file=sys.stderr)
         sys.exit(1)
-
-    xml_dir.mkdir(parents=True, exist_ok=True)
-    txt_dir.mkdir(parents=True, exist_ok=True)
-    wikitext_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Parsing {full_xml} ...")
     tree = ET.parse(full_xml)
@@ -143,15 +270,25 @@ def process_full_export(raw_dir: Path, processed_dir: Path):
     pages = root.findall(f"{MW_NS}page")
     print(f"Found {len(pages)} pages.\n")
 
+    built = []
+    for page_el in pages:
+        page = build_page(page_el)
+        if page is not None:
+            built.append((page_el, page))
+
+    if wikitext_dir.is_dir():
+        confirm_wikitext_overwrite([page for _, page in built], wikitext_dir)
+
+    xml_dir.mkdir(parents=True, exist_ok=True)
+    txt_dir.mkdir(parents=True, exist_ok=True)
+    wikitext_dir.mkdir(parents=True, exist_ok=True)
+
     split_count = 0
     convert_count = 0
 
-    for page_el in pages:
-        title_el = page_el.find(f"{MW_NS}title")
-        if title_el is None or not title_el.text:
-            continue
-        title = title_el.text
-        safe_name = sanitize_filename(title)
+    for page_el, page in built:
+        title = page["title"]
+        safe_name = page["safe_name"]
 
         # --- Write individual XML ---
         xml_path = xml_dir / f"{safe_name}.xml"
@@ -166,67 +303,8 @@ def process_full_export(raw_dir: Path, processed_dir: Path):
         ind_tree.write(str(xml_path), encoding="unicode", xml_declaration=True)
         split_count += 1
 
-        # --- Convert to plaintext ---
-        txt_path = txt_dir / f"{safe_name}.txt"
-
-        ns_el = page_el.find(f"{MW_NS}ns")
-        page_id_el = page_el.find(f"{MW_NS}id")
-        revision = page_el.find(f"{MW_NS}revision")
-
-        timestamp = ""
-        contributor = ""
-        wikitext = ""
-        comment = ""
-
-        if revision is not None:
-            ts_el = revision.find(f"{MW_NS}timestamp")
-            timestamp = ts_el.text if ts_el is not None and ts_el.text else ""
-
-            contrib_el = revision.find(f"{MW_NS}contributor")
-            if contrib_el is not None:
-                uname_el = contrib_el.find(f"{MW_NS}username")
-                contributor = uname_el.text if uname_el is not None and uname_el.text else ""
-
-            text_el = revision.find(f"{MW_NS}text")
-            wikitext = text_el.text if text_el is not None and text_el.text else ""
-
-            comment_el = revision.find(f"{MW_NS}comment")
-            comment = comment_el.text if comment_el is not None and comment_el.text else ""
-
-        plaintext = strip_wikitext(wikitext)
-
-        lines = []
-        lines.append(f"Title:        {title}")
-        lines.append(f"URL:          https://wiki.lustre.org/{safe_name.replace(' ', '_')}")
-        if page_id_el is not None and page_id_el.text:
-            lines.append(f"Page ID:      {page_id_el.text}")
-        lines.append(f"Last Updated: {timestamp}")
-        lines.append(f"Last Editor:  {contributor}")
-        if comment:
-            lines.append(f"Edit Comment: {comment}")
-        lines.append("")
-        lines.append("--- Content ---")
-        lines.append(plaintext)
-        lines.append("")
-
-        txt_path.write_text("\n".join(lines), encoding="utf-8")
-
-        # --- Write wikitext (original MediaWiki markup) ---
-        wikitext_path = wikitext_dir / f"{safe_name}.txt"
-        wt_lines = []
-        wt_lines.append(f"Title:        {title}")
-        wt_lines.append(f"URL:          https://wiki.lustre.org/{safe_name.replace(' ', '_')}")
-        if page_id_el is not None and page_id_el.text:
-            wt_lines.append(f"Page ID:      {page_id_el.text}")
-        wt_lines.append(f"Last Updated: {timestamp}")
-        wt_lines.append(f"Last Editor:  {contributor}")
-        if comment:
-            wt_lines.append(f"Edit Comment: {comment}")
-        wt_lines.append("")
-        wt_lines.append("--- Content (MediaWiki markup) ---")
-        wt_lines.append(wikitext)
-        wt_lines.append("")
-        wikitext_path.write_text("\n".join(wt_lines), encoding="utf-8")
+        (txt_dir / f"{safe_name}.txt").write_text(page["plaintext"], encoding="utf-8")
+        (wikitext_dir / f"{safe_name}.txt").write_text(page["wikitext"], encoding="utf-8")
 
         convert_count += 1
         print(f"OK  {title}")

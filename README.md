@@ -34,25 +34,25 @@ co-lustre/
 | Source | Origin | Raw Format | Processed Format |
 |--------|--------|------------|------------------|
 | **JIRA Issues** | [jira.whamcloud.com](https://jira.whamcloud.com/) | XML | Plaintext + TSV index |
-| **Official Manual** | Lustre documentation (DocBook) | DocBook XML | Plaintext |
+| **Official Manual** | [review.whamcloud.com/doc/manual](https://review.whamcloud.com/doc/manual) (DocBook) | DocBook XML | Plaintext |
 | **Wiki** | [wiki.lustre.org](https://wiki.lustre.org/) | MediaWiki XML | Plaintext |
 | **Source Code** | [git.whamcloud.com](https://git.whamcloud.com/fs/lustre-release.git) | — | As-is |
 
 ## Scripts
 
-### `download_jira_xml.sh`
+### `download_jira_xml.py`
 
-Downloads JIRA issues as XML from Whamcloud's JIRA server using parallel `curl` requests.
+Downloads JIRA issues as XML from Whamcloud's JIRA server. `range` mode fetches a key range for the initial download, skipping issues already present. `update` mode is the routine refresh: it asks JIRA for every issue updated since the last run and re-downloads any that are new or have changed (status, resolution, comments, …), tracking progress in `raw/jira/xml/<PROJECT>/.last_update`.
 
 ```bash
-# Usage: download_jira_xml.sh <PROJECT> <MIN_ID> <MAX_ID>
-./scripts/download_jira_xml.sh LU 1 <MAX_LU_ID>
-./scripts/download_jira_xml.sh LUDOC 1 <MAX_LUDOC_ID>
+./scripts/download_jira_xml.py range LU 1 <MAX_LU_ID>     # initial download
+./scripts/download_jira_xml.py update LU LUDOC --dry-run  # preview a refresh
+./scripts/download_jira_xml.py update LU LUDOC            # refresh new + changed issues
 ```
 
 ### `convert_jira_xml_to_text.py`
 
-Converts raw JIRA XML to structured plaintext. Strips HTML, extracts metadata (status, priority, assignee, dates, comments), and generates a TSV index.
+Converts raw JIRA XML to structured plaintext. Strips HTML, extracts metadata (status, priority, assignee, dates, comments), and generates a TSV index. Only XML files newer than their text file are reconverted; the index is always rebuilt.
 
 ```bash
 ./scripts/convert_jira_xml_to_text.py raw/jira processed/jira
@@ -60,15 +60,16 @@ Converts raw JIRA XML to structured plaintext. Strips HTML, extracts metadata (s
 
 ### `convert_manual_to_text.sh`
 
-Converts DocBook XML manual chapters to plaintext using `pandoc`.
+Converts DocBook XML manual chapters to plaintext using `pandoc`. The manual source in `raw/manual/src/lustre-manual` tracks Gerrit (`https://review.whamcloud.com/doc/manual`), which is the canonical upstream; the GitHub mirror is no longer updated, and git.whamcloud.com is behind a Cloudflare challenge that blocks scripted clones.
 
 ```bash
-./scripts/convert_manual_to_text.sh raw/manual/src/lustre-manual processed/manual/txt
+git -C raw/manual/src/lustre-manual pull
+PANDOC=~/.local/opt/pandoc-2.9.2.1/bin/pandoc ./scripts/convert_manual_to_text.sh raw/manual/src/lustre-manual processed/manual/txt
 ```
 
 ### `convert_wiki_xml_to_text.py`
 
-Splits a full MediaWiki XML export into individual pages and converts each to plaintext, stripping wikitext markup and templates.
+Splits a full MediaWiki XML export into individual pages and converts each to plaintext, stripping wikitext markup and templates. It also rewrites `processed/wiki_in_wikitext/`, where local page edits are made before upload, so it first lists every local page the export would replace and requires typing `overwrite` to continue. Commit `wiki_in_wikitext/` before running it.
 
 ```bash
 ./scripts/convert_wiki_xml_to_text.py raw/wiki processed/wiki
@@ -77,8 +78,7 @@ Splits a full MediaWiki XML export into individual pages and converts each to pl
 ## Prerequisites
 
 - **Python 3**
-- **[pandoc](https://pandoc.org/)** — required for manual conversion (`apt install pandoc` / `brew install pandoc`)
-- **curl** — used by the JIRA download script
+- **[pandoc](https://pandoc.org/) 2.9.2.1** — required for manual conversion. The corpus is rendered with this exact release and `convert_manual_to_text.sh` refuses other versions; if your system pandoc differs, unpack the [static build](https://github.com/jgm/pandoc/releases/tag/2.9.2.1) and set `PANDOC=/path/to/pandoc`.
 
 ## Processed Data Format
 
