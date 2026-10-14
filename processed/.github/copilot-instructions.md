@@ -1,7 +1,8 @@
 # Lustre Public Dataset — Processed Reference Data
 
-This workspace contains processed, AI-searchable versions of four
-primary Lustre documentation sources. All content is plain text or
+This workspace contains processed, AI-searchable versions of five
+primary Lustre documentation sources (JIRA, source code, the operations
+manual, the wiki, and Gerrit code review). All content is plain text or
 source code — no binary formats.
 
 ## Recommended Search Order
@@ -115,7 +116,7 @@ git diff refs/changes/79/64079/37^..refs/changes/79/64079/37  # diff
 
 Lustre Operations Manual, converted from DocBook XML to plain text.
 
-- **txt/** — 47 chapter files (e.g., `ConfiguringStorage.txt`,
+- **txt/** — One plain-text file per chapter (e.g., `ConfiguringStorage.txt`,
   `LustreTuning.txt`, `ManagingStripingFreeSpace.txt`).
   Chapter names are self-descriptive.
 
@@ -124,8 +125,8 @@ Lustre Operations Manual, converted from DocBook XML to plain text.
 Lustre Wiki pages (plaintext — **use this directory** for searching,
 reading, and answering questions about wiki content).
 
-- **txt/** — 359 plain-text files, one per wiki page (e.g.,
-  `ZFS.txt`, `Configuring_Lustre_File_Striping.txt`).
+- **txt/** — One plain-text file per page published on the wiki as of
+  the last export (e.g., `ZFS.txt`, `Configuring_Lustre_File_Striping.txt`).
   Each file has a metadata header (Title, URL, Page ID, Last Updated,
   Last Editor) followed by the page content with markup stripped for
   easy reading and grepping.
@@ -143,9 +144,12 @@ plain-text extracts. The editing workflow is:
 Lustre Wiki pages in original MediaWiki markup. **This is the
 directory to edit** when creating or modifying wiki page content.
 
-- **txt/** — Same pages as `wiki/txt/`, but the content section
+- **txt/** — Every page in `wiki/txt/`, but the content section
   preserves the original MediaWiki wikitext markup (templates, links,
-  tables, headings, categories, etc.).
+  tables, headings, categories, etc.). It can be ahead of `wiki/txt/`:
+  it also holds new pages that have not been uploaded yet (these have
+  no `wiki/txt/` counterpart), and pages edited locally whose content
+  differs from the published version until the next wiki export.
 
 **Workflow for wiki edits:**
 - **Read** wiki content from `wiki/txt/` (plain text, easier to search).

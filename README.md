@@ -1,6 +1,6 @@
 # co-lustre
 
-A comprehensive text corpus of [Lustre](http://lustre.org) filesystem documentation, JIRA issues, and source code — converted to searchable plaintext for analysis, reference, and retrieval.
+A comprehensive text corpus of [Lustre](http://lustre.org) filesystem documentation, JIRA issues, Gerrit code reviews, and source code — converted to searchable plaintext for analysis, reference, and retrieval.
 
 Lustre is an open-source, distributed parallel file system designed for large-scale HPC environments. This repository collects and normalizes data from multiple Lustre knowledge sources into a single, grepable dataset.
 
@@ -10,7 +10,8 @@ Lustre is an open-source, distributed parallel file system designed for large-sc
 
 ```
 co-lustre/
-├── raw/                        # Original source data (XML, DocBook, MediaWiki)
+├── raw/                        # Original source data (XML, JSON, DocBook, MediaWiki)
+│   ├── gerrit/json/            # Raw Gerrit change JSON (fs/lustre-release)
 │   ├── jira/xml/               # Raw JIRA issue XML exports (LU, LUDOC projects)
 │   ├── manual/src/             # DocBook XML source for the official Lustre manual
 │   └── wiki/                   # Full MediaWiki XML export of the Lustre wiki
@@ -18,6 +19,10 @@ co-lustre/
 │       └── page-list.txt
 ├── processed/                  # Cleaned plaintext output
 │   ├── code/lustre-release/    # Lustre source code (GPL-2.0)
+│   ├── gerrit/                 # Plaintext Gerrit code reviews + TSV index
+│   │   ├── index.tsv           # Tab-separated index (number, status, branch, owner, …)
+│   │   ├── txt/                # One file per change, bot noise filtered
+│   │   └── txt_full/           # One file per change, all messages unfiltered
 │   ├── jira/                   # Plaintext JIRA issues + TSV index
 │   │   ├── index.tsv           # Tab-separated index (key, status, priority, type, …)
 │   │   └── txt/
@@ -37,6 +42,7 @@ co-lustre/
 | **Official Manual** | [review.whamcloud.com/doc/manual](https://review.whamcloud.com/doc/manual) (DocBook) | DocBook XML | Plaintext |
 | **Wiki** | [wiki.lustre.org](https://wiki.lustre.org/) | MediaWiki XML | Plaintext |
 | **Source Code** | [git.whamcloud.com](https://git.whamcloud.com/fs/lustre-release.git) | — | As-is |
+| **Code Reviews** | [review.whamcloud.com](https://review.whamcloud.com/q/project:fs/lustre-release) | JSON | Plaintext + TSV index |
 
 ## Scripts
 
@@ -73,6 +79,23 @@ Splits a full MediaWiki XML export into individual pages and converts each to pl
 
 ```bash
 ./scripts/convert_wiki_xml_to_text.py raw/wiki processed/wiki
+```
+
+### `download_gerrit_json.py`
+
+Downloads Gerrit changes for `fs/lustre-release` as JSON via the REST API. Subsequent runs are incremental: only changes updated since the last completed run (tracked in `raw/gerrit/json/.last_update`) are fetched.
+
+```bash
+./scripts/download_gerrit_json.py --update   # refresh changed changes
+./scripts/download_gerrit_json.py --full     # force a complete re-download
+```
+
+### `convert_gerrit_json_to_text.py`
+
+Converts Gerrit JSON to plaintext in two forms — `txt/` with verbose bot output (test logs, checkpatch, build details) reduced to short summaries, and `txt_full/` unfiltered — and regenerates the TSV index. Only JSON files newer than their text files are reconverted.
+
+```bash
+./scripts/convert_gerrit_json_to_text.py raw/gerrit processed/gerrit
 ```
 
 ## Prerequisites
