@@ -1,0 +1,1058 @@
+Change:     68440
+Subject:    LU-20543 gss: fix leftover key on failed negotiation
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68440
+Change-Id:  Id4ad292d6b9eee17f23143f97c917be884d6cfdf
+Project:    fs/lustre-release
+Branch:     master
+Status:     MERGED
+Owner:      Sebastien Buisson
+Created:    2026-08-27 15:59:26.000000000
+Updated:    2026-09-21 07:54:18.000000000
+Patch Set:  8
+Insertions: +104
+Deletions:  -39
+Comments:   30 (0 unresolved)
+
+--- Labels ---
+  Code-Review: Aurelien Degremont: +1; Bruno Faccini: +1; Oleg Drokin: +2
+  Verified: jenkins: +1; Maloo: +1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
+  REVIEWER: Oleg Drokin, Andreas Dilger, Bruno Faccini, Aurelien Degremont
+
+--- Commit Message ---
+LU-20543 gss: fix leftover key on failed negotiation
+
+When a regular user with no Kerberos credentials tries to access a
+krb5 file system, the gss context negotiation fails as expected, but
+a leftover lgssc key is sometimes left behind, referenced and in
+invalidated state:
+
+  0686fa5e I--Q--i 1 perm 3d010000 500 500 lgssc 500@1a
+
+Several defects combine to produce this.
+
+Keys are unlinked from a keyring by index key, that is by type and
+description, and not by identity. All gss keys of a given user for a
+given sec share the same description. So error_kernel_key() calling
+keyctl_unlink() after do_keyctl_update() has succeeded is racy: the
+downcall makes the kernel unlink the key and wake up the process
+waiting for the context, and that process is then free to request a
+new key, which gets linked into the very same keyring slot. The late
+keyctl_unlink() then evicts that brand new key.
+
+Once evicted, the new key is no longer reachable from the requesting
+process keyrings, so the upcall no longer possesses it. Setting the
+key permissions is denied, the key does not get KEY_USR_WRITE, and
+the subsequent keyctl_update() reporting the negotiation error is
+denied as well. The kernel never learns about the failure, and waits
+for the negotiation timeout to expire.
+
+Only unlink the key from userspace when the downcall was delivered but
+failed for some other reason. Also, only unlink a key that we are the
+ones invalidating.
+
+When the negotiation timeout expires, ctx_upcall_timeout_kr() runs
+in interrupt context, so it can neither take the key semaphore nor
+unlink the key. Invalidating the key there only makes it invisible
+to lookups, while it stays linked and referenced. And then
+unbind_key_ctx() gives up on that key because it is invalidated, so
+it never drops the key and ctx references taken by bind_key_ctx().
+The key can never be freed, and stays in the kernel keys tree for
+good.
+
+So just expire the context in the timeout handler, as killing it
+unbinds the key properly. And rely solely on the key payload in
+unbind_key_ctx() to detect that a key was already unbound, as the
+payload is set and cleared under the key semaphore.
+
+Invalidating a key is never enough to get rid of it, because the
+kernel garbage collector only reaps invalidated keys when it is
+notified through key_schedule_gc_links(), which is not exported to
+modules. So also unlink the key in the two other places that
+invalidate one: the context allocation failure path in
+gss_sec_lookup_ctx_kr(), and flush_user_ctx_cache_kr() when the key
+has no context bound, or a context that was already unlisted.
+
+The key is invalidated right after being unlinked, and still under the
+key semaphore, so a racing lookup sees KEY_FLAG_INVALIDATED as soon as
+it is granted the semaphore. Test it in gss_sec_lookup_ctx_kr(), and
+ask for a brand new key instead. Asking once is enough: the key is
+both unlinked and invalidated by then, so check_cached_key() and the
+keyring search skip it, and request_key() can only come back with a
+new key, for which it does run the upcall.
+
+Finally, keyctl_unlink() returns -1 and sets errno on failure, so
+comparing its return value to ENOENT never matches. Compare errno
+instead, so that error_kernel_key() does not log an error when the
+key was simply not found in the keyring.
+
+Fixes: 21aa8404a42b ("LU-17612 gss: always try to unlink key in error")
+Fixes: 9ec0e5029602 ("LU-17940 gss: get rid of root key in all cases")
+
+Test-Parameters: trivial
+Test-Parameters: testgroup=review-dne-selinux-ssk-part-1
+Test-Parameters: testgroup=review-dne-selinux-ssk-part-2
+Test-Parameters: kerberos=true testlist=sanity-krb5
+Test-Parameters: kerberos=true testlist=sanity-krb5
+Test-Parameters: kerberos=true testlist=sanity-krb5
+Test-Parameters: kerberos=true testlist=sanity-krb5
+Test-Parameters: kerberos=true testlist=sanity-krb5
+Signed-off-by: Sebastien Buisson <sbuisson@ddn.com>
+Assisted-by: Claude:claude-opus-5
+Change-Id: Id4ad292d6b9eee17f23143f97c917be884d6cfdf
+Reviewed-on: https://review.whamcloud.com/c/fs/lustre-release/+/68440
+Reviewed-by: Bruno Faccini <bfaccini@nvidia.com>
+Tested-by: jenkins <devops@whamcloud.com>
+Tested-by: Maloo <maloo@whamcloud.com>
+Reviewed-by: Aurelien Degremont <adegremont@nvidia.com>
+Reviewed-by: Oleg Drokin <green@whamcloud.com>
+
+--- Review History ---
+
+--- Message (Sebastien Buisson, 2026-08-27 15:59:26.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-27 16:02:35.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-27 16:03:22.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/68987/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (wc-checkpatch, 2026-08-27 16:11:35.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-08-27 16:34:28.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130460/ : SUCCESS
+
+--- Message (Maloo, 2026-08-27 16:35:27.000000000) ---
+Patch Set 1:
+
+#### The following sessions will be run for Build 130460 (patch #1):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-ldiskfs-dne on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=130460&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=130460#redirect
+
+--- Message (Lustre Gerrit Janitor, 2026-08-27 16:41:23.000000000) ---
+Patch Set 1:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/68987/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (Lustre RISC-V Builder, 2026-08-27 21:48:57.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Maloo, 2026-08-28 03:23:56.000000000) ---
+Patch Set 1:
+
+Failed enforced test custom-1007 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-156vm159: https://testing.whamcloud.com/test_sessions/553ef4e7-4a22-46e3-8fa2-b087e0f54eaf ran 3 tests.  1 tests failed: sanity-krb5.
+
+--- Message (Autotest, 2026-08-28 06:52:44.000000000) ---
+Patch Set 1:
+
+Trevis Autotest retesting enforced custom session on el9.7-x86_64/ldiskfs servers and clients for build 130460 patch 1. Requested by S Buisson because of LU-18511.
+The following test parameters were specified: kerberos=true testlist=sanity-krb5.
+
+--- Message (Maloo, 2026-08-28 07:47:54.000000000) ---
+Patch Set 1: Verified-1
+
+Passed enforced test review-ldiskfs-dne-arm on RHEL 8.10 / x86_64, Rocky 9.5 / aarch64 uploaded by Onyx Autotest from onyx-180vm35: https://testing.whamcloud.com/test_sessions/0e266091-37cf-494c-9a02-1ed077335037 ran 5 tests.
+
+--- Message (Maloo, 2026-08-28 07:49:26.000000000) ---
+Patch Set 1: Verified+1
+
+Passed enforced test custom-1007 on RHEL 9.7 / x86_64 uploaded by Trevis Autotest from trevis-155vm10: https://testing.whamcloud.com/test_sessions/920c3975-755a-4197-8ae1-69f4f41bfd1d ran 3 tests.
+
+--- Message (Maloo, 2026-08-28 07:49:37.000000000) ---
+Patch Set 1:
+
+Passed enforced test review-ldiskfs-dne on RHEL 9.7 / x86_64 uploaded by Trevis Autotest from trevis-156vm147: https://testing.whamcloud.com/test_sessions/1b08d9e0-48f2-4333-873d-cea6138f70c0 ran 5 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-08-28 08:03:37.000000000) ---
+Patch Set 1:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, and the kernel-side reference/unlink bookkeeping now looks self-consistent. The userspace half rests on an assumption that does not hold once the upcall timer has already fired - see inline comments.
+
+--- Message (Sebastien Buisson, 2026-08-28 09:23:57.000000000) ---
+Patch Set 1:
+
+(3 comments)
+
+--- Message (Sebastien Buisson, 2026-08-28 09:24:41.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-28 09:26:51.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-28 09:30:42.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-28 09:32:05.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/69048/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (Lustre Gerrit Janitor, 2026-08-28 10:13:19.000000000) ---
+Patch Set 2:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/69048/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (jenkins, 2026-08-28 10:43:43.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130529/ : SUCCESS
+
+--- Message (Maloo, 2026-08-28 10:44:26.000000000) ---
+Patch Set 2:
+
+#### The following sessions will be run for Build 130529 (patch #2):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-ldiskfs-dne on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=130529&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=130529#redirect
+
+--- Message (Lustre RISC-V Builder, 2026-08-28 13:13:38.000000000) ---
+Patch Set 2:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Maloo, 2026-08-29 06:31:39.000000000) ---
+Patch Set 2: Verified+1
+
+Passed enforced test review-dne-selinux-ssk-part-1 on RHEL 8.10 / x86_64 uploaded by Onyx Autotest from onyx-156vm162: https://testing.whamcloud.com/test_sessions/4cfd7524-d827-47e4-b3ca-039a5da23ea7 ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-08-29 06:46:20.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Mostly good; the key lifecycle reasoning holds up. One thought on coverage: sanity-krb5 test_11 already runs `$RUNAS touch $DIR/$tdir/$tfile` with no Kerberos credentials, which is exactly the scenario in the description, and test_10/test_13 already count lgssc entries in /proc/keys. Adding a key count check after that failed access would give this a regression test that fails before and passes after.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-29 13:31:01.000000000) ---
+Patch Set 2:
+
+Even though "Test-Parameters: trivial" was detected, this deeply suspicious bot still run some testing
+
+Testing has completed with errors!
+
+> recovery-small@zfs Failure(8518s)
+- 155(ls1 != ls2) 
+> replay-dual@ldiskfs+DNE Timeout(347s)
+> sanity2@ldiskfs+DNE Timeout(13441s)
+> sanity1@zfs Failure(9380s)
+- 45(write wasn't cached) 
+> sanity-pcc@ldiskfs+DNE Failure(4031s)
+- 1c(/mnt/lustre/d1c.sanity-pcc/f1c.sanity-pcc expected pcc state: readwrite, but got: none) 1d(expected /mnt/pcc.d1d.sanity-pcc/d1d.sanity-pcc/13a3/0x2000013a1:0x2:0x0 size: 7654321 got: 0) 
+> sanity-pcc@zfs Failure(3629s)
+- 1c(/mnt/lustre/d1c.sanity-pcc/f1c.sanity-pcc expected pcc state: readwrite, but got: none) 1d(/mnt/lustre/d1d.sanity-pcc/f1d.sanity-pcc expected pcc state: readwrite, but got: none) 
+> sanity-quota@zfs Failure(14132s)
+- 86(succeed to create files, expect failed) 
+> sanityn@ldiskfs+DNE Timeout(5927s)
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/69048/results.html
+
+--- Message (Sebastien Buisson, 2026-08-31 09:27:30.000000000) ---
+Patch Set 2:
+
+(2 comments)
+
+--- Message (Sebastien Buisson, 2026-08-31 11:11:52.000000000) ---
+Uploaded patch set 3: Patch Set 2 was rebased.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-31 11:14:38.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-31 11:16:58.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/69226/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-31 11:17:20.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-31 11:25:03.000000000) ---
+Patch Set 3:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-31 11:39:36.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130707/ : SUCCESS
+
+--- Message (Maloo, 2026-08-31 11:41:02.000000000) ---
+Patch Set 3:
+
+#### The following sessions will be run for Build 130707 (patch #3):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-ldiskfs-dne on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=130707&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=130707#redirect
+
+--- Message (Lustre Gerrit Janitor, 2026-08-31 12:08:14.000000000) ---
+Patch Set 3:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/69226/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (Maloo, 2026-08-31 20:39:01.000000000) ---
+Patch Set 3: Verified+1
+
+Passed enforced test review-dne-selinux-ssk-part-1 on RHEL 8.10 / x86_64 uploaded by Onyx Autotest from onyx-145vm24: https://testing.whamcloud.com/test_sessions/5adf7dea-7cd7-4fa7-9ba8-5ed022384f02 ran 3 tests.
+
+--- Message (Lustre Gerrit Janitor, 2026-09-01 03:49:00.000000000) ---
+Patch Set 3:
+
+Even though "Test-Parameters: trivial" was detected, this deeply suspicious bot still run some testing
+
+Testing has completed with errors!
+IMPORTANT: these tests appear to be new failures unique to this patch
+- sanity1@zfs:test_56ab(Seen in reviews: 68419 68416 68190 68158 68155 68004 67631 67591 67570 67459 67404 67373 67116 67028 66739 66588 66553 66267 65914 65838 65771 65770 65552 65512 65414 65140 65094 65083 65061 64429 64408 64355 64321 64314 63981 63511 62581 58508 58493 58456 58275 55770 49732 37246)
+
+
+> sanity1@zfs Failure(8979s)
+- 56ab(>1M blocks files 3 isn't 1 as expected) 
+> sanity-pcc@ldiskfs+DNE Failure(3865s)
+- 1c(expected /mnt/pcc.d1c.sanity-pcc/d1c.sanity-pcc/0bd3/0x200000bd1:0x2:0x0 size: 7654321 got: 0) 1d(expected /mnt/pcc.d1d.sanity-pcc/d1d.sanity-pcc/13a3/0x2000013a1:0x2:0x0 size: 7654321 got: 0) 
+> sanity-pcc@zfs Failure(3519s)
+- 1c(expected /mnt/pcc.d1c.sanity-pcc/d1c.sanity-pcc/0bd3/0x200000bd1:0x2:0x0 size: 7654321 got: 0) 1d(expected /mnt/pcc.d1d.sanity-pcc/d1d.sanity-pcc/13a3/0x2000013a1:0x2:0x0 size: 7654321 got: 0) 
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/69226/results.html
+
+--- Message (Aurelien Degremont, 2026-09-01 10:17:57.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+--- Message (Sebastien Buisson, 2026-09-01 15:20:43.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+--- Message (Sebastien Buisson, 2026-09-01 15:20:59.000000000) ---
+Uploaded patch set 4.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Lustre Gerrit Janitor, 2026-09-01 15:26:26.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/69310/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-01 15:26:44.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-01 15:29:00.000000000) ---
+Patch Set 4:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-09-01 15:58:32.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130788/ : SUCCESS
+
+--- Message (Maloo, 2026-09-01 15:59:47.000000000) ---
+Patch Set 4:
+
+#### The following sessions will be run for Build 130788 (patch #4):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-ldiskfs-dne on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=130788&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=130788#redirect
+
+--- Message (Lustre Gerrit Janitor, 2026-09-01 16:03:57.000000000) ---
+Patch Set 4:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/69310/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (Lustre RISC-V Builder, 2026-09-01 17:02:07.000000000) ---
+Patch Set 4:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Lustre Gerrit Janitor, 2026-09-01 23:18:37.000000000) ---
+Patch Set 4:
+
+Even though "Test-Parameters: trivial" was detected, this deeply suspicious bot still run some testing
+
+Testing has completed with errors!
+
+> sanity-pcc@ldiskfs+DNE Failure(3635s)
+- 1c(expected /mnt/pcc.d1c.sanity-pcc/d1c.sanity-pcc/0bd3/0x200000bd1:0x2:0x0 size: 7654321 got: 0) 1d(expected /mnt/pcc.d1d.sanity-pcc/d1d.sanity-pcc/13a3/0x2000013a1:0x2:0x0 size: 7654321 got: 0) 
+> sanity-pcc@zfs Failure(3228s)
+- 1c(expected /mnt/pcc.d1c.sanity-pcc/d1c.sanity-pcc/0bd3/0x200000bd1:0x2:0x0 size: 7654321 got: 0) 1d(expected /mnt/pcc.d1d.sanity-pcc/d1d.sanity-pcc/13a3/0x2000013a1:0x2:0x0 size: 7654321 got: 0) 
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/69310/results.html
+
+--- Message (Maloo, 2026-09-02 10:38:12.000000000) ---
+Patch Set 4:
+
+Failed enforced test custom-1007 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-157vm17: https://testing.whamcloud.com/test_sessions/cf660ef5-fb16-424d-9763-1d66ce73cd08 ran 3 tests.  1 tests failed: sanity-krb5.
+
+--- Message (Maloo, 2026-09-02 14:38:04.000000000) ---
+Patch Set 4: Verified-1
+
+Passed enforced test review-dne-selinux-ssk-part-1 on RHEL 8.10 / x86_64 uploaded by Trevis Autotest from trevis-156vm27: https://testing.whamcloud.com/test_sessions/0639f969-8e69-42a2-a3a0-7768a040c7dc ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-09-02 15:02:11.000000000) ---
+Patch Set 4:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good. The key/ctx lifecycle changes look correct: the payload-only test in unbind_key_ctx() is safe because key_set_payload() is only ever called under key->sem, the test_and_set_bit() guard keeps exactly one unlink per key, and dropping the key work from ctx_upcall_timeout_kr() is fine since the woken waiter reaches gss_cli_ctx_validate_kr()->kill_ctx_kr() (and gss_sec_gc_ctx_kr() otherwise), which unbinds and unlinks in process context. Two small comments inline.
+
+--- Message (Autotest, 2026-09-02 15:14:17.000000000) ---
+Patch Set 4:
+
+Trevis Autotest retesting enforced custom session on el9.7-x86_64/ldiskfs servers and clients for build 130788 patch 4. Requested by S Buisson because of LU-18511.
+The following test parameters were specified: kerberos=true testlist=sanity-krb5.
+
+--- Message (Sebastien Buisson, 2026-09-02 15:56:22.000000000) ---
+Patch Set 4:
+
+(2 comments)
+
+--- Message (Sebastien Buisson, 2026-09-02 15:56:30.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-02 15:59:14.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-02 16:00:59.000000000) ---
+Patch Set 5:
+
+Looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-09-02 16:01:52.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/69375/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (Maloo, 2026-09-02 16:13:11.000000000) ---
+Patch Set 4: Verified+1
+
+Passed enforced test custom-1007 on RHEL 9.7 / x86_64 uploaded by Trevis Autotest from trevis-155vm167: https://testing.whamcloud.com/test_sessions/b44cbadc-79ec-4e68-bf7e-76f63dcb46a4 ran 3 tests.
+
+--- Message (Lustre RISC-V Builder, 2026-09-02 16:20:31.000000000) ---
+Patch Set 5:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Lustre Gerrit Janitor, 2026-09-02 16:21:56.000000000) ---
+Patch Set 5:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/69375/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (jenkins, 2026-09-02 16:22:01.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130846/ : SUCCESS
+
+--- Message (Maloo, 2026-09-02 16:23:31.000000000) ---
+Patch Set 5:
+
+#### The following sessions will be run for Build 130846 (patch #5):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-ldiskfs-dne on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=130846&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=130846#redirect
+
+--- Message (Lustre Gerrit Janitor, 2026-09-02 19:37:28.000000000) ---
+Patch Set 5:
+
+Even though "Test-Parameters: trivial" was detected, this deeply suspicious bot still run some testing
+
+Testing has completed with errors!
+
+> sanity-pcc@ldiskfs+DNE Failure(3103s)
+- 1c(expected /mnt/pcc.d1c.sanity-pcc/d1c.sanity-pcc/0bd3/0x200000bd1:0x2:0x0 size: 7654321 got: 0) 1d(expected /mnt/pcc.d1d.sanity-pcc/d1d.sanity-pcc/13a3/0x2000013a1:0x2:0x0 size: 7654321 got: 0) 
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/69375/results.html
+
+--- Message (Maloo, 2026-09-02 22:17:32.000000000) ---
+Patch Set 5:
+
+Failed enforced test custom-1006 on RHEL 9.7 / x86_64 uploaded by Trevis Autotest from trevis-153vm8: https://testing.whamcloud.com/test_sessions/fb677df9-9615-420b-b6e4-129f54d68b8a ran 3 tests.  1 tests failed: sanity-krb5.
+
+--- Message (Maloo, 2026-09-02 22:19:35.000000000) ---
+Patch Set 5:
+
+Failed enforced test custom-1004 on RHEL 9.7 / x86_64 uploaded by Trevis Autotest from trevis-154vm6: https://testing.whamcloud.com/test_sessions/65c1999a-c7dd-4116-80ec-bd0aaafbc51e ran 3 tests.  1 tests failed: sanity-krb5.
+
+--- Message (Maloo, 2026-09-02 22:51:46.000000000) ---
+Patch Set 5:
+
+Failed enforced test custom-1005 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-156vm42: https://testing.whamcloud.com/test_sessions/b72cfa2c-806b-448c-8759-1ba6562d8a26 ran 3 tests.  1 tests failed: sanity-krb5.
+
+--- Message (Maloo, 2026-09-03 03:13:03.000000000) ---
+Patch Set 5: Verified-1
+
+Passed enforced test review-ldiskfs-dne-arm on RHEL 8.10 / x86_64, Rocky 9.5 / aarch64 uploaded by Onyx Autotest from onyx-180vm15: https://testing.whamcloud.com/test_sessions/469ed825-0ee0-4b46-9825-0133e3d226fc ran 5 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-09-03 03:31:32.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Mostly good - the key/ctx lifecycle rework hangs together and the userspace side reads correctly. One concern inline about the new invalidate-then-unlink helper.
+
+--- Message (Sebastien Buisson, 2026-09-03 13:26:44.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+--- Message (Sebastien Buisson, 2026-09-03 13:27:05.000000000) ---
+Uploaded patch set 6.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-03 13:30:26.000000000) ---
+Patch Set 6:
+
+Looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-09-03 13:31:07.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/69446/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-03 13:32:54.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-09-03 14:06:40.000000000) ---
+Patch Set 6:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/69446/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (Lustre RISC-V Builder, 2026-09-03 15:39:00.000000000) ---
+Patch Set 6:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-09-03 16:57:06.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130939/ : SUCCESS
+
+--- Message (Maloo, 2026-09-03 16:58:18.000000000) ---
+Patch Set 6:
+
+#### The following sessions will be run for Build 130939 (patch #6):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-ldiskfs-dne on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=130939&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=130939#redirect
+
+--- Message (Maloo, 2026-09-03 22:43:37.000000000) ---
+Patch Set 6: Verified+1
+
+Passed enforced test review-ldiskfs-dne on RHEL 9.8 / x86_64 uploaded by Trevis Autotest from trevis-155vm6: https://testing.whamcloud.com/test_sessions/2170d269-28ae-42df-ac5e-60f9fde52c55 ran 5 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-09-03 23:06:42.000000000) ---
+Patch Set 6:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Looks good overall; the leftover-key analysis holds up and the flow through gss_kt_update() closes the loop on the userspace side. Two optional notes inline on the new key_invalidate_unlink_locked() helper - neither is a reason to re-spin, they are just free to fold in whenever the patch is next refreshed.
+
+--- Message (Lustre Gerrit Janitor, 2026-09-04 07:39:35.000000000) ---
+Patch Set 6:
+
+Even though "Test-Parameters: trivial" was detected, this deeply suspicious bot still run some testing
+
+Testing has completed with errors!
+
+> racer@ldiskfs+DNE Timeout(3014s)
+> sanity-pcc@ldiskfs+DNE Failure(4240s)
+- 1c(/mnt/lustre/d1c.sanity-pcc/f1c.sanity-pcc expected pcc state: readwrite, but got: none) 1d(expected /mnt/pcc.d1d.sanity-pcc/d1d.sanity-pcc/13a3/0x2000013a1:0x2:0x0 size: 7654321 got: 0) 
+> sanity-pcc@zfs Failure(3279s)
+- 1c(expected /mnt/pcc.d1c.sanity-pcc/d1c.sanity-pcc/0bd3/0x200000bd1:0x2:0x0 size: 7654321 got: 0) 1d(expected /mnt/pcc.d1d.sanity-pcc/d1d.sanity-pcc/13a3/0x2000013a1:0x2:0x0 size: 7654321 got: 0) 
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/69446/results.html
+
+--- Message (Sebastien Buisson, 2026-09-04 12:22:49.000000000) ---
+Patch Set 6:
+
+(2 comments)
+
+--- Message (Sebastien Buisson, 2026-09-04 12:23:05.000000000) ---
+Uploaded patch set 7.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-04 12:28:59.000000000) ---
+Patch Set 7:
+
+Code-wise looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-09-04 12:30:54.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/69544/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (wc-checkpatch, 2026-09-04 12:33:58.000000000) ---
+Patch Set 7:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-09-04 12:37:38.000000000) ---
+Patch Set 7:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-09-04 12:48:37.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131034/ : SUCCESS
+
+--- Message (Maloo, 2026-09-04 12:49:46.000000000) ---
+Patch Set 7:
+
+#### The following sessions will be run for Build 131034 (patch #7):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-ldiskfs-dne on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=131034&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=131034#redirect
+
+--- Message (Lustre Gerrit Janitor, 2026-09-04 13:19:50.000000000) ---
+Patch Set 7:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/69544/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (Lustre Gerrit Janitor, 2026-09-05 10:06:15.000000000) ---
+Patch Set 7:
+
+Even though "Test-Parameters: trivial" was detected, this deeply suspicious bot still run some testing
+
+Testing has completed with errors!
+
+> recovery-small@zfs Failure(7857s)
+- 155(ls1 != ls2) 
+> sanity1@zfs Failure(9025s)
+- 45(write wasn't cached) 
+> sanity-pcc@ldiskfs+DNE Failure(3735s)
+- 1c(/mnt/lustre/d1c.sanity-pcc/f1c.sanity-pcc expected pcc state: readwrite, but got: none) 1d(expected /mnt/pcc.d1d.sanity-pcc/d1d.sanity-pcc/13a3/0x2000013a1:0x2:0x0 size: 7654321 got: 0) 
+> sanity-pcc@zfs Failure(3599s)
+- 1c(expected /mnt/pcc.d1c.sanity-pcc/d1c.sanity-pcc/0bd3/0x200000bd1:0x2:0x0 size: 7654321 got: 0) 1d(expected /mnt/pcc.d1d.sanity-pcc/d1d.sanity-pcc/13a3/0x2000013a1:0x2:0x0 size: 7654321 got: 0) 
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/69544/results.html
+
+--- Message (Maloo, 2026-09-05 14:42:41.000000000) ---
+Patch Set 7:
+
+Failed enforced test custom-1003 on RHEL 9.7 / x86_64 uploaded by Trevis Autotest from trevis-152vm135: https://testing.whamcloud.com/test_sessions/5df079f6-713a-48f1-9c74-c8dbcf76d253 ran 3 tests.  1 tests failed: sanity-krb5.
+
+--- Message (Maloo, 2026-09-05 19:33:00.000000000) ---
+Patch Set 7: Verified-1
+
+Passed enforced test review-ldiskfs-dne-arm on RHEL 8.10 / x86_64, Rocky 9.5 / aarch64 uploaded by Onyx Autotest from onyx-154vm43: https://testing.whamcloud.com/test_sessions/cfac4e07-545c-4402-aa33-b6b888ad646a ran 5 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-09-05 19:50:35.000000000) ---
+Patch Set 7:
+
+Looks good to me.
+
+--- Message (Autotest, 2026-09-07 09:52:36.000000000) ---
+Patch Set 7:
+
+Onyx Autotest retesting enforced custom session on el9.7-x86_64/ldiskfs servers and clients for build 131034 patch 7. Requested by S Buisson because of LU-18511.
+The following test parameters were specified: kerberos=true testlist=sanity-krb5.
+
+--- Message (Maloo, 2026-09-07 11:13:02.000000000) ---
+Patch Set 7: Verified+1
+
+Passed enforced test custom-1003 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-140vm22: https://testing.whamcloud.com/test_sessions/74b53c53-a2d8-4bf8-804d-1cae70a30f7c ran 3 tests.
+
+--- Message (Aurelien Degremont, 2026-09-07 12:01:16.000000000) ---
+Patch Set 7: Code-Review+1
+
+(1 comment)
+
+--- Message (Bruno Faccini, 2026-09-07 13:12:52.000000000) ---
+Patch Set 7: Code-Review+1
+
+--- Message (Sebastien Buisson, 2026-09-07 13:24:59.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+--- Message (Marc Vef, 2026-09-07 18:57:14.000000000) ---
+Hashtag added: master-next
+
+--- Message (Marc Vef, 2026-09-07 18:57:15.000000000) ---
+Patch Set 7:
+
+[Marc Bot] Note: This change has been cherry-picked to master-next and is considered for landing. Please avoid updates unless required while the master-next hashtag is set; doing so may cause the patch to be removed from master-next and not landed. Note: AI review comments should be addressed/responded to.
+
+--- Message (Marc Vef, 2026-09-07 18:57:16.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Oleg Drokin, 2026-09-18 16:56:20.000000000) ---
+Patch Set 7: Code-Review+2
+
+--- Message (Oleg Drokin, 2026-09-18 16:56:23.000000000) ---
+Change has been successfully cherry-picked as 048bb8c49fc1cf2f9d520a34b2423e205664a884
+
+--- Message (Marc Vef, 2026-09-21 07:54:18.000000000) ---
+Hashtag removed: master-next

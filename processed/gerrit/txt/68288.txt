@@ -1,0 +1,1200 @@
+Change:     68288
+Subject:    LU-20637 llapi: name a device scan's objects
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68288
+Change-Id:  I6476abfd28c91b2ccc04fb08c4e5860aef8fe009
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Hiroshi Nishida
+Created:    2026-08-24 22:52:15.000000000
+Updated:    2026-10-14 04:01:30.000000000
+Patch Set:  28
+Insertions: +2272
+Deletions:  -73
+Comments:   139 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
+
+--- Commit Message ---
+LU-20637 llapi: name a device scan's objects
+
+A target scan has names and parent FIDs but no paths, so lfs find
+prints FIDs, and a user cannot turn them into pathnames. The HLD
+defines an Output Format for this.
+
+Add llapi_scan_rec_path(). It uses the path that a namespace walk put
+in the record, and otherwise resolves the FID through a client mount.
+lfs find gets --fid2path MOUNT and --paths.
+
+An object with no pathname is counted and reported at the end, not
+printed: the target's own internal objects, an OST object that no file
+owns yet, and on DNE an object none of whose links has its parent
+path on this MDT. A hardlinked object is printed once, under the first
+name that --name matches and the target can place; if there is none,
+it counts as having no pathname. Without --name it is printed under
+the first name the target can place. On an OST, a file is printed
+once per object it has there.
+A lookup that fails for another reason, such as -EPERM without
+CAP_DAC_READ_SEARCH, or -ERANGE, is an error, so a broken search does
+not look complete.
+The message names the FID that was looked up, and names the mount only
+when the lookup went through it.
+
+Neither way of naming asks the target being scanned, so both work on a
+target that is out of service. A ZFS target can only be scanned out of
+service.
+
+OST objects: a data object is named by the file that owns it. Its own
+FID is in an OST sequence, which __ll_fid2path() resolves only by
+asking that OST through the OSC, and that OST is the target being
+read. The owner's MDT FID is ff_parent in the object's trusted.fid;
+the stripe index in f_ver is dropped. An object with no trusted.fid
+(precreated and never written) has no name. An OST with 256-byte
+inodes has no trusted.fid: osd_xattr_set_pfid() stores the parent in
+the LMA as struct lustre_ost_attrs, with LMAC_STRIPE_INFO set. The
+scan reads it from the LMA buffer that it already has. Measured on an
+OST formatted with -I 256: without this, none of 33 objects had an
+owner.
+
+MDT objects: an object is named from its trusted.link and a map of the
+target's directories, from FID to parent FID and name. A pre-pass
+builds the map before the search, because objects arrive in inode
+order and a child usually comes before its parents. The pre-pass asks
+for no layout, SOM or HSM, and runs on the same open as the search
+(scan_device_run_prepass()). On an OST it is skipped, from the label.
+When the map is used there is no fallback to a lookup: a lookup asks
+the target, which may be out of service. Objects the pre-pass skips
+are reported, because everything below a missing directory has no
+name.
+
+A striped directory's shards are in the map with an empty name, and
+scan_dirmap_path() steps through them, so an object under a striped
+directory is named through its master directory. A shard itself is
+not in the namespace and is not reported. The pre-pass asks for
+LLAPI_SCAN_LMV, and every search asks for LLAPI_SCAN_LMV_SHARD, which
+also reads trusted.lmv.
+llapi_scan_namespace.3 has a section on shards.
+
+--paths builds names from the map with no mount, so it works on a
+filesystem that is completely down. The names are relative to the
+filesystem root and begin with '/'. It is refused on an OST. It uses
+the map even when the map is empty, so it never prints a FID in
+place of a name.
+
+--fid2path needs a mount of the same filesystem. A mount of another
+filesystem is refused with -EXDEV when the target is opened, by
+comparing the mount's fsname with the target's label. It cannot be
+checked later: FID sequences are not unique between filesystems
+(FID_SEQ_ROOT is a constant, and every filesystem starts from
+FID_SEQ_NORMAL), so a lookup on the wrong mount returns that
+filesystem's paths and exits 0. The check is inside the scan's own
+open, so the target is opened once. The mount point is resolved
+first, so a bare fsname, a directory inside the mount and a trailing
+slash all work. A fileset mount, whose root is not the filesystem root
+(from the mount source or from a nodemap), is refused with -EINVAL:
+an MDT's paths are composed from the filesystem root.
+
+lfsp_fsname gives a public caller the same check. llapi_scan_device()
+passes it to the scan, and llapi_scan_rec_path.3 points callers to it.
+
+The filesystem root is printed as / (or as MOUNT with --fid2path).
+llapi_scan_rec_path() with no mnt_path returns a pathname that starts
+with /, the same form --paths prints.
+A --local or --fsname sweep with --paths reads only the MDTs, and
+refuses --ost.
+A --local sweep with --fid2path reads only the targets of the mount's
+filesystem.
+
+Refused: --paths with --fid2path, --paths on an OST, either option
+without a target, and -printf with either option, because a format
+prints its own fields and not the pathname.
+
+fp_paths uses fp_unused_bit1.
+
+A directory map entry keeps its name inline, 288 bytes, and the table
+is a power of two at most three quarters full: a million directories
+use a 2^21-entry table, about 576 MiB, and about 864 MiB while
+scan_dirmap_grow() holds both tables. Keeping names in an arena would
+use less. Not done now: no measured case needs it, and an allocation
+failure fails the search cleanly.
+
+Tests, all in conf-sanity:
+- 301: --fid2path on an MDT in service, compared with the client's
+  paths; a hardlinked object is named once. It mounts a client on the
+  MDS. ldiskfs only.
+- 302: stops an OST, exports its pool on ZFS, and compares the names
+  with what the client saw. The files are written, because a
+  precreated object has no name. --search points at the ZFS vdevs in
+  $TMP.
+- 303: --paths on an MDT in service with no mount: one root-relative
+  path per object, the hardlinked object once, no FID and no mount
+  prefix; and the refusals. ldiskfs only.
+- 304: --paths on a stopped MDT, on both backends; on ZFS the pool is
+  exported and --search is given.
+The tests check the server version, so a packaging fault fails them,
+and they skip on ENOTSUP only for a ZFS target. 301 and 303 also sync
+the MDS, because a client sync does not commit the MDT. They call
+$LFS, not a bare lfs.
+
+The pre-pass drops every object that is not a directory before its
+xattrs are read, through a filter of its own. On a 300,000-file MDT
+that was about two thirds of the pass.
+
+Documentation: lfs-find.1 describes both options and their cost (one
+lookup per kept object on an OST, an extra pass on an MDT) and points
+to lfs-fid2path(1), and no longer says the output is always a FID. The
+lfs find usage lists --fid2path and --paths. llapi_find_device.3
+documents fp_fid2path_mnt and its -ENAMETOOLONG, and adds
+llapi_scan_rec_path(3) to SEE ALSO.
+
+Signed-off-by: Hiroshi Nishida <hnishida@thelustrecollective.com>
+Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
+Change-Id: I6476abfd28c91b2ccc04fb08c4e5860aef8fe009
+
+--- Review History ---
+
+--- Message (Hiroshi Nishida, 2026-08-24 22:52:15.000000000) ---
+Uploaded patch set 1.
+
+--- Message (wc-checkpatch, 2026-08-24 22:57:34.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre RISC-V Builder, 2026-08-24 23:09:56.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-24 23:20:51.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130160/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-08-25 12:51:25.000000000) ---
+Patch Set 1:
+
+(8 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The central one is that an OST data object does resolve to a pathname today (the owning file's), which the commit message, both man pages and the code comments all state it never does. That is also the case conf-sanity test_166 does not cover -- it only exercises an MDT -- so a case that scans an OST with --fid2path would be worth adding alongside it.
+
+--- Message (Hiroshi Nishida, 2026-08-25 16:42:54.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-25 16:51:15.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-08-25 16:59:26.000000000) ---
+Patch Set 2:
+
+(8 comments)
+
+--- Message (Lustre RISC-V Builder, 2026-08-25 18:22:02.000000000) ---
+Patch Set 2:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-26 07:30:55.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-26 07:32:49.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130244/ : SUCCESS
+
+--- Message (Hiroshi Nishida, 2026-08-26 16:04:29.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-26 16:13:42.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-26 16:23:40.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-27 04:04:57.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130406/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-27 16:49:15.000000000) ---
+Patch Set 3:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-27 21:33:47.000000000) ---
+Patch Set 3:
+
+(6 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, comments inline. The commit message and lfind.8 both describe what a scan of an OST does with --fid2path (the owning file's path, once per stripe on that target), but conf-sanity test_166 only exercises an MDT -- could it cover an OST as well, and the --internal case where objects are expected to come back with no pathname?
+
+--- Message (Hiroshi Nishida, 2026-08-28 00:00:00.000000000) ---
+Uploaded patch set 4.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-28 00:11:15.000000000) ---
+Patch Set 4:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-28 00:38:16.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-28 02:06:12.000000000) ---
+Patch Set 4: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/130494/ : FAILURE
+
+--- Message (Lustre RISC-V Builder, 2026-08-28 02:50:31.000000000) ---
+Patch Set 4:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Hiroshi Nishida, 2026-08-29 13:32:34.000000000) ---
+Uploaded patch set 5: Patch Set 4 was rebased.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-29 13:44:52.000000000) ---
+Patch Set 5:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-29 14:07:42.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-29 14:39:52.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130575/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-29 15:57:51.000000000) ---
+Patch Set 5:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Hiroshi Nishida, 2026-08-29 18:09:55.000000000) ---
+Uploaded patch set 6: Patch Set 5 was rebased.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-29 18:23:03.000000000) ---
+Patch Set 6:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-29 18:38:05.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-29 19:15:23.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130595/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-29 20:12:36.000000000) ---
+Patch Set 6:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-30 08:47:45.000000000) ---
+Patch Set 6:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments.
+
+The OST side of --fid2path is the case the commit message describes in the most detail, and it is the one conf-sanity test_166 does not cover: test_165 only runs the raw scanner against an OST, never lfind, and test_166 is MDT-only. A case that runs `lfind --device <OST> --fid2path MOUNT` and checks both the output and the exit status would be worth adding.
+
+--- Message (Hiroshi Nishida, 2026-08-30 14:47:27.000000000) ---
+Uploaded patch set 7.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-08-30 14:48:18.000000000) ---
+Patch Set 7:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-08-30 15:01:02.000000000) ---
+Patch Set 7:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-30 15:16:02.000000000) ---
+Patch Set 7:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-30 16:27:46.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130629/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-30 17:03:36.000000000) ---
+Patch Set 7:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-31 07:27:59.000000000) ---
+Patch Set 7:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The "a MOUNT of another filesystem is an error and not a missing name" behaviour that the commit message, lfind.8 and the code comment all describe does not appear to be implemented. conf-sanity test_166 covers only the happy path, so none of the --fid2path failure modes are exercised; a case that points --fid2path at another filesystem, and one that points it at a non-Lustre mount, would pin down what is meant to happen there.
+
+--- Message (Hiroshi Nishida, 2026-08-31 14:07:31.000000000) ---
+Uploaded patch set 8.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-08-31 14:08:40.000000000) ---
+Patch Set 7:
+
+(5 comments)
+
+--- Message (wc-checkpatch, 2026-08-31 14:20:22.000000000) ---
+Patch Set 8:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-31 14:38:47.000000000) ---
+Patch Set 8:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-31 16:42:44.000000000) ---
+Patch Set 8:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-31 19:01:53.000000000) ---
+Patch Set 8: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130723/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-01 07:34:35.000000000) ---
+Patch Set 8:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The main one is that pointing --fid2path at a client mount of a different Lustre filesystem does not fail safe the way the patch says it does.
+
+--- Message (Hiroshi Nishida, 2026-09-01 16:24:32.000000000) ---
+Uploaded patch set 9.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-01 16:31:29.000000000) ---
+Patch Set 9:
+
+Looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-09-01 16:36:27.000000000) ---
+Patch Set 8:
+
+(5 comments)
+
+Round 17: replies to the review comments on this patch set.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-01 16:52:53.000000000) ---
+Patch Set 9:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-01 17:50:03.000000000) ---
+Patch Set 9: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130800/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-01 19:09:05.000000000) ---
+Patch Set 9:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-09-02 23:49:42.000000000) ---
+Patch Set 9:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, a few comments inline. The wrong-filesystem guard added in this revision is the part worth a second look: it is only applied when the mount's fsname could be read, and the mechanism it relies on is not reachable from the public API that llapi_scan_rec_path(3) points an out-of-tree caller at.
+
+--- Message (Hiroshi Nishida, 2026-09-03 15:58:48.000000000) ---
+Uploaded patch set 10.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-03 16:32:28.000000000) ---
+Patch Set 10:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-09-03 17:45:07.000000000) ---
+Patch Set 10:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Hiroshi Nishida, 2026-09-03 18:09:57.000000000) ---
+Patch Set 9:
+
+(3 comments)
+
+--- Message (jenkins, 2026-09-03 18:39:47.000000000) ---
+Patch Set 10: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130959/ : SUCCESS
+
+--- Message (wc-checkpatch, 2026-09-03 20:12:37.000000000) ---
+Patch Set 10:
+
+Looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-09-03 20:51:48.000000000) ---
+Patch Set 9:
+
+(1 comment)
+
+--- Message (Gerrit AI review for Lustre, 2026-09-04 11:27:31.000000000) ---
+Patch Set 10:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The --paths refusal keys off an empty directory map rather than off what the target is, and that looks able to reject a legitimate MDT scan; the remaining points are documentation and commit-message items that can ride along on the same refresh.
+
+--- Message (Hiroshi Nishida, 2026-09-04 21:56:30.000000000) ---
+Uploaded patch set 11.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-04 22:06:50.000000000) ---
+Patch Set 11:
+
+(11 comments)
+
+--- Message (wc-checkpatch, 2026-09-04 22:09:12.000000000) ---
+Patch Set 11:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-09-04 22:33:48.000000000) ---
+Patch Set 11:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-04 22:50:08.000000000) ---
+Patch Set 11:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-05 01:49:15.000000000) ---
+Patch Set 11: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131100/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-06 16:35:53.000000000) ---
+Patch Set 11:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The main one is that a path composed from the directory map looks wrong, not merely missing, for any file under a striped directory - none of the three new subtests covers that shape, so an 'lfs setdirstripe' case alongside them would be worth adding.
+
+--- Message (Hiroshi Nishida, 2026-09-06 19:43:04.000000000) ---
+Patch Set 11:
+
+(1 comment)
+
+--- Message (Hiroshi Nishida, 2026-09-06 19:47:10.000000000) ---
+Patch Set 11:
+
+(1 comment)
+
+--- Message (Hiroshi Nishida, 2026-09-06 20:04:00.000000000) ---
+Patch Set 10:
+
+(1 comment)
+
+--- Message (Hiroshi Nishida, 2026-09-08 19:50:18.000000000) ---
+Patch Set 11:
+
+(1 comment)
+
+--- Message (Hiroshi Nishida, 2026-09-09 03:23:05.000000000) ---
+Uploaded patch set 12.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-09 03:40:05.000000000) ---
+Patch Set 12:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-09 03:58:37.000000000) ---
+Patch Set 12:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-09 05:49:20.000000000) ---
+Patch Set 12: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131391/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-09 12:56:56.000000000) ---
+Patch Set 12:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Hiroshi Nishida, 2026-09-09 17:04:40.000000000) ---
+Uploaded patch set 13.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-09 17:15:31.000000000) ---
+Patch Set 13:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-09 17:23:23.000000000) ---
+Patch Set 13:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-09 17:39:55.000000000) ---
+Patch Set 13: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131439/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-10 00:06:38.000000000) ---
+Patch Set 13:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Hiroshi Nishida, 2026-09-10 14:30:42.000000000) ---
+Uploaded patch set 14.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-10 14:44:57.000000000) ---
+Patch Set 14:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-10 14:57:55.000000000) ---
+Patch Set 14:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-10 15:24:50.000000000) ---
+Patch Set 14: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131519/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-10 16:57:55.000000000) ---
+Patch Set 14:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-09-11 21:33:36.000000000) ---
+Patch Set 14:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The one that matters: under --paths the composer is skipped whenever the pre-pass map comes back empty, so a run that asked for pathnames prints FIDs and exits 0. The rest are optional nits that can ride along on the same refresh.
+
+--- Message (Hiroshi Nishida, 2026-09-22 21:36:04.000000000) ---
+Uploaded patch set 15.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-22 21:36:24.000000000) ---
+Patch Set 15:
+
+(5 comments)
+
+--- Message (Lustre Gerrit Janitor, 2026-09-22 21:43:00.000000000) ---
+Patch Set 15:
+
+(1 comment)
+
+rocky8.10: Compile failed
+
+rocky9.6: Compile failed
+
+
+ Job output URL: https://testing.whamcloud.com/gerrit-janitor/70698/results.html
+
+--- Message (wc-checkpatch, 2026-09-22 21:45:06.000000000) ---
+Patch Set 15:
+
+Looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-09-22 21:54:44.000000000) ---
+Uploaded patch set 16: Patch Set 15 was rebased.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-22 21:57:04.000000000) ---
+Patch Set 15:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-22 22:02:28.000000000) ---
+Patch Set 16:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-22 22:19:07.000000000) ---
+Patch Set 16:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-23 03:20:03.000000000) ---
+Patch Set 15: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/132160/ : FAILURE
+
+--- Message (jenkins, 2026-09-23 03:45:10.000000000) ---
+Patch Set 16: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132163/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-23 16:33:49.000000000) ---
+Patch Set 16:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Looks good; nothing here needs a re-spin. Two documentation/commit-message inaccuracies and two optional code notes inline, for whenever the patch is next refreshed.
+
+--- Message (Hiroshi Nishida, 2026-09-23 18:54:04.000000000) ---
+Uploaded patch set 17.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-23 18:54:53.000000000) ---
+Patch Set 16:
+
+(5 comments)
+
+--- Message (wc-checkpatch, 2026-09-23 19:01:32.000000000) ---
+Patch Set 17:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-23 19:15:32.000000000) ---
+Patch Set 17:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-23 20:24:10.000000000) ---
+Patch Set 17: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132230/ : SUCCESS
+
+--- Message (Autotest, 2026-09-24 14:07:09.000000000) ---
+Patch Set 17:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-5 session on el9.7-x86_64/zfs servers and clients for build 132230 patch 17. Requested by Hiroshi Nishida because of LU-17857.
+
+--- Message (Gerrit AI review for Lustre, 2026-09-24 18:47:04.000000000) ---
+Patch Set 17:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good. One question inline about which mounts --fid2path accepts that looks worth a refresh; the rest are optional nits that can ride along in the same cycle.
+
+--- Message (Hiroshi Nishida, 2026-09-25 01:26:14.000000000) ---
+Uploaded patch set 18.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-25 01:37:54.000000000) ---
+Patch Set 17:
+
+(5 comments)
+
+--- Message (wc-checkpatch, 2026-09-25 01:38:23.000000000) ---
+Patch Set 18:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-25 01:43:29.000000000) ---
+Patch Set 18:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-25 02:51:55.000000000) ---
+Patch Set 18: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/132290/ : FAILURE
+
+--- Message (Hiroshi Nishida, 2026-09-25 12:45:37.000000000) ---
+Patch Set 18:
+
+BUILD
+
+--- Message (jenkins, 2026-09-25 14:00:55.000000000) ---
+Patch Set 18: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132319/ : SUCCESS
+
+--- Message (Autotest, 2026-09-25 22:54:38.000000000) ---
+Patch Set 18:
+
+Onyx Autotest 2 retesting enforced review-dne-part-6 session on el9.8-x86_64/ldiskfs servers and clients for build 132319 patch 18. Requested by Hiroshi Nishida because of LU-19372.
+
+--- Message (Gerrit AI review for Lustre, 2026-09-26 06:41:15.000000000) ---
+Patch Set 18:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Looks good; I found no correctness problems. A design question and two optional nits are inline, for whenever the patch is next refreshed. No need to re-spin for them.
+
+--- Message (Hiroshi Nishida, 2026-09-26 21:51:10.000000000) ---
+Uploaded patch set 19.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-26 21:52:45.000000000) ---
+Patch Set 18:
+
+(3 comments)
+
+--- Message (wc-checkpatch, 2026-09-26 21:56:52.000000000) ---
+Patch Set 19:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-26 22:07:31.000000000) ---
+Patch Set 19:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-26 23:05:13.000000000) ---
+Patch Set 19: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132371/ : SUCCESS
+
+--- Message (Autotest, 2026-09-27 03:12:16.000000000) ---
+Patch Set 19:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-5 session on el9.7-x86_64/zfs servers and clients for build 132371 patch 19. Requested by Hiroshi Nishida because of LU-20276.
+
+--- Message (Gerrit AI review for Lustre, 2026-09-27 10:29:25.000000000) ---
+Patch Set 19:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The --internal case below prints a stale pathname and is worth fixing in a refresh; the other two are minor and can ride along.
+
+--- Message (Hiroshi Nishida, 2026-09-27 19:45:45.000000000) ---
+Uploaded patch set 20.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-27 19:46:08.000000000) ---
+Patch Set 19:
+
+(3 comments)
+
+--- Message (wc-checkpatch, 2026-09-27 19:46:27.000000000) ---
+Patch Set 20:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-27 20:02:00.000000000) ---
+Patch Set 20:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-27 20:55:45.000000000) ---
+Patch Set 20: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132406/ : SUCCESS
+
+--- Message (Autotest, 2026-09-28 12:39:57.000000000) ---
+Patch Set 20:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-5 session on el9.7-x86_64/zfs servers and clients for build 132406 patch 20. Requested by Hiroshi Nishida because of LU-19372.
+
+--- Message (Hiroshi Nishida, 2026-09-28 13:09:10.000000000) ---
+Uploaded patch set 21: Patch Set 20 was rebased.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-28 13:19:46.000000000) ---
+Patch Set 21:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-09-28 14:10:35.000000000) ---
+Patch Set 21: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132441/ : SUCCESS
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-28 16:08:52.000000000) ---
+Patch Set 21:
+
+Code-wise looks good to me.
+
+--- Message (Autotest, 2026-09-28 18:06:45.000000000) ---
+Patch Set 21:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-5 session on el9.7-x86_64/zfs servers and clients for build 132441 patch 21. Requested by Hiroshi Nishida because of LU-20276.
+
+--- Message (Autotest, 2026-09-28 23:12:35.000000000) ---
+Patch Set 21:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-5 session on el9.7-x86_64/zfs servers and clients for build 132441 patch 21. Requested by Hiroshi Nishida because of LU-20276.
+
+--- Message (Gerrit AI review for Lustre, 2026-10-05 08:11:28.000000000) ---
+Patch Set 21:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Looks good; a couple of optional items inline for whenever it is next refreshed. No need to re-spin for them. None of the new tests exercises the safety refusals (a fileset --fid2path mount refused with -EINVAL, and -printf with --paths/--fid2path). A fileset mount on the MDS in test_301 would cover the first, and a one-line check would cover the second, if the tests are touched again.
+
+--- Message (Hiroshi Nishida, 2026-10-05 23:41:12.000000000) ---
+Uploaded patch set 22.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-10-05 23:41:53.000000000) ---
+Patch Set 22:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-10-05 23:47:35.000000000) ---
+Patch Set 22:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-06 00:05:10.000000000) ---
+Patch Set 22:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-06 00:51:03.000000000) ---
+Patch Set 22: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132892/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-06 14:38:00.000000000) ---
+Patch Set 22:
+
+Looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-10-06 22:56:44.000000000) ---
+Uploaded patch set 23: Patch Set 22 was rebased.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-10-06 23:09:38.000000000) ---
+Patch Set 23:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-06 23:19:28.000000000) ---
+Patch Set 23:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-06 23:59:26.000000000) ---
+Patch Set 23: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132982/ : SUCCESS
+
+--- Message (Hiroshi Nishida, 2026-10-08 00:06:07.000000000) ---
+Uploaded patch set 24: Patch Set 23 was rebased.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-10-08 00:17:08.000000000) ---
+Patch Set 24:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-08 00:34:15.000000000) ---
+Patch Set 24:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-08 01:30:32.000000000) ---
+Patch Set 24: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133081/ : SUCCESS
+
+--- Message (Hiroshi Nishida, 2026-10-09 11:46:43.000000000) ---
+Uploaded patch set 25.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-10-09 11:52:26.000000000) ---
+Patch Set 25:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-09 12:13:48.000000000) ---
+Patch Set 25:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-09 12:31:12.000000000) ---
+Patch Set 25: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133275/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-10 12:54:27.000000000) ---
+Patch Set 25:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Looks good; a few optional nits inline for whenever the patch is next refreshed. No need to re-spin for them.
+
+--- Message (Hiroshi Nishida, 2026-10-10 23:16:28.000000000) ---
+Uploaded patch set 26.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-10-10 23:16:48.000000000) ---
+Patch Set 25:
+
+(4 comments)
+
+--- Message (wc-checkpatch, 2026-10-10 23:19:37.000000000) ---
+Patch Set 26:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-10 23:34:45.000000000) ---
+Patch Set 26:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-11 00:27:06.000000000) ---
+Patch Set 26: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133363/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-11 12:12:12.000000000) ---
+Patch Set 26:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Looks good; one optional documentation nit inline for whenever the patch is next refreshed. No need to re-spin for it.
+
+--- Message (Hiroshi Nishida, 2026-10-12 05:45:44.000000000) ---
+Uploaded patch set 27.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-10-12 05:46:03.000000000) ---
+Patch Set 26:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-10-12 05:56:09.000000000) ---
+Patch Set 27:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-12 05:58:21.000000000) ---
+Patch Set 27:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-12 07:03:23.000000000) ---
+Patch Set 27: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133432/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-13 17:03:31.000000000) ---
+Patch Set 27:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Looks good. Two optional items inline for whenever the patch is next refreshed; no need to re-spin for them.
+
+--- Message (Autotest, 2026-10-13 21:52:02.000000000) ---
+Patch Set 27:
+
+Trevis Autotest retesting enforced review-dne-zfs-part-2 session on el9.8-x86_64/zfs servers and clients for build 133432 patch 27. Requested by Hiroshi Nishida because of LU-17891.
+
+--- Message (Autotest, 2026-10-13 21:52:10.000000000) ---
+Patch Set 27:
+
+Onyx Autotest retesting enforced review-dne-part-2 session on el9.7-x86_64/ldiskfs servers and clients for build 133432 patch 27. Requested by Hiroshi Nishida because of LU-17891.
+
+--- Message (Autotest, 2026-10-13 21:52:21.000000000) ---
+Patch Set 27:
+
+Trevis Autotest retesting enforced review-dne-zfs-part-4 session on el9.8-x86_64/zfs servers and clients for build 133432 patch 27. Requested by Hiroshi Nishida because of LU-20585.
+
+--- Message (Hiroshi Nishida, 2026-10-14 02:12:00.000000000) ---
+Uploaded patch set 28.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-10-14 02:12:20.000000000) ---
+Patch Set 27:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-10-14 02:14:30.000000000) ---
+Patch Set 28:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-14 02:44:21.000000000) ---
+Patch Set 28:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-14 03:36:57.000000000) ---
+Patch Set 28: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133615/ : SUCCESS

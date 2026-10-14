@@ -1,0 +1,527 @@
+Change:     67438
+Subject:    LU-20501 osd-zfs: fix stale FID on generated ".." entries
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67438
+Change-Id:  I0e999b877991e3c784d3f38a8d43ada0d99e7c44
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Oleg Drokin
+Created:    2026-07-22 02:24:37.000000000
+Updated:    2026-10-14 09:15:59.000000000
+Patch Set:  10
+Insertions: +138
+Deletions:  -2
+Comments:   43 (4 unresolved)
+Hashtags:   testfix
+
+--- Labels ---
+  Code-Review: James Simmons: +1; Andreas Dilger: +1; Alex Zhuravlev: +1
+  Verified: jenkins: +1; Maloo: +1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder, Gerrit AI review for Lustre, patrick bot
+  REVIEWER: Andreas Dilger, Alex Zhuravlev, James Simmons
+
+--- Commit Message ---
+LU-20501 osd-zfs: fix stale FID on generated ".." entries
+
+ZFS does not store "." and ".." on disk, so osd-zfs generates them in
+osd_dir_it_rec() and gets the ".." FID from osd_find_parent_fid(): from
+the directory's linkEA, or failing that from the FID of the dnode named
+by SA_ZPL_PARENT.  For the objects created directly under the OSD root
+neither works.  They have no linkEA, and their SA_ZPL_PARENT does not
+name the OSD root even though osd_dir_insert() writes it there when it
+adds "..": osd_object_create() leaves oo_parent at the OI ZAP that
+indexes the object when the creation hint carries no parent, and the
+late SA init replaces the whole attribute set, oo_parent included, at
+the end of the same transaction.  The OI ZAP carries no LMA, so
+osd_get_fid_by_oid() returns -ENOENT for it.  On a freshly formatted MDT
+here the ROOT directory is dnode 525, its SA_ZPL_PARENT is 24 (an oi.N
+ZAP), and the OSD root is dnode 34.
+
+That branch only skipped setting LUDA_FID and left lde_fid untouched, so
+".." kept whatever the recycled dirent page happened to contain.
+Instrumenting the value showed it varying between the correct FID, zero,
+wild values such as [0xfcaae7467e00fcaa:0xc834a400:0x450008], and real
+FIDs of unrelated objects.  That is how LU-20501 handed ll_get_name() a
+".." entry whose FID matched the child being looked up.
+
+Report the OSD root.  It is the real parent -- ROOT and update_log_dir
+are entries in its ZAP -- and it is what osd-ldiskfs answers for the same
+objects through dt_lookup(), where osd_ea_lookup_rec() falls through to
+osd_iget_fid() and that maps the LMA-less root inode to
+lu_local_obj_fid(OSD_FS_ROOT_OID).  That FID is in FID_SEQ_LOCAL_FILE, so
+lfsck_find_mdt_idx_by_fid() always resolves it to the local target and
+the LFSCK takes the idx == lfsck_dev_idx() path, where ".." is a no-op.
+
+osd-ldiskfs does not give one answer here, so there is no single
+behaviour to match: its iterator disagrees with its own lookup.
+do_osd_ldiskfs_filldir() substitutes the directory's own FID whenever a
+dirent points at the ldiskfs superblock root, so through readdir /ROOT's
+".." reads back as /ROOT itself, and osd_ea_fid_get() is never reached
+for it.  A client therefore sees a different ".." inode number at the
+mount root on zfs than on ldiskfs.  That divergence is accepted: the OSD
+root is where these objects actually live, and both values are local, so
+the LFSCK behaves identically either way.
+
+osd_dir_lookup() is left alone, so on zfs dt_lookup(dir, "..") still
+answers -ENODATA for these objects while the iterator now answers.  No
+current consumer hits that: mdd_is_parent() short-circuits on
+mdd_is_root(), and the LFSCK's dt_lookup_dir(child, dotdot) tolerates
+-ENODATA.  Making the lookup answer would feed the LFSCK a parent FID
+where it currently gets nothing, which wants its own patch and its own
+validation.
+
+Tracing every -ENOENT through a full sanity-lfsck run on a 2-MDT DNE
+filesystem finds exactly three objects reaching this branch, all direct
+children of the OSD root:
+
+  lustre-MDT0000  [0x200000007:0x1:0x0]  FID_SEQ_ROOT, the fs root
+  lustre-MDT0000  [0x20000000a:0x0:0x0]  FID_SEQ_UPDATE_LOG_DIR
+  lustre-MDT0001  [0x20000000a:0x1:0x0]  FID_SEQ_UPDATE_LOG_DIR
+
+.lustre/fid reaches it too, but only through a client readdir: the LFSCK
+never opens it, since FID_SEQ_DOT_LUSTRE is below FID_SEQ_NORMAL and
+lfsck_master_oit_engine() drops objects that are neither norm nor igif.
+
+Gate that answer on the iterated object's own FID, not on the parent
+dnode: SA_ZPL_PARENT does not name the OSD root for these objects, it
+names the OI ZAP that indexes them, so testing the dnode against
+osd->od_root never matches.  osd_find_parent_fid() returns -ENOENT for
+any object whose linkEA is unreadable and whose SA_ZPL_PARENT names an
+LMA-less dnode, which also covers DNE remote directories and striped
+shards; the OSD root is not their parent, so only ROOT and
+update_log_dir take that arm.
+
+Everything else reaching this branch reports the object itself.  That is
+not a claim about the parent; it is the value that leaks nothing, asserts
+nothing false, and stays local, so lfsck_find_mdt_idx_by_fid() resolves
+to this target and the LFSCK dotdot check is a no-op.  It is marked
+LUDA_UNKNOWN to document that, the same way the sibling
+osd_get_fid_by_oid() failure below is marked.  The flag is documentation
+only: readdir does not gate on it -- ll_dir_read() builds the d_ino from
+lde_fid whatever the flags say, and mdd_dir_page_build() only consults
+LUDA_FID to spot .lustre and packs the entry either way -- and the LFSCK
+reads lde_fid regardless of any flag, which is why the value has to be
+sane and local rather than merely unmarked.
+
+Zeroing lde_fid is not usable here.  A zero FID on ".." is a defined
+value: lfsck_namespace_assistant_handler_p1() reads it as "parent
+unknown" and flags LNTF_CHECK_PARENT.  The fs root is scanned by the
+namespace LFSCK -- lfsck_master_oit_engine() lets li_global_root_fid
+through the filter that drops purely local objects -- so a zeroing
+scheme would raise that flag on the root on every scan.
+
+The sibling case is left alone: when osd_get_fid_by_oid() fails for an
+ordinary entry further down, lde_fid is likewise left unwritten under
+LUDA_UNKNOWN.  Neither a stale FID nor a zero one is benign for the
+LFSCK there -- it can misrepair either way, adding a link naming an
+unrelated object or taking the dangling path -- so choosing a value for
+it wants its own patch.  The companion llite patch covers that path from
+the client side, by ignoring any entry without LUDA_FID.  For the ".."
+entries this branch produces the same client guard is never reached:
+do_nfs_get_name_filldir() drops "." and ".." by name before it looks at
+the flags.
+
+sanity test_913 covers it: it reads the ".." d_ino of the mount root
+through getdents64() ten times over dropped caches and requires a stable,
+non-zero value.  On zfs it also requires that value to differ from ".",
+so a gate that stopped matching the root and let it fall to the self-FID
+arm would be caught too; that half is not checked on ldiskfs, where the
+filldir substitution above makes the root its own parent by design.  On
+an unpatched ZFS MDT the value is 0 half the time and
+5188147320583553024 the rest; with the patch it is 144115188092633101
+every time.  The new dirent_ino helper is needed because stat(2) -- and
+so ls(1), find(1) and $LFS path2fid -- resolves ".." through the VFS,
+which at a mount root answers with the mountpoint's parent instead of
+what the OSD put in the entry.
+
+Validated on a ZFS DNE cluster (2 MDT, 2 OST) with the companion llite
+patches, tracing both arms of the gate: the fs root and both
+update_log_dir objects take the OSD root, .lustre/fid reports itself, and
+no zero FID is emitted.  sanityn test_102a fails 5/30 without the patches;
+with them full sanity-lfsck passes 73/73, sanity test_154f passes, and
+test_102a passes 29/30 -- the one failure being the unrelated "stat data
+mismatch" (LU-15842), not an ESTALE.
+
+Fixes: 0780fde4d415 ("LU-3573 osd-zfs: Only advance zap cursor as needed")
+Test-Parameters: fstype=zfs mdscount=2 mdtcount=4 testlist=sanityn env=ONLY=102a,ONLY_REPEAT=200
+Test-Parameters: fstype=zfs testlist=sanity,sanity-lfsck
+Signed-off-by: Oleg Drokin <green@whamcloud.com>
+Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
+Change-Id: I0e999b877991e3c784d3f38a8d43ada0d99e7c44
+
+--- Review History ---
+
+--- Message (Oleg Drokin, 2026-07-22 02:24:37.000000000) ---
+Uploaded patch set 1.
+
+--- Message (wc-checkpatch, 2026-07-22 02:28:25.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-22 02:30:22.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-07-22 02:52:25.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-07-22 02:56:22.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/127893/ : SUCCESS
+
+--- Message (Andreas Dilger, 2026-07-22 10:33:12.000000000) ---
+Patch Set 1: Code-Review+1
+
+(2 comments)
+
+--- Message (Andreas Dilger, 2026-07-22 17:01:37.000000000) ---
+Hashtag added: testfix
+
+--- Message (James Simmons, 2026-07-22 18:14:08.000000000) ---
+Patch Set 1: Code-Review+1
+
+--- Message (Alex Zhuravlev, 2026-07-23 09:46:49.000000000) ---
+Patch Set 1: Code-Review+1
+
+--- Message (Marc Vef, 2026-07-25 16:10:56.000000000) ---
+Hashtag added: master-next
+
+--- Message (Marc Vef, 2026-07-25 16:10:57.000000000) ---
+Patch Set 1:
+
+[Marc Bot] Note: This change has been cherry-picked to master-next and is considered for landing. Please avoid updates unless required while the master-next hashtag is set; doing so may cause the patch to be removed from master-next and not landed. Note: AI review comments should be addressed/responded to.
+
+--- Message (Marc Vef, 2026-07-25 16:10:57.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Oleg Drokin, 2026-08-02 21:27:49.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Oleg Drokin, 2026-08-03 05:53:49.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-03 05:57:12.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-03 05:59:10.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (Oleg Drokin, 2026-08-03 06:05:45.000000000) ---
+Uploaded patch set 3: Patch Set 2 was rebased.
+
+--- Message (jenkins, 2026-08-03 06:05:52.000000000) ---
+Patch Set 2: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/128571/ : ABORTED
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-03 06:11:39.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-03 06:12:42.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-03 06:23:13.000000000) ---
+Patch Set 3:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-03 06:37:50.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128575/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-08-03 18:26:54.000000000) ---
+Patch Set 3:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, minor comments inline. The two arms both trace out safe for the consumers that matter today (mdd_dir_page_build() -> llite, lfsck_master_dir_engine() -> lfsck_namespace_assistant_handler_p1(), lod_update_log_dir_gc()); the comments below are about the gate being wider than the reasoning behind it.
+
+--- Message (Oleg Drokin, 2026-08-04 04:38:00.000000000) ---
+Uploaded patch set 4.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-04 04:40:23.000000000) ---
+Patch Set 4:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-04 04:43:49.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-04 04:58:21.000000000) ---
+Patch Set 4:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-04 05:42:26.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128629/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-08-04 17:57:16.000000000) ---
+Patch Set 4:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good. The osd-zfs change itself traces out cleanly: both arms produce a sane, local FID, lfsck_find_mdt_idx_by_fid() resolves either one to this target so the dotdot check stays a no-op, and the Fixes: commit is the right one. Comments inline are about the test gating and two commit-message points.
+
+--- Message (Oleg Drokin, 2026-08-05 04:30:02.000000000) ---
+Uploaded patch set 5: Patch Set 4 was rebased. Commit message was updated.
+
+Copied Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR **changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE** OR is:MIN")
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-05 04:37:41.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-05 04:40:47.000000000) ---
+Patch Set 5:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-08-05 05:18:00.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128699/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-05 07:31:53.000000000) ---
+Patch Set 5:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Oleg Drokin, 2026-08-06 20:16:49.000000000) ---
+Uploaded patch set 6.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-06 20:19:23.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-06 20:22:48.000000000) ---
+Patch Set 6:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-06 20:33:40.000000000) ---
+Patch Set 6:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-06 22:17:30.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128837/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-08-07 11:15:11.000000000) ---
+Patch Set 6:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, comments inline. The mechanism analysis and the gate itself hold up; the concerns are with the osd-ldiskfs comparisons the commit message leans on to justify the chosen FID.
+
+--- Message (Marc Vef, 2026-08-10 07:49:12.000000000) ---
+Hashtag removed: master-next
+
+--- Message (Marc Vef, 2026-08-10 07:49:13.000000000) ---
+Patch Set 6:
+
+[Marc Bot] Note: This change has been removed from master-next and is no longer considered for landing in its current form.
+
+--- Message (Marc Vef, 2026-08-10 07:49:13.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Oleg Drokin, 2026-08-31 18:05:44.000000000) ---
+Hashtag removed: testfix
+
+--- Message (Oleg Drokin, 2026-09-04 21:35:35.000000000) ---
+Uploaded patch set 7.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-04 21:49:35.000000000) ---
+Patch Set 7:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-04 21:50:37.000000000) ---
+Patch Set 7:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-04 23:42:44.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131078/ : SUCCESS
+
+--- Message (Maloo, 2026-09-04 23:43:51.000000000) ---
+Patch Set 7:
+
+#### Build 131078 (patch #7) will not be tested because: the Test-Parameters contain an error: Unknown parameter mdsfilesystemtype
+
+--- Message (Lustre RISC-V Builder, 2026-09-05 06:35:43.000000000) ---
+Patch Set 7:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Andreas Dilger, 2026-09-14 15:08:50.000000000) ---
+Patch Set 7: Code-Review+1
+
+(20 comments)
+
+--- Message (James Simmons, 2026-09-14 15:31:27.000000000) ---
+Patch Set 7: Code-Review+1
+
+--- Message (Andreas Dilger, 2026-10-02 14:19:21.000000000) ---
+Hashtag added: testfix
+
+--- Message (Andreas Dilger, 2026-10-02 14:20:38.000000000) ---
+Patch Set 8: Commit message was updated.
+
+Copied Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR **changekind:NO_CODE_CHANGE** OR changekind:TRIVIAL_REBASE OR **changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE** OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR **changekind:NO_CODE_CHANGE**")
+
+--- Message (Andreas Dilger, 2026-10-02 14:20:51.000000000) ---
+Patch Set 9: Patch Set 8 was rebased
+
+Copied Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR **changekind:TRIVIAL_REBASE** OR **changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE** OR is:MIN")
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andreas Dilger, 2026-10-02 14:21:37.000000000) ---
+Patch Set 9: Code-Review+1
+
+(1 comment)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-02 14:23:38.000000000) ---
+Patch Set 9:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-02 14:31:55.000000000) ---
+Patch Set 9:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-10-02 14:43:40.000000000) ---
+Patch Set 9: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132730/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-05 08:39:45.000000000) ---
+Patch Set 9:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Looks good. The osd-zfs change is correct for every in-tree consumer of the generated ".." entry that I traced. The comments inline are optional nits for the next refresh and not a reason to re-spin.
+
+The PS7 design questions about returning the self-FID for the root (for MTFL tenants) and about matching osd-ldiskfs still have no answer. If the self-FID route is taken, test_913's "'..' equals '.'" check on zfs would have to be dropped, so those questions should be settled before the test is.
+
+test_913 only exercises the OSD-root arm. The self-FID arm is reachable from a client on zfs through `.lustre/fid` (the commit message traced it there). A stable, non-zero `dirent_ino $MOUNT/.lustre/fid ..` check would give that arm some coverage too.
+
+--- Message (Alex Zhuravlev, 2026-10-08 11:58:36.000000000) ---
+Patch Set 9: Code-Review+1
+
+--- Message (Andreas Dilger, 2026-10-09 05:52:00.000000000) ---
+Patch Set 9:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-10-09 05:55:24.000000000) ---
+Patch Set 9:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-10-09 06:06:48.000000000) ---
+Patch Set 9:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-10-09 06:24:55.000000000) ---
+Patch Set 9:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-10-14 09:12:39.000000000) ---
+Patch Set 10: Commit message was updated.
+
+Copied Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR **changekind:NO_CODE_CHANGE** OR changekind:TRIVIAL_REBASE OR **changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE** OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR **changekind:NO_CODE_CHANGE**")
+
+--- Message (Andreas Dilger, 2026-10-14 09:13:32.000000000) ---
+Patch Set 10: Code-Review+1
+
+(3 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-14 09:15:35.000000000) ---
+Patch Set 10:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-14 09:15:59.000000000) ---
+Patch Set 10:
+
+Looks good to me.

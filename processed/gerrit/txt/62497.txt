@@ -1,5 +1,5 @@
 Change:     62497
-Subject:    LU-7266 ldlm: Fix LDLM pool Server Lock Volume
+Subject:    LU-7266 ldlm: introduce pressure-based SLV
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/62497
 Change-Id:  If8a6f247127576965ae45c349a4ab04fb286615a
 Project:    fs/lustre-release
@@ -7,124 +7,79 @@ Branch:     master
 Status:     NEW
 Owner:      kg.xu
 Created:    2025-11-12 09:27:39.000000000
-Updated:    2026-02-27 18:45:14.000000000
-Patch Set:  10
-Insertions: +765
-Deletions:  -37
-Comments:   125 (11 unresolved)
+Updated:    2026-10-07 04:21:18.000000000
+Patch Set:  28
+Insertions: +2191
+Deletions:  -68
+Comments:   794 (11 unresolved)
 
 --- Labels ---
-  Code-Review: (no votes)
+  Code-Review: wc-checkpatch: -1
   Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
-  CC: Oleg Drokin
-  REVIEWER: Andreas Dilger, Vitaly Fertman, Qian Yingjin, Patrick Farrell, Timothy Day
+  CC: Oleg Drokin, Lustre RISC-V Builder, Gerrit AI review for Lustre
+  REVIEWER: Andreas Dilger, Vitaly Fertman, Qian Yingjin, Patrick Farrell, Timothy Day, kg.xu, Keguang Xu
 
 --- Commit Message ---
-LU-7266 ldlm: Fix LDLM pool Server Lock Volume
+LU-7266 ldlm: introduce pressure-based SLV
 
-In the previous implementation of SLV/CLV, there exists misalignment
-between SLV and CLV, causing their comparison failed to produce the
-desired lock revocation behavior.
+Legacy SLV/CLV reacts to server pressure indirectly and can delay
+lock reclaim. This change introduces a pressure-based SLV path:
+server sends packed pressure in SLV, and client converts it to evict
+quota.
 
-The goal of this patch is to fix the impl, so we could
-1. Enable clients to retain sufficient locks to accelerate their
-   computation when resources are abundant;
-2. Properly revoke locks from clients during memory pressure.
+Packed SLV Format:
+ * Bits 63..60: format version (current 0x1). Legacy SLV leaves
+   these bits clear.
+ * Bits 59..16: reserved for future use.
+ * Bits 15..0: pressure in hundredths of a percent, where 10000
+   means 100.00%. Here pressure is total-grant-lock/total-limit.
+   Unlike the previous grant-plan-based scalar SLV.
 
-Implementation changes:
-- Align lock granularity: both SLV and CLV now use sizeof(ldlm_lock)
-  as the base unit
-- Align SVR_POOL_MAX_AGE with CLI_LRU_MAX_AGE: reduce from 36000s
-  to 600s (LDLM_DEFAULT_LRU_MAX_AGE) for consistency
-- Replace gradual adjustment based on grant_plan (which exhibits
-  significant delay) with a pressure-based method that considers:
-  * Memory pressure: ratio of total-available/total-granted locks
-  * Client count: number of connected clients
-  This approach ensures proper alignment between SLV and CLV
+Rationale:
+- Percentage-based eviction scales with client lock footprint, so
+  larger lock holders evict more locks under pressure while smaller
+  clients are not over-penalized.
+- Gradual rollout is gated by packed-capable export coverage,
+  avoiding a mixed-upgrade case where only a small subset of new
+  clients absorbs repeated reclaim pressure.
+- Client eviction uses segmented pressure-to-evict mapping, so
+  reclaim is mild at low pressure and stronger at high pressure. At
+  relatively low pressure, clients react faster to keep pressure in
+  a healthy range; at higher pressure, clients use a longer evict
+  interval because each round evicts more locks, reducing oscillation
+  and avoiding over-evicting locks that should be retained; at or
+  above the last curve point the interval shortens so high-pressure
+  reclaim stays frequent.
 
-New SLV calculation formula:
-  slv = (lock_limit * pool_max_age * adjust_factor) / client_count
+Key updates:
+- add OBD_CONNECT2_POOL_SLV_PACKED negotiation and packed SLV helpers
+- add slv_mode (legacy_slv / pressure_rollout), rollout threshold,
+  and client evict-curve sysfs controls
+- pressure_rollout pools use ldlm.lock_pool_limit_mem_pct (default
+  30% of RAM / LDLM_LOCK_MEM_OVERHEAD) instead of LDLM_POOL_HOST_L
+- keep dual SLV state (legacy scalar + pressure scalar) for
+  compatibility, where in pressure path; add quota-based client
+  reclaim policy: ldlm_cancel_pressure_policy
+- fall back to legacy_slv on mixed-filesystem server nodes
+- keep legacy behavior for old clients and pre-threshold rollout
+  stages
+- add sanity-ldlm-pool.sh, sanity 124aa, and man pages for the new
+  pool parameters
 
-Where adjust_factor = exp(4 * (available/granted - 1)), which:
-- Increases SLV when resources are abundant (available >> granted)
-- Decreases SLV under memory pressure (available << granted)
-- Maintains stability when available ~= granted, and by `-1` we could reach the balance target (adjust_factor = 1)
-- Apply exp() transformation to smooth and amplify values which helps to
-  * Enable clients to retain sufficient locks to accelerate their computation when resources are abundant, and
-  * Actively revoke locks from clients during memory pressure.
+Performance impact:
+CPU overhead should be negligible.
+- The server recomputes pressure once per second per pool. On the
+  client, pool recalc runs on the ~10s timer and when unused locks
+  are decrefed.
+- On the packed pressure path, reclaim no longer performs per-lock
+  arithmetic during LRU scanning, so lock-heavy workloads should see
+  unchanged or slightly lower CPU usage.
 
-Backward compatibility:
-- Parameter 'slv_pressure_adjust' is provided to fallback to the
-  previous implementation if needed
-
-A simple test sanity-ldlm-pool.sh is introduced, with some output,
-
-Phase 1: Gradual file creation with lock monitoring
---------------------------------------------------------------
-Phase                 Granted    Limit Avai/Grant             SLV
---------------------------------------------------------------
-Batch 1 (subdir 0)      10006   100000 89994/10006   1489666526458
-Batch 2 (subdir 1)      20008   100000 79992/20008   1933486114518
-Batch 3 (subdir 2)      30010   100000 69990/30010   1347042858596
-Batch 4 (subdir 3)      40012   100000 59988/40012     44241836402
-Batch 5 (subdir 4)      50014   100000 49986/50014      1935912934
-Batch 6 (subdir 5)      60016   100000 39984/60016        70554719
-Batch 7 (subdir 6)      70018   100000 29982/70018         5466001
-Batch 8 (subdir 7)      61084   100000 38916/61084         4861214
-Batch 9 (subdir 8)      70018   100000 29982/70018         2590221
-Batch 10 (subdir 9)     59720   100000 40280/59720         7609647
-
-Phase 2: Sustained workload with continuous monitoring
---------------------------------------------------------------
-Phase                 Granted    Limit Avai/Grant             SLV
---------------------------------------------------------------
-16:58:33                59724   100000 40276/59724         3397819
-16:58:43                59742   100000 40258/59742         2657108
-16:58:54                49744   100000 50256/49744         6328254
-16:59:04                59750   100000 40250/59750         4458436
-16:59:14                59752   100000 40248/59752         2307801
-16:59:24                63014   100000 36986/63014         2249070
-16:59:34                69744   100000 30256/69744         2271087
-16:59:44                60050   100000 39950/60050         7916277
-16:59:54                60050   100000 39950/60050         3412491
-17:00:04                60048   100000 39952/60048         2868834
-17:00:14                61048   100000 38952/61048         2237576
-17:00:24                50480   100000 49520/50480         2812093
---------------------------------------------------------------
-
-Note, the number fluctuation is likely because the test only involved
-two clients and a relatively large volume of lock requests. In
-production environment, it should be smoother.
-
-
-PENDING TO DO ==============================================================
-Currently SLV/CLV treat all clients equally.
-Under pressure, large and small clients may keep a similar number
-of locks, which is not ideal for HPC workloads.
-
-Introduce a proportional target:
-target = CPU_cores × locks_per_core
-
-CLV takes actual_locks / target into account, so clients retain
-locks relative to their capacity rather than in absolute terms.
-
-To avoid oscillation under sustained pressure, locks_per_core
-must not be fixed. Since only the server has global visibility,
-it dynamically determines this value and embeds it into SLV.
-
-SLV layout extension (backward compatible):
-
-bit 63..60 : 0xF, for compatibility, old SLV not fill this part,
-bit 59..48 : reserved
-bit 47..40 : locks_per_core
-bit 39..0  : original SLV
-
-This improves proportional fairness while keeping server-side
-pressure control centralized.
-
+Assisted-by: Cursor:auto/codex5.5
 Signed-off-by: Keguang Xu <squalfof@gmail.com>
+Signed-off-by: Keguang Xu <kxu@ddn.com>
 Change-Id: If8a6f247127576965ae45c349a4ab04fb286615a
 
 --- Review History ---
@@ -487,3 +442,654 @@ https://build.whamcloud.com/job/lustre-reviews/121985/ : SUCCESS
 
 --- Message (kg.xu, 2026-02-27 13:52:54.000000000) ---
 Set Work In Progress
+
+--- Message (kg.xu, 2026-05-08 10:52:46.000000000) ---
+Uploaded patch set 11.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-05-08 11:07:27.000000000) ---
+Patch Set 11:
+
+(35 comments)
+
+37 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-05-08 11:22:23.000000000) ---
+Patch Set 11: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/124739/ : SUCCESS
+
+--- Message (kg.xu, 2026-05-09 02:22:16.000000000) ---
+Uploaded patch set 12.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-05-09 02:23:26.000000000) ---
+Patch Set 12:
+
+(37 comments)
+
+39 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-05-09 02:48:51.000000000) ---
+Patch Set 12: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/124771/ : SUCCESS
+
+--- Message (kg.xu, 2026-05-10 05:37:01.000000000) ---
+Set Ready For Review
+
+--- Message (wc-checkpatch, 2026-05-11 00:36:24.000000000) ---
+Patch Set 12: Code-Review-1
+
+This change cannot be cherry-picked to master.
+Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (kg.xu, 2026-05-11 06:49:17.000000000) ---
+Uploaded patch set 13.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (kg.xu, 2026-05-11 06:55:09.000000000) ---
+Uploaded patch set 14.
+
+--- Message (jenkins, 2026-05-11 06:55:20.000000000) ---
+Patch Set 13: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/124837/ : ABORTED
+
+--- Message (wc-checkpatch, 2026-05-11 06:57:34.000000000) ---
+Patch Set 14:
+
+(36 comments)
+
+38 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (kg.xu, 2026-05-11 07:02:47.000000000) ---
+Patch Set 14:
+
+(1 comment)
+
+--- Message (jenkins, 2026-05-11 07:48:26.000000000) ---
+Patch Set 14: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/124838/ : SUCCESS
+
+--- Message (Autotest, 2026-05-14 06:10:18.000000000) ---
+Patch Set 14:
+
+Trevis Autotest retesting enforced review-dne-zfs-part-5 session on el8.10-x86_64/zfs servers and clients for build 124838 patch 14. Requested by keguang because of LU-19487.
+
+--- Message (Andreas Dilger, 2026-05-15 21:37:37.000000000) ---
+Patch Set 14:
+
+(7 comments)
+
+--- Message (kg.xu, 2026-05-26 09:45:17.000000000) ---
+Uploaded patch set 15.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-05-26 09:47:37.000000000) ---
+Patch Set 15:
+
+(42 comments)
+
+44 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (kg.xu, 2026-05-26 09:57:34.000000000) ---
+Patch Set 15:
+
+(8 comments)
+
+--- Message (jenkins, 2026-05-26 10:12:42.000000000) ---
+Patch Set 15: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/125547/ : SUCCESS
+
+--- Message (kg.xu, 2026-05-29 01:48:11.000000000) ---
+Uploaded patch set 16.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-05-29 01:58:32.000000000) ---
+Patch Set 16:
+
+(41 comments)
+
+42 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (kg.xu, 2026-05-29 02:03:50.000000000) ---
+Patch Set 16:
+
+(8 comments)
+
+--- Message (jenkins, 2026-05-29 02:14:15.000000000) ---
+Patch Set 16: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/125754/ : SUCCESS
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-05-29 03:55:34.000000000) ---
+Patch Set 15:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-05-29 08:02:33.000000000) ---
+Patch Set 16:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-05-29 09:13:14.000000000) ---
+Patch Set 16:
+
+Code-wise looks good to me.
+
+--- Message (kg.xu, 2026-06-11 04:53:30.000000000) ---
+Patch Set 16:
+
+(1 comment)
+
+--- Message (jenkins, 2026-06-11 05:27:49.000000000) ---
+Patch Set 16: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/126331/ : FAILURE
+
+--- Message (kg.xu, 2026-06-11 23:48:09.000000000) ---
+Patch Set 17: Patch Set 16 was rebased
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-06-11 23:52:38.000000000) ---
+Patch Set 17:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-06-12 00:00:50.000000000) ---
+Patch Set 17:
+
+(41 comments)
+
+42 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-06-12 00:22:22.000000000) ---
+Patch Set 17: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/126430/ : FAILURE
+
+--- Message (jenkins, 2026-06-12 01:11:57.000000000) ---
+Patch Set 17: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/126433/ : SUCCESS
+
+--- Message (Keguang Xu, 2026-06-13 04:46:59.000000000) ---
+Uploaded patch set 18.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-06-13 04:49:40.000000000) ---
+Patch Set 18:
+
+(26 comments)
+
+26 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-06-13 04:50:28.000000000) ---
+Patch Set 18:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-06-13 05:12:36.000000000) ---
+Patch Set 18: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/126506/ : SUCCESS
+
+--- Message (wc-checkpatch, 2026-06-20 08:37:19.000000000) ---
+Patch Set 18: Code-Review-1
+
+This change cannot be cherry-picked to master.
+Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (Keguang Xu, 2026-06-22 01:01:46.000000000) ---
+Uploaded patch set 19.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-06-22 01:04:14.000000000) ---
+Patch Set 19:
+
+Code-wise looks good to me.
+
+--- Message (kg.xu, 2026-06-22 01:12:06.000000000) ---
+Patch Set 19: Code-Review-1
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-06-22 01:13:35.000000000) ---
+Patch Set 19:
+
+(26 comments)
+
+26 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-06-22 01:23:48.000000000) ---
+Patch Set 19: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/126794/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-06-22 22:08:36.000000000) ---
+Patch Set 18:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Keguang Xu, 2026-06-27 09:20:16.000000000) ---
+Uploaded patch set 20.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-06-27 09:22:51.000000000) ---
+Patch Set 20:
+
+(27 comments)
+
+27 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre RISC-V Builder, 2026-06-27 10:36:57.000000000) ---
+Patch Set 20:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-06-27 10:51:00.000000000) ---
+Patch Set 20: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/127035/ : SUCCESS
+
+--- Message (Andreas Dilger, 2026-06-28 06:42:35.000000000) ---
+Patch Set 20:
+
+(13 comments)
+
+--- Message (wc-checkpatch, 2026-07-06 18:38:05.000000000) ---
+Patch Set 20: Code-Review-1
+
+This change cannot be cherry-picked to master.
+Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-06 18:41:56.000000000) ---
+Patch Set 20:
+
+Code-wise looks good to me.
+
+--- Message (Keguang Xu, 2026-07-13 08:36:24.000000000) ---
+Uploaded patch set 21.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-13 08:39:21.000000000) ---
+Patch Set 21:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-07-13 08:40:33.000000000) ---
+Patch Set 21:
+
+(35 comments)
+
+37 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre RISC-V Builder, 2026-07-13 09:03:51.000000000) ---
+Patch Set 21:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-07-13 09:18:25.000000000) ---
+Patch Set 21: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/127485/ : SUCCESS
+
+--- Message (Keguang Xu, 2026-07-13 10:16:12.000000000) ---
+Uploaded patch set 22.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (kg.xu, 2026-07-13 10:17:02.000000000) ---
+Patch Set 21:
+
+(12 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-13 10:19:12.000000000) ---
+Patch Set 22:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-07-13 10:30:03.000000000) ---
+Patch Set 22:
+
+(34 comments)
+
+36 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (wc-checkpatch, 2026-07-13 10:35:05.000000000) ---
+Patch Set 21: Code-Review-1
+
+This change cannot be cherry-picked to master.
+Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (Keguang Xu, 2026-07-13 11:27:41.000000000) ---
+Uploaded patch set 23.
+
+--- Message (jenkins, 2026-07-13 11:27:50.000000000) ---
+Patch Set 22: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/127496/ : ABORTED
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-13 11:30:53.000000000) ---
+Patch Set 23:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-07-13 11:31:56.000000000) ---
+Patch Set 23:
+
+(34 comments)
+
+36 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre RISC-V Builder, 2026-07-13 12:07:04.000000000) ---
+Patch Set 22:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Lustre RISC-V Builder, 2026-07-13 12:38:55.000000000) ---
+Patch Set 23:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-07-13 13:09:38.000000000) ---
+Patch Set 23: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/127502/ : SUCCESS
+
+--- Message (Keguang Xu, 2026-07-14 01:14:51.000000000) ---
+Uploaded patch set 24.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-14 01:17:27.000000000) ---
+Patch Set 24:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-07-14 01:18:08.000000000) ---
+Patch Set 24:
+
+(34 comments)
+
+36 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre RISC-V Builder, 2026-07-14 01:33:09.000000000) ---
+Patch Set 24:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-07-14 01:39:54.000000000) ---
+Patch Set 24: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/127534/ : SUCCESS
+
+--- Message (Autotest, 2026-07-14 01:40:39.000000000) ---
+Patch Set 23:
+
+Onyx Autotest 2 is abandoning the following sessions because: later build 127534 found
+- Enforced review-dne-part-3 on el8.10-x86_64/ldiskfs servers and clients
+
+--- Message (kg.xu, 2026-07-14 01:52:08.000000000) ---
+Patch Set 24:
+
+(2 comments)
+
+--- Message (Gerrit AI review for Lustre, 2026-07-28 00:38:57.000000000) ---
+Patch Set 24:
+
+(11 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. Two of them land outside the new feature path: the ldlm_ratio2locknr() divisor change moves the existing server lock-reclaim watermarks, and the new limit loop in ldlm_pools_recalc_task() overrides the modest/greedy limits for every server pool, including legacy_slv ones.
+
+sanity-ldlm-pool.sh is added to noinst_SCRIPTS but not to lustre/tests/test-groups/regression, so it will not run in the normal rotation; test_1 is also a ~6 minute soak whose only hard assertion is that granted stayed under 90% of the limit. Since ldlm_pool_init() turns pressure_rollout on by default for every pool, a subtest that pins a known pressure and checks the resulting evict count would be worth having.
+
+--- Message (Keguang Xu, 2026-08-08 10:41:04.000000000) ---
+Uploaded patch set 25.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (kg.xu, 2026-08-08 10:43:00.000000000) ---
+Patch Set 25:
+
+(10 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-08 10:44:26.000000000) ---
+Patch Set 25:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-08 10:52:11.000000000) ---
+Patch Set 25:
+
+(34 comments)
+
+36 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre RISC-V Builder, 2026-08-08 10:59:34.000000000) ---
+Patch Set 25:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-08 11:06:38.000000000) ---
+Patch Set 25: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128950/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-08-08 21:50:19.000000000) ---
+Patch Set 25:
+
+(10 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The main one is that on the packed path the client's LRU-resize weighting is replaced by what is effectively the aged policy plus a per-pass quota capped at 4096 locks, so a busy client's lock cache ends up bounded only by ns_max_age.
+
+sanity test_124aa only checks that lru_size shrank, which the legacy SLV path does too, so it would pass even if packed SLV never engaged. Could it also assert that the pool actually reached the packed path (pool.slv_pressure_ready / a packed pool.server_lock_volume on the client)?
+
+--- Message (Keguang Xu, 2026-08-09 07:08:51.000000000) ---
+Uploaded patch set 26.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (kg.xu, 2026-08-09 07:09:23.000000000) ---
+Patch Set 25:
+
+(7 comments)
+
+--- Message (wc-checkpatch, 2026-08-09 07:09:49.000000000) ---
+Patch Set 26:
+
+(33 comments)
+
+35 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-09 07:11:40.000000000) ---
+Patch Set 26:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-09 07:22:59.000000000) ---
+Patch Set 26:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-09 07:32:32.000000000) ---
+Patch Set 26: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128974/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-08-09 19:02:16.000000000) ---
+Patch Set 26:
+
+(12 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The main one is that the rollout gate counts MDT->OST OSC exports in its denominator, so OST pools may never reach the coverage threshold in DNE configurations.
+
+Andreas' patchset-14 question on whether the same effect could be obtained by fixing the existing SLV values rather than adding a new protocol is still open; he noted it had been marked resolved without an answer, and it has not been answered since.
+
+--- Message (Keguang Xu, 2026-08-15 01:37:27.000000000) ---
+Uploaded patch set 27.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (kg.xu, 2026-08-15 01:38:13.000000000) ---
+Patch Set 27:
+
+(11 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-15 01:41:05.000000000) ---
+Patch Set 27:
+
+Code-wise looks good to me.
+
+--- Message (Keguang Xu, 2026-08-15 01:43:07.000000000) ---
+Uploaded patch set 28.
+
+--- Message (jenkins, 2026-08-15 01:43:16.000000000) ---
+Patch Set 27:
+
+No Builds Executed
+
+--- Message (kg.xu, 2026-08-15 01:43:26.000000000) ---
+Patch Set 28:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-08-15 01:44:30.000000000) ---
+Patch Set 28:
+
+(33 comments)
+
+35 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-15 01:46:42.000000000) ---
+Patch Set 28:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-15 02:51:04.000000000) ---
+Patch Set 28: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129438/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-15 03:14:32.000000000) ---
+Patch Set 28:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-15 13:59:31.000000000) ---
+Patch Set 28:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The main one is what non-packed clients experience once a pool crosses slv_pressure_ready_pct.
+
+--- Message (wc-checkpatch, 2026-08-19 02:40:46.000000000) ---
+Patch Set 28: Code-Review-1
+
+This change cannot be cherry-picked to master.
+Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (Andreas Dilger, 2026-10-07 03:32:38.000000000) ---
+Patch Set 28:
+
+(1 comment)
+
+--- Message (Keguang Xu, 2026-10-07 04:21:18.000000000) ---
+Patch Set 28:
+
+(1 comment)

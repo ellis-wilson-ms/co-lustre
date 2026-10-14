@@ -1,0 +1,974 @@
+Change:     68419
+Subject:    LU-20650 lfs: add find --since-cookie, a per-MDT anchor
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68419
+Change-Id:  Ia8ce93368a2c2c8c2ea2ee88c8e7f7e099b1bfa5
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Hiroshi Nishida
+Created:    2026-08-26 16:04:40.000000000
+Updated:    2026-10-14 04:24:18.000000000
+Patch Set:  20
+Insertions: +957
+Deletions:  -45
+Comments:   109 (2 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
+
+--- Commit Message ---
+LU-20650 lfs: add find --since-cookie, a per-MDT anchor
+
+cr_index belongs to one MDT, so "where I got to" on a DNE filesystem
+is one number per MDT and not one number.  --since <time> is the human
+spelling and means the same thing everywhere, but only as far as the
+clocks agree; a cookie holds an index per MDT, and is what a repeated
+job should use.
+
+The file is a line per MDT, "<mdtname> <index>", read as the anchors
+and rewritten with the indexes this run reached.  It is written whole
+and renamed over, so an interrupted run leaves the previous anchors
+rather than half of the new ones -- a half-written cookie is worse
+than a stale one, because the stale one is caught.
+
+Which is the reason a cookie is worth having.  If an MDT has purged
+past its anchor the records in between are gone, and reading from the
+oldest one left would return a short answer with nothing to say so.
+So the oldest surviving index is read first, by a one-record scan that
+stops at the first callback, and an anchor older than it is refused
+naming both numbers.  Every MDT is checked before any of them is
+scanned: refusing from inside the scan would leave the earlier MDTs'
+matches on stdout with no cookie written, and the next run would
+repeat them.  An MDT with no anchor is not probed at all -- 0 has
+nothing to be stale against, and that is every MDT of a first run.
+
+An anchor past the end of a log that holds records is refused too.
+Indexes restart at 1 when an MDT's last changelog user is deregistered
+and the MDT is remounted, and a run from the old anchor would skip
+every record in the new log.  A second one-record scan from the
+anchor finds nothing in that case.  Once the new log grows past the
+anchor, indexes alone cannot show the restart.
+
+Zero is reserved for "the log is empty", which is why a record that
+arrives without an index is reported rather than recorded as index 0.
+Changelog indexes start at 1, so storing 0 for a record that has one
+would make a log holding records look like a log holding none, and 0
+compares false against every anchor -- the check would go on being
+skipped and say nothing about it.  An empty log does proceed: from a
+client, "nothing happened since the anchor" and "everything since it
+was purged" look the same, and refusing on that would fail on every
+idle filesystem.
+
+A cookie from another filesystem would anchor this one at indexes that
+mean nothing here, so a line whose name does not match the filesystem
+is ignored, and a file whose header names another filesystem is
+refused.  Ignoring every one of its lines instead would leave no
+anchors at all, rescan this filesystem's whole log, and then drop the
+other one's anchors in the rewrite -- three wrong answers, none of
+them said out loud.
+
+The rest of the file is input the caller does not control either.  The
+scanf width is not optional: %s into a fixed buffer is how such a file
+overruns it.  Nor is the type of the bound test, since %x accepts a
+sign: "<fsname>-MDT-1" reads back as 0xffffffff, which passes a test
+made against an int and then indexes the array far past its end.  So
+the sign is refused at the parse and the bound is compared against the
+value that does the indexing.
+
+--since and --since-cookie are two ways to say where to start, so
+giving both is refused rather than one of them silently winning.  More
+than one path is refused for a related reason: lfs find runs the
+search once per path and every run advances the anchors, so a second
+path would start past the end of the log, print nothing, and leave the
+records it should match behind the anchor for good.
+
+The cookie is proved writable in the same pre-pass that proves the
+anchors are not stale, and for the same reason -- a cookie that cannot
+be written leaves the matches on stdout and the next run repeating
+them.  A missing directory component reads as ENOENT, which
+find_cookie_read() takes for a first run, so a typo would not be
+noticed until every log had been scanned.
+
+The temporary file is fsync()ed before the rename, and the directory
+after it.  The rename makes the replacement atomic against another
+process, which is not the same as durable: after a host crash the
+rename can be on disk while the contents are not, and an empty cookie
+parses as no anchors at all.
+
+The pre-pass probes by creating a temporary beside the cookie rather
+than opening the cookie itself, because the write creates one and
+renames over: what it needs is permission on the directory, which
+opening an existing cookie for append does not test.  A cookie owned
+by the job user in a root-owned directory would pass that and then
+fail EACCES with every match already printed.
+
+The temporary is private to the run, "<cookie>.<pid>.<n>.new" created
+O_EXCL.  One fixed name would let an overlapping run -- a cron job
+that outlasts its interval -- truncate or unlink the other's copy
+between its write and its rename, and an empty cookie reads as no
+anchors at all.  O_EXCL rather than mkstemp() keeps the umask's mode
+for a first run's cookie.
+
+Matches that could not be written hold the anchors too.  They go to
+stdout through llapi_printf(), which reports nothing, so stdout is
+flushed and its error flag read before the rewrite; otherwise
+"lfs find --since-cookie ck > out" on a full filesystem would lose
+the matches, advance past their records and exit 0.  When stdout is
+a regular file it is also fsync()ed, and a failed sync holds the
+anchors and returns -EIO.
+
+The anchors are left where they were when a run did not finish.  A
+resolve failure that is not "this object has no name" drops matches,
+and writing the cookie anyway would advance past the very records a
+rerun needs, so the exit status is settled before the rewrite rather
+than after it.
+
+An index is read with strtoull() and a leading sign refused, the MDT
+number having been refused for the same reason: "%llu" negates, so
+"-2" would anchor a run at 0xfffffffffffffffe, match nothing, and
+write that value back.
+
+find_device_supported() refuses --since-cookie along with --since: lfs
+find parses it for a target scan too, and llapi_find_device() never
+reads it -- a target scan would have printed every object the other
+predicates kept and exited 0, without even reading or writing the
+cookie it was given.
+
+ONLY=56 is the regression check that the shared paths still answer as
+they did; --since-cookie's own subtests are in the tests patch at the
+end of this series.
+
+The cookie names the search as well as the filesystem, and a
+mismatch is refused the way a wrong fsname is.  The anchors say how
+far each log was read, not how far a subtree was: a record is counted
+before the FID and the subtree are tested, so a run over one subtree
+carries every anchor to the end of the log, and a second subtree
+sharing the cookie would start past its own changes and print nothing.
+That is the collision lfs_find() refuses when two paths are given to
+one command, reached by running the command twice.  A header with no
+root is accepted.
+
+A cookie that exists and is not a regular file is refused when it is
+read, and again before the search for one swapped in since: the write
+ends in rename(), which answers EISDIR over a directory, so it would
+otherwise be found only after every log had been scanned and every
+match printed.  An empty name is refused with it.
+
+The root is the rest of the header line rather than a field, because
+a pathname can hold a space and %s cuts at the first one.  It is
+whatever realpath() returned for the caller's path.  And it is escaped
+rather than written raw, because a name can hold a newline, which the
+rest of a line cannot: only '/' and NUL are excluded from a name.  Both
+sides escape and the reader compares the escaped forms, so nothing
+decodes: the mapping only has to be injective for a comparison, which
+is also why backslash is escaped.  The refusal names both sides in
+that spelling, or a newline would break the line meant to name it.
+
+Every refusal in find_cookie_check() names the argument at fault, so a
+run does not end at the caller's "failed for '<path>': Invalid
+argument".  The refusal of --resolve without --changelog names both
+anchored spellings, since --since-cookie reaches it too.  A cookie
+refused for its filesystem or its root is reported once:
+find_cookie_read() names the refusal, and the wrapper adds nothing.
+
+The MDT number is exactly the four hex digits find_cookie_write()
+emits.  %4x converts the leading digits and ignores what follows, so
+without the span "<fsname>-MDT00001" and "<fsname>-MDT0000_UUID"
+would both anchor MDT0000 at an index never written for it -- the
+short answer with nothing said that the stale check exists to catch.
+The span refuses a sign as well.
+
+ERRORS lists -ESTALE, the error the whole option is built around.
+
+llapi_find_with_cb() refuses fp_since_cookie as it refuses
+fp_since_kind.
+
+Test-Parameters: testlist=sanity env=ONLY=56
+Signed-off-by: Hiroshi Nishida <hnishida@thelustrecollective.com>
+Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
+Change-Id: Ia8ce93368a2c2c8c2ea2ee88c8e7f7e099b1bfa5
+
+--- Review History ---
+
+--- Message (Hiroshi Nishida, 2026-08-26 16:04:40.000000000) ---
+Uploaded patch set 1.
+
+--- Message (wc-checkpatch, 2026-08-26 16:12:47.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-26 16:32:33.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-27 04:42:03.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130411/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-27 15:35:59.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-27 21:39:41.000000000) ---
+Patch Set 1:
+
+(6 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. Two of them affect the anchor bookkeeping the feature exists to get right. Also, --since-cookie is new user-visible behaviour with no test: Test-Parameters points at sanity ONLY=56, but no new subtest is added there, so the run exercises nothing new. Could a sanity case be added that runs twice over a cookie and checks the second run only reports what changed in between (and a DNE variant, since the per-MDT bookkeeping is the whole point)?
+
+--- Message (Hiroshi Nishida, 2026-08-28 00:00:00.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-28 00:09:25.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-28 00:38:43.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-28 01:36:57.000000000) ---
+Patch Set 2:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-28 02:42:53.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130500/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-08-29 00:05:14.000000000) ---
+Patch Set 2:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The cookie-file parser has an out-of-bounds write that a malformed line reaches. Separately, nothing in this patch exercises the new option: a sanity case that runs twice over a cookie file and checks the second run reports only what changed since the first, plus the stale-anchor refusal, would be worth adding.
+
+--- Message (Hiroshi Nishida, 2026-08-29 13:32:34.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-08-29 13:34:43.000000000) ---
+Patch Set 3:
+
+(4 comments)
+
+--- Message (wc-checkpatch, 2026-08-29 13:44:07.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-29 14:08:09.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-29 14:14:27.000000000) ---
+Patch Set 3:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-29 15:06:30.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130579/ : SUCCESS
+
+--- Message (Hiroshi Nishida, 2026-08-29 18:09:55.000000000) ---
+Uploaded patch set 4: Patch Set 3 was rebased.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-29 18:23:25.000000000) ---
+Patch Set 4:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-29 18:38:32.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-29 18:40:33.000000000) ---
+Patch Set 4:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-29 19:46:11.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130600/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-08-30 10:54:00.000000000) ---
+Patch Set 4:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The main one is that `lfs find` takes more than one path and calls llapi_find_since() once per path, which does not compose with an anchor that the call advances.
+
+Nothing in lustre/tests exercises --since-cookie (or --since/--changelog from the earlier patches). A sanity case that runs the same command twice over a DNE filesystem and checks that the second run reports only what changed in between, plus one that feeds a purged-past anchor and expects the refusal, would pin down most of what this patch is asserting.
+
+--- Message (Hiroshi Nishida, 2026-08-30 14:47:27.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-08-30 14:48:22.000000000) ---
+Patch Set 5:
+
+(5 comments)
+
+--- Message (wc-checkpatch, 2026-08-30 15:00:40.000000000) ---
+Patch Set 5:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-30 15:16:30.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-30 15:17:06.000000000) ---
+Patch Set 5:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-30 16:56:43.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130634/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-08-31 08:49:03.000000000) ---
+Patch Set 5:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The new option also looks untested -- there is nothing under lustre/tests/ that exercises --since-cookie (or --since/--changelog from the earlier patches), so a sanity case covering a first run, a second run resuming from the anchor, and the stale-anchor refusal would be worth adding here.
+
+--- Message (Hiroshi Nishida, 2026-08-31 14:07:31.000000000) ---
+Uploaded patch set 6.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-08-31 14:08:43.000000000) ---
+Patch Set 5:
+
+(5 comments)
+
+--- Message (wc-checkpatch, 2026-08-31 14:21:19.000000000) ---
+Patch Set 6:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-31 14:39:14.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-31 14:54:16.000000000) ---
+Patch Set 6:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-31 17:42:47.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130727/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-01 08:16:57.000000000) ---
+Patch Set 6:
+
+(6 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good; the anchor bookkeeping, the inclusive-startrec resume and the pre-pass all check out against llapi_scan_changelog() and mdc_changelog.c. A few minor comment/dead-code points inline.
+
+--- Message (Hiroshi Nishida, 2026-09-01 16:24:32.000000000) ---
+Uploaded patch set 7.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-01 16:30:32.000000000) ---
+Patch Set 7:
+
+Looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-09-01 16:36:30.000000000) ---
+Patch Set 6:
+
+(6 comments)
+
+Round 17: replies to the review comments on this patch set.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-01 16:53:21.000000000) ---
+Patch Set 7:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-09-01 17:57:04.000000000) ---
+Patch Set 7:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-09-01 18:02:45.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130803/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-03 00:02:41.000000000) ---
+Patch Set 7:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Some comments inline; nothing that looks like a correctness bug. The per-MDT anchor bookkeeping, the stale-anchor pre-pass, the whole-file rewrite and the sign handling all trace out correctly against llapi_scan_changelog() and the changelog device's inclusive seek.
+
+--- Message (Hiroshi Nishida, 2026-09-03 15:58:48.000000000) ---
+Uploaded patch set 8.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-03 16:32:55.000000000) ---
+Patch Set 8:
+
+Code-wise looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-09-03 18:11:57.000000000) ---
+Patch Set 7:
+
+(3 comments)
+
+--- Message (jenkins, 2026-09-03 19:10:48.000000000) ---
+Patch Set 8: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130964/ : SUCCESS
+
+--- Message (wc-checkpatch, 2026-09-03 20:10:42.000000000) ---
+Patch Set 8:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-09-03 20:44:19.000000000) ---
+Patch Set 8:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-09-04 13:14:03.000000000) ---
+Patch Set 8:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Looks good. The per-MDT anchor, the pre-pass that settles staleness and writability before anything is printed, and the ordering of the fss_path_rc fold ahead of the rewrite all hold up. Only optional nits inline, all about diagnostics rather than behaviour - no need to re-spin for them.
+
+--- Message (Autotest, 2026-09-04 14:58:54.000000000) ---
+Patch Set 8:
+
+Onyx Autotest retesting enforced review-dne-selinux-ssk-part-2 session on el8.10-x86_64/ldiskfs servers and clients for build 130964 patch 8. Requested by Jin Gwoun because of ATM-4035.
+
+--- Message (Hiroshi Nishida, 2026-09-04 21:56:30.000000000) ---
+Uploaded patch set 9.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-04 22:08:14.000000000) ---
+Patch Set 9:
+
+Looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-09-04 22:10:20.000000000) ---
+Patch Set 9:
+
+(6 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-04 22:50:36.000000000) ---
+Patch Set 9:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-05 02:13:18.000000000) ---
+Patch Set 9: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/131105/ : FAILURE
+
+--- Message (Lustre RISC-V Builder, 2026-09-05 04:32:09.000000000) ---
+Patch Set 9:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Hiroshi Nishida, 2026-09-06 14:02:59.000000000) ---
+Patch Set 8:
+
+(4 comments)
+
+--- Message (Hiroshi Nishida, 2026-09-09 03:23:05.000000000) ---
+Uploaded patch set 10.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-09 03:38:16.000000000) ---
+Patch Set 10:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-09 03:59:05.000000000) ---
+Patch Set 10:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-09 06:06:01.000000000) ---
+Patch Set 10: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/131394/ : FAILURE
+
+--- Message (Lustre RISC-V Builder, 2026-09-09 11:43:53.000000000) ---
+Patch Set 10:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Hiroshi Nishida, 2026-09-09 17:04:40.000000000) ---
+Uploaded patch set 11: Patch Set 10 was rebased.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-09 17:14:31.000000000) ---
+Patch Set 11:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-09 17:23:51.000000000) ---
+Patch Set 11:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-09 17:52:34.000000000) ---
+Patch Set 11: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131442/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-09 23:35:45.000000000) ---
+Patch Set 11:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Hiroshi Nishida, 2026-09-10 14:30:42.000000000) ---
+Uploaded patch set 12: Patch Set 11 was rebased.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-10 14:44:09.000000000) ---
+Patch Set 12:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-10 14:58:21.000000000) ---
+Patch Set 12:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-09-10 15:44:10.000000000) ---
+Patch Set 12:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-09-10 16:04:24.000000000) ---
+Patch Set 12: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131524/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-12 01:03:27.000000000) ---
+Patch Set 12:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Looks good; the cookie machinery itself reads correct -- the anchors, the stale pre-pass, the bounds on the parsed MDT number and the write-then-rename all check out. A few optional notes inline for whenever it is next refreshed; none of them is a reason to re-spin.
+
+--- Message (Hiroshi Nishida, 2026-10-05 23:41:12.000000000) ---
+Uploaded patch set 13.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-10-05 23:41:57.000000000) ---
+Patch Set 13:
+
+(4 comments)
+
+--- Message (wc-checkpatch, 2026-10-05 23:46:35.000000000) ---
+Patch Set 13:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-06 00:05:38.000000000) ---
+Patch Set 13:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-06 01:31:36.000000000) ---
+Patch Set 13: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132897/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-06 16:25:57.000000000) ---
+Patch Set 13:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good; two documentation/commit-message accuracy points inline. Neither needs a re-spin by itself, but please pick them up on the next refresh.
+
+--- Message (Autotest, 2026-10-06 21:14:16.000000000) ---
+Patch Set 13:
+
+Trevis Autotest retesting enforced review-dne-part-4 session on el10.1-x86_64/ldiskfs servers and clients for build 132897 patch 13. Requested by Hiroshi Nishida because of LU-16932.
+
+--- Message (Autotest, 2026-10-06 21:20:58.000000000) ---
+Patch Set 13:
+
+Onyx Autotest retesting enforced review-dne-part-2 session on el9.7-x86_64/ldiskfs servers and clients for build 132897 patch 13. Requested by Hiroshi Nishida because of LU-18276.
+
+--- Message (Hiroshi Nishida, 2026-10-06 22:56:44.000000000) ---
+Uploaded patch set 14.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-10-06 23:09:14.000000000) ---
+Patch Set 14:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-06 23:19:57.000000000) ---
+Patch Set 14:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-07 00:29:47.000000000) ---
+Patch Set 14: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132986/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-07 14:17:14.000000000) ---
+Patch Set 14:
+
+(6 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good; one design question about a cookie that can never advance, and a few minor/style items inline. Nothing here needs a re-spin on its own.
+
+--- Message (Autotest, 2026-10-07 21:16:13.000000000) ---
+Patch Set 14:
+
+Onyx Autotest retesting enforced review-dne-zfs-part-2 session on el10.1-x86_64/zfs servers and clients for build 132986 patch 14. Requested by Hiroshi Nishida because of LU-17891.
+
+--- Message (Hiroshi Nishida, 2026-10-08 00:06:07.000000000) ---
+Uploaded patch set 15.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-10-08 00:06:20.000000000) ---
+Patch Set 14:
+
+(6 comments)
+
+--- Message (wc-checkpatch, 2026-10-08 00:15:00.000000000) ---
+Patch Set 15:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-08 00:34:42.000000000) ---
+Patch Set 15:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-08 02:01:56.000000000) ---
+Patch Set 15: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/133086/ : FAILURE
+
+--- Message (Hiroshi Nishida, 2026-10-08 02:08:35.000000000) ---
+Patch Set 15:
+
+BUILD
+
+--- Message (jenkins, 2026-10-08 04:03:38.000000000) ---
+Patch Set 15: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133109/ : SUCCESS
+
+--- Message (Autotest, 2026-10-09 01:41:21.000000000) ---
+Patch Set 15:
+
+Onyx Autotest retesting enforced review-dne-zfs-part-2 session on el10.1-x86_64/zfs servers and clients for build 133109 patch 15. Requested by Hiroshi Nishida because of LU-20723.
+
+--- Message (Gerrit AI review for Lustre, 2026-10-09 04:36:06.000000000) ---
+Patch Set 15:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Looks good; two optional comment nits inline for whenever the patch is next refreshed. No need to re-spin for them.
+
+--- Message (Hiroshi Nishida, 2026-10-09 11:46:43.000000000) ---
+Uploaded patch set 16.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-10-09 11:46:56.000000000) ---
+Patch Set 15:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-10-09 11:50:39.000000000) ---
+Patch Set 16:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-09 12:14:15.000000000) ---
+Patch Set 16:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-09 13:11:57.000000000) ---
+Patch Set 16: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133280/ : SUCCESS
+
+--- Message (Hiroshi Nishida, 2026-10-10 02:20:59.000000000) ---
+Uploaded patch set 17.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-10-10 02:30:15.000000000) ---
+Patch Set 17:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-10 02:41:14.000000000) ---
+Patch Set 17:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-10 03:20:17.000000000) ---
+Patch Set 17: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133326/ : SUCCESS
+
+--- Message (Autotest, 2026-10-10 20:51:40.000000000) ---
+Patch Set 17:
+
+Onyx Autotest retesting enforced review-dne-zfs-part-5 session on el9.7-x86_64/zfs servers and clients for build 133326 patch 17. Requested by Hiroshi Nishida because of LU-20501.
+
+--- Message (Autotest, 2026-10-10 20:51:42.000000000) ---
+Patch Set 17:
+
+Trevis Autotest retesting enforced review-dne-part-1 session on el9.8-x86_64/ldiskfs servers and clients for build 133326 patch 17. Requested by Hiroshi Nishida because of LU-17601.
+
+--- Message (Gerrit AI review for Lustre, 2026-10-10 22:07:11.000000000) ---
+Patch Set 17:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Looks good. One optional minor point inline; no need to re-spin just for it.
+
+--- Message (Hiroshi Nishida, 2026-10-10 23:23:47.000000000) ---
+Uploaded patch set 18.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-10-10 23:23:51.000000000) ---
+Patch Set 17:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-10-10 23:36:24.000000000) ---
+Patch Set 18:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-10 23:44:46.000000000) ---
+Patch Set 18:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-11 01:07:25.000000000) ---
+Patch Set 18: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133368/ : SUCCESS
+
+--- Message (Autotest, 2026-10-11 08:24:44.000000000) ---
+Patch Set 18:
+
+Onyx Autotest retesting enforced review-dne-zfs-part-4 session on el10.1-x86_64/zfs servers and clients for build 133368 patch 18. Requested by Hiroshi Nishida because of LU-17077.
+
+--- Message (Gerrit AI review for Lustre, 2026-10-11 13:58:10.000000000) ---
+Patch Set 18:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Looks good; two optional nits inline for whenever the patch is next refreshed, no need to re-spin for them.
+
+--- Message (Hiroshi Nishida, 2026-10-12 06:12:28.000000000) ---
+Uploaded patch set 19.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-10-12 06:12:47.000000000) ---
+Patch Set 18:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-10-12 06:13:48.000000000) ---
+Patch Set 19:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-12 06:33:03.000000000) ---
+Patch Set 19:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-12 08:03:36.000000000) ---
+Patch Set 19: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133438/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-13 16:46:38.000000000) ---
+Patch Set 19:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Looks good; a few optional comment/documentation nits inline for whenever the patch is next refreshed. No need to re-spin for them.
+
+--- Message (Hiroshi Nishida, 2026-10-14 02:12:00.000000000) ---
+Uploaded patch set 20.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-10-14 02:12:25.000000000) ---
+Patch Set 19:
+
+(3 comments)
+
+--- Message (wc-checkpatch, 2026-10-14 02:13:29.000000000) ---
+Patch Set 20:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-14 02:44:51.000000000) ---
+Patch Set 20:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-14 04:23:07.000000000) ---
+Patch Set 20: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133620/ : SUCCESS

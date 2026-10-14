@@ -1,0 +1,417 @@
+Change:     67346
+Subject:    LU-12571 llite: drain straggling cl_objects before cl_sb_fini
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67346
+Change-Id:  Ib2360e9a9427af31115902d57bd4b6fb91916eb9
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Oleg Drokin
+Created:    2026-07-18 15:25:24.000000000
+Updated:    2026-09-06 08:08:52.000000000
+Patch Set:  6
+Insertions: +76
+Deletions:  -1
+Comments:   52 (13 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: -1
+
+--- Reviewers ---
+  CC: Qian Yingjin, Timothy Day, Lustre RISC-V Builder, Gerrit AI review for Lustre
+  REVIEWER: Andreas Dilger, Alex Zhuravlev, Sebastien Buisson
+
+--- Commit Message ---
+LU-12571 llite: drain straggling cl_objects before cl_sb_fini
+
+The VFS runs shrink_dcache_for_umount() and evict_inodes() before
+->put_super, but either can leave an inode behind: a dentry that is still
+referenced at that moment is not reclaimed, and evict_inodes() skips any
+inode whose i_count is non-zero.  Such inodes reach
+client_common_put_super() with their cl_objects alive, and lu_stack_fini()
+cannot purge a referenced object, so cl_sb_fini() trips:
+
+  lu_device_fini() ASSERTION( atomic_read(&d->ld_ref) == 0 ) Refcount
+    lovsub_device_free() -> cl_sb_fini() -> ll_put_super()
+
+The straggling reference is released moments later, but by then the
+teardown has already reached cl_sb_fini(), so the failure is
+intermittent.  It is seen most often on a subdir (fileset) mount, where a
+lookup of /.fscrypt is redirected to the .fscrypt directory at the real
+filesystem root (LU-15176): that instantiates a cross-tree dcache subtree
+under the mount root whose regular-file inodes carry cl_objects, and it
+crashes the fscrypt client in sanity-sec test_54.
+
+Before tearing down the cl object stack, reclaim what has since become
+unused with shrink_dcache_sb() -- which evicts the inodes too, SB_ACTIVE
+being clear -- purge the site, and give the remaining references a window
+to drain.  A teardown with nothing left on the site returns before any of
+that, so the umount that is not racing pays neither the dcache shrink nor
+a site purge that lu_stack_fini() is about to repeat as its first
+statement.
+
+The wait is on ls_obj_alive, so it ends only once no object is left on the
+site and therefore every lu_device_put() one owes has been made -- which is
+what lu_device_fini() asserts on.  Two counts that are nearer to hand both
+reach their final value too early:
+
+ - sb->s_inodes.  evict() calls inode_sb_list_del() at its top, before
+   ->evict_inode(), so a thread that drops the last reference to an inode
+   empties s_inodes while it is still inside ll_delete_inode(), which has
+   yet to reach cl_inode_fini() and can spend a long time before it does
+   -- cl_sync_file_range() issues OST RPCs there.  That thread need not be
+   the umounting one: ll_lock_cancel_bits() takes the inode with igrab()
+   via ll_inode_from_resource_lock() and iput()s it from the ldlm callback
+   thread.
+
+ - the site object hash.  A dying cl object is unhashed by
+   lu_object_put() while the bucket lock is held, and only then, outside
+   it, does lu_object_free() run each layer's lu_object_fini() to release
+   the device reference.
+
+The loop keeps its lu_site_purge() call for a different reason: a cl
+object whose last reference goes away while it is not dying is parked on
+the site LRU and stays hashed, still holding its device references, so it
+has to be purged rather than waited for.
+
+ls_obj_alive is per-site, and the client cl stack has two sites:
+sbi->ll_site carries the vvp and lov slices, while the lovsub and osc ones
+-- including those of the lovsub device that asserts in the trace above --
+live on the LOV device's own site.  Polling sbi->ll_site covers them
+because lov_object_delete() runs lov_subobject_kill() for every stripe
+before any layer of the lov object is freed, and that waits for the
+sub-object to be destroyed.  Its wait is on lovsub_object_free() clearing
+r0->lo_sub[], which until now it did before lu_object_fini() gave the
+lovsub device reference back, so the wait could end while the sub-object
+still held one; do the fini first so the slot really is the "done" signal.
+
+Measured against the reproducers in "LU-12571 llite: deterministic
+reproducers for the umount LBUG" (change 67547, which this one does not
+depend on), which pin inodes from a foreign thread and stall that thread
+in both windows: with no drain the umount asserts "Refcount is 5", with an
+s_inodes-based drain it asserts "Refcount is 1", and with ls_obj_alive it
+completes.  On a clean umount the count is already zero and the loop exits
+on its first test.
+
+Because the final reference is usually dropped by an eviction that flushes
+the inode's dirty pages first, the wait is bounded by obd_timeout rather
+than by a fixed value, so it tracks the RPCs actually being waited on -- a
+forced umount is not waiting on RPCs that are still coming, so it gets the
+5s floor instead.  The budget is wall-clock rather than a poll count,
+because a poll costs a dcache shrink and a site purge on top of its sleep.
+It stays bounded either way: a genuinely leaked reference gets a console
+warning naming the count and the time spent, and then the same LBUG as
+before.  Because obd_timeout makes that budget long and the sleep is
+uninterruptible, it also says once, five seconds in, that it is waiting
+and for how many objects, rather than leaving an umount looking wedged
+until the budget is already gone.
+
+This is not a re-instatement of the obd_zombie_barrier() that LU-2543
+added here in 2013 and LU-6173 removed in 2015.  That barrier ran after
+cl_sb_fini(), waited for the OSC devices themselves rather than for
+cl_objects, and existed only to keep sbi->ll_cache alive; LU-6173 made
+that cache refcounted, which retired it properly.  Reverting it would not
+help here -- it fires long after the assertion.
+
+No Fixes: tag: the assertion is not the product of one commit.  LU-12571
+was filed in 2019 against sanity-dom test_150, with neither fscrypt nor a
+subdir mount involved, two and a half years before commit c12378fba7f0
+("LU-15176 sec: present .fscrypt in subdir mount") made one instance of it
+much easier to hit.
+
+Signed-off-by: Oleg Drokin <green@whamcloud.com>
+Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
+Change-Id: Ib2360e9a9427af31115902d57bd4b6fb91916eb9
+
+--- Review History ---
+
+--- Message (Oleg Drokin, 2026-07-18 15:25:24.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-18 15:28:02.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-07-18 15:36:57.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful
+
+--- Message (wc-checkpatch, 2026-07-18 15:37:45.000000000) ---
+Patch Set 1:
+
+(8 comments)
+
+16 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-07-18 15:51:31.000000000) ---
+Patch Set 1: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/127760/ : FAILURE
+
+--- Message (Oleg Drokin, 2026-07-18 16:12:34.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-18 16:15:15.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-07-18 16:23:45.000000000) ---
+Patch Set 2:
+
+(6 comments)
+
+14 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre RISC-V Builder, 2026-07-18 16:34:46.000000000) ---
+Patch Set 2:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-07-18 16:41:38.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/127763/ : SUCCESS
+
+--- Message (Oleg Drokin, 2026-07-18 20:47:07.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-18 20:50:30.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-07-18 20:58:10.000000000) ---
+Patch Set 3:
+
+(10 comments)
+
+10 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre RISC-V Builder, 2026-07-18 21:00:17.000000000) ---
+Patch Set 3:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-07-18 21:13:25.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/127772/ : SUCCESS
+
+--- Message (Oleg Drokin, 2026-07-19 02:57:14.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-07-21 01:24:45.000000000) ---
+Patch Set 3:
+
+(6 comments)
+
+--- Message (Oleg Drokin, 2026-07-22 01:07:43.000000000) ---
+Patch Set 3:
+
+(2 comments)
+
+--- Message (Timothy Day, 2026-07-22 13:43:03.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+--- Message (Marc Vef, 2026-07-22 13:52:35.000000000) ---
+Hashtag added: master-next
+
+--- Message (Marc Vef, 2026-07-22 13:52:36.000000000) ---
+Patch Set 3:
+
+[Marc Bot] Note: This change has been cherry-picked to master-next and is considered for landing. Please avoid updates unless required while the master-next hashtag is set; doing so may cause the patch to be removed from master-next and not landed. Note: AI review comments should be addressed/responded to.
+
+--- Message (Marc Vef, 2026-07-22 13:52:36.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Oleg Drokin, 2026-07-26 00:05:21.000000000) ---
+Uploaded patch set 4.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Oleg Drokin, 2026-07-26 00:07:07.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-26 00:08:53.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-07-26 00:12:30.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre RISC-V Builder, 2026-07-26 00:22:22.000000000) ---
+Patch Set 4:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-07-26 00:31:40.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128101/ : SUCCESS
+
+--- Message (Andreas Dilger, 2026-07-26 03:20:03.000000000) ---
+Patch Set 4: Code-Review+1
+
+(1 comment)
+
+--- Message (Timothy Day, 2026-07-27 14:41:52.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+--- Message (Gerrit AI review for Lustre, 2026-07-27 20:06:51.000000000) ---
+Patch Set 4:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Experimental feature testing in progress, please pay attention to the comments
+
+Some concerns, see inline comments. The drain narrows the window but does not close it: the loop's completion test (s_inodes empty) can become true while a concurrent evictor is still on its way to cl_inode_fini(), so cl_sb_fini() can still be reached with a live cl_object. Waiting on something that tracks the cl_object refcount (or on lu_site/ld_ref draining) rather than on the VFS inode list would make the fix deterministic instead of timing-dependent.
+
+--- Message (Sebastien Buisson, 2026-08-06 13:14:43.000000000) ---
+Patch Set 4: Code-Review+1
+
+--- Message (Marc Vef, 2026-08-10 07:49:03.000000000) ---
+Hashtag removed: master-next
+
+--- Message (Marc Vef, 2026-08-10 07:49:04.000000000) ---
+Patch Set 4:
+
+[Marc Bot] Note: This change has been removed from master-next and is no longer considered for landing in its current form.
+
+--- Message (Marc Vef, 2026-08-10 07:49:05.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Marc Vef, 2026-08-13 13:19:08.000000000) ---
+Hashtag added: master-next
+
+--- Message (Marc Vef, 2026-08-13 13:19:08.000000000) ---
+Patch Set 4:
+
+[Marc Bot] Note: This change has been cherry-picked to master-next and is considered for landing. Please avoid updates unless required while the master-next hashtag is set; doing so may cause the patch to be removed from master-next and not landed. Note: AI review comments should be addressed/responded to.
+
+--- Message (Marc Vef, 2026-08-13 13:19:09.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Marc Vef, 2026-08-20 09:42:52.000000000) ---
+Hashtag removed: master-next
+
+--- Message (Marc Vef, 2026-08-20 09:42:52.000000000) ---
+Patch Set 4:
+
+[Marc Bot] Note: This change has been removed from master-next and is no longer considered for landing in its current form.
+
+--- Message (Marc Vef, 2026-08-20 09:42:53.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Oleg Drokin, 2026-08-22 23:05:20.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-22 23:10:56.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-22 23:17:00.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-08-22 23:46:09.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130011/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-23 00:44:10.000000000) ---
+Patch Set 5:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-23 12:29:55.000000000) ---
+Patch Set 5:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, minor comments inline.
+
+--- Message (Oleg Drokin, 2026-09-04 21:33:44.000000000) ---
+Uploaded patch set 6.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-04 21:44:00.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-04 21:48:40.000000000) ---
+Patch Set 6:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-04 23:15:41.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131075/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-05 08:08:03.000000000) ---
+Patch Set 6:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-09-06 08:08:52.000000000) ---
+Patch Set 6:
+
+Looks good to me.

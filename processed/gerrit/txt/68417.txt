@@ -1,0 +1,951 @@
+Change:     68417
+Subject:    LU-20650 lfs: add find --since, from the changelog
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68417
+Change-Id:  I13426ef1ed12cd08d78aa5a5da9f8ba4465690d2
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Hiroshi Nishida
+Created:    2026-08-26 16:04:40.000000000
+Updated:    2026-10-14 04:07:56.000000000
+Patch Set:  20
+Insertions: +1258
+Deletions:  -14
+Comments:   131 (2 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
+
+--- Commit Message ---
+LU-20650 lfs: add find --since, from the changelog
+
+Add "lfs find --since TIME|INDEX" and llapi_find_since(). They run
+find's predicates only over the objects that an MDT changelog reports
+as changed, so a periodic search does not have to walk the whole
+namespace.
+
+The three pieces were already here.  llapi_scan_changelog() says which
+objects had an event, llapi_scan_fid() fills each one's record the way
+a walk fills it, and find_decide() judges it with the predicates a
+walk uses.  --since composes them, so it answers over fewer objects
+and judges each the same way: the objects are a subset, never a
+different set.  A hardlinked file is printed once rather than once
+per link -- a walk reaches it once per directory entry, while --since
+reaches it once per FID and prints the first of its names that is
+under the root and matches.  No new predicates and no second copy of the
+vocabulary.
+
+Coalescing gives an object one record per burst, so one object can
+arrive more than once in a run.  Each FID is kept in one set across
+bursts and MDTs.  It is done once it was printed, could not be read
+or was undecided; find_decide() now sets fc_matched at print: to say
+so.  An object the lookup did not find is not done: a rename between
+fid2path and the stat looks the same, so a later record looks again.
+A rejected object is looked up again for a later record
+whose event is less than FIND_SINCE_CLOCK_SLACK seconds older than
+that lookup: a change made after the lookup may make it match, and
+the next run starts past it.
+
+An MDT whose changelog cannot be read does not end the search.  The
+first such error is kept, the other MDTs are read, and it is returned
+at the end, unless fp_stop_on_error is set.
+
+The argument is never guessed.  A bare integer is an index, which is
+what "lfs changelog MDT <startrec>" already takes; a single-unit
+duration (30m, 2h, 7d) is that far back from now; a timestamp or
+@<seconds> is that time; anything else is an error naming the four
+spellings.  Only a value that starts with a digit is read as a
+number, so a sign is refused, even after a space, rather than wrapped
+through strtoull().  A duration reaching past the epoch is a typo
+rather than a window.
+
+cr_index belongs to one MDT, so a bare index is refused on a
+filesystem with more than one and the message says which time
+spellings do work.  That count has to be right, and the obvious source
+is not: LL_IOC_GETOBDCOUNT answers with the size of the LMV's target
+array, so a single-MDT filesystem reports 64.  It is used as an upper
+bound and each index confirmed with llapi_search_tgt() before its
+changelog is read.  A count that cannot be read at all is an error
+rather than a bound of one, which would search MDT0000 alone and say
+nothing.
+
+A changelog covers the whole filesystem, so the subtree the caller
+named is enforced against the pathname llapi_scan_fid() resolved, and
+the depth the walk would have counted is recovered from it for
+--maxdepth and --mindepth.  Without that, a find rooted at one
+directory would answer for its siblings.  --mdt is answered from the
+index in the record: llapi_scan_fid() fills its own find_param, so
+the index is copied into the caller's for check_mdt_match().
+
+Against every name the object has, not just the resolved one.
+llapi_scan_fid() resolves linkno 0, so a hardlinked file arrives under
+whichever name fid2path answered with first: with /a/f and /b/f the
+same inode, "lfs find /a --since 2h" would be handed b/f, reject it,
+and lose a file a walk of /a prints.  -name has the same shape, which
+is why a target scan walks every linkea name.  The names come from
+fid2path here, one ioctl each, and only a file whose link count says
+it has another name pays for any of them.
+
+A time anchor is cut on the record rather than at the start index,
+because a time cannot be turned into a per-MDT index without reading
+the log; coalescing has already reduced an object to its latest event,
+so an object whose latest event is older than the window did not
+change in it.  An object unlinked between its event and now cannot be
+verified, so it is not in the answer -- that is what the flag gives up
+-- and the run says how many were dropped that way.
+
+--since is refused for a target scan rather than ignored.  lfs find
+parses the option for a target scan as well, so `lfs find --local
+--since 2h` would parse and then scan the whole target:
+llapi_find_device() has no changelog to anchor on and never reads
+fp_since_kind.  It joins the list find_device_supported() already
+keeps for --maxdepth, --threads and -printf.
+
+llapi_find_since() refuses fp_thread_count above 1 for itself, once
+its arguments are well formed and before any MDT is read: this source
+reads one MDT's changelog at a time and has no work to divide.  So
+lfs_find() computes the default thread count on the walk's arm of the
+dispatch rather than above it -- computed for every search, the
+default alone is above 1 and the refusal would fire on every --since
+run, which is not a setting the caller made.
+
+The mount point is found from realpath() of the root, not from the
+spelling, so the subtree test and the mount agree for a symlinked
+path (/home/user/data -> /mnt/lustre/data), a relative one, and one
+under $MOUNT2.  llapi_search_mounts() matches mnt_dir literally, and
+a relative path would otherwise reach the first mount of the
+filesystem by its fsname.
+
+What is printed is then the caller's spelling of that root with the
+resolved remainder appended, because a walk prints the path as it was
+given -- param_callback() copies the argument and
+llapi_semantic_traverse() appends to it.  Named from the mount every
+time, "lfs find . --since 2h" would answer /mnt/lustre/sub/f where
+"lfs find ." answers ./sub/f, and --since promises the same answer as
+the search without it.
+
+ONLY=56 is the regression check that the shared paths still answer as
+they did; the subtests for the new options arrive with the tests
+patch at the end of this series.
+
+Two things the page is careful about.  An MDT with no registered user
+does not record at all, rather than recording and purging:
+mdd_changelog_off() clears CLM_ON when the last user deregisters and
+mdd_changelog_enabled() requires it.  And the usage string spells the
+argument TIME|INDEX rather than TIME, because a bare integer is a
+changelog index -- the one distinction the parser goes out of its way
+to make, and the one a reader is most likely to get wrong.
+
+llapi_find() and llapi_find_with_cb() return -EINVAL for a set
+fp_since_kind instead of walking with it ignored.
+
+Test-Parameters: testlist=sanity env=ONLY=56
+Signed-off-by: Hiroshi Nishida <hnishida@thelustrecollective.com>
+Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
+Change-Id: I13426ef1ed12cd08d78aa5a5da9f8ba4465690d2
+
+--- Review History ---
+
+--- Message (Hiroshi Nishida, 2026-08-26 16:04:40.000000000) ---
+Uploaded patch set 1.
+
+--- Message (wc-checkpatch, 2026-08-26 16:13:09.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-26 16:32:22.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-27 04:24:36.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130408/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-27 16:04:45.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-27 21:51:23.000000000) ---
+Patch Set 1:
+
+(11 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The main one is that this path skips find_prefilter(), so --since answers a different question than a plain find for -name and --mdt-count. There is also no test: the patch adds a user-visible option but nothing under lustre/tests/ exercises it, and Test-Parameters only re-runs sanity test_56 as it already was; a case that creates files, reads them back with 'lfs find <dir> --since <n>m' and compares against the same find without --since would have caught the -name gap.
+
+--- Message (Hiroshi Nishida, 2026-08-28 00:00:00.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-28 00:09:14.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-28 00:38:32.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-28 02:04:05.000000000) ---
+Patch Set 2:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-28 02:35:24.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130498/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-08-28 20:26:50.000000000) ---
+Patch Set 2:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The rest of this series lands its user-visible surface with coverage (sanity.sh for llapi_scan_namespace, conf-sanity.sh for the device scans, a C test for llapi_scan_changelog), but nothing here exercises --since: no sanity 56 subtest builds a changelog and checks that `lfs find <dir> --since <t>` returns the same set as the plain find restricted to what changed, and none of the four argument spellings or the multi-MDT index refusal is tested. Could a test_56 case be added?
+
+--- Message (Hiroshi Nishida, 2026-08-29 13:32:34.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-29 13:44:30.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-29 14:07:58.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-08-29 14:48:00.000000000) ---
+Patch Set 3:
+
+(4 comments)
+
+--- Message (Lustre RISC-V Builder, 2026-08-29 15:12:12.000000000) ---
+Patch Set 3:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-29 15:13:04.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130580/ : SUCCESS
+
+--- Message (Hiroshi Nishida, 2026-08-29 18:09:55.000000000) ---
+Uploaded patch set 4: Patch Set 3 was rebased.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-29 18:23:47.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-29 18:38:21.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-29 19:12:06.000000000) ---
+Patch Set 4:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-29 19:54:16.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130599/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-08-30 10:12:08.000000000) ---
+Patch Set 4:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, comments inline. One thing that looks worth fixing before landing: lfs_find_parse.c is compiled into lfind as well, so lfind now accepts --since and ignores it. The new behaviour also appears untested -- Test-Parameters names sanity ONLY=56 but no test_56* is added, and neither the index form, the four --since spellings, the subtree/maxdepth bound nor the hardlink case is exercised anywhere.
+
+--- Message (Hiroshi Nishida, 2026-08-30 14:47:27.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-08-30 14:48:21.000000000) ---
+Patch Set 5:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-08-30 15:01:45.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-30 15:16:18.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-30 15:47:41.000000000) ---
+Patch Set 5:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-30 16:45:10.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130632/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-08-31 08:08:09.000000000) ---
+Patch Set 5:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, comments inline. The new option is user-visible and there is no test for it anywhere under lustre/tests/ -- would a sanity case that writes a file, then checks `lfs find $DIR --since <window>` finds it and `--since <newer window>` does not, be worth adding here?
+
+--- Message (Hiroshi Nishida, 2026-08-31 14:07:31.000000000) ---
+Uploaded patch set 6.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-08-31 14:08:42.000000000) ---
+Patch Set 5:
+
+(4 comments)
+
+--- Message (wc-checkpatch, 2026-08-31 14:20:45.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-31 14:39:03.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-31 15:34:13.000000000) ---
+Patch Set 6:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-31 17:32:45.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130724/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-01 06:30:37.000000000) ---
+Patch Set 6:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, comments inline.
+
+--- Message (Hiroshi Nishida, 2026-09-01 16:24:32.000000000) ---
+Uploaded patch set 7.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-01 16:30:55.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Hiroshi Nishida, 2026-09-01 16:36:29.000000000) ---
+Patch Set 6:
+
+(5 comments)
+
+Round 17: replies to the review comments on this patch set.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-01 16:53:10.000000000) ---
+Patch Set 7:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-01 17:50:07.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130801/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-01 18:24:17.000000000) ---
+Patch Set 7:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-09-02 23:38:54.000000000) ---
+Patch Set 7:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, minor comments inline.
+
+--- Message (Hiroshi Nishida, 2026-09-03 15:58:48.000000000) ---
+Uploaded patch set 8.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-03 16:32:44.000000000) ---
+Patch Set 8:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-09-03 16:59:55.000000000) ---
+Patch Set 8:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Hiroshi Nishida, 2026-09-03 18:11:55.000000000) ---
+Patch Set 7:
+
+(3 comments)
+
+--- Message (jenkins, 2026-09-03 18:56:37.000000000) ---
+Patch Set 8: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130962/ : SUCCESS
+
+--- Message (wc-checkpatch, 2026-09-03 20:11:26.000000000) ---
+Patch Set 8:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Gerrit AI review for Lustre, 2026-09-04 12:35:23.000000000) ---
+Patch Set 8:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The composition of llapi_scan_changelog() + llapi_scan_fid() + find_decide() reads well, but one error path ends the whole search where a walk would carry on.
+
+--- Message (Hiroshi Nishida, 2026-09-04 21:56:30.000000000) ---
+Uploaded patch set 9.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-04 22:08:35.000000000) ---
+Patch Set 9:
+
+(13 comments)
+
+--- Message (wc-checkpatch, 2026-09-04 22:08:37.000000000) ---
+Patch Set 9:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-04 22:50:25.000000000) ---
+Patch Set 9:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-05 02:00:18.000000000) ---
+Patch Set 9: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/131103/ : FAILURE
+
+--- Message (Lustre RISC-V Builder, 2026-09-05 04:46:59.000000000) ---
+Patch Set 9:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Hiroshi Nishida, 2026-09-06 19:08:17.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Hiroshi Nishida, 2026-09-06 19:12:41.000000000) ---
+Patch Set 9:
+
+(1 comment)
+
+--- Message (Hiroshi Nishida, 2026-09-09 03:23:05.000000000) ---
+Uploaded patch set 10.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-09 03:37:19.000000000) ---
+Patch Set 10:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-09 03:58:54.000000000) ---
+Patch Set 10:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-09 06:00:14.000000000) ---
+Patch Set 10: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/131393/ : FAILURE
+
+--- Message (Lustre RISC-V Builder, 2026-09-09 12:12:07.000000000) ---
+Patch Set 10:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Hiroshi Nishida, 2026-09-09 17:04:40.000000000) ---
+Uploaded patch set 11: Patch Set 10 was rebased.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-09 17:14:54.000000000) ---
+Patch Set 11:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-09 17:23:40.000000000) ---
+Patch Set 11:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-09 17:49:27.000000000) ---
+Patch Set 11: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131441/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-09 23:51:13.000000000) ---
+Patch Set 11:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Hiroshi Nishida, 2026-09-10 14:30:42.000000000) ---
+Uploaded patch set 12: Patch Set 11 was rebased.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-10 14:44:32.000000000) ---
+Patch Set 12:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-10 14:58:11.000000000) ---
+Patch Set 12:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-10 15:54:25.000000000) ---
+Patch Set 12: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131522/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-10 16:12:45.000000000) ---
+Patch Set 12:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-09-11 23:15:56.000000000) ---
+Patch Set 12:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Only optional nits from this pass, inline. None of them is a reason to re-spin on its own; they would ride along free on a refresh that happens for other reasons.
+
+--- Message (Hiroshi Nishida, 2026-09-16 15:15:46.000000000) ---
+Patch Set 12:
+
+(1 comment)
+
+--- Message (Hiroshi Nishida, 2026-10-05 23:41:12.000000000) ---
+Uploaded patch set 13.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-10-05 23:41:55.000000000) ---
+Patch Set 13:
+
+(4 comments)
+
+--- Message (wc-checkpatch, 2026-10-05 23:46:58.000000000) ---
+Patch Set 13:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-06 00:05:27.000000000) ---
+Patch Set 13:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-06 01:14:21.000000000) ---
+Patch Set 13: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132895/ : SUCCESS
+
+--- Message (Autotest, 2026-10-06 09:34:09.000000000) ---
+Patch Set 13:
+
+Onyx Autotest retesting enforced review-dne-zfs-part-5 session on el9.7-x86_64/zfs servers and clients for build 132895 patch 13. Requested by Hiroshi Nishida because of LU-20501.
+
+--- Message (Gerrit AI review for Lustre, 2026-10-06 15:58:18.000000000) ---
+Patch Set 13:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Needs a refresh: --mdt gives a wrong answer under --since (see inline). While at it, the inline minors can ride along.
+
+--- Message (Hiroshi Nishida, 2026-10-06 22:56:44.000000000) ---
+Uploaded patch set 14.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-10-06 22:57:03.000000000) ---
+Patch Set 13:
+
+(4 comments)
+
+--- Message (wc-checkpatch, 2026-10-06 23:07:51.000000000) ---
+Patch Set 14:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-06 23:19:45.000000000) ---
+Patch Set 14:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-07 00:24:56.000000000) ---
+Patch Set 14: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132985/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-07 13:56:52.000000000) ---
+Patch Set 14:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good; two minor points inline, fine to pick up whenever the patch is next refreshed. No need to re-spin for them.
+
+--- Message (Autotest, 2026-10-07 21:16:29.000000000) ---
+Patch Set 14:
+
+Trevis Autotest retesting enforced review-dne-zfs-part-4 session on el10.1-x86_64/zfs servers and clients for build 132985 patch 14. Requested by Hiroshi Nishida because of LU-17077.
+
+--- Message (Hiroshi Nishida, 2026-10-08 00:06:07.000000000) ---
+Uploaded patch set 15.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-10-08 00:06:18.000000000) ---
+Patch Set 14:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-10-08 00:15:23.000000000) ---
+Patch Set 15:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-08 00:34:31.000000000) ---
+Patch Set 15:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-08 01:55:50.000000000) ---
+Patch Set 15: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133084/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-08 15:54:51.000000000) ---
+Patch Set 15:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, minor comments inline. None of them needs a re-spin by itself; they can ride along on the next refresh.
+
+--- Message (Hiroshi Nishida, 2026-10-09 11:46:43.000000000) ---
+Uploaded patch set 16.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-10-09 11:46:54.000000000) ---
+Patch Set 15:
+
+(5 comments)
+
+--- Message (wc-checkpatch, 2026-10-09 11:51:03.000000000) ---
+Patch Set 16:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-09 12:14:04.000000000) ---
+Patch Set 16:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-09 12:54:42.000000000) ---
+Patch Set 16: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133278/ : SUCCESS
+
+--- Message (Hiroshi Nishida, 2026-10-10 02:20:59.000000000) ---
+Uploaded patch set 17.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-10-10 02:30:39.000000000) ---
+Patch Set 17:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-10 02:41:03.000000000) ---
+Patch Set 17:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-10 02:59:15.000000000) ---
+Patch Set 17: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133324/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-10 21:26:52.000000000) ---
+Patch Set 17:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The subtree issue changes the exit status of an ordinary search and is worth fixing in this refresh. The other two are minor.
+
+--- Message (Hiroshi Nishida, 2026-10-10 23:16:28.000000000) ---
+Uploaded patch set 18.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-10-10 23:16:50.000000000) ---
+Patch Set 17:
+
+(3 comments)
+
+--- Message (wc-checkpatch, 2026-10-10 23:19:12.000000000) ---
+Patch Set 18:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-10 23:35:00.000000000) ---
+Patch Set 18:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-11 00:50:20.000000000) ---
+Patch Set 18: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133366/ : SUCCESS
+
+--- Message (Autotest, 2026-10-11 06:40:37.000000000) ---
+Patch Set 18:
+
+Onyx Autotest retesting enforced review-dne-part-4 session on el10.1-x86_64/ldiskfs servers and clients for build 133366 patch 18. Requested by Hiroshi Nishida because of LU-20834.
+
+--- Message (Gerrit AI review for Lustre, 2026-10-11 12:42:59.000000000) ---
+Patch Set 18:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, a few minor comments inline. None of them needs a re-spin on its own; they can ride along on the next refresh.
+
+--- Message (Hiroshi Nishida, 2026-10-12 06:12:28.000000000) ---
+Uploaded patch set 19.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-10-12 06:12:46.000000000) ---
+Patch Set 18:
+
+(3 comments)
+
+--- Message (wc-checkpatch, 2026-10-12 06:14:11.000000000) ---
+Patch Set 19:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-12 06:32:53.000000000) ---
+Patch Set 19:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-12 07:42:04.000000000) ---
+Patch Set 19: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133436/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-13 16:50:51.000000000) ---
+Patch Set 19:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good; two optional comments inline. Neither needs a re-spin on its own.
+
+--- Message (Hiroshi Nishida, 2026-10-14 02:12:00.000000000) ---
+Uploaded patch set 20.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-10-14 02:12:23.000000000) ---
+Patch Set 19:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-10-14 02:13:53.000000000) ---
+Patch Set 20:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-14 02:44:39.000000000) ---
+Patch Set 20:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-14 04:06:06.000000000) ---
+Patch Set 20: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133618/ : SUCCESS

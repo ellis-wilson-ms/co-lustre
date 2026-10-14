@@ -1,0 +1,200 @@
+Change:     67322
+Subject:    LU-19955 osd: flush the old EOF page after a growing fallocate
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67322
+Change-Id:  I92e6a67f29a06dc6ca2a5a89c5cc3b63bf447ec6
+Project:    fs/lustre-release
+Branch:     master
+Status:     MERGED
+Owner:      Oleg Drokin
+Created:    2026-07-17 03:29:47.000000000
+Updated:    2026-07-25 16:28:51.000000000
+Patch Set:  2
+Insertions: +11
+Deletions:  -1
+Comments:   3 (1 unresolved)
+Hashtags:   testfix
+
+--- Labels ---
+  Code-Review: Andreas Dilger: +1; Alex Zhuravlev: +1; Oleg Drokin: +2
+  Verified: jenkins: +1; Maloo: +1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder
+  REVIEWER: Oleg Drokin, Andreas Dilger, Alex Zhuravlev
+
+--- Commit Message ---
+LU-19955 osd: flush the old EOF page after a growing fallocate
+
+fsx based tests intermittently LBUG the OSS:
+
+  LustreError: (osd_io.c:1525:osd_write_commit())
+          ASSERTION( !PageDirty(lnb[i].lnb_page) ) failed
+
+osd_write_commit() requires that no page it is handed is dirty.  That
+holds only if nothing leaves a dirty page behind in the OST page
+cache, because osd_get_page() reuses an existing page cache page for
+an IO that bypasses the cache, rather than allocating a private one,
+to avoid data aliasing.
+
+fsx issues fallocate(FALLOC_FL_ZERO_RANGE) without FALLOC_FL_KEEP_SIZE,
+so a zero range that reaches past EOF grows the file.  osd_fallocate()
+defers such a request to osd_execute_fallocate(), which calls into
+ldiskfs and then flushes the range it asked for:
+
+	rc = file->f_op->fallocate(file, mode, start, end - start);
+	if (rc == 0)
+		osd_partial_page_flush_punch(d, inode, start, end - 1);
+
+ldiskfs_zero_range() allocates the blocks via
+ldiskfs_alloc_file_blocks(), which, as it extends i_size, does:
+
+	if (epos > old_size) {
+		pagecache_isize_extended(inode, old_size, epos);
+		ldiskfs_zero_partial_blocks(handle, inode,
+					    old_size, epos - old_size);
+	}
+
+That zeroes - and with mark_buffer_dirty() dirties - the partial block
+at the *old* EOF.  The old EOF is unrelated to [start, end), so the
+range flush above never covers it and the page stays dirty in the page
+cache.  A write that lands on it before the next journal commit writes
+it back picks it up out of the page cache and hits the assert.
+
+Instrumenting osd_execute_fallocate() on a growing zero range shows the
+page left behind, and shows it gone once the old EOF is flushed too:
+
+  before: start=65536 end=69632 old_size=49999 new_size=69632 rc=0
+          dirty_tag=1 nrpages=1
+  after:  start=65536 end=69632 old_size=49999 new_size=69632 rc=0
+          dirty_tag=0 nrpages=0
+
+A crash dump agrees: the asserting page is a page cache page (mapping
+set, private_2 clear) at the offset the write covers, PG_dirty and
+PG_private set but PG_uptodate clear, while its sole buffer_head is
+Uptodate|Dirty|Mapped - the state ldiskfs_block_zero_page_range()
+leaves, since it reads the block in and dirties the buffer but never
+marks the folio uptodate.  It was the only dirty page in the mapping,
+no punch was in flight, and neither the fallocate nor writeback had
+reported an error.
+
+Flush the partial page at the old EOF when the fallocate grew the file.
+osd_partial_page_flush() already skips the case where the old EOF was
+block aligned and ldiskfs had nothing to zero.
+
+The other edge ldiskfs zeroes, at epos - 1, is inside [start, end) and
+is already covered.
+
+No separate test is required as fsx in sanityn hits this pretty
+reliably and a synthetic test seems complicated due to a relative
+small window.
+
+Fixes: cb037f305c ("LU-14160 fallocate: Add punch mode to fallocate")
+Test-Parameters: testlist=sanity,sanityn,sanity-benchmark,sanity-flr,sanity-dom
+Signed-off-by: Oleg Drokin <green@whamcloud.com>
+Assisted-by: ClaudeCode:Opus-4.8 llm_code_and_review_tools
+Change-Id: I92e6a67f29a06dc6ca2a5a89c5cc3b63bf447ec6
+Reviewed-on: https://review.whamcloud.com/c/fs/lustre-release/+/67322
+Tested-by: Maloo <maloo@whamcloud.com>
+Tested-by: jenkins <devops@whamcloud.com>
+Reviewed-by: Alex Zhuravlev <bzzz@whamcloud.com>
+Reviewed-by: Andreas Dilger <adilger@thelustrecollective.com>
+
+--- Review History ---
+
+--- Message (Oleg Drokin, 2026-07-17 03:29:47.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-17 03:32:22.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-07-17 03:33:40.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-07-17 03:42:25.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-07-17 04:16:24.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/127712/ : SUCCESS
+
+--- Message (Alex Zhuravlev, 2026-07-17 05:41:43.000000000) ---
+Patch Set 1: Code-Review+1
+
+--- Message (Andreas Dilger, 2026-07-17 20:44:19.000000000) ---
+Patch Set 1: Code-Review+1
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-07-17 20:53:09.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Autotest, 2026-07-17 20:54:57.000000000) ---
+Patch Set 1:
+
+Onyx Autotest 2 retesting enforced review-dne-part-5 session on el9.7-x86_64/ldiskfs servers and clients for build 127712 patch 1. Requested by Andreas Dilger because of LU-16489.
+
+--- Message (Autotest, 2026-07-17 20:57:56.000000000) ---
+Patch Set 1:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-5 session on el9.7-x86_64/zfs servers and clients for build 127712 patch 1. Requested by Andreas Dilger because of LU-16489.
+
+--- Message (Maloo, 2026-07-17 20:59:47.000000000) ---
+Patch Set 1:
+
+#### The following Test-Parameters sessions will be run for Build 127712 (patch #1):
+
+- Test-Parameters: testlist=sanity-benchmark env=ONLY=fsx,ONLY_REPEAT=20
+
+--- Message (Autotest, 2026-07-17 21:03:05.000000000) ---
+Patch Set 1:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-4 session on el10.1-x86_64/zfs servers and clients for build 127712 patch 1. Requested by Andreas Dilger because of LU-17077.
+
+--- Message (Andreas Dilger, 2026-07-17 21:18:30.000000000) ---
+Hashtag added: testfix
+
+--- Message (Andreas Dilger, 2026-07-17 23:24:30.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Autotest, 2026-07-20 14:07:30.000000000) ---
+Patch Set 1:
+
+Trevis Autotest 2 retesting enforced review-dne-zfs-part-5 session on el9.7-x86_64/zfs servers and clients for build 127712 patch 1. Requested by Andreas Dilger because of LU-16489.
+
+--- Message (Autotest, 2026-07-20 17:38:55.000000000) ---
+Patch Set 1:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-5 session on el9.7-x86_64/zfs servers and clients for build 127712 patch 1. Requested by Andreas Dilger because of LU-16489.
+
+--- Message (Marc Vef, 2026-07-22 13:52:28.000000000) ---
+Hashtag added: master-next
+
+--- Message (Marc Vef, 2026-07-22 13:52:28.000000000) ---
+Patch Set 1:
+
+[Marc Bot] Note: This change has been cherry-picked to master-next and is considered for landing. Please avoid updates unless required while the master-next hashtag is set; doing so may cause the patch to be removed from master-next and not landed. Note: AI review comments should be addressed/responded to.
+
+--- Message (Marc Vef, 2026-07-22 13:52:29.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Oleg Drokin, 2026-07-23 23:07:21.000000000) ---
+Patch Set 1: Code-Review+2
+
+--- Message (Oleg Drokin, 2026-07-23 23:07:30.000000000) ---
+Change has been successfully cherry-picked as f2ffe89c0d38cfab952c7d9d0a25e13336c7ed8f
+
+--- Message (Marc Vef, 2026-07-25 16:28:51.000000000) ---
+Hashtag removed: master-next

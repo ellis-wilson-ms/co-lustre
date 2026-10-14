@@ -1,0 +1,242 @@
+Change:     67547
+Subject:    LU-12571 llite: deterministic reproducers for the umount LBUG
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67547
+Change-Id:  I9a65f1818a0b488a201a367dc1df82b4ca23140f
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Oleg Drokin
+Created:    2026-07-26 00:05:21.000000000
+Updated:    2026-09-06 08:34:16.000000000
+Patch Set:  3
+Insertions: +349
+Deletions:  -2
+Comments:   36 (14 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: -1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
+  REVIEWER: Timothy Day
+
+--- Commit Message ---
+LU-12571 llite: deterministic reproducers for the umount LBUG
+
+This change makes the intermittent LU-12571 umount crash deterministic so
+that the fix ("LU-12571 llite: drain straggling cl_objects before
+cl_sb_fini") can be exercised.  It renames sanity-sec test_54 to test_54a
+and adds test_54b and test_54c.
+
+Both fail_locs model the straggling reference the same way production
+produces it, with an igrab() taken on a lookup and an iput() from another
+thread part way into the umount -- which is what ll_lock_cancel_bits()
+does via ll_inode_from_resource_lock() from the ldlm callback thread.
+They differ in what they pin:
+
+OBD_FAIL_LLITE_FSCRYPT_UMOUNT_PIN (0x143a) pins only the cross-tree
+.fscrypt metadata files.  On a subdir (fileset) mount, /.fscrypt is
+presented from the real fs root (LU-15176), instantiating a cross-tree
+dcache subtree whose regular-file inodes carry cl_objects; that is the
+shape the crash is reported in.  ll_splice_alias() igrabs those inodes,
+selected by their parent's name, and client_common_put_super() hands them
+to a short delayed work that iputs them.
+
+OBD_FAIL_LLITE_UMOUNT_IGRAB_PIN (0x143b) pins any regular-file inode
+spliced in, so it needs no encryption at all: three files read on a fresh
+mount are enough, and there is nothing fscrypt-shaped to go stale.
+
+Whichever of the two took the pins, the release thread is stalled for
+500ms in two places -- in ll_delete_inode(), standing in for the OST RPCs
+cl_sync_file_range() issues below it, and in vvp_object_free(), standing
+in for the work lu_object_free() does before lu_object_fini() hands the
+device reference back.  The stall is keyed on the releasing thread, not
+on the fail_loc.  Those two stalls make the two windows observable -- the
+first is the one an sb->s_inodes-based drain cannot cover, the second the
+one a site-object-hash-based drain cannot cover.
+
+The pin is on the inode and not on the dentry.  A dentry still referenced
+when generic_shutdown_super() calls shrink_dcache_for_umount(), which is
+before ->put_super(), trips umount_check()'s WARN() in fs/dcache.c, so a
+dget()-based pin would leave a kernel warning and a stack trace in dmesg
+on every passing run and would kill a panic_on_warn client before the code
+under test was reached.  evict_inodes() passes over a pinned inode
+silently, and an inode reference is what the production straggler is
+anyway.
+
+The pins are per-superblock, and so is the cap on them:
+client_common_put_super() claims only the entries whose inode belongs to
+the superblock it is tearing down, and the cap counts only those.  A
+second mount -- sanity-sec routinely has $MOUNT and $MOUNT2 -- therefore
+neither releases another mount's pins, nor loses its own, nor eats the
+slots the mount under test needs, which matters because cfs_fail_loc is
+node-global.  The release runs on
+system_unbound_wq rather than system_wq, because it sleeps for about a
+second per pin, which the bounded per-CPU pool is the wrong place for, and
+because a congested system_wq could otherwise push the release past the
+drain budget and fail a client that is correctly fixed.
+
+sanity-sec test_54b drives 0x143a end to end: it subdir-mounts an
+encrypted vault, arms the fail_loc, unlocks via the virtually-presented
+/.fscrypt, and unmounts.  test_54c drives 0x143b on a plain mount.  Both
+check that the injection actually fired, by counting the pins in the debug
+log before the umount, so that a lookup served from cache or a changed
+fscrypt metadata layout fails the test rather than passing it without
+reproducing anything.
+
+The number of pins is capped, at three by default and at fail_val when
+that is set.  Each one costs the release thread about a second of the
+umount's finite drain budget, so an uncapped injection on a lookup-heavy
+workload would exhaust even a fixed client and LBUG it -- the opposite of
+what the reproducer is for.
+
+These reproducers are intentionally invasive -- they add a pin path to the
+dentry lookup and umount paths and a stall to inode eviction -- and are
+provided as a separate change to demonstrate the fix; they need not land
+with it.  What production pays for them is a load: ll_splice_alias() and
+the pin selection are behind CFS_FAIL_PRECHECK() on the two fail_locs, and
+the two stall sites read ll_test_pin_task, which is NULL unless a release
+is in flight.
+
+Signed-off-by: Oleg Drokin <green@whamcloud.com>
+Change-Id: I9a65f1818a0b488a201a367dc1df82b4ca23140f
+Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
+
+--- Review History ---
+
+--- Message (Oleg Drokin, 2026-07-26 00:05:21.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Oleg Drokin, 2026-07-26 00:06:18.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-26 00:08:58.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-07-26 00:09:40.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: Cannot build patch due to 10, messages:
+
+ b'git checkout error!\n'
+
+--- Message (wc-checkpatch, 2026-07-26 00:12:20.000000000) ---
+Patch Set 1:
+
+(8 comments)
+
+8 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-07-26 00:34:58.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128102/ : SUCCESS
+
+--- Message (Timothy Day, 2026-07-27 14:40:29.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Gerrit AI review for Lustre, 2026-07-27 20:06:42.000000000) ---
+Patch Set 1:
+
+(8 comments)
+
+AI code review results below, please doublecheck
+
+Experimental feature testing in progress, please pay attention to the comments
+
+Some concerns, see inline comments. The injection reproduces the failure by pinning at the dentry level, which trips the VFS's own "Dentry still in use" WARN in shrink_dcache_for_umount() before ->put_super() is even reached, and the hand-off between the release work and the teardown is a 300ms-vs-5s timing coincidence rather than a synchronised one; both are worth resolving before this is used as the demonstration vehicle for the fix. Separately, test_54a already performs exactly this sequence (encrypt a vault, subdir-remount it, unlock through the virtual /.fscrypt, umount) at lines 6528-6548 -- arming the fail_loc around that existing umount would give the same coverage without ~60 duplicated lines and without renaming a long-standing subtest.
+
+--- Message (Oleg Drokin, 2026-07-28 00:30:02.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Oleg Drokin, 2026-08-22 23:05:20.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-22 23:11:01.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-22 23:16:49.000000000) ---
+Patch Set 2:
+
+(8 comments)
+
+8 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-08-22 23:35:17.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130010/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-23 01:51:45.000000000) ---
+Patch Set 2:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-23 11:47:03.000000000) ---
+Patch Set 2:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, minor comments inline. The two injections and the drain they exercise line up with the fix they are meant to demonstrate; nothing here looks like a correctness problem in the production paths.
+
+--- Message (Oleg Drokin, 2026-09-04 21:33:44.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-04 21:44:06.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-04 21:49:02.000000000) ---
+Patch Set 3:
+
+(3 comments)
+
+3 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-04 23:10:33.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131074/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-05 07:41:23.000000000) ---
+Patch Set 3:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-09-06 08:34:16.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Looks good; one optional note inline for whenever this is next refreshed - no need to re-spin for it.

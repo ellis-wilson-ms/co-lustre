@@ -1,0 +1,1222 @@
+Change:     68347
+Subject:    LU-10026 ofd: csdc final integration patch
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68347
+Change-Id:  I7b95416530b5d0f1994900ee4ae1ceb392046e32
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Marc Vef
+Created:    2026-08-25 21:12:47.000000000
+Updated:    2026-08-27 20:12:41.000000000
+Patch Set:  2
+Insertions: +3772
+Deletions:  -421
+Comments:   328 (5 unresolved)
+Hashtags:   csdc
+
+--- Labels ---
+  Code-Review: Marc Vef: -1
+  Verified: jenkins: -1
+
+--- Reviewers ---
+  CC: Artem Blagodarenko, Lustre RISC-V Builder
+  REVIEWER: Zhenyu Xu, Alex Zhuravlev, Hongchao Zhang, Li Dongyang, Sergey Cheremencev, Sebastien Buisson, Marc Vef
+
+--- Commit Message ---
+LU-10026 ofd: csdc final integration patch
+
+Add calls to the csdc functions from the regular read/write paths.
+This also brings OFD range locking back for compressed objects,
+reverting commit a21ce928aa64 ("LU-15894 ofd: revert range locking
+in ofd") for this use case.
+
+ofd: rename 'local' in thread_big_cache
+
+It's not a big deal since it's only used a few times, but
+let's give this variable a descriptive name.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: Ide136cd42e885d59f1a2e4ce22a2e7449faca3f9
+
+ofd: rename map_remote_to_local
+
+osd_map_remote_to_local implies some complex role, but in
+fact what this does is initialize the fields of the
+local niobuf structs to represent the requested range.
+
+This *may* be the same as a remote niobuf, but it also
+isn't in some cases.  Name it osd_init_lnbs instead.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: I0d3b5f24e42ee8dc962437daea7cf9347ccb9059
+
+ofd: series description and reorder declarations
+
+Reorder declarations in tgt_brw_read prior to adding things.
+
+This trivial patch is a good place to put the description
+of this series, which handles unaligned reads to compressed
+files.
+
+-----------------------
+These patches handle compression chunk unaligned reads on
+the server.
+
+When using compression, the client attempts to send chunk
+aligned reads, but sometimes it can't, and the client will
+send a read to the server which is not chunk aligned.
+
+In this case, the server must read the full chunk,
+decompress it, and provide the requested data to the client.
+
+Here's how we do this.
+
+The server receives a set of remote niobufs describing IO
+from the client.  Each remote niobuf (rnb) describes a range
+of data the client wants to do IO to.
+
+These are translated to a set of local niobufs on the
+server, which we then use to do the read.  For compression,
+the server has to read complete chunks on unalinged reads.
+
+So we walk these remote niobufs and identify unaligned read
+requests (in ofd_preprw_read), then round them to chunk
+size. The server then reads the chunk rounded read request
+from storage.
+
+The local niobufs now contain a set of complete compressed
+chunks, ie, the raw data from disk.  We need to decompress
+the chunks where the client is doing an unaligned read, but
+leave the other chunks compressed (because the client will
+uncompress them).
+
+So, in obd_decompress_read, we use the remote niobuf to
+identify unaligned reads from the client.  We then walk the
+local niobufs, identify the chunks which match the unaligned
+reads from the client, and decompress them 'in place'.
+The decompression uses temporary buffers, but the
+decompressed data is placed back in the local niobuf.
+(If the data is uncompressed on disk, we of course do not
+decompress it.  This happens for incompressible data.)
+
+Now the local niobuf contains some raw chunks and some
+chunks which have been decompressed.  This is *more* data
+than the client asked for.  Normally, the server local
+niobuf contains exactly what the client asked for, so the
+server checksums and sends the entire local niobuf.  But
+because we read complete chunks, the local niobuf contains
+more data than the client requested.
+
+This means we need to identify the subset of the local
+niobuf which the client actually wants to read and present
+that to the client.
+
+In order to do that, we walk the local niobuf and use the
+remote niobufs (the description of the pages the client
+needs) and create a special tx niobuf which points to only
+the pages the client wants (io_lnb_to_tx_lnb).  Then we use
+this tx niobuf for checksum and transfer to the client.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: Ic89dcef7e169879725caa6cdef4619b9a76b2b37
+
+ofd: identify reads to round
+
+If the beginning or end of a client read is unaligned, we
+must round the locking.  This patch identifies reads where
+this is required, the next patch will do the locking.
+
+Print a debug message when such an IO is found, but don't
+do anything different - yet.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: Ibdab35b733225b4b1349ef457f66ca37dcb2d9bf
+
+ofd: round read lock to chunk
+
+For unaligned reads, we need to round the read locking to
+cover the any leading or trailing chunks.  We do this by
+creating a local 'remote niobuf' to describe the rounded
+range and doing the locking against that niobuf.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: I8818522c188aca3c5c5eb564da2a8ba8aef18a4b
+
+ofd: convert dt_bufs_get to offset, len
+
+dt_bufs_get takes a remote niobuf, but just uses the
+offset and length for getting pages.
+
+Compression requires rounding the local IO to include the
+full compression chunk, which means the local IO does not
+match the remote niobuf any more.
+
+So we modify dt_bufs_get to take an offset and length
+rather than a remote niobuf, so we can ask for the pages we
+need.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: I4beaf8207fa00d802c0a339df3de2a3c71154fc7
+
+ofd: add chunk_size to preprw_read
+
+preprw_read needs chunk size for rounding.  Add this in a
+separate patch to keep things trivial, it will be used in
+a subsequent patch.
+
+Also use this to add a check in DOM to ensure it doesn't
+attempt to do compression.  This should already be
+prevented by setstripe, so this is just an extra safety
+check.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: I9dc4d1559e5c8be315268a593466571b54c90a96
+
+ofd: add remote_pages
+
+When we round a read to get all of the compressed chunks,
+the number of local and the number of remote pages will
+differ.  We need to make sure we do the checksum and data
+transfer using the number of remote pages, not the number of
+local pages.
+
+This patch calculates the number of remote pages and uses it
+accordingly.  This doesn't do anything yet, but when we
+round the local read to include the whole compressed chunk,
+this will be needed.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: I4875b02016570d227b3b926efd117f0a7cda41b4
+
+tgt: add second tbc lnb for RDMA
+
+Compression requires the server to do local IO which differs
+from the IO requested by the client.  This means we cannot
+directly use the IO niobufs for doing the transfer to the
+client.
+
+So we add a second set of lnb pointers, which are used to
+point at a specific subset of the pages in the main
+per-thread cache.  This subset will be used for doing the
+transfer to the client.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: I53aa46045aaf335da20a311900ac0bf425823b22
+
+tgt: add io_lnb_to_tx_lnb
+
+With compression, the lnbs used for the disk IO on the
+server can contain more data than the client requested,
+due to reading up whole chunks for decompression.
+
+This means we need to transfer only a subset of the lnbs.
+We do this by creating a second set of lnbs, and pointing
+them at the pages in the local io lnb which need to be
+transferred to the client.
+
+This code doesn't do anything for now, but it will kick in
+with the next patch when we start rounding chunks for read.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: I0fe690718a3484578b139eaaec52c0c3b265da6a
+
+ofd: add chunk rounding to read
+
+We need to round all niobufs to chunk size in the read
+process, so we read in the full chunk.
+
+dt_bufs_get sets up the local niobuf for the read, so we
+round before calling it.
+
+This patch is a partial implementation of unaligned read
+support, and breaks compression testing until the next few
+patches are landed.  So this patch temporarily adds the
+compression tests to ALWAYS_EXCEPT.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: I587a519db4dae983db5db1d690e63e15bc010b7e
+
+ofd: add chunk_size to preprw_write
+
+preprw_write needs chunk size for rounding.  Add this in a
+separate patch to keep things trivial, it will be used in
+a subsequent patch.
+
+This patch is really trivial on the write side, since the
+read side already did most of this.  But it's being kept
+separate for symmetry.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: Id25957dbc185b6e61b7f208cee8cf5f897f03944
+
+ofd: do not use page cache for compressed files
+
+It is challenging for the server to safely use the page
+cache with compressed files, because if data is
+decompressed in to the page cache, the data in cache now
+differs from the data on disk.
+
+This is a problem if *part* of the page cache is ever
+evicted, because we can end up with a situation where a read
+will be partially satisfied from cache and partially from
+disk, but the data on disk is compressed and the data in
+cache is not.
+
+It is possible to deal with this by carefully ensuring the
+page cache is not used just for decompressed data, but this
+makes getting the buffers/lnbs for compressed files fairly
+complicated.  Instead, we can just entirely block using the
+server page cache for compressed files.
+
+This must be done for both read and write, and only works
+for ldiskfs - ZFS cannot easily be forced to not use its
+page cache.  But that's OK because we do not support CSDC
+with ZFS.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: Iee73abb29ad5631bb2203c2133756d7ebf5b686d
+
+ofd: add ofd_decompress_read implementation
+
+ofd_decompress_read is responsible for walking the
+remote niobufs (rnbs) in the RPC and identifying if they
+are chunk unaligned.  It then passes them on to the rnb
+decompression code (not implemented yet, see next patch).
+
+It also allocates the bounce buffers for decompression so
+they can be reused for each remote niobuf.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: I1f2f86ce3fc036ac5d79b060a5e44f6564e123aa
+
+ofd: lock pages from read to decompression
+
+When using the page cache on the server, for pages which
+will be decompressed, we can't unlock them until they've
+been decompressed.
+
+Rather than only waiting to unlock the pages which will be
+decompressed, we keep all of the read pages locked.  This
+simplifies the code, at the cost of delaying other reads to
+the aligned portion of an unaligned read.  ie, shouldn't be
+important in practice.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: Ie98920327979a5c9600e8c9e8627816461ea1a34
+
+ofd: (ofd part)add obd level compression lib
+
+Some compression functions will be used by several areas of
+of Lustre, so they need to be in obdclass.
+
+This moves merge_chunk and unmerge_chunk there and adds the
+ability for them to merge lnbs.  This is used in a future
+patch.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: If4a318119bb7685e41adb9f3b31a66074031e6ac
+
+ofd: make compress_chunk take chunk_bits
+
+Chunk bits is used everywhere, have compress_chunk convert
+to log bits rather than have the callers do it.
+
+Was-Signed-off-by: Patrick Farrell <pfarrell@whamcloud.com>
+
+ofd: add decompress_rnb implementation
+
+This implements decompress_rnb, which is the core code for
+handling unaligned reads from the client.
+
+Decompress rnb takes an unaligned remote niobuf and
+identifies the unaligned portion(s) of the IO, then finds
+the corresponding local niobufs (pages read from disk),
+and passes them on for decompression in place.
+
+decompress_chunk_in_lnb decompresses the data in a set of
+lnbs and copies it back to the same location, replacing the
+raw data from disk with decompressed data.  (If the chunk
+was not compressed, it does nothing.)
+
+With this patch, the implementation of unaligned reads is
+complete and we can add the compression sanity tests back
+safely.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: Ifd1d9b03d5d004bec3f5e456da359b8d10e005f9
+
+ofd: improve decompress_rnb debug
+
+Since we're very close on landing the unaligned read
+patches, this minor debug improvement is being placed later
+in the series.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: I36ad243bd1f7025e358f9593f1008f0b851cc1bb
+
+tgt: reorder tgt_brw_write decls
+
+Reorder the declarations in tgt_brw_write.
+
+This patch also serves as the series head for implementing
+read-modify-write support for compressed chunks.
+
+The process for read-modify-write is similar to that used
+for unaligned reads.
+
+At a high level, read-modify-write means we must read up,
+decompress, then recompress and write back the data.  This
+only applies when we're actually doing read-modify-write.
+
+To know when to do this, we rely partly on the client.  If
+the client is able to compress a chunk, either because it is
+a complete chunk, or because the start is chunk aligned and
+the write is past EOF, we know there is no read-modify-write
+required.  Either there is no existing data (write past EOF)
+or the data will be fully replaced.
+
+So, when we see a write which is not fully chunk aligned and
+not already compressed, we will do a read-modify-write.
+
+For this, we round the IO lnbs and associated locking to
+cover complete chunks, then we do a read of the unaligned
+chunks.
+
+ie, if we have a write which goes from 63 KiB to 257 KiB
+with a chunk size of 64 KiB, we will read 0-64 KiB and
+256-320 KiB, and decompress those chunks in to the buffer.
+64 KiB to 256 KiB is *NOT* read, because those are complete
+chunks.
+
+We then set up a transfer mapping - identical to the process
+for unaligned reads - so the client data is written in to
+the correct lnbs.
+
+Now we have a set of chunk aligned lnbs which contain data
+updated with the client write.  In the initial version, we
+write these to disk uncompressed.  This is sufficient for
+correct operation, but it does mean read-modify-write will
+decompress those chunks.
+
+There is code for recompression, but it is not working 100%
+yet, and there are some complexities around managing holes
+and EOF which still need to be resolved.
+
+TBD if this will make our initial release - I am hopeful but
+not sure yet.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: Ia24583d4221f498928e99afa8c289b70e4d25f5b
+
+tests: unaligned read tests
+
+This adds testing for handling unaligned reads and partial
+chunk reads from compressed files.
+
+Testing for writes and multi-client and racing tests will
+be added later, but we put the checking function in
+test-framework now so it's easy to use later.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: I06217c8aeba75016aa4168f329026842dff1d979
+
+obd: add error check in merge_chunk
+
+If the lnbs we're trying to merge have an error recorded in
+them, then they're not going to be valid input for
+decompression, so return an error.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: I1bf17131cb65106087eb5e72e2700db30c0cc975
+
+obd: do not decompress empty lnbs
+
+For reads which cross EOF, we may get lnbs with no data in
+them (similarly for writes which cross EOF).
+
+For these cases, it's important to only copy from the lnbs
+where there is data, and only do decompression on the lnbs
+if there's actually data in them.
+
+Modify merge chunk to do this.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: I83fefcfa6d1396dcd97fad994334bf29438bb4bf
+
+ofd: clear pages in decompression
+
+Handling writes to compressed files requires a
+read-modify-write cycle, which has implications for how we
+handle reads.
+
+Consider the case of a file with an 8 KiB write at offset 0,
+which is compressed to 4 KiB.  Then there is another 4 KiB
+write at offset 16 KiB.
+
+Updating this correctly requires reading the first chunk,
+then decompressing it.  However, this read will go past
+EOF, because the write has not occurred yet.  The OSD read
+code does not fill in these pages, because read past EOF is
+not returned to the client (client gets a short read and
+does not actually use the pages).
+
+In our case, however, we must use these pages (from 8 KiB
+16 KiB).  In the naive version without recompression, we
+simply write out 0 - 16 KiB, so we must have zeroes in
+those pages, and once we have recompression, we must
+compress those pages so we need zeroes in that case too.
+
+So we note if a page has data in it after decompression,
+then if it does not, we clear the page.  Note we do NOT set
+lnb_rc to 0 when we clear a page, because lnb_rc = 0 is
+used to indicate EOF rather than a gap in the file.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: If1d1360185eb087e821167a08e49c9427e29ffc4
+
+tgt: identify writes to round
+
+If the beginning or end of a client write is unaligned, we
+must round the locking.  This patch identifies writes where
+this is required, the next patch will do the locking.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: Iec140c24423a0da478f6d42ff6fc620d7ad3ba4a
+
+tgt: round write lock to chunk
+
+For unaligned writes, we need to round the write locking to
+cover the any leading or trailing chunks.  We do this by
+creating a local 'remote niobuf' to describe the rounded
+range and doing the locking against that niobuf.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: I2bdea620386ad229375647a0e2cc6180c9bd7aa6
+
+tgt: add remote_pages for writes
+
+When we round a write to get all of the compressed chunks,
+the number of local and the number of remote pages will
+differ.  We need to make sure we do the checksum and data
+transfer using the number of remote pages, not the number of
+local pages.
+
+This patch calculates the number of remote pages and uses it
+accordingly.
+
+Note that just like on the read side, this patch doesn't do
+anything until we're actually rounding the chunks for IO in
+a later patch.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: I38256070d68246613ce67b0bfe328f6443a95533
+
+csdc: fix ofd_preprw_write() for sanity 819b test
+
+Sanity 819b asserts:
+tgt_brw_write()) ASSERTION( npages_local == npages_remote )
+
+The test triggers fault inject in ofd_preprw_write():
+if (OBD_FAIL_CHECK(OBD_FAIL_OST_2BIG_NIOBUF))
+     rnb[i].rnb_len += PAGE_SIZE;
+
+ofd_preprw_write() calculates npages_local taking in account
+additional len from fault inject, BUT npages_remote is calulated
+BEFORE the fault inject. So npages_remote was not adjusted.
+
+To solve the problem it is enough to move range_to_page_count() call.
+
+DDN-bug-id: EX-9523
+Was-Change-Id: Ifd659985a78c7630049a17622aff2eb7f4525fb1
+
+tgt: add tx lnb for writes
+
+With compression, the lnbs used for the disk IO on the
+server can contain more data than the client requested,
+due to reading up whole chunks for decompression.
+
+This means the client is only going to write data in to
+a subset of the lnbs used for io to storage.
+
+We handle this the same way we do for reads:
+We create a second set of lnbs just for the transfer, and
+point these lnbs at the pages which will actually receive
+data from the client.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: I5b668547537698309792daf309842866be79f0b6
+
+ofd: switch preprw to chunk_bits
+
+The compression/decompression code requires chunk_bits
+rather than chunk size.  Since we need to call this code
+from ofd_preprw_write, we need chunk_bits there.
+
+This modifies the functions so chunk_bits is available
+there.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: Id98e6d6364eeaaa7753a8aba059387e3e659d2a2
+
+vvp: remove unaligned write restriction
+
+This series will resolve the unaligned write issue for
+compressed files, so we need to remove the restriction on
+unaligned writes in order to test it.
+
+This does not mean unaligned writes are working yet, but we
+need to make this change so the subsequent patches can be
+tested.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: I4abcbdcd18b00718099483c8dfdb9a7aa41c3ce7
+
+ofd: add chunk rounding to write
+
+For compressed files, we need to round all niobufs to
+chunk size in the write process, so we have buffers for
+reading in and rewriting the complete chunks.
+
+dt_bufs_get sets up the local niobuf for the write, so we
+round before calling it.
+
+Note this breaks writing to compressed files, which is not
+fixed until a few patches later.  For this reason, we
+disable the compression tests.  They will be reenabled
+shortly - similar to how we handled the read series.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: I413aaba9866dd7d6c4463fa620eadf1423379ba1
+
+ofd: add read to write process
+
+This adds a very simple read to the write process, which
+just reads up the entire chunk-rounded write range.
+
+This is a first step - the read will eventually be modified
+to only read the unaligned portions which must be
+decompressed for read-modify-write.  We will create a
+special lnb mapping which contains only the pages which must
+be read for decompression (similar to the tx lnb mapping).
+
+For now, this read allows us to test decompression without
+handling the mapping.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: I169ddc2e161094aebdad1a60ec62e9c1d75cd6d8
+
+ofd: add decompress_read to ofd_preprw_write
+
+We have read up the compressed data from disk, now we must
+decompress it so we can rewrite it successfully.
+
+This code still works on the whole lnbs rather than just on
+the portion of it which is unaligned.  This is temporary
+and will be resolved by a future patch.
+
+With this patch, we have basic read-modify-write support,
+so we can re-enable testing.  The next patch adds tests
+for read-modify-write.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: Ib6503c15e9fb3d425a7bc295bcc61b41c089a1f0
+
+ofd: add read lnb to ofd_preprw_write
+
+The read phase of read-modify-write for compressed files
+needs to read only a subset of the pages which will be
+written, so it needs a separate set of lnb pointers for
+tracking this subset.
+
+This patch passes around the necessary argument but does
+not set up or use the lnb yet.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: I7ec7101e65e73a6c9e67cea3c58d8cace38e70e0
+
+ofd: distinguish nr_write and nr_read
+
+We will have two counts of pages in lnbs, distinguish
+between them.
+
+Not actually used yet - will be calculated when the read
+lnb mapping is created.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: I709b8fd299163d348a196184152bb0294fcb650b
+
+ofd: create read mapping for read-modify-write
+
+When we need to do a read-modify-write for unaligned writes
+to a compressed file, it's important we read only the
+portion of the file which is receiving unaligned IO.
+
+This patch identifies these chunks in preprw_write and
+creates a read lnb mapping from a subset of the pages for
+write.  These pages we read up are then decompressed.
+
+Note one issue this patch does not address is reading of
+data past EOF.  If the final chunk is unaligned, we will
+round the write to cover it.  This results in extending the
+file inappropriately, writing zeroes where they aren't
+needed.  The read side gives us the info to address this,
+which we will do in a future patch.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: Iede43f12127cbb93e73c22a915192aa2f814a927
+
+osd: add assert for prepare partial page
+
+In the write prep code, we read up any partial pages (pages
+which are not completely overwritten by the write) to
+prepare them for write.  But for compressed files, we will
+have already done this to prepare for decompression.
+
+Add an assert to make sure we catch if this is ever wrong.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: I1366b1f5b191a4d581448d692933d562198c3a1f
+
+ofd: minor debug improvements
+
+A smattering of minor debug improvements across several
+patches, placed at the end because they're all minor and
+some of them would disturb early parts of the series.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: I2071911eb09f5c7fad28203db05396bb31ccda59
+
+ofd: set compressed file size for fake writes
+
+When using the fake writes fail_loc, file size setting is
+done at the ofd layer, since the osd layer isn't used.  So
+we must also handle the compressed file size for this case.
+
+This fixes sanity test 399a with compression.
+
+DDN-bug-id: EX-8826
+Was-Change-Id: Icda612405908166d043e1e568d0d8bd9cd0c5156
+
+tgt: objcount in RPC must be 1
+
+Much of the BRW write code assumes objcount is one, but
+there is some provision for multiple objects.
+
+Since the code will break if we send it multiple objects,
+add errors to make sure anyone changing it will notice.
+
+This isn't strictly compression related, but compression
+adds even more code which assumes this, so this protection
+will be useful.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: Idcbf33fd14d4b1bd179c9516bed07cca907008bc
+
+ofd: multiple reads in same chunk
+
+When doing DIO or if we get unusual cache behavior on the
+client, multiple reads can hit the same chunk.
+
+This only shows up in racing tests, but it's important to
+handle.  We do this by making sure we start searching the
+lnbs for decompression at the start of the last chunk we
+decompressed.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: I81fbbba79b16066e6d4519c66030cc58e03d2de7
+
+ofd: don't read for writes past eof
+
+There's no data past EOF, so there's no need to do
+read-modify-writes when the entire write is past the chunk
+at EOF.  So in that case, don't read up data and don't
+attempt decompression.
+
+There's no explicit test for this, but this shows up
+immediately in the random-offset copy tests, because they
+seek and write various sizes to offsets past current EOF.
+
+We also need this functionality for reads, because in some
+cases the client will do reads past EOF (this is unusual,
+but can still happen sometimes).  This is added in a
+separate patch because it requires some code reorganization.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: Ia2b598165d5645c5a44c3d58bea69c7e42f10e41
+
+ofd: same-ify preprw_read and preprw_write
+
+preprw_read and preprw_write have some sections which are
+functionally the same but which have diverged slightly.
+(These can't easily be shared between the functions.)
+
+This is a short patch to make them more similar before
+adding eof checking to reads.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: I7bce912e99e61a4eec4060d6b49d4917894b44c4
+
+ofd: put decompress_read in read prep
+
+ofd_decompress_read is called from ofd_write_prep for
+writes, but from tgt_brw_read for reads.  This makes the
+code a little harder to follow and makes it difficult to
+check read side decompression against EOF.
+
+Instead, we move the decompression call to ofd_preprw_read.
+This makes no change to the real operations here, but makes
+for better code (and more similar code between read and
+write).
+
+DDN-bug-id: EX-7601
+Was-Change-Id: Ibefd0a48ad08e83725f2df64618db60ba61c5ce0
+
+ofd: add past eof check for reads
+
+The client does not normally generate reads past EOF, but
+this can occur during some racing situations.  We need to
+check for that case and not attempt decompression, since
+there's no data to decompress if we're reading past EOF.
+
+This covers a failure which shows up occasionally in the
+racing parts of the test suite, but it's challenging to
+write an explicit test for this.
+
+We also add handling for complete reads of the last chunk,
+even if that chunk is partial, because we can send that to
+the client for decompression.
+
+This allows us to remove the slightly funky eof handling
+in decompress_rnb, since we'll just not call that code in
+this case now.  Note we'll still call decompress_rnb, etc,
+for writes if they start before EOF and finish after EOF
+(and are unaligned).  This is fine - this case should be
+rare and if we hit it, we'll notice there's nothing to
+decompress and proceed accordingly.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: I50295f2803af611de5069d094c0a5d1b0a4a9c2d
+
+ofd: add checks to io_lnb_to_tx_lnb
+
+We should always be able to find the remote niobuf in the
+local io range, if we can't, there's a bug.  So assert on
+this.
+
+We should also never have page level overlapping remote IOs,
+at least until we have unaligned DIO.  (We can remove this
+check when we combine the features.)
+
+DDN-bug-id: EX-7601
+Was-Change-Id: I325d4a37d25c116e42621964e90b225b71fd8f1f
+
+tests: tests for read-modify-write
+
+This patch adds tests for the read-modify-write case for
+EX-7601.  There's still some additional tests to be added
+here, but this is a good start.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: I5dd9e566b8274ece99283c8962e0d34225089cc0
+
+tests: use alternative data source for rewriting
+
+Using the same file as input has disadvantages. It is not
+possible to understand that data was not rewritten at all.
+Alternative data source should be used.
+
+Let's shift source file data and use it as a source.
+To check rewriting result the same operarion is performed
+on the destination file copy stored outside the Lustre FS.
+
+DDN-bug-id: EX-8598
+Was-Change-Id: I6ef400520359bfe9156c3f47e757064863bdf4e0
+
+tests: add multi-mount compression test
+
+This adds a multi-mount correctness test for compression.
+This races IO from two mountpoints at varying sizes to
+stress test compression.
+
+DDN-bug-id: EX-7601
+Was-Change-Id: If49cbd6d171068faa802835146f273d835b39bc3
+
+obd: add 'lvl' for best and fast
+
+'best' and 'fast' compression types must also set a level,
+because not all levels are supported by all algorithms.
+
+Rather than trying to be clever, just use simple universally
+supported values, except for lz4fast, where we special case
+this, because otherwise '0' is the slowest setting (and
+lz4fast is likely to remain our default fastest).
+
+DDN-bug-id: EX-6269
+Was-Change-Id: I7c29659d4f027af2e44285ae38e4c9d91e35509a
+
+ofd: use niocount consistently
+
+'niocount' refers to the number of remote niobufs, ie, the
+number of separate IOs from the client.  Except for a few
+places, where it's used to refer to the number of pages in
+the entire RPC.  Eek.
+
+Replace this usage with 'npages', making niocount usage
+consistent.
+
+DDN-bug-id: EX-8993
+Was-Change-Id: I266087ad8dccadb54c054b0a11fb03dc9868a725
+
+csdc: allow specify 'fast'/'best' compression type
+
+Use lctl set_param osc.*.compress_type_{fast|best}=<type>:<level>
+to specify the compression_type:level for LL_COMPR_TYPE_FAST/
+LL_COMPR_TYPE_BEST.
+
+lctl get_param osc.*.compress_type_{fast|best} will list these
+values.
+
+DDN-bug-id: EX-8311
+Was-Change-Id: Ifeff7f25e30fc0884f0c770a3b6d0798937b3c35
+
+lfs: not iterate compr_type_table using ARRAY_SIZE
+
+patch modifies compr_type_table to contain NULL fields in the
+array, so iterate over the array should not use ARRAY_SIZE, but skip
+those elements with NULL compression type name.
+
+DDN-bug-id: EX-8311
+Was-Change-Id: I8e4988fd3a63c1cb66f75510d190c2ebc4f8f9be
+
+ofd: handle 'missing object' reads
+
+When the read code (eg, mdt_preprw_read) finds there is no
+object, it will return a read with 0 pages, but not fail the
+read.  The assert for local and remote pages needs to
+recognize this case.
+
+DDN-bug-id: EX-8996
+Was-Change-Id: Idc6ff70f71abc100f750a63eca73a754a56f6435
+
+ofd: do not write 'hole' pages on compression
+
+When doing unaligned read-modify-write to a compressed file,
+we must round the IO lnb used for write in order to read up
+the compressed data for modification.
+
+In some cases, this creates a situation where there are
+pages in the write lnb which have no data in them.  It is
+important not to write out these pages, because if we do,
+this wastes space and can cause incorrect file size.
+
+In most cases, the file size is covered by the client
+sending the file size, but if the client does not compress
+a particular write, it does not send the size and the server
+does not use it.  We could resolve this by having the client
+always send size info and have the server always use it, but
+it's better to make server writes 'hole' aware, since this
+improves space usage.  (And this will be required for the
+server to do recompression on read-modify-write, otherwise
+no space is gained.)
+
+DDN-bug-id: EX-8993
+Was-Change-Id: I66169e205fe4691ed03b2c9b3005ffc4ecd3213d
+
+obdclass: disable T10PI guard from disk when decompressing
+
+When server handles chunk unaligned read, we need to read
+the chunk from disk and decompress the raw data.
+This means we should not use the guard tags from the storage,
+as they only match the raw data.
+Disable the guard from disk and the T10PI checksum will be
+recalculated later using decompressed data.
+
+DDN-bug-id: EX-9108
+Was-Change-Id: I49964e1412e9d02769797c64aab290b17851e26f
+
+ofd: take local chunk-aligned lock
+
+On OST side to prevent racing read-modify-write against same
+compressed chunk from the same client.
+
+DDN-bug-id: EX-9192
+Was-Change-Id: Iffaf2d2856e276cb2f9becce2506154314217e3c
+
+csdc: Do not print error if a chunk is not compressed
+
+is_chunk_start() can decide that a chunk can not be decompressed in
+two cases: 1) chunk has not been compressed 2) chunk is corrupted
+
+The error message should be printed only in case 2)
+
+DDN-bug-id: EX-9784
+Was-Change-Id: I85f4850f989ba0fc8f00653f8f6b0f1b4837d625
+
+osd: add @read param to dt_write_prep()
+
+the purpose is to skip full page reading when OSD is aked for
+pages to be written later. in CSDC we need all data as the
+pages can be compressed and we may need to decompress them
+first.
+
+DDN-bug-id: EX-9858
+Was-Change-Id: I2ea9888a1dab419275dbee97e9acc661101b5262
+
+ofd: new structures and data for csdc in ofd
+
+just structures and few helper function to manipulate
+chunks and buffers.
+
+DDN-bug-id: EX-9858
+Was-Change-Id: I25931f8360a30689a027eaf05ad6c43b4f1746f9
+
+ofd: chunk decompress function
+
+ofd_decompress_chunk() is to literally decompress chunks.
+it uses kernel's vmap infrastructure to create a virtual
+linear buffer from the pages provided by OSD.
+
+memcpy vs vm_map_ramp()+vm_unmap_ram() benchmark as it's
+a replacement for memcpy, each operation repeats 1M times
+in each thread, then cost in usec is calculated:
+
+memcpy 32 pages 1 threads - 2404282998, 2404 usec/1
+memcpy 32 pages 2 threads - 4830830436, 2415 usec/1
+memcpy 32 pages 4 threads - 10098563354, 2524 usec/1
+
+vmap 32 pages 1 threads - 1088538713, 1088 usec/1
+vmap 32 pages 2 threads - 2207667980, 1103 usec/1
+vmap 32 pages 4 threads - 4613110111, 1153 usec/1
+
+memcpy 64 pages 1 threads - 5564630189, 5564 usec/1
+memcpy 64 pages 2 threads - 15904163026, 7952 usec/1
+memcpy 64 pages 4 threads - 30345722986, 7586 usec/1
+
+vmap 64 pages 1 threads - 1587480151, 1587 usec/1
+vmap 64 pages 2 threads - 3190874847, 1595 usec/1
+vmap 64 pages 4 threads - 6887315343, 1721 usec/1
+
+the benchmark was done in qemu (6 cores enabled).
+
+DDN-bug-id: EX-9858
+Was-Change-Id: Ia46406401d3c8d720065cc8000b6a52d1a437349
+
+ofd: vm_map_ram prot argument
+
+From kernel 5.8 commit d4efd79a81 "mm: remove the prot argument from
+vm_map_ram" the vm_map_ram() function does not accept a prot argument
+anymore.
+
+DDN-bug-id: EX-9858
+Was-Change-Id: Ib878ba6c6a214ebc0b0716392ce9b7e91bb74453
+
+ofd: csdc read helpers
+
+few functions to implement read path in ofd.
+
+DDN-bug-id: EX-9895
+Was-Change-Id: Idca3b095471dbbf177b4026853aa716414280757
+
+ofd: csdc write helpers
+
+few functions to implement write path in ofd.
+
+DDN-bug-id: EX-9895
+Was-Change-Id: I0f6802b0911bd358bdb69e0ddb5e8581878cb9dc
+
+ofd: csdc truncate support
+
+to truncate a compressed file correctly we may need to
+convert a compressed chunk into a regular one first.
+
+DDN-bug-id: EX-9895
+Was-Change-Id: Ia8a3b12eda81874e209046eef1afd33e165561b0
+
+ofd: ofd_object_punch_compr
+
+Fix potential memory leak in ofd_object_punch_compr.
+It might not release orig_lnb in case of error from
+ofd_trans_create or ofd_map_niobuf_to_chunks.
+
+DDN-bug-id: EX-11092
+Was-Change-Id: I45bafdbbf06036add5b5fa9993cbac9e06c856e9
+
+tests: couple new FAIL codes
+
+and trivial way to break a compressed chunk on a disk.
+
+DDN-bug-id: EX-9858
+Was-Change-Id: I5516ab3d7add4eb5d76292cf15ac220db08a7150
+
+csdc: expand filter_fid
+
+Expand filter_fid to include compression information, for
+compatibility reason, if the file is an uncompressed file, still
+store the old filter_fid with no compression info in FID EA.
+
+WasChange-Id: I388500c03604749d05849aeed3c9141974540e4a
+
+lfsck: support compression in filter_fid
+
+The OST object compression info has been stored in filter_fid
+by EX-8038, the LFSCK also needs to handle the compression info
+during processing the filter_fid.
+
+DDN-bug-id: EX-6247
+Was-Change-Id: Id050214ba0057776a05c194dc9222117c5d7fd8b
+
+ofd: add info in overflow error message
+
+Such a message should help to inverstigate which
+client triggered the overflow.
+
+DDN-bug-id: EX-9895
+Was-Change-Id: I701d8c8fb2a37684ecb0cd5cd272321c715db864
+
+ofd: reject incomplete compressed chunks
+
+client can send a compressed tail, but this RPC can race with another
+newer RPC containing bits (uncompressed) from the same compression
+chunk as the first RPC. OST can't handle such a compressed partial
+chunk properly (that would need to decompress into a temp buffer,
+then merge back to disk buffers). but we can ask the client to resend
+this RPC uncompressed.
+
+DDN-bug-id: EX-10402
+Was-Change-Id: I5e854be4300d50bc8368911782018fb6fa6d38fa
+
+Test-Parameters: forjanitoronly
+Signed-off-by: Patrick Farrell <pfarrell@whamcloud.com>
+Signed-off-by: Artem Blagodarenko <ablagodarenko@ddn.com>
+Signed-off-by: Bobi Jam <bobijam@whamcloud.com>
+Signed-off-by: Li Dongyang <dongyangli@ddn.com>
+Signed-off-by: Alex Zhuravlev <bzzz@whamcloud.com>
+Signed-off-by: Artem Blagodarenko <artem.blagodarenko@hpe.com>
+Signed-off-by: Sebastien Buisson <sbuisson@ddn.com>
+Signed-off-by: Sergey Cheremencev <scherementsev@ddn.com>
+Signed-off-by: Hongchao Zhang <hongchao@whamcloud.com>
+Signed-off-by: Marc Vef <mvef@whamcloud.com>
+Change-Id: I7b95416530b5d0f1994900ee4ae1ceb392046e32
+
+--- Review History ---
+
+--- Message (Marc Vef, 2026-08-25 21:12:47.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Marc Vef, 2026-08-25 21:14:33.000000000) ---
+Hashtag added: csdc
+
+--- Message (wc-checkpatch, 2026-08-25 21:16:12.000000000) ---
+Patch Set 1:
+
+(160 comments)
+
+186 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Marc Vef, 2026-08-25 21:24:00.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Lustre Gerrit Janitor, 2026-08-25 21:30:04.000000000) ---
+Patch Set 1:
+
+(4 comments)
+
+rocky9.6: Compile failed
+
+
+ Job output URL: https://testing.whamcloud.com/gerrit-janitor/68786/results.html
+
+--- Message (Lustre RISC-V Builder, 2026-08-26 03:24:38.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: Cannot build patch due to 13, messages:
+
+ b"build error!\n   CC [M]  /home/ahalim/lustre-release/lustre/llite/vvp_io.o\n   CC [M]  /home/ahalim/lustre-release/lustre/ptlrpc/../ldlm/ldlm_flock.o\n   CC [M]  /home/ahalim/lustre-release/lustre/ptlrpc/../ldlm/ldlm_inodebits.o\n   CC [M]  /home/ahalim/lustre-release/lustre/llite/vvp_object.o\n   CC [M]  /home/ahalim/lustre-release/lustre/llite/pcc.o\n   CC [M]  /home/ahalim/lustre-release/lustre/ptlrpc/../ldlm/ldlm_pool.o\n   CC [M]  /home/ahalim/lustre-release/lustre/llite/crypto.o\n   CC [M]  /home/ahalim/lustre-release/lustre/ptlrpc/../ldlm/ldlm_reclaim.o\n   CC [M]  /home/ahalim/lustre-release/lustre/llite/llite_foreign.o\n   CC [M]  /home/ahalim/lustre-release/lustre/ptlrpc/../ldlm/ldlm_cache_policy.o\n   CC [M]  /home/ahalim/lustre-release/lustre/llite/llite_foreign_symlink.o\n   CC [M]  /home/ahalim/lustre-release/lustre/llite/acl.o\n   LD [M]  /home/ahalim/lustre-release/lustre/ptlrpc/ptlrpc.o\n   LD [M]  /home/ahalim/lustre-release/lustre/llite/lustre.o\n make[3]: *** [scripts/Makefile.build:480: /home/ahalim/lustre-release/lustre] Error 2\n make[2]: *** [/usr/src/linux-headers-6.6.63/Makefile:1921: /home/ahalim/lustre-release] Error 2\n make[1]: *** [Makefile:234: __sub-make] Error 2\n make[1]: Leaving directory '/usr/src/linux-headers-6.6.63'\n make: *** [Makefile:144: __modules] Error 2\n === make completed in 8m 58s ===\n"
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-26 09:02:27.000000000) ---
+Patch Set 1:
+
+Cannot build patch due to 14, messages:
+
+ make[4]: *** [scripts/Makefile.build:249: /home/green/git/lustre-release/lustre/osc/lproc_osc.o] Error 1
+make[3]: *** [scripts/Makefile.build:478: /home/green/git/lustre-release/lustre/osc] Error 2
+make[2]: *** [scripts/Makefile.build:478: /home/green/git/lustre-release/lustre] Error 2
+make[1]: *** [Makefile:1944: /home/green/git/lustre-release] Error 2
+make: *** [Makefile:144: __modules] Error 2
+ config/Makefile.codetags:29: warning: overriding recipe for target 'cscope'
+ autoMakefile:819: warning: ignoring old recipe for target 'cscope'
+ /home/green/git/lustre-release/lustre/osc/lproc_osc.c:999:25: error: initialization of âconst struct file_operations *â from incompatible pointer type âconst struct proc_ops *â [-Werror=incompatible-pointer-types]
+   999 |           .fops =       &osc_compress_type_fast_fops    },
+       |                         ^
+ /home/green/git/lustre-release/lustre/osc/lproc_osc.c:999:25: note: (near initialization for âldebugfs_osc_obd_vars[10].fopsâ)
+ /home/green/git/lustre-release/lustre/osc/lproc_osc.c:1001:25: error: initialization of âconst struct file_operations *â from incompatible pointer type âconst struct proc_ops *â [-Werror=incompatible-pointer-types]
+  1001 |           .fops =       &osc_compress_type_best_fops    },
+       |                         ^
+ /home/green/git/lustre-release/lustre/osc/lproc_osc.c:1001:25: note: (near initialization for âldebugfs_osc_obd_vars[11].fopsâ)
+
+--- Message (Marc Vef, 2026-08-26 09:47:36.000000000) ---
+Uploaded patch set 2.
+
+--- Message (wc-checkpatch, 2026-08-26 09:54:25.000000000) ---
+Patch Set 2:
+
+(158 comments)
+
+184 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre Gerrit Janitor, 2026-08-26 10:03:44.000000000) ---
+Patch Set 2:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/68847/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity-special1@ldiskfs+DNE sanity-special1@ldiskfs sanity-special2@ldiskfs+DNE sanity-special2@ldiskfs sanity-special3@ldiskfs+DNE sanity-special3@ldiskfs sanity-special4@ldiskfs+DNE sanity-special4@ldiskfs sanity-special5@ldiskfs+DNE sanity-special5@ldiskfs sanity-special6@ldiskfs+DNE sanity-special6@ldiskfs sanity-special7@ldiskfs+DNE sanity-special7@ldiskfs sanity-special8@ldiskfs+DNE sanity-special8@ldiskfs sanity-special9@ldiskfs+DNE sanity-special9@ldiskfs sanity-special10@ldiskfs+DNE sanity-special10@ldiskfs sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-special1@zfs sanity-special1@zfs+DNE sanity-special2@zfs sanity-special2@zfs+DNE sanity-special3@zfs sanity-special3@zfs+DNE sanity-special4@zfs sanity-special4@zfs+DNE sanity-special5@zfs sanity-special5@zfs+DNE sanity-special6@zfs sanity-special6@zfs+DNE sanity-special7@zfs sanity-special7@zfs+DNE sanity-special8@zfs sanity-special8@zfs+DNE sanity-special9@zfs sanity-special9@zfs+DNE sanity-special10@zfs sanity-special10@zfs+DNE sanity-compr-special1@ldiskfs+DNE sanity-compr-special1@ldiskfs sanity-compr-special2@ldiskfs+DNE sanity-compr-special2@ldiskfs sanity-compr-special3@ldiskfs+DNE sanity-compr-special3@ldiskfs sanity-compr-special4@ldiskfs+DNE sanity-compr-special4@ldiskfs sanity-compr-special5@ldiskfs+DNE sanity-compr-special5@ldiskfs sanity-compr-special6@ldiskfs+DNE sanity-compr-special6@ldiskfs sanity-compr-special7@ldiskfs+DNE sanity-compr-special7@ldiskfs sanity-compr-special8@ldiskfs+DNE sanity-compr-special8@ldiskfs sanity-compr-special9@ldiskfs+DNE sanity-compr-special9@ldiskfs sanity-compr-special10@ldiskfs+DNE sanity-compr-special10@ldiskfs sanity-compr-special1@ldiskfs+DNE sanity-compr-special1@ldiskfs sanity-compr-special2@ldiskfs+DNE sanity-compr-special2@ldiskfs sanity-compr-special3@ldiskfs+DNE sanity-compr-special3@ldiskfs sanity-compr-special4@ldiskfs+DNE sanity-compr-special4@ldiskfs sanity-compr-special5@ldiskfs+DNE sanity-compr-special5@ldiskfs sanity-compr-special6@ldiskfs+DNE sanity-compr-special6@ldiskfs sanity-compr-special7@ldiskfs+DNE sanity-compr-special7@ldiskfs sanity-compr-special8@ldiskfs+DNE sanity-compr-special8@ldiskfs sanity-compr-special9@ldiskfs+DNE sanity-compr-special9@ldiskfs sanity-compr-special10@ldiskfs+DNE sanity-compr-special10@ldiskfs sanity-compr-special1@ldiskfs+DNE sanity-compr-special1@ldiskfs sanity-compr-special2@ldiskfs+DNE sanity-compr-special2@ldiskfs sanity-compr-special3@ldiskfs+DNE sanity-compr-special3@ldiskfs sanity-compr-special4@ldiskfs+DNE sanity-compr-special4@ldiskfs sanity-compr-special5@ldiskfs+DNE sanity-compr-special5@ldiskfs sanity-compr-special6@ldiskfs+DNE sanity-compr-special6@ldiskfs sanity-compr-special7@ldiskfs+DNE sanity-compr-special7@ldiskfs sanity-compr-special8@ldiskfs+DNE sanity-compr-special8@ldiskfs sanity-compr-special9@ldiskfs+DNE sanity-compr-special9@ldiskfs sanity-compr-special10@ldiskfs+DNE sanity-compr-special10@ldiskfs sanity-compr-special1@zfs sanity-compr-special1@zfs+DNE sanity-compr-special2@zfs sanity-compr-special2@zfs+DNE sanity-compr-special3@zfs sanity-compr-special3@zfs+DNE sanity-compr-special4@zfs sanity-compr-special4@zfs+DNE sanity-compr-special5@zfs sanity-compr-special5@zfs+DNE sanity-compr-special6@zfs sanity-compr-special6@zfs+DNE sanity-compr-special7@zfs sanity-compr-special7@zfs+DNE sanity-compr-special8@zfs sanity-compr-special8@zfs+DNE sanity-compr-special9@zfs sanity-compr-special9@zfs+DNE sanity-compr-special10@zfs sanity-compr-special10@zfs+DNE sanity-compr-special1@zfs sanity-compr-special1@zfs+DNE sanity-compr-special2@zfs sanity-compr-special2@zfs+DNE sanity-compr-special3@zfs sanity-compr-special3@zfs+DNE sanity-compr-special4@zfs sanity-compr-special4@zfs+DNE sanity-compr-special5@zfs sanity-compr-special5@zfs+DNE sanity-compr-special6@zfs sanity-compr-special6@zfs+DNE sanity-compr-special7@zfs sanity-compr-special7@zfs+DNE sanity-compr-special8@zfs sanity-compr-special8@zfs+DNE sanity-compr-special9@zfs sanity-compr-special9@zfs+DNE sanity-compr-special10@zfs sanity-compr-special10@zfs+DNE sanity-compr-special1@zfs sanity-compr-special1@zfs+DNE sanity-compr-special2@zfs sanity-compr-special2@zfs+DNE sanity-compr-special3@zfs sanity-compr-special3@zfs+DNE sanity-compr-special4@zfs sanity-compr-special4@zfs+DNE sanity-compr-special5@zfs sanity-compr-special5@zfs+DNE sanity-compr-special6@zfs sanity-compr-special6@zfs+DNE sanity-compr-special7@zfs sanity-compr-special7@zfs+DNE sanity-compr-special8@zfs sanity-compr-special8@zfs+DNE sanity-compr-special9@zfs sanity-compr-special9@zfs+DNE sanity-compr-special10@zfs sanity-compr-special10@zfs+DNE sanity-lfsck@ldiskfs+DNE sanity-lfsck-special1@ldiskfs+DNE sanity-lfsck-special1@ldiskfs sanity-lfsck-special2@ldiskfs+DNE sanity-lfsck-special2@ldiskfs sanity-lfsck-special3@ldiskfs+DNE sanity-lfsck-special3@ldiskfs sanity-lfsck-special4@ldiskfs+DNE sanity-lfsck-special4@ldiskfs sanity-lfsck-special5@ldiskfs+DNE sanity-lfsck-special5@ldiskfs sanity-lfsck-special6@ldiskfs+DNE sanity-lfsck-special6@ldiskfs sanity-lfsck-special7@ldiskfs+DNE sanity-lfsck-special7@ldiskfs sanity-lfsck-special8@ldiskfs+DNE sanity-lfsck-special8@ldiskfs sanity-lfsck-special9@ldiskfs+DNE sanity-lfsck-special9@ldiskfs sanity-lfsck-special10@ldiskfs+DNE sanity-lfsck-special10@ldiskfs sanity-lfsck-special1@ldiskfs+DNE sanity-lfsck-special1@ldiskfs sanity-lfsck-special2@ldiskfs+DNE sanity-lfsck-special2@ldiskfs sanity-lfsck-special3@ldiskfs+DNE sanity-lfsck-special3@ldiskfs sanity-lfsck-special4@ldiskfs+DNE sanity-lfsck-special4@ldiskfs sanity-lfsck-special5@ldiskfs+DNE sanity-lfsck-special5@ldiskfs sanity-lfsck-special6@ldiskfs+DNE sanity-lfsck-special6@ldiskfs sanity-lfsck-special7@ldiskfs+DNE sanity-lfsck-special7@ldiskfs sanity-lfsck-special8@ldiskfs+DNE sanity-lfsck-special8@ldiskfs sanity-lfsck-special9@ldiskfs+DNE sanity-lfsck-special9@ldiskfs sanity-lfsck-special10@ldiskfs+DNE sanity-lfsck-special10@ldiskfs sanity-lfsck@zfs sanity-lfsck-special1@zfs sanity-lfsck-special1@zfs+DNE sanity-lfsck-special2@zfs sanity-lfsck-special2@zfs+DNE sanity-lfsck-special3@zfs sanity-lfsck-special3@zfs+DNE sanity-lfsck-special4@zfs sanity-lfsck-special4@zfs+DNE sanity-lfsck-special5@zfs sanity-lfsck-special5@zfs+DNE sanity-lfsck-special6@zfs sanity-lfsck-special6@zfs+DNE sanity-lfsck-special7@zfs sanity-lfsck-special7@zfs+DNE sanity-lfsck-special8@zfs sanity-lfsck-special8@zfs+DNE sanity-lfsck-special9@zfs sanity-lfsck-special9@zfs+DNE sanity-lfsck-special10@zfs sanity-lfsck-special10@zfs+DNE sanity-lfsck-special1@zfs sanity-lfsck-special1@zfs+DNE sanity-lfsck-special2@zfs sanity-lfsck-special2@zfs+DNE sanity-lfsck-special3@zfs sanity-lfsck-special3@zfs+DNE sanity-lfsck-special4@zfs sanity-lfsck-special4@zfs+DNE sanity-lfsck-special5@zfs sanity-lfsck-special5@zfs+DNE sanity-lfsck-special6@zfs sanity-lfsck-special6@zfs+DNE sanity-lfsck-special7@zfs sanity-lfsck-special7@zfs+DNE sanity-lfsck-special8@zfs sanity-lfsck-special8@zfs+DNE sanity-lfsck-special9@zfs sanity-lfsck-special9@zfs+DNE sanity-lfsck-special10@zfs sanity-lfsck-special10@zfs+DNE
+
+--- Message (jenkins, 2026-08-26 10:10:59.000000000) ---
+Patch Set 1: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/130280/ : FAILURE
+
+--- Message (Lustre Gerrit Janitor, 2026-08-26 10:18:24.000000000) ---
+Patch Set 2:
+
+Test script sanity-lfsck subtest test_18i that was touched by this patch failed with '(5) Data in /mnt/lustre/d18i.sanity-lfsck/f0 is broken'. This is just a heads up on first fatal failure and a full report would be posted on test completion. See the results link above if you want intermediate results.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-26 10:30:03.000000000) ---
+Patch Set 2:
+
+(3 comments)
+
+3 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-26 11:53:23.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+Crash (id 75333 seen 1) in sanity-lfsck@zfs
+- Failed run: https://testing.whamcloud.com/gerrit-janitor/68847/testresults/sanity-lfsck-special10-zfs-rocky8.10_x86_64-rocky8.10_x86_64
+
+--- Message (jenkins, 2026-08-26 21:44:54.000000000) ---
+Patch Set 2: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/130325/ : FAILURE
+
+--- Message (Lustre RISC-V Builder, 2026-08-27 01:39:47.000000000) ---
+Patch Set 2:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Marc Vef, 2026-08-27 20:12:41.000000000) ---
+Patch Set 2: Code-Review-1
+
+(1 comment)

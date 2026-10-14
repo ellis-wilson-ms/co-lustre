@@ -1,0 +1,428 @@
+Change:     67322
+Subject:    LU-19955 osd: flush the old EOF page after a growing fallocate
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67322
+Change-Id:  I92e6a67f29a06dc6ca2a5a89c5cc3b63bf447ec6
+Project:    fs/lustre-release
+Branch:     master
+Status:     MERGED
+Owner:      Oleg Drokin
+Created:    2026-07-17 03:29:47.000000000
+Updated:    2026-07-25 16:28:51.000000000
+Patch Set:  2
+Insertions: +11
+Deletions:  -1
+Comments:   3 (1 unresolved)
+Hashtags:   testfix
+
+--- Labels ---
+  Code-Review: Andreas Dilger: +1; Alex Zhuravlev: +1; Oleg Drokin: +2
+  Verified: jenkins: +1; Maloo: +1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder
+  REVIEWER: Oleg Drokin, Andreas Dilger, Alex Zhuravlev
+
+--- Commit Message ---
+LU-19955 osd: flush the old EOF page after a growing fallocate
+
+fsx based tests intermittently LBUG the OSS:
+
+  LustreError: (osd_io.c:1525:osd_write_commit())
+          ASSERTION( !PageDirty(lnb[i].lnb_page) ) failed
+
+osd_write_commit() requires that no page it is handed is dirty.  That
+holds only if nothing leaves a dirty page behind in the OST page
+cache, because osd_get_page() reuses an existing page cache page for
+an IO that bypasses the cache, rather than allocating a private one,
+to avoid data aliasing.
+
+fsx issues fallocate(FALLOC_FL_ZERO_RANGE) without FALLOC_FL_KEEP_SIZE,
+so a zero range that reaches past EOF grows the file.  osd_fallocate()
+defers such a request to osd_execute_fallocate(), which calls into
+ldiskfs and then flushes the range it asked for:
+
+	rc = file->f_op->fallocate(file, mode, start, end - start);
+	if (rc == 0)
+		osd_partial_page_flush_punch(d, inode, start, end - 1);
+
+ldiskfs_zero_range() allocates the blocks via
+ldiskfs_alloc_file_blocks(), which, as it extends i_size, does:
+
+	if (epos > old_size) {
+		pagecache_isize_extended(inode, old_size, epos);
+		ldiskfs_zero_partial_blocks(handle, inode,
+					    old_size, epos - old_size);
+	}
+
+That zeroes - and with mark_buffer_dirty() dirties - the partial block
+at the *old* EOF.  The old EOF is unrelated to [start, end), so the
+range flush above never covers it and the page stays dirty in the page
+cache.  A write that lands on it before the next journal commit writes
+it back picks it up out of the page cache and hits the assert.
+
+Instrumenting osd_execute_fallocate() on a growing zero range shows the
+page left behind, and shows it gone once the old EOF is flushed too:
+
+  before: start=65536 end=69632 old_size=49999 new_size=69632 rc=0
+          dirty_tag=1 nrpages=1
+  after:  start=65536 end=69632 old_size=49999 new_size=69632 rc=0
+          dirty_tag=0 nrpages=0
+
+A crash dump agrees: the asserting page is a page cache page (mapping
+set, private_2 clear) at the offset the write covers, PG_dirty and
+PG_private set but PG_uptodate clear, while its sole buffer_head is
+Uptodate|Dirty|Mapped - the state ldiskfs_block_zero_page_range()
+leaves, since it reads the block in and dirties the buffer but never
+marks the folio uptodate.  It was the only dirty page in the mapping,
+no punch was in flight, and neither the fallocate nor writeback had
+reported an error.
+
+Flush the partial page at the old EOF when the fallocate grew the file.
+osd_partial_page_flush() already skips the case where the old EOF was
+block aligned and ldiskfs had nothing to zero.
+
+The other edge ldiskfs zeroes, at epos - 1, is inside [start, end) and
+is already covered.
+
+No separate test is required as fsx in sanityn hits this pretty
+reliably and a synthetic test seems complicated due to a relative
+small window.
+
+Fixes: cb037f305c ("LU-14160 fallocate: Add punch mode to fallocate")
+Test-Parameters: testlist=sanity,sanityn,sanity-benchmark,sanity-flr,sanity-dom
+Signed-off-by: Oleg Drokin <green@whamcloud.com>
+Assisted-by: ClaudeCode:Opus-4.8 llm_code_and_review_tools
+Change-Id: I92e6a67f29a06dc6ca2a5a89c5cc3b63bf447ec6
+Reviewed-on: https://review.whamcloud.com/c/fs/lustre-release/+/67322
+Tested-by: Maloo <maloo@whamcloud.com>
+Tested-by: jenkins <devops@whamcloud.com>
+Reviewed-by: Alex Zhuravlev <bzzz@whamcloud.com>
+Reviewed-by: Andreas Dilger <adilger@thelustrecollective.com>
+
+--- Review History ---
+
+--- Message (Oleg Drokin, 2026-07-17 03:29:47.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-17 03:32:22.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-07-17 03:33:40.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-07-17 03:34:12.000000000) ---
+Patch Set 1:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/66295/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests@ldiskfs runtests-ssk@ldiskfs+SharedKey
+
+--- Message (Lustre RISC-V Builder, 2026-07-17 03:42:25.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Lustre Gerrit Janitor, 2026-07-17 03:48:31.000000000) ---
+Patch Set 1:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests@ldiskfs runtests-ssk@ldiskfs+SharedKey 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/66295/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity1@ldiskfs conf-sanity2@ldiskfs+DNE conf-sanity2@ldiskfs conf-sanity3@ldiskfs+DNE conf-sanity3@ldiskfs conf-sanity4@ldiskfs+DNE conf-sanity4@ldiskfs conf-sanity-slow@ldiskfs+DNE conf-sanity-slow@ldiskfs conf-sanity-slow-106@ldiskfs+DNE conf-sanity-slow-106@ldiskfs insanity@ldiskfs+DNE insanity@ldiskfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@ldiskfs ost-pools@ldiskfs+DNE ost-pools@ldiskfs pjdfstest@ldiskfs+DNE pjdfstest@ldiskfs racer@ldiskfs+DNE racer@ldiskfs recovery-small@ldiskfs+DNE recovery-small@ldiskfs replay-dual@ldiskfs+DNE replay-dual@ldiskfs replay-ost-single@ldiskfs+DNE replay-ost-single@ldiskfs replay-single1@ldiskfs+DNE replay-single1@ldiskfs replay-single2@ldiskfs+DNE replay-single2@ldiskfs replay-vbr@ldiskfs+DNE replay-vbr@ldiskfs sanity1@ldiskfs+DNE sanity1@ldiskfs sanity2@ldiskfs+DNE sanity2@ldiskfs sanity3@ldiskfs+DNE sanity3@ldiskfs sanity-slow@ldiskfs+DNE sanity-slow@ldiskfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@ldiskfs sanity-dom@ldiskfs+DNE sanity-dom@ldiskfs sanity-ec@ldiskfs+DNE sanity-ec@ldiskfs sanity-flr@ldiskfs+DNE sanity-flr@ldiskfs sanity-hsm@ldiskfs+DNE sanity-hsm@ldiskfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@ldiskfs sanity-pcc@ldiskfs+DNE sanity-pcc@ldiskfs sanity-pfl@ldiskfs+DNE sanity-pfl@ldiskfs sanity-quota@ldiskfs+DNE sanity-quota@ldiskfs sanity-scrub@ldiskfs+DNE sanity-scrub@ldiskfs sanity-sec@ldiskfs+DNE sanity-sec@ldiskfs sanityn@ldiskfs+DNE sanityn@ldiskfs
+
+--- Message (jenkins, 2026-07-17 04:16:24.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/127712/ : SUCCESS
+
+--- Message (Maloo, 2026-07-17 04:18:50.000000000) ---
+Patch Set 1:
+
+#### The following sessions will be run for Build 127712 (patch #1):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-ipv6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.7-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=127712&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=127712#redirect
+
+--- Message (Alex Zhuravlev, 2026-07-17 05:41:43.000000000) ---
+Patch Set 1: Code-Review+1
+
+--- Message (Maloo, 2026-07-17 09:29:00.000000000) ---
+Patch Set 1:
+
+Failed enforced test review-dne-zfs-part-5 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-156vm116: https://testing.whamcloud.com/test_sessions/c4ee78d8-3d35-4526-9d2d-032f24d52857 ran 5 tests.  1 tests failed: lustre-rsync-test.
+
+--- Message (Maloo, 2026-07-17 09:37:38.000000000) ---
+Patch Set 1:
+
+Failed enforced test review-dne-part-5 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-155vm5: https://testing.whamcloud.com/test_sessions/a3f58575-66fa-4afc-9bc8-6c30ac924ca9 ran 5 tests.  1 tests failed: lustre-rsync-test.
+
+--- Message (Lustre Gerrit Janitor, 2026-07-17 10:02:22.000000000) ---
+Patch Set 1:
+
+Testing has completed with errors!
+IMPORTANT: these tests appear to be new failures unique to this patch
+- sanityn@ldiskfs:test_71a(Seen in reviews: 63283)
+
+
+> racer@ldiskfs+DNE Timeout(1510s)
+> sanityn@ldiskfs Failure(5530s)
+- 71a(61 cancel RPC occured.) 
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity1@ldiskfs conf-sanity2@ldiskfs+DNE conf-sanity2@ldiskfs conf-sanity3@ldiskfs+DNE conf-sanity3@ldiskfs conf-sanity4@ldiskfs+DNE conf-sanity4@ldiskfs conf-sanity-slow@ldiskfs+DNE conf-sanity-slow@ldiskfs conf-sanity-slow-106@ldiskfs+DNE conf-sanity-slow-106@ldiskfs insanity@ldiskfs+DNE insanity@ldiskfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@ldiskfs ost-pools@ldiskfs+DNE ost-pools@ldiskfs pjdfstest@ldiskfs+DNE pjdfstest@ldiskfs racer@ldiskfs recovery-small@ldiskfs+DNE recovery-small@ldiskfs replay-dual@ldiskfs+DNE replay-dual@ldiskfs replay-ost-single@ldiskfs+DNE replay-ost-single@ldiskfs replay-single1@ldiskfs+DNE replay-single1@ldiskfs replay-single2@ldiskfs+DNE replay-single2@ldiskfs replay-vbr@ldiskfs+DNE replay-vbr@ldiskfs sanity1@ldiskfs+DNE sanity1@ldiskfs sanity2@ldiskfs+DNE sanity2@ldiskfs sanity3@ldiskfs+DNE sanity3@ldiskfs sanity-slow@ldiskfs+DNE sanity-slow@ldiskfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@ldiskfs sanity-dom@ldiskfs+DNE sanity-dom@ldiskfs sanity-ec@ldiskfs+DNE sanity-ec@ldiskfs sanity-flr@ldiskfs+DNE sanity-flr@ldiskfs sanity-hsm@ldiskfs+DNE sanity-hsm@ldiskfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@ldiskfs sanity-pcc@ldiskfs+DNE sanity-pcc@ldiskfs sanity-pfl@ldiskfs+DNE sanity-pfl@ldiskfs sanity-quota@ldiskfs+DNE sanity-quota@ldiskfs sanity-scrub@ldiskfs+DNE sanity-scrub@ldiskfs sanity-sec@ldiskfs+DNE sanity-sec@ldiskfs sanityn@ldiskfs+DNE 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/66295/results.html
+
+--- Message (Maloo, 2026-07-17 11:58:35.000000000) ---
+Patch Set 1:
+
+Failed enforced test review-dne-zfs-part-4 on RHEL 10.1 / x86_64 uploaded by Onyx Autotest 2 from onyx-155vm153: https://testing.whamcloud.com/test_sessions/4fb4bda9-8308-443a-aeae-a0f60bd3b955 ran 9 tests.  1 tests failed: sanity-quota.
+
+--- Message (Maloo, 2026-07-17 16:57:37.000000000) ---
+Patch Set 1: Verified-1
+
+Passed enforced test review-dne-part-3 on RHEL 9.7 / x86_64 uploaded by Trevis Autotest 2 from trevis-156vm1: https://testing.whamcloud.com/test_sessions/984793bd-11d8-4399-956c-2c2cb51e9538 ran 3 tests.
+
+--- Message (Andreas Dilger, 2026-07-17 20:44:19.000000000) ---
+Patch Set 1: Code-Review+1
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-07-17 20:53:09.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Autotest, 2026-07-17 20:54:57.000000000) ---
+Patch Set 1:
+
+Onyx Autotest 2 retesting enforced review-dne-part-5 session on el9.7-x86_64/ldiskfs servers and clients for build 127712 patch 1. Requested by Andreas Dilger because of LU-16489.
+
+--- Message (Autotest, 2026-07-17 20:57:56.000000000) ---
+Patch Set 1:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-5 session on el9.7-x86_64/zfs servers and clients for build 127712 patch 1. Requested by Andreas Dilger because of LU-16489.
+
+--- Message (Maloo, 2026-07-17 20:59:47.000000000) ---
+Patch Set 1:
+
+#### The following Test-Parameters sessions will be run for Build 127712 (patch #1):
+
+- Test-Parameters: testlist=sanity-benchmark env=ONLY=fsx,ONLY_REPEAT=20
+
+--- Message (Autotest, 2026-07-17 21:03:05.000000000) ---
+Patch Set 1:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-4 session on el10.1-x86_64/zfs servers and clients for build 127712 patch 1. Requested by Andreas Dilger because of LU-17077.
+
+--- Message (Andreas Dilger, 2026-07-17 21:18:30.000000000) ---
+Hashtag added: testfix
+
+--- Message (Andreas Dilger, 2026-07-17 23:24:30.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Maloo, 2026-07-18 01:19:15.000000000) ---
+Patch Set 1:
+
+Failed enforced test review-dne-zfs-part-5 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-158vm192: https://testing.whamcloud.com/test_sessions/fe99498d-0144-4e6c-927f-d0c7697803ef ran 5 tests.  1 tests failed: lustre-rsync-test.
+
+--- Message (Maloo, 2026-07-18 01:33:49.000000000) ---
+Patch Set 1:
+
+Passed enforced test review-dne-part-5 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-155vm195: https://testing.whamcloud.com/test_sessions/91c02ec6-5246-4301-95e5-0b6a34867df4 ran 5 tests.
+
+--- Message (Maloo, 2026-07-18 03:37:00.000000000) ---
+Patch Set 1:
+
+Passed enforced test review-dne-zfs-part-4 on RHEL 10.1 / x86_64 uploaded by Onyx Autotest 2 from onyx-155vm105: https://testing.whamcloud.com/test_sessions/fcaecd74-5ba0-420a-8a5b-0c1ec27064fa ran 9 tests.
+
+--- Message (Autotest, 2026-07-20 14:07:30.000000000) ---
+Patch Set 1:
+
+Trevis Autotest 2 retesting enforced review-dne-zfs-part-5 session on el9.7-x86_64/zfs servers and clients for build 127712 patch 1. Requested by Andreas Dilger because of LU-16489.
+
+--- Message (Maloo, 2026-07-20 17:18:25.000000000) ---
+Patch Set 1:
+
+Failed enforced test review-dne-zfs-part-5 on RHEL 9.7 / x86_64 uploaded by Trevis Autotest 2 from trevis-155vm16: https://testing.whamcloud.com/test_sessions/08e0b5b4-a916-4ef4-9502-b7f16343cb07 ran 5 tests.  2 tests failed: sanityn, lustre-rsync-test.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Autotest, 2026-07-20 17:38:55.000000000) ---
+Patch Set 1:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-5 session on el9.7-x86_64/zfs servers and clients for build 127712 patch 1. Requested by Andreas Dilger because of LU-16489.
+
+--- Message (Maloo, 2026-07-20 21:44:03.000000000) ---
+Patch Set 1: Verified+1
+
+Passed enforced test review-dne-zfs-part-5 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-159vm93: https://testing.whamcloud.com/test_sessions/cbb67ee4-7885-4fff-9805-9c92874ad430 ran 5 tests.
+
+--- Message (Marc Vef, 2026-07-22 13:52:28.000000000) ---
+Hashtag added: master-next
+
+--- Message (Marc Vef, 2026-07-22 13:52:28.000000000) ---
+Patch Set 1:
+
+[Marc Bot] Note: This change has been cherry-picked to master-next and is considered for landing. Please avoid updates unless required while the master-next hashtag is set; doing so may cause the patch to be removed from master-next and not landed. Note: AI review comments should be addressed/responded to.
+
+--- Message (Marc Vef, 2026-07-22 13:52:29.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Oleg Drokin, 2026-07-23 23:07:21.000000000) ---
+Patch Set 1: Code-Review+2
+
+--- Message (Oleg Drokin, 2026-07-23 23:07:30.000000000) ---
+Change has been successfully cherry-picked as f2ffe89c0d38cfab952c7d9d0a25e13336c7ed8f
+
+--- Message (Marc Vef, 2026-07-25 16:28:51.000000000) ---
+Hashtag removed: master-next

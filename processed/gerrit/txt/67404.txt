@@ -1,0 +1,685 @@
+Change:     67404
+Subject:    LU-20501 llite: skip dot/dotdot in NFS get_name
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67404
+Change-Id:  I0b9854525a165780e505db977a89f91c6d11b705
+Project:    fs/lustre-release
+Branch:     master
+Status:     MERGED
+Owner:      Oleg Drokin
+Created:    2026-07-21 06:40:57.000000000
+Updated:    2026-09-21 07:54:07.000000000
+Patch Set:  12
+Insertions: +27
+Deletions:  -2
+Comments:   49 (3 unresolved)
+Hashtags:   testfix
+
+--- Labels ---
+  Code-Review: James Simmons: +1; Andreas Dilger: +1; Oleg Drokin: +2
+  Verified: jenkins: +1; Maloo: +1
+
+--- Reviewers ---
+  CC: Timothy Day, Lustre RISC-V Builder, Gerrit AI review for Lustre
+  REVIEWER: Lai Siyao, Oleg Drokin, Andreas Dilger, James Simmons
+
+--- Commit Message ---
+LU-20501 llite: skip dot/dotdot in NFS get_name
+
+sanityn test_102a intermittently fails on ZFS DNE with a spurious ESTALE
+from open_by_handle_at() of a striped subdirectory:
+
+  open_by_handle_at(subdir) error: Stale file handle
+
+The handle decodes fine.  The ESTALE comes out of the NFS reconnect:
+reconnect_one() finds the disconnected dentry's parent, calls
+exportfs_get_name() (ll_get_name()) to get the child's name in that
+parent, then lookup_one() on it.  ll_get_name() returned "..", so
+lookup_one("..") failed -EACCES, and exportfs_decode_fh() converts any
+decode error into -ESTALE.
+
+ll_get_name() walks the parent's dirents with do_nfs_get_name_filldir(),
+matching each lde_fid against the child FID.  It matches "." and ".."
+like any other name, and it does not check LUDA_FID, which is what tells
+it whether lde_fid is meaningful at all.
+
+On ZFS the ".." entry of the filesystem root has no dependable FID:
+osd-zfs osd_dir_it_rec() computes it with osd_find_parent_fid(), which
+returns -ENOENT at the root, and that path left lde_fid untouched, so it
+kept whatever the recycled dirent page held.  Instrumenting the root's
+".." FID showed it varying per run between the correct root FID, zero,
+wild values such as [0xfcaae7467e00fcaa:0xc834a400:0x450008], and real
+FIDs of unrelated objects -- and when it happened to equal the child FID
+being searched, ll_get_name() returned "..".
+
+Skip "." and ".." outright.  A child is never reached through those
+names, so they are never a valid answer here regardless of what lde_fid
+holds.  The generic get_name() has the same guards and hit the same bug:
+filldir_one() in fs/exportfs/expfs.c has long bounded the name at
+NAME_MAX, and 9473c4450e9c ("exportfs: fix the fallback implementation
+of the get_name export operation") added the dot/dotdot skip for exactly
+this reason -- matching "." or ".." makes the following lookup fail.  It
+is absent from the 6.8 tree here and present in 6.12.
+
+Also skip any entry the server did not mark LUDA_FID.  lde_fid is only
+defined when that flag is set, and mdd_dir_page_build() already tests it
+before reading the field.  osd-zfs has a second path that leaves lde_fid
+unwritten for an ordinary name: when osd_get_fid_by_oid() fails it marks
+the entry LUDA_UNKNOWN and returns without setting the FID.  The name
+check above does not cover that one, and matching its stale FID would
+return a name the child does not have.  Skipping is the safe failure --
+ll_get_name() reports "not found" rather than a wrong name.
+
+Bound the name length while here.  do_nfs_get_name_filldir() memcpy()s
+namelen bytes into lgd_name, which is ll_get_name()'s caller buffer --
+exportfs_decode_fh_raw()'s char nbuf[NAME_MAX + 1] -- and lde_namelen
+comes straight off the wire with nothing on the client bounding it, since
+mdc_adjust_dirpages() only rewrites lde_reclen.  ll_getname_data gains
+lgd_sbi so the report can name the device, as console messages are
+expected to.
+
+The check belongs here rather than in ll_dir_read().  There, namelen is
+lde_namelen for every entry, and for an encrypted directory that is the
+critically-encoded ciphertext length, which legitimately exceeds NAME_MAX
+(osd_ldiskfs_filldir() stores critical_chars() of the name, and llcrypt
+caps the ciphertext itself at NAME_MAX); bounding it at the source drops
+those entries from readdir entirely.  By the time the filldir runs the
+encrypted name has been decoded into a NAME_MAX buffer, so this branch
+can only fire for a plain directory -- which is exactly the case where
+nothing has bounded the value.
+
+The server side is fixed separately by the companion osd-zfs patch,
+which reports the OSD root instead of leaving lde_fid unwritten.  These
+guards are worth keeping regardless: neither depends on the FID value,
+so they also protect a new client talking to an unfixed server.
+
+The existing open-by-handle test is renamed test_102a here, where the
+parent patch added test_102b beside it.  It belongs in this patch rather
+than that one: renaming a subtest is what makes autotest's
+review-*-subtest-change groups run it in a repeat loop, and test_102 is
+the test this failure is about -- it fails on ZFS DNE in roughly one
+master session in ten, so a loop against a patch that does not fix it
+only produces a Verified-1.  Here the loop runs against the fix.
+
+Validated on a ZFS DNE cluster (2 MDT, 2 OST) together with the osd-zfs
+patch: sanityn test_102a fails 5/30 without the two patches and
+passes 30/30 with them; full sanity-lfsck passes 73/73; sanity test_154f
+passes.
+
+Fixes: 96a5daa0c08d ("LU-163 MDS returns 32/64-bit dir name hash according to client type")
+Test-Parameters: optional fstype=zfs mdscount=2 mdtcount=4 testlist=sanityn env=ONLY=102a,ONLY_REPEAT=200
+Test-Parameters: optional serverversion=2.16 testlist=sanityn env=ONLY=102a,ONLY_REPEAT=30
+Signed-off-by: Oleg Drokin <green@whamcloud.com>
+Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
+Change-Id: I0b9854525a165780e505db977a89f91c6d11b705
+Reviewed-on: https://review.whamcloud.com/c/fs/lustre-release/+/67404
+Tested-by: Maloo <maloo@whamcloud.com>
+Reviewed-by: James Simmons <jsimmons@infradead.org>
+Tested-by: jenkins <devops@whamcloud.com>
+Reviewed-by: Andreas Dilger <adilger@thelustrecollective.com>
+
+--- Review History ---
+
+--- Message (Oleg Drokin, 2026-07-21 06:40:57.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-21 06:44:10.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-07-21 06:52:19.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-07-21 06:56:47.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Andreas Dilger, 2026-07-21 07:04:11.000000000) ---
+Patch Set 1:
+
+(3 comments)
+
+--- Message (jenkins, 2026-07-21 07:17:43.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/127862/ : SUCCESS
+
+--- Message (Andreas Dilger, 2026-07-21 13:22:37.000000000) ---
+Patch Set 1: Code-Review+1
+
+(3 comments)
+
+--- Message (Andreas Dilger, 2026-07-21 15:08:34.000000000) ---
+Hashtag added: testfix
+
+--- Message (Autotest, 2026-07-21 15:12:16.000000000) ---
+Patch Set 1:
+
+Onyx Autotest 2 retesting enforced review-dne-part-5 session on el9.7-x86_64/ldiskfs servers and clients for build 127862 patch 1. Requested by Andreas Dilger because of LU-16489.
+
+--- Message (Autotest, 2026-07-21 15:15:08.000000000) ---
+Patch Set 1:
+
+Trevis Autotest 2 retesting enforced review-dne-zfs-part-1 session on el9.7-x86_64/zfs servers and clients for build 127862 patch 1. Requested by Andreas Dilger because of LU-20428.
+
+--- Message (Autotest, 2026-07-21 15:38:57.000000000) ---
+Patch Set 1:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-1 session on el9.7-x86_64/zfs servers and clients for build 127862 patch 1. Requested by Andreas Dilger because of LU-20428.
+
+--- Message (Autotest, 2026-07-21 15:42:08.000000000) ---
+Patch Set 1:
+
+Trevis Autotest 2 retesting enforced review-dne-part-1 session on el9.7-x86_64/ldiskfs servers and clients for build 127862 patch 1. Requested by Andreas Dilger because of LU-17601.
+
+--- Message (Autotest, 2026-07-21 15:43:28.000000000) ---
+Patch Set 1:
+
+Trevis Autotest 2 retesting enforced review-dne-zfs-part-2 session on el9.7-x86_64/zfs servers and clients for build 127862 patch 1. Requested by Andreas Dilger because of LU-19730.
+
+--- Message (James Simmons, 2026-07-21 16:32:55.000000000) ---
+Patch Set 1:
+
+(2 comments)
+
+--- Message (Timothy Day, 2026-07-21 16:50:40.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Oleg Drokin, 2026-07-21 16:54:31.000000000) ---
+Patch Set 1:
+
+(4 comments)
+
+--- Message (James Simmons, 2026-07-21 16:55:10.000000000) ---
+Patch Set 1:
+
+(2 comments)
+
+--- Message (Oleg Drokin, 2026-07-21 17:29:50.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Oleg Drokin, 2026-07-21 17:35:26.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-21 17:38:25.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-07-21 17:48:47.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-07-21 17:50:18.000000000) ---
+Patch Set 2:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-07-21 21:44:17.000000000) ---
+Patch Set 2: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/127870/ : ABORTED
+
+--- Message (Oleg Drokin, 2026-07-21 22:49:05.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (Oleg Drokin, 2026-07-21 23:53:37.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Oleg Drokin, 2026-07-21 23:54:10.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-07-21 23:56:01.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-21 23:57:04.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-07-22 00:30:42.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/127889/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-07-22 00:50:27.000000000) ---
+Patch Set 3:
+
+RISC-V Client Builder: build succesful
+
+--- Message (James Simmons, 2026-07-22 18:13:52.000000000) ---
+Patch Set 3: Code-Review+1
+
+--- Message (Andreas Dilger, 2026-07-22 20:26:07.000000000) ---
+Patch Set 3: Code-Review+1
+
+--- Message (Lai Siyao, 2026-07-23 08:41:30.000000000) ---
+Patch Set 3: Code-Review+1
+
+--- Message (Timothy Day, 2026-07-24 03:31:02.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+--- Message (Oleg Drokin, 2026-07-24 04:07:20.000000000) ---
+Uploaded patch set 4.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Oleg Drokin, 2026-07-24 04:07:48.000000000) ---
+Patch Set 4:
+
+(2 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-24 04:10:16.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-07-24 04:14:14.000000000) ---
+Patch Set 4:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-07-24 04:31:09.000000000) ---
+Patch Set 4: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/128018/ : FAILURE
+
+--- Message (Lustre RISC-V Builder, 2026-07-24 05:34:50.000000000) ---
+Patch Set 4:
+
+RISC-V Client Builder: build succesful
+
+--- Message (James Simmons, 2026-07-24 18:15:45.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+--- Message (James Simmons, 2026-07-24 18:16:10.000000000) ---
+Patch Set 4: Code-Review+1
+
+--- Message (jenkins, 2026-07-24 20:19:12.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128075/ : SUCCESS
+
+--- Message (Marc Vef, 2026-07-25 16:10:50.000000000) ---
+Hashtag added: master-next
+
+--- Message (Marc Vef, 2026-07-25 16:10:51.000000000) ---
+Patch Set 4:
+
+[Marc Bot] Note: This change has been cherry-picked to master-next and is considered for landing. Please avoid updates unless required while the master-next hashtag is set; doing so may cause the patch to be removed from master-next and not landed. Note: AI review comments should be addressed/responded to.
+
+--- Message (Marc Vef, 2026-07-25 16:10:51.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Andreas Dilger, 2026-07-26 17:27:05.000000000) ---
+Patch Set 4: Code-Review+1
+
+(1 comment)
+
+--- Message (Gerrit AI review for Lustre, 2026-07-27 20:21:40.000000000) ---
+Patch Set 4:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Experimental feature testing in progress, please pay attention to the comments
+
+The skip itself is correct and harmless, but the mechanism it is justified with does not hold up under tracing. Comments inline.
+
+--- Message (Andreas Dilger, 2026-07-30 17:04:15.000000000) ---
+Patch Set 4:
+
+(2 comments)
+
+--- Message (Oleg Drokin, 2026-08-03 05:53:49.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-03 05:57:23.000000000) ---
+Patch Set 5:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-03 05:59:05.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (Oleg Drokin, 2026-08-03 05:59:11.000000000) ---
+Patch Set 5:
+
+(8 comments)
+
+--- Message (Oleg Drokin, 2026-08-03 06:05:45.000000000) ---
+Uploaded patch set 6: Patch Set 5 was rebased.
+
+--- Message (jenkins, 2026-08-03 06:05:52.000000000) ---
+Patch Set 5: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/128572/ : ABORTED
+
+--- Message (Oleg Drokin, 2026-08-03 06:11:05.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-03 06:11:34.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-03 06:12:53.000000000) ---
+Patch Set 6:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-03 06:35:23.000000000) ---
+Patch Set 6:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-03 06:35:34.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128574/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-08-03 18:25:55.000000000) ---
+Patch Set 6:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The ll_dir_read() length bound is an independent hardening change from the get_name() fix, and it would probably be better as its own patch: it changes every readdir, and as written it drops valid entries in encrypted directories.
+
+--- Message (Oleg Drokin, 2026-08-04 04:38:00.000000000) ---
+Uploaded patch set 7.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-04 04:40:34.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-04 04:43:44.000000000) ---
+Patch Set 7:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-04 05:11:02.000000000) ---
+Patch Set 7:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-04 05:13:00.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128627/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-08-04 17:28:20.000000000) ---
+Patch Set 7:
+
+Looks good to me.
+
+--- Message (Oleg Drokin, 2026-08-05 04:30:02.000000000) ---
+Uploaded patch set 8: Patch Set 7 was rebased. Commit message was updated.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-05 04:37:35.000000000) ---
+Patch Set 8:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-05 04:40:58.000000000) ---
+Patch Set 8:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-08-05 05:39:24.000000000) ---
+Patch Set 8: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128697/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-05 07:16:50.000000000) ---
+Patch Set 8:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Marc Vef, 2026-08-10 07:49:08.000000000) ---
+Hashtag removed: master-next
+
+--- Message (Marc Vef, 2026-08-10 07:49:09.000000000) ---
+Patch Set 8:
+
+[Marc Bot] Note: This change has been removed from master-next and is no longer considered for landing in its current form.
+
+--- Message (Marc Vef, 2026-08-10 07:49:09.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Andreas Dilger, 2026-08-13 01:06:09.000000000) ---
+Patch Set 8: Code-Review+1
+
+--- Message (Marc Vef, 2026-08-13 13:19:12.000000000) ---
+Hashtag added: master-next
+
+--- Message (Marc Vef, 2026-08-13 13:19:13.000000000) ---
+Patch Set 8:
+
+[Marc Bot] Note: This change has been cherry-picked to master-next and is considered for landing. Please avoid updates unless required while the master-next hashtag is set; doing so may cause the patch to be removed from master-next and not landed. Note: AI review comments should be addressed/responded to.
+
+--- Message (Marc Vef, 2026-08-13 13:19:13.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Andreas Dilger, 2026-08-14 04:30:54.000000000) ---
+Patch Set 8:
+
+(1 comment)
+
+--- Message (Oleg Drokin, 2026-08-19 19:14:31.000000000) ---
+Uploaded patch set 9: Patch Set 8 was rebased.
+
+Copied Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR **changekind:TRIVIAL_REBASE** OR **changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE** OR is:MIN")
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-19 19:20:11.000000000) ---
+Patch Set 9:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-19 19:22:37.000000000) ---
+Patch Set 9:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre RISC-V Builder, 2026-08-19 20:02:43.000000000) ---
+Patch Set 9:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-19 20:24:47.000000000) ---
+Patch Set 9: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129753/ : SUCCESS
+
+--- Message (Marc Vef, 2026-08-20 09:42:56.000000000) ---
+Hashtag removed: master-next
+
+--- Message (Marc Vef, 2026-08-20 09:42:57.000000000) ---
+Patch Set 9:
+
+[Marc Bot] Note: This change has been removed from master-next and is no longer considered for landing in its current form.
+
+--- Message (Marc Vef, 2026-08-20 09:42:58.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Oleg Drokin, 2026-08-30 21:45:04.000000000) ---
+Patch Set 10: Patch Set 9 was rebased
+
+Copied Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR **changekind:TRIVIAL_REBASE** OR **changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE** OR is:MIN")
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-30 21:48:42.000000000) ---
+Patch Set 10:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-30 21:55:18.000000000) ---
+Patch Set 10:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-08-30 22:15:48.000000000) ---
+Patch Set 10: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130653/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-31 01:14:34.000000000) ---
+Patch Set 10:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Marc Vef, 2026-08-31 10:55:03.000000000) ---
+Hashtag added: master-next
+
+--- Message (Marc Vef, 2026-08-31 10:55:04.000000000) ---
+Patch Set 10:
+
+[Marc Bot] Note: This change has been cherry-picked to master-next and is considered for landing. Please avoid updates unless required while the master-next hashtag is set; doing so may cause the patch to be removed from master-next and not landed. Note: AI review comments should be addressed/responded to.
+
+--- Message (Marc Vef, 2026-08-31 10:55:04.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Oleg Drokin, 2026-09-04 21:35:35.000000000) ---
+Uploaded patch set 11.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-04 21:49:24.000000000) ---
+Patch Set 11:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-04 21:50:32.000000000) ---
+Patch Set 11:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-04 23:23:54.000000000) ---
+Patch Set 11: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131076/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-05 06:48:06.000000000) ---
+Patch Set 11:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-09-06 08:09:52.000000000) ---
+Patch Set 11:
+
+Looks good to me.
+
+--- Message (Andreas Dilger, 2026-09-09 00:10:08.000000000) ---
+Patch Set 11: Code-Review+1
+
+--- Message (Andreas Dilger, 2026-09-14 14:34:22.000000000) ---
+Patch Set 11:
+
+(1 comment)
+
+--- Message (James Simmons, 2026-09-14 15:28:17.000000000) ---
+Patch Set 11: Code-Review+1
+
+--- Message (Oleg Drokin, 2026-09-18 17:01:23.000000000) ---
+Patch Set 11: Code-Review+2
+
+--- Message (Oleg Drokin, 2026-09-18 17:01:26.000000000) ---
+Change has been successfully cherry-picked as 9c4f2ce7ec7540cf435269c01def642e89c6f67b
+
+--- Message (Marc Vef, 2026-09-21 07:54:07.000000000) ---
+Hashtag removed: master-next

@@ -1,0 +1,1477 @@
+Change:     68163
+Subject:    LU-20613 llapi: add a ZFS backend to llapi_scan_device()
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68163
+Change-Id:  I97a6d8815924b2671c818152f42d66cc580a609d
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Hiroshi Nishida
+Created:    2026-08-20 01:08:10.000000000
+Updated:    2026-10-14 03:40:11.000000000
+Patch Set:  34
+Insertions: +1662
+Deletions:  -137
+Comments:   148 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1
+
+--- Reviewers ---
+  CC: Artem Blagodarenko, Lustre RISC-V Builder
+  REVIEWER: Gerrit AI review for Lustre
+
+--- Commit Message ---
+LU-20613 llapi: add a ZFS backend to llapi_scan_device()
+
+Add scan_osd_zfs.so, the ZFS half of llapi_scan_device(), which reads
+objects out of a pool through libzpool the way zdb does, behind the
+same llapi_scan_sink the ldiskfs backend is behind.
+
+A pool that is still imported answers EBUSY rather than being read
+underneath its server: reading an imported pool from outside is not
+supported, so the pool has to be exported first, and its snapshots
+then become readable too. lfsp_search names the directories to look in
+for a pool's vdevs, since a pool on file vdevs is invisible to a scan
+of /dev. The scan loads no /etc/zfs/zpool.cache: a pool listed there
+would be opened directly, before those checks, and a pool the kernel
+holds would answer EREMOTEIO instead of EBUSY. ZFS 2.4 also falls back
+to /boot/zfs/zpool.cache, so the scan drops every pool that
+kernel_init() loaded before it opens its own.
+
+Like zdb, the scan caps the ARC at 256 MB, because it reads each
+block once. It also sets zfs_arc_min to 32 MB: in libzpool the
+minimum starts at half the maximum, and a cap below the minimum is
+ignored. On an MDT with 1.2 million objects this lowered peak memory
+from about 450 MB to about 345 MB, with no measurable change in scan
+time. There is no spa_export() call: under SPA_MODE_READ it returns
+EROFS, and the import ends at kernel_fini() when the last scan closes.
+
+A directory's size is the length of its ZAP, as osd_attr_get()
+reports it to a client. The SA size of a directory is not kept up to
+date on osd-zfs.
+
+osd-zfs keeps an xattr that does not fit in the SA in a directory of
+its own, one object for each value. These objects hold the xattrs of
+another object, like an ldiskfs ea_inode, so they are neither reported
+nor counted. They have no ZPL_MODE, so otherwise they would be counted
+in ss_skipped, and lfs find --device would report damage that is not
+there.
+
+A dataset that holds no ZPL objects -- a zvol, or a snapshot of one --
+answers EMEDIUMTYPE, which is this backend refusing this dataset and
+not the ENOTSUP the library returns when it has no backend to ask at
+all.  The ldiskfs backend separates the same two with ENOPKG; a caller
+that skips its work where a build cannot scan must not also skip it
+where the build can and the target was misnamed.
+
+conf-sanity 300 is extended to cover it rather than left
+ldiskfs-only: its gate becomes ldiskfs-or-zfs, and so does the OST
+half's, which asks about ost1_FSTYPE for itself rather than about
+whether it matches the MDT's.  MDSFSTYPE and OSTFSTYPE are set
+separately -- facet_fstype() reads the facet's own first -- so an
+ldiskfs OST under a ZFS MDT is a real combination, and keying off
+the match would leave it unscanned by a backend that can read it.
+Both facets grow an export_zpool and import_zpool pair around the
+scan, because a pool still imported by its server answers EBUSY.
+-p and --search are passed so a pool on file vdevs is found.
+
+lfs find gains --search DIRS, which sets lfsp_search, and --device
+takes a pool/dataset name for a ZFS target; lfs-find.1 says when such
+a pool answers EBUSY.  scan_device_target(), which llapi_find_device()
+reads a target's label with, takes the search path too and selects its
+backend the way llapi_scan_device() does.  The ldiskfs half of
+conf-sanity 300 still errors where the backend will not load, an
+ldiskfs build being unable to configure without libext2fs; only a ZFS
+target skips on ENOTSUP, and only when the build has no ZFS backend:
+every dlopen() tried found no scan_osd_zfs.so. The loader now names
+each attempt's error, so a plugin that is there but does not load
+fails the test instead. While mds1 is still up, the test also checks
+that --target on a ZFS MDT is refused as in use.
+
+The backend goes into the programs that scan, not into liblustreapi,
+which is what mkfs.lustre already does with -lzfs -lnvpair -lzpool.
+libzpool is the DMU built for userspace and it arrives with libspl and
+libnvpair behind it.  In the no-plugins build those are linked into
+the library, so they reach every program that links it -- lfs, lctl,
+and every helper under lustre/tests -- and not only the ones that
+scan.  sanity 131d shows this: it reads errno through rwv, which
+links liblustreapi and never scans anything.  libext2fs is one
+ordinary library and does not carry that, so the ldiskfs backend stays
+where it is.
+
+So liblustreapi keeps -DHAVE_ZFS_SCAN and declares the five entry
+points weak, and libscan_zfs_in.la is linked into
+llapi_scan_device_test, the scanner conf-sanity 300 drives, and not
+into lfs, which clients install.  A program without it links and
+leaves the slot NULL, which is the -ENOTSUP llapi_scan_device.3
+already describes -- the same answer as a build whose configure found
+no libzpool headers at all, so no caller and no test learns a new
+outcome.  lfs find --device therefore reads a ZFS target in a packaged
+build, which dlopens scan_osd_zfs.so, and answers ENOTSUP for one in a
+build without plugins; conf-sanity 300 skips its lfs find half on
+exactly that, for a ZFS target only.
+
+The weak reference is not on its own enough to link the backend in,
+and the failure is silent.  libtool hands a convenience library to the
+link as a plain .a, and an undefined *weak* symbol is not a reason for
+the linker to extract an archive member -- so the five stay NULL, the
+scanner answers -ENOTSUP on a build that has the backend, and nothing
+says why: nm reads "w scan_zfs_open" and the binary holds no
+libzpool symbol at all.  So the program names one symbol undefined
+up front, -Wl,-u,scan_zfs_open,
+which extracts the member that defines it and brings the other four
+with it.
+
+Its own autotest reaches the ZFS half only where configure finds the
+headers; the Test-Parameters line below asks for the ZFS session that
+can say something, and the default testing already runs sanity 157c.
+
+Neither exercises the weak slot, and that is not an omission.
+PLUGINS is enable_shared, so the weak references, libscan_zfs_in.la
+and the -u exist only in a --disable-shared build; the autotest
+sessions are built from the spec, which is %bcond_without shared, and
+take the dlopen() path.  The build that does carry them is the
+janitor's, which configures --disable-shared and runs the whole of
+sanity on every change.
+Asking for ONLY=131d here would run it against the shared build,
+where the condition cannot arise.
+
+lustre.spec.in changes with it: %files osd-zfs-mount becomes a
+generated lustre-osd-zfs-mount.files, carrying its %dir and zed.d
+entries over, because the plugin is built only when configure found
+libzpool and a static file list cannot say that.
+
+A name that begins with '/' is a device path. scan_device_exists()
+stats it and returns -ENOENT, -ENOTDIR, -ELOOP or -EACCES before a
+backend is chosen, so a mistyped path gets the real error even on a
+build without ZFS. scan_backend_kind() also takes such a name as
+ldiskfs before its own stat(), so a mount point or another directory
+is never sent to the ZFS backend. A relative name is ldiskfs only if
+it is a block device or a regular file; any other relative name,
+including one that does not exist, is taken as a dataset. -ENOTSUP
+keeps the meaning that llapi_scan_device.3 gives it, and that
+conf-sanity 300 uses for its skip: this build has no backend for the
+target.
+
+SCAN_CHUNKS_MAX is derived from DN_MAX_OBJECT in <sys/dnode.h>, the
+bound the walk needs, so a ZFS that widens the object id carries
+this along with it.
+
+A pool this kernel holds is told from one that is merely named like
+a kstat by asking for a directory.  /proc/spl/kstat/zfs holds about
+twenty global kstats -- zil, fm, dbufs, arcstats and the rest -- as
+regular files in the same directory pools appear in, so a stat() that
+only asks "does the name exist" would answer -EBUSY for an exported
+pool called fm.  Only a directory there is a pool.
+
+-EBUSY names both of the things that raise it: a pool another mount
+holds, and a dataset already owned within this process, which is a
+second scan of the same target.  dmu_objset_own() answers the same
+errno through dsl_dataset_tryown() for the second, where the pool is
+exported and there is nothing to export.  llapi_scan_device.3 says
+the same.
+
+Test-Parameters: fstype=zfs testlist=conf-sanity env=ONLY=300
+Signed-off-by: Hiroshi Nishida <hnishida@thelustrecollective.com>
+Assisted-by: ClaudeCode:Fable-5 llm_code_and_review_tools
+Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
+Change-Id: I97a6d8815924b2671c818152f42d66cc580a609d
+
+--- Review History ---
+
+--- Message (Hiroshi Nishida, 2026-08-20 01:08:10.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-20 01:12:16.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-20 01:13:00.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+rocky8.10: Compile failed
+
+rocky9.6: Compile failed
+
+
+ Job output URL: https://testing.whamcloud.com/gerrit-janitor/68286/results.html
+
+--- Message (wc-checkpatch, 2026-08-20 01:18:36.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-08-20 01:41:05.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129784/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-20 01:55:10.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Hiroshi Nishida, 2026-08-20 13:58:41.000000000) ---
+Uploaded patch set 2: Patch Set 1 was rebased.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-20 14:10:17.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-20 14:11:27.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+rocky8.10: Compile failed
+
+rocky9.6: Compile failed
+
+
+ Job output URL: https://testing.whamcloud.com/gerrit-janitor/68335/results.html
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-20 14:14:21.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-20 15:22:28.000000000) ---
+Patch Set 2:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Hiroshi Nishida, 2026-08-20 15:56:38.000000000) ---
+Uploaded patch set 3.
+
+--- Message (wc-checkpatch, 2026-08-20 15:59:59.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-20 16:11:49.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-08-20 17:29:21.000000000) ---
+Uploaded patch set 4.
+
+--- Message (jenkins, 2026-08-20 17:29:23.000000000) ---
+Patch Set 3:
+
+No Builds Executed
+
+--- Message (wc-checkpatch, 2026-08-20 17:32:54.000000000) ---
+Patch Set 4:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-20 17:44:24.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-20 18:47:33.000000000) ---
+Patch Set 3:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-20 20:43:57.000000000) ---
+Patch Set 2: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/129832/ : FAILURE
+
+--- Message (Lustre RISC-V Builder, 2026-08-20 22:10:30.000000000) ---
+Patch Set 4:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-20 22:50:04.000000000) ---
+Patch Set 4: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/129854/ : FAILURE
+
+--- Message (Hiroshi Nishida, 2026-08-21 13:03:46.000000000) ---
+Patch Set 4:
+
+BUILD
+
+--- Message (jenkins, 2026-08-21 14:40:49.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129931/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-08-22 11:44:10.000000000) ---
+Patch Set 4:
+
+(7 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The backend structure mirrors the ldiskfs one cleanly and the SA/DXATTR handling matches what osd-zfs writes; the two things worth a second look are the dnode-walk error handling in scan_zfs_scan_chunk() and what happens when the device string is a path that does not exist.
+
+--- Message (Hiroshi Nishida, 2026-08-23 13:18:48.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-23 13:34:25.000000000) ---
+Patch Set 5:
+
+Looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-08-23 13:35:50.000000000) ---
+Patch Set 4:
+
+(7 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-23 13:36:22.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-23 14:35:45.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130051/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-23 15:19:03.000000000) ---
+Patch Set 5:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-23 21:59:04.000000000) ---
+Patch Set 5:
+
+(8 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, minor comments inline. No correctness problems found in the new backend: the chunk arithmetic covers the dnode id space exactly once, the DXATTR/spill xattr path mirrors osd-zfs's own __osd_sa_xattr_get()/__osd_xattr_get_large(), and the dnode_hold()/dmu_bonus_hold_by_dnode()/sa_handle_destroy() hold pairing balances on every exit.
+
+--- Message (Hiroshi Nishida, 2026-08-24 16:50:11.000000000) ---
+Uploaded patch set 6.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-08-24 16:53:52.000000000) ---
+Patch Set 6:
+
+(8 comments)
+
+--- Message (wc-checkpatch, 2026-08-24 17:03:04.000000000) ---
+Patch Set 6:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-24 17:31:41.000000000) ---
+Patch Set 6:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-24 18:05:50.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130147/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-08-25 11:46:07.000000000) ---
+Patch Set 6:
+
+(6 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, comments inline. The ZFS read path lines up with what osd-zfs actually writes (ZFS_SA_ATTRS registry, DXATTR nvlist first, xattr-directory spill second, SA_ZPL_SIZE for the value length), and the chunk walk terminates correctly: only ESRCH from dmu_object_next() sets *done, so an empty chunk in the middle of a sparse id space does not cut the scan short. One whole-patch point worth settling before this lands: by the commit message's own account the build hosts do not build scan_zfs.so, so conf-sanity 165 skips the ZFS half everywhere the Test-Parameters sessions run and the backend arrives with no automated coverage. Is there a session, or a build option on one, that can actually exercise it?
+
+--- Message (Hiroshi Nishida, 2026-08-25 16:42:54.000000000) ---
+Uploaded patch set 7.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-25 16:50:42.000000000) ---
+Patch Set 7:
+
+Looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-08-25 16:59:03.000000000) ---
+Patch Set 7:
+
+(6 comments)
+
+--- Message (Lustre RISC-V Builder, 2026-08-25 18:50:24.000000000) ---
+Patch Set 7:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-26 07:00:52.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130243/ : SUCCESS
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-26 07:30:50.000000000) ---
+Patch Set 7:
+
+Code-wise looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-08-26 16:04:29.000000000) ---
+Uploaded patch set 8: Patch Set 7 was rebased. Commit message was updated.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-26 16:13:54.000000000) ---
+Patch Set 8:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-26 16:23:35.000000000) ---
+Patch Set 8:
+
+Code-wise looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-08-26 17:04:41.000000000) ---
+Patch Set 8:
+
+(1 comment)
+
+--- Message (jenkins, 2026-08-27 04:21:35.000000000) ---
+Patch Set 8: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130407/ : SUCCESS
+
+--- Message (Autotest, 2026-08-27 04:22:28.000000000) ---
+Patch Set 7:
+
+Onyx Autotest 2 is abandoning the following sessions because: later build 130407 found
+- Enforced review-dne-zfs-part-4 on el9.7-x86_64/zfs servers and clients
+
+--- Message (Lustre RISC-V Builder, 2026-08-27 15:09:18.000000000) ---
+Patch Set 8:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-27 22:19:23.000000000) ---
+Patch Set 8:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, comments inline.
+
+--- Message (Hiroshi Nishida, 2026-08-28 00:00:00.000000000) ---
+Uploaded patch set 9.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-28 00:11:27.000000000) ---
+Patch Set 9:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-28 00:38:11.000000000) ---
+Patch Set 9:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-28 02:08:12.000000000) ---
+Patch Set 9: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/130493/ : FAILURE
+
+--- Message (Lustre RISC-V Builder, 2026-08-28 03:06:11.000000000) ---
+Patch Set 9:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Hiroshi Nishida, 2026-08-29 13:32:34.000000000) ---
+Uploaded patch set 10.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-29 13:45:15.000000000) ---
+Patch Set 10:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-29 14:07:36.000000000) ---
+Patch Set 10:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-29 14:52:08.000000000) ---
+Patch Set 10: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130577/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-29 16:26:14.000000000) ---
+Patch Set 10:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Hiroshi Nishida, 2026-08-29 18:09:55.000000000) ---
+Uploaded patch set 11: Patch Set 10 was rebased.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-29 18:22:40.000000000) ---
+Patch Set 11:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-29 18:38:00.000000000) ---
+Patch Set 11:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-29 19:20:33.000000000) ---
+Patch Set 11: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130596/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-29 20:28:24.000000000) ---
+Patch Set 11:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-30 10:22:51.000000000) ---
+Patch Set 11:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Looks good. The ZFS reader itself holds up: the chunk walk covers [idx*64K, (idx+1)*64K) exactly once and object 0 is the meta dnode, the SA table is set up per dataset as zdb does, the DMU_OT_SA bonus test matches osd_zap_create_flags() so directories and OI files are delivered, the ZFS_UNLINKED_SET skip matches osd-zfs's own "%llx" keying, and the kernel_init()/spa_import() lifetimes balance on every exit from scan_zfs_open(). One man-page nit inline.
+
+--- Message (Hiroshi Nishida, 2026-08-30 14:47:27.000000000) ---
+Uploaded patch set 12.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-08-30 14:48:17.000000000) ---
+Patch Set 12:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-08-30 15:01:57.000000000) ---
+Patch Set 12:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-30 15:15:57.000000000) ---
+Patch Set 12:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-30 16:28:06.000000000) ---
+Patch Set 12: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130628/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-30 17:19:26.000000000) ---
+Patch Set 12:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-31 07:06:13.000000000) ---
+Patch Set 12:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, minor comments inline.
+
+--- Message (Hiroshi Nishida, 2026-08-31 14:07:31.000000000) ---
+Uploaded patch set 13.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-08-31 14:08:40.000000000) ---
+Patch Set 12:
+
+(5 comments)
+
+--- Message (wc-checkpatch, 2026-08-31 14:22:13.000000000) ---
+Patch Set 13:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-31 14:38:42.000000000) ---
+Patch Set 13:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-31 16:35:42.000000000) ---
+Patch Set 13: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130721/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-31 16:56:56.000000000) ---
+Patch Set 13:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-09-01 07:13:51.000000000) ---
+Patch Set 13:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, a few small comments inline.
+
+--- Message (Hiroshi Nishida, 2026-09-01 16:24:32.000000000) ---
+Uploaded patch set 14.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-01 16:31:41.000000000) ---
+Patch Set 14:
+
+Looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-09-01 16:36:27.000000000) ---
+Patch Set 13:
+
+(3 comments)
+
+Round 17: replies to the review comments on this patch set.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-01 16:52:48.000000000) ---
+Patch Set 14:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-01 17:26:26.000000000) ---
+Patch Set 14: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130797/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-01 19:25:17.000000000) ---
+Patch Set 14:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-09-02 22:22:26.000000000) ---
+Patch Set 14:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Mostly good; one comment inline on how a device string that is not a path gets classified.
+
+--- Message (Hiroshi Nishida, 2026-09-03 15:58:48.000000000) ---
+Uploaded patch set 15.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-03 16:32:22.000000000) ---
+Patch Set 15:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-09-03 17:59:32.000000000) ---
+Patch Set 15:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-09-03 18:39:20.000000000) ---
+Patch Set 15: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130958/ : SUCCESS
+
+--- Message (Hiroshi Nishida, 2026-09-03 18:40:26.000000000) ---
+Patch Set 8:
+
+(3 comments)
+
+--- Message (wc-checkpatch, 2026-09-03 20:13:11.000000000) ---
+Patch Set 15:
+
+Looks good to me.
+
+--- Message (Gerrit AI review for Lustre, 2026-09-04 10:55:20.000000000) ---
+Patch Set 15:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Looks good. The ZFS reader itself holds up on a re-read; two optional nits inline for whenever this is next refreshed, neither worth a re-spin on its own.
+
+--- Message (Hiroshi Nishida, 2026-09-04 21:56:30.000000000) ---
+Uploaded patch set 16.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-04 22:05:28.000000000) ---
+Patch Set 16:
+
+(3 comments)
+
+--- Message (wc-checkpatch, 2026-09-04 22:09:35.000000000) ---
+Patch Set 16:
+
+Looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-09-04 22:10:31.000000000) ---
+Patch Set 16:
+
+Disclosure on this patchset, since it is not visible from the diff: the two ZFS fixes in it -- the SA handle leak on the xattr path, and the errno split (-EINVAL for a name that is not a dataset, -ENODEV when /dev/zfs is absent) -- have never executed. This lab builds with ENABLE_ZFS='no', so they are compile-checked against libzfs 2.2 headers and reasoned against ZFS's own sa.c, and nothing more. Everything else on the change was run.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-04 22:50:03.000000000) ---
+Patch Set 16:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-09-05 01:35:26.000000000) ---
+Patch Set 16:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-09-05 01:37:07.000000000) ---
+Patch Set 16: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131099/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-06 18:39:49.000000000) ---
+Patch Set 16:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Looks good; the backend tracks osd-zfs's own SA/DXATTR/unlinked-set handling and the hold/release pairing checks out. Only optional documentation and commit-message nits inline, for whenever this is next refreshed -- no need to re-spin for them. Worth a reviewer keeping in mind that the build hosts do not build scan_zfs.so, so none of this 800-line backend is exercised by the standard test sessions.
+
+--- Message (Hiroshi Nishida, 2026-09-08 14:13:31.000000000) ---
+Patch Set 16:
+
+(3 comments)
+
+Replies to the aireview comments on this patchset.  Every fix named is local and unpushed; "lands in the next patchset" is meant literally.
+
+--- Message (Hiroshi Nishida, 2026-09-09 03:23:05.000000000) ---
+Uploaded patch set 17.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-09 03:40:28.000000000) ---
+Patch Set 17:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-09 03:58:32.000000000) ---
+Patch Set 17:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-09 05:36:30.000000000) ---
+Patch Set 17: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131389/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-09 13:11:46.000000000) ---
+Patch Set 17:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Hiroshi Nishida, 2026-09-09 17:04:40.000000000) ---
+Uploaded patch set 18.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-09 17:13:47.000000000) ---
+Patch Set 18:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-09 17:14:40.000000000) ---
+Patch Set 18:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-09 17:28:49.000000000) ---
+Patch Set 18: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131437/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-10 00:37:26.000000000) ---
+Patch Set 18:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Hiroshi Nishida, 2026-09-10 14:30:42.000000000) ---
+Uploaded patch set 19.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-10 14:45:09.000000000) ---
+Patch Set 19:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-10 14:57:49.000000000) ---
+Patch Set 19:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-10 15:15:54.000000000) ---
+Patch Set 19: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131518/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-10 17:13:11.000000000) ---
+Patch Set 19:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-09-11 21:08:26.000000000) ---
+Patch Set 19:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good. The ZFS walk, the SA/DXATTR handling and the import/export dance all read correctly against libzpool and against what osd-zfs writes. Only optional items inline -- nothing here needs a re-spin on its own.
+
+--- Message (Hiroshi Nishida, 2026-09-21 19:26:59.000000000) ---
+Uploaded patch set 20.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-21 19:28:51.000000000) ---
+Patch Set 20:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-21 19:34:17.000000000) ---
+Patch Set 20:
+
+Code-wise looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-09-21 19:35:12.000000000) ---
+Patch Set 19:
+
+(3 comments)
+
+--- Message (jenkins, 2026-09-21 20:55:16.000000000) ---
+Patch Set 20: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132085/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-22 08:33:40.000000000) ---
+Patch Set 20:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Looks good. The ZFS backend, the backend-selection split in liblustreapi_scan_device.c, the weak-symbol/-Wl,-u linkage and the spec/m4 changes all check out against libzpool and osd-zfs (unlinked-set key format, xattr ZAP value, directory size from doi_max_offset, SA handle ownership on the sa_handle_get_from_db() error path, and nvlist_free(cfg) after spa_import(), which spa_add() dups). One optional nit inline for whenever the patch is next refreshed -- no need to re-spin for it.
+
+--- Message (Hiroshi Nishida, 2026-09-22 21:36:04.000000000) ---
+Uploaded patch set 21.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-22 21:40:36.000000000) ---
+Patch Set 21:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-09-22 21:45:18.000000000) ---
+Patch Set 21:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre Gerrit Janitor, 2026-09-22 21:48:19.000000000) ---
+Patch Set 21:
+
+(1 comment)
+
+rocky8.10: Compile failed
+
+rocky9.6: Compile failed
+
+
+ Job output URL: https://testing.whamcloud.com/gerrit-janitor/70699/results.html
+
+--- Message (Hiroshi Nishida, 2026-09-22 21:54:44.000000000) ---
+Uploaded patch set 22.
+
+--- Message (jenkins, 2026-09-22 21:54:47.000000000) ---
+Patch Set 21:
+
+No Builds Executed
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-22 21:56:59.000000000) ---
+Patch Set 21:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-22 22:02:40.000000000) ---
+Patch Set 22:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-22 22:19:01.000000000) ---
+Patch Set 22:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-23 03:23:51.000000000) ---
+Patch Set 22: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132161/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-23 15:49:45.000000000) ---
+Patch Set 22:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Looks good. The ZFS backend tracks osd-zfs and zdb closely -- the SA table lookup per dataset, the unlinked-set gate, the directory size from doi_max_offset, the EBUSY/EMEDIUMTYPE/ENODEV split and the -Wl,-u for the weak slot all check out against the OpenZFS and osd-zfs sources. Only optional nits inline; no need to re-spin for them.
+
+--- Message (Hiroshi Nishida, 2026-09-23 18:54:04.000000000) ---
+Uploaded patch set 23.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-23 18:54:52.000000000) ---
+Patch Set 22:
+
+(3 comments)
+
+--- Message (wc-checkpatch, 2026-09-23 19:01:44.000000000) ---
+Patch Set 23:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-23 19:15:26.000000000) ---
+Patch Set 23:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-23 20:14:26.000000000) ---
+Patch Set 23: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132229/ : SUCCESS
+
+--- Message (Artem Blagodarenko, 2026-09-24 13:15:23.000000000) ---
+Patch Set 23:
+
+(3 comments)
+
+Two findings from a review of this change mirrored on the TLC GitHub (by the Claude review bot), checked against ps23.
+
+--- Message (Autotest, 2026-09-24 13:59:39.000000000) ---
+Patch Set 23:
+
+Onyx Autotest 2 retesting enforced review-dne-part-5 session on el9.7-x86_64/ldiskfs servers and clients for build 132229 patch 23. Requested by Hiroshi Nishida because of LU-17857.
+
+--- Message (Autotest, 2026-09-24 14:02:23.000000000) ---
+Patch Set 23:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-4 session on el9.8-x86_64/zfs servers and clients for build 132229 patch 23. Requested by Hiroshi Nishida because of LU-19908.
+
+--- Message (Gerrit AI review for Lustre, 2026-09-24 17:57:51.000000000) ---
+Patch Set 23:
+
+Looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-09-25 01:26:14.000000000) ---
+Uploaded patch set 24.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-25 01:37:54.000000000) ---
+Patch Set 23:
+
+(3 comments)
+
+--- Message (wc-checkpatch, 2026-09-25 01:38:35.000000000) ---
+Patch Set 24:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-25 01:43:24.000000000) ---
+Patch Set 24:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-25 02:46:39.000000000) ---
+Patch Set 24: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132288/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-25 15:42:56.000000000) ---
+Patch Set 24:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Looks good; one optional minor inline for whenever the patch is next refreshed, no need to re-spin for it.
+
+--- Message (Hiroshi Nishida, 2026-09-26 21:51:10.000000000) ---
+Uploaded patch set 25.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-26 21:52:49.000000000) ---
+Patch Set 24:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-09-26 21:55:51.000000000) ---
+Patch Set 25:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-26 22:07:25.000000000) ---
+Patch Set 25:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-26 23:00:10.000000000) ---
+Patch Set 25: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132370/ : SUCCESS
+
+--- Message (Autotest, 2026-09-27 04:14:19.000000000) ---
+Patch Set 25:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-5 session on el9.7-x86_64/zfs servers and clients for build 132370 patch 25. Requested by Hiroshi Nishida because of LU-9827.
+
+--- Message (Gerrit AI review for Lustre, 2026-09-27 10:22:40.000000000) ---
+Patch Set 25:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good; a few minor items inline. None of them needs a re-spin on its own, so fix them only if the patch is refreshed for another reason.
+
+--- Message (Autotest, 2026-09-27 13:33:15.000000000) ---
+Patch Set 25:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-5 session on el9.7-x86_64/zfs servers and clients for build 132370 patch 25. Requested by Hiroshi Nishida because of LU-20276.
+
+--- Message (Hiroshi Nishida, 2026-09-27 19:45:45.000000000) ---
+Uploaded patch set 26.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-27 19:46:07.000000000) ---
+Patch Set 25:
+
+(4 comments)
+
+--- Message (wc-checkpatch, 2026-09-27 19:46:39.000000000) ---
+Patch Set 26:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-27 20:01:55.000000000) ---
+Patch Set 26:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-27 20:31:44.000000000) ---
+Patch Set 26: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132404/ : SUCCESS
+
+--- Message (Hiroshi Nishida, 2026-09-28 13:09:10.000000000) ---
+Uploaded patch set 27.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-28 13:19:58.000000000) ---
+Patch Set 27:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-28 14:18:28.000000000) ---
+Patch Set 27: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132442/ : SUCCESS
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-28 16:08:46.000000000) ---
+Patch Set 27:
+
+Code-wise looks good to me.
+
+--- Message (Gerrit AI review for Lustre, 2026-10-05 08:25:50.000000000) ---
+Patch Set 27:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Looks good; one optional (minor) point inline for whenever the patch is next refreshed, no need to re-spin for it.
+
+--- Message (Hiroshi Nishida, 2026-10-05 23:41:12.000000000) ---
+Uploaded patch set 28.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-10-05 23:41:53.000000000) ---
+Patch Set 28:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-10-05 23:47:47.000000000) ---
+Patch Set 28:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-06 00:05:05.000000000) ---
+Patch Set 28:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-06 00:43:49.000000000) ---
+Patch Set 28: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132891/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-06 14:15:56.000000000) ---
+Patch Set 28:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Looks good overall; one minor question inline about the zpool.cache bypass on newer libzpool. No need to re-spin just for it, but worth folding into the next refresh.
+
+--- Message (Autotest, 2026-10-06 21:13:56.000000000) ---
+Patch Set 28:
+
+Trevis Autotest retesting enforced review-dne-zfs-part-4 session on el10.1-x86_64/zfs servers and clients for build 132891 patch 28. Requested by Hiroshi Nishida because of LU-18293.
+
+--- Message (Hiroshi Nishida, 2026-10-06 22:56:44.000000000) ---
+Uploaded patch set 29.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-10-06 22:57:02.000000000) ---
+Patch Set 28:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-10-06 23:08:17.000000000) ---
+Patch Set 29:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-06 23:19:22.000000000) ---
+Patch Set 29:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-06 23:49:37.000000000) ---
+Patch Set 29: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132981/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-07 12:20:57.000000000) ---
+Patch Set 29:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Looks good overall. One minor ZFS-version issue in the EACCES path and a stale comment inline; fine to pick up on the next refresh, no need to re-spin for them alone.
+
+--- Message (Hiroshi Nishida, 2026-10-08 00:06:07.000000000) ---
+Uploaded patch set 30.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-10-08 00:06:17.000000000) ---
+Patch Set 29:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-10-08 00:15:49.000000000) ---
+Patch Set 30:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-08 00:34:10.000000000) ---
+Patch Set 30:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-08 01:20:01.000000000) ---
+Patch Set 30: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133080/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-08 14:42:36.000000000) ---
+Patch Set 30:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Looks good; one optional comment nit inline for whenever the patch is next refreshed. No need to re-spin for it.
+
+--- Message (Autotest, 2026-10-08 23:39:28.000000000) ---
+Patch Set 30:
+
+Onyx Autotest retesting enforced review-dne-ipv6 session on el9.8-x86_64/ldiskfs servers and clients for build 133080 patch 30. Requested by Hiroshi Nishida because of LU-20710.
+
+--- Message (Hiroshi Nishida, 2026-10-09 11:46:43.000000000) ---
+Uploaded patch set 31.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-10-09 11:46:53.000000000) ---
+Patch Set 30:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-10-09 11:51:28.000000000) ---
+Patch Set 31:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-09 12:13:43.000000000) ---
+Patch Set 31:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-09 12:24:22.000000000) ---
+Patch Set 31: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133274/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-10 12:15:17.000000000) ---
+Patch Set 31:
+
+Looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-10-10 23:16:28.000000000) ---
+Uploaded patch set 32: Patch Set 31 was rebased.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-10-10 23:20:14.000000000) ---
+Patch Set 32:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-10 23:34:39.000000000) ---
+Patch Set 32:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-11 00:09:23.000000000) ---
+Patch Set 32: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133362/ : SUCCESS
+
+--- Message (Autotest, 2026-10-11 06:37:18.000000000) ---
+Patch Set 32:
+
+Onyx Autotest retesting enforced review-dne-zfs-part-1 session on el10.1-x86_64/zfs servers and clients for build 133362 patch 32. Requested by Hiroshi Nishida because of LU-20523.
+
+--- Message (Autotest, 2026-10-11 06:37:32.000000000) ---
+Patch Set 32:
+
+Onyx Autotest retesting enforced review-dne-zfs-part-1 session on el9.8-x86_64/zfs servers and clients for build 133362 patch 32. Requested by Hiroshi Nishida because of LU-20884.
+
+--- Message (Hiroshi Nishida, 2026-10-12 05:45:44.000000000) ---
+Uploaded patch set 33: Patch Set 32 was rebased.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-10-12 05:56:47.000000000) ---
+Patch Set 33:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-12 05:58:16.000000000) ---
+Patch Set 33:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-12 06:46:12.000000000) ---
+Patch Set 33: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133431/ : SUCCESS
+
+--- Message (Hiroshi Nishida, 2026-10-14 02:12:00.000000000) ---
+Uploaded patch set 34.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-10-14 02:16:07.000000000) ---
+Patch Set 34:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-14 02:44:15.000000000) ---
+Patch Set 34:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-14 03:38:41.000000000) ---
+Patch Set 34: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133614/ : SUCCESS

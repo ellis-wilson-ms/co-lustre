@@ -1,0 +1,450 @@
+Change:     67744
+Subject:    LU-15842 osd-zfs: report a logical size for directories
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67744
+Change-Id:  I894515a8ed9fba867ce42120ecf5f0c03ed75550
+Project:    fs/lustre-release
+Branch:     master
+Status:     ABANDONED
+Owner:      Oleg Drokin
+Created:    2026-08-05 04:30:02.000000000
+Updated:    2026-08-30 22:36:26.000000000
+Patch Set:  1
+Insertions: +67
+Deletions:  -6
+Comments:   13 (5 unresolved)
+Hashtags:   testfix
+
+--- Labels ---
+  Code-Review: James Simmons: +1; wc-checkpatch: -1; Andreas Dilger: +1; Alex Zhuravlev: +1
+  Verified: jenkins: +1; Maloo: +1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
+  REVIEWER: Andreas Dilger, Alex Zhuravlev, James Simmons, Brian Behlendorf, Timothy Day
+
+--- Commit Message ---
+LU-15842 osd-zfs: report a logical size for directories
+
+sanityn test_102 fails intermittently on ZFS, comparing a directory's
+stat data taken through two mounts of the same filesystem.
+check_fhandle_syscalls.c compares st_dev, st_ino, st_mode, st_mtime and
+st_size, and names the field that differed:
+
+  st_size mismatch: open <sampled before the sync>,
+                    open_by_handle_at <sampled after it>
+
+The reported failure is on d102.sanityn.remote/subdir, which sanityn
+creates with "lfs mkdir -c -1"; the sizes seen for each directory shape
+are in the table below.
+
+osd_attr_get() discards a directory's logical size and substitutes DMU
+space accounting instead:
+
+	sa_object_size(obj->oo_sa_hdl, &blksize, &blocks);
+	if (S_ISDIR(attr->la_mode))
+		attr->la_size = 512 * blocks;
+
+sa_object_size() reads dn_phys, the on-disk dnode, whose dn_used is
+updated only from syncing context.  A directory's reported size therefore
+changes when the txg syncs, and a txg sync performs no metadata operation:
+no MDS_INODELOCK_UPDATE is revoked, so no client cache is invalidated.  A
+client that sampled before the sync keeps serving the old value under a
+lock that is still perfectly valid, while a second mount that samples
+afterwards gets a different, equally valid value.  Nothing the client can
+do closes that gap, because from the DLM's point of view nothing changed.
+
+Report the ZAP's logical length instead.  dn_maxblkid is advanced in open
+context, in the same tx that adds the dirent, so it moves only under a
+lock the client has to reacquire.  la_blocks is left as physical
+accounting, which is what st_blocks is meant to be everywhere else; only
+la_size changes.  osd-ldiskfs already reports a logical i_size for
+directories, which is why this has always been a ZFS-only failure.
+
+That covers a directory that grows, which is what the reported failure
+is.  It is not symmetric: zap_shrink() frees an emptied tail leaf and
+dnode_sync_free_range_impl() lowers dn_phys->dn_maxblkid only, from
+syncing context, while the in-core dn_maxblkid is never lowered
+(dnode_new_blkid() returns early for a smaller blkid).  A directory that
+shrinks therefore keeps the larger size until its dnode is evicted and
+reloaded, and reports the smaller one afterwards.  Creating and then
+unlinking 20000 entries gave 2564096 before and 2465792 after exporting
+and importing the pool.  Squeezing the ARC with the filesystem still
+mounted did not move it, but that is not a bound on when it can surface:
+the dnode stays pinned only while the osd_object is cached, and
+lu_site_purge() drops idle objects under memory pressure.  No
+client-visible disagreement was produced either way.  Making the size
+stable in both directions means maintaining it in the SA as osd-ldiskfs
+does, which is a larger change than this one.
+
+Measured on a 4-MDT ZFS DNE cluster with a probe that creates a
+directory and stats it through two mounts either side of a "zpool sync"
+that touches nothing.  The last column is the pair of sizes the two
+mounts reported without the patch:
+
+                        before          after   sizes seen before
+  mkdir                 20/20 mismatch  0/20    512 -> 7680
+  lfs mkdir -i 1        20/20 mismatch  0/20    1024 -> 7168
+  lfs mkdir -c -1       20/20 mismatch  0/20    22528 -> 28672
+
+Over 120 runs of sanityn test_102 on the same clusters, classified by
+failure signature, the mismatch appears 10 times without this patch and
+0 times with it.
+
+With the patch a directory reports 16384 per stripe and keeps it: 16384
+for a plain or remote one, and 65536 for "lfs mkdir -c -1" across four
+MDTs, since the client sums the stripes in lmv_merge_attr().  Exporting
+and importing all eight pools, which evicts and reloads every dnode from
+disk, leaves 30 directories reporting identical sizes.
+
+dmu_object_info_from_dnode() is exported with this signature and the same
+internal locking in every supported OpenZFS, verified in 2.0.0 and 2.4.0,
+and doi_max_offset is (dn_maxblkid + 1) * dn_datablksz in both.
+
+sanityn test_102 only catches this when the two stats happen to straddle
+a txg sync, so add sanityn test_122, which stats a plain, a remote and a
+striped directory through both mounts either side of a deliberate sync.
+
+conf-sanity's t32_test() verifies an upgraded image by diffing an
+"ls -Rni" listing against one recorded when the image was made, and that
+listing includes the directory size, so it fails on every ZFS image once
+the reported size changes.  The helper is shared by test_32a through
+test_32j, so all ten variants are affected.  Nothing else in the listing
+moves: of 48 differing lines, 48 are directories and the inodes, modes,
+owners, timestamps and file sizes all still match.  Normalise that one
+column out of both sides before the comparison, as the test already does
+for inode numbers when the image came from an architecture with a
+different long.
+
+This does not make st_blocks coherent: it is physical accounting and still
+settles at txg sync, as it does on any filesystem.  It is deliberately not
+added to check_fhandle_syscalls.
+
+Fixes: 234ce16dba60 ("LU-1943 zfs-osd: different fixes for zfs")
+Test-Parameters: optional fstype=zfs mdscount=2 mdtcount=4 testlist=sanityn env=ONLY=102,ONLY_REPEAT=300
+Signed-off-by: Oleg Drokin <green@whamcloud.com>
+Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
+Change-Id: I894515a8ed9fba867ce42120ecf5f0c03ed75550
+
+--- Review History ---
+
+--- Message (Oleg Drokin, 2026-08-05 04:30:02.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-05 04:35:44.000000000) ---
+Patch Set 1:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/67262/results.html
+
+ Commencing initial testing: conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs runtests-ssk@ldiskfs+SharedKey runtests@zfs runtests@zfs+DNE sanityn@ldiskfs+DNE sanityn-special1@ldiskfs+DNE sanityn-special1@ldiskfs sanityn-special2@ldiskfs+DNE sanityn-special2@ldiskfs sanityn-special3@ldiskfs+DNE sanityn-special3@ldiskfs sanityn-special4@ldiskfs+DNE sanityn-special4@ldiskfs sanityn-special5@ldiskfs+DNE sanityn-special5@ldiskfs sanityn-special6@ldiskfs+DNE sanityn-special6@ldiskfs sanityn-special7@ldiskfs+DNE sanityn-special7@ldiskfs sanityn-special8@ldiskfs+DNE sanityn-special8@ldiskfs sanityn-special9@ldiskfs+DNE sanityn-special9@ldiskfs sanityn-special10@ldiskfs+DNE sanityn-special10@ldiskfs sanityn@zfs sanityn-special1@zfs sanityn-special1@zfs+DNE sanityn-special2@zfs sanityn-special2@zfs+DNE sanityn-special3@zfs sanityn-special3@zfs+DNE sanityn-special4@zfs sanityn-special4@zfs+DNE sanityn-special5@zfs sanityn-special5@zfs+DNE sanityn-special6@zfs sanityn-special6@zfs+DNE sanityn-special7@zfs sanityn-special7@zfs+DNE sanityn-special8@zfs sanityn-special8@zfs+DNE sanityn-special9@zfs sanityn-special9@zfs+DNE sanityn-special10@zfs sanityn-special10@zfs+DNE
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-05 04:37:25.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-05 04:41:19.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-08-05 06:02:12.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128700/ : SUCCESS
+
+--- Message (Maloo, 2026-08-05 06:06:34.000000000) ---
+Patch Set 1:
+
+#### The following sessions will be run for Build 128700 (patch #1):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+#### Optional:
+
+- review-dne-ipv6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.7-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=128700&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=128700#redirect
+
+--- Message (Lustre RISC-V Builder, 2026-08-05 06:50:21.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Maloo, 2026-08-05 14:40:20.000000000) ---
+Patch Set 1:
+
+Failed enforced test review-dne-zfs-part-2 on RHEL 10.1 / x86_64 uploaded by Onyx Autotest from onyx-142vm15: https://testing.whamcloud.com/test_sessions/82805be4-d9fd-415c-bbb6-79d666b2bc88 ran 11 tests.  1 tests failed: sanity-lfsck.
+
+--- Message (Maloo, 2026-08-05 17:04:37.000000000) ---
+Patch Set 1:
+
+Failed enforced test review-dne-zfs-part-4 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-143vm13: https://testing.whamcloud.com/test_sessions/cad2b71d-9217-4e0f-bf45-e0c0cf60e0c8 ran 9 tests.  1 tests failed: sanity-quota.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-08-05 18:29:04.000000000) ---
+Patch Set 1: Verified-1
+
+Passed enforced test review-dne-part-3 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-145vm8: https://testing.whamcloud.com/test_sessions/8cc87ad5-c749-4b90-9ba7-6aebd8154fdf ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-08-05 18:47:07.000000000) ---
+Patch Set 1:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, minor comments inline. The ZFS reasoning checks out: dmu_object_info_from_dnode() is exported with this signature and takes dn_struct_rwlock/dn_mtx internally in both 2.0.0 and 2.4.0, doi_max_offset is (dn_maxblkid + 1) * dn_datablksz in both, and dn_maxblkid is only advanced from open context, so the new value moves under the same lock the client has to reacquire.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-05 21:15:23.000000000) ---
+Patch Set 1:
+
+Initial testing failed:
+
+> conf-sanity4@ldiskfs+DNE Failure(16632s)
+- 135(creation thread is running. Is changelog reader stuck?) 
+> conf-sanity3@zfs Timeout(3585s)
+> sanityn@zfs Timeout(4833s)
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs runtests-ssk@ldiskfs+SharedKey runtests@zfs runtests@zfs+DNE sanityn@ldiskfs+DNE sanityn-special1@ldiskfs+DNE sanityn-special1@ldiskfs sanityn-special2@ldiskfs+DNE sanityn-special2@ldiskfs sanityn-special3@ldiskfs+DNE sanityn-special3@ldiskfs sanityn-special4@ldiskfs+DNE sanityn-special4@ldiskfs sanityn-special5@ldiskfs+DNE sanityn-special5@ldiskfs sanityn-special6@ldiskfs+DNE sanityn-special6@ldiskfs sanityn-special7@ldiskfs+DNE sanityn-special7@ldiskfs sanityn-special8@ldiskfs+DNE sanityn-special8@ldiskfs sanityn-special9@ldiskfs+DNE sanityn-special9@ldiskfs sanityn-special10@ldiskfs+DNE sanityn-special10@ldiskfs sanityn-special1@zfs sanityn-special1@zfs+DNE sanityn-special2@zfs sanityn-special2@zfs+DNE sanityn-special3@zfs sanityn-special3@zfs+DNE sanityn-special4@zfs sanityn-special4@zfs+DNE sanityn-special5@zfs sanityn-special5@zfs+DNE sanityn-special6@zfs sanityn-special6@zfs+DNE sanityn-special7@zfs sanityn-special7@zfs+DNE sanityn-special8@zfs sanityn-special8@zfs+DNE sanityn-special9@zfs sanityn-special9@zfs+DNE sanityn-special10@zfs sanityn-special10@zfs+DNE 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/67262/results.html
+
+--- Message (Autotest, 2026-08-06 21:05:09.000000000) ---
+Patch Set 1:
+
+Trevis Autotest retesting enforced review-dne-zfs-part-2 session on el10.1-x86_64/zfs servers and clients for build 128700 patch 1. Requested by Oleg Drokin because of LU-20477.
+
+--- Message (Autotest, 2026-08-06 21:07:59.000000000) ---
+Patch Set 1:
+
+Onyx Autotest retesting enforced review-dne-zfs-part-4 session on el9.7-x86_64/zfs servers and clients for build 128700 patch 1. Requested by Oleg Drokin because of LU-20523.
+
+--- Message (Maloo, 2026-08-07 02:44:50.000000000) ---
+Patch Set 1:
+
+Passed enforced test review-dne-zfs-part-4 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-159vm49: https://testing.whamcloud.com/test_sessions/4f340f60-fb7d-406f-a6e6-e521c2267472 ran 9 tests.
+
+--- Message (Maloo, 2026-08-07 03:33:19.000000000) ---
+Patch Set 1: Verified+1
+
+Passed enforced test review-dne-zfs-part-2 on RHEL 10.1 / x86_64 uploaded by Trevis Autotest from trevis-154vm88: https://testing.whamcloud.com/test_sessions/67dcb0a8-34a7-4702-9ba9-45e9734ad512 ran 11 tests.
+
+--- Message (Andreas Dilger, 2026-08-13 00:11:58.000000000) ---
+Patch Set 1: Code-Review+1
+
+(2 comments)
+
+--- Message (Marc Vef, 2026-08-13 13:19:31.000000000) ---
+Hashtag added: master-next
+
+--- Message (Marc Vef, 2026-08-13 13:19:32.000000000) ---
+Patch Set 1:
+
+[Marc Bot] Note: This change has been cherry-picked to master-next and is considered for landing. Please avoid updates unless required while the master-next hashtag is set; doing so may cause the patch to be removed from master-next and not landed. Note: AI review comments should be addressed/responded to.
+
+--- Message (Marc Vef, 2026-08-13 13:19:32.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (James Simmons, 2026-08-13 14:10:20.000000000) ---
+Patch Set 1: Code-Review+1
+
+--- Message (Andreas Dilger, 2026-08-13 17:01:28.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Alex Zhuravlev, 2026-08-17 09:51:35.000000000) ---
+Patch Set 1: Code-Review+1
+
+(1 comment)
+
+--- Message (Oleg Drokin, 2026-08-18 18:19:00.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-08-18 18:37:08.000000000) ---
+Patch Set 1:
+
+(3 comments)
+
+--- Message (Andreas Dilger, 2026-08-18 19:05:19.000000000) ---
+Patch Set 1:
+
+(2 comments)
+
+--- Message (Andreas Dilger, 2026-08-18 20:35:09.000000000) ---
+Hashtag added: testfix
+
+--- Message (Oleg Drokin, 2026-08-19 19:16:09.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Marc Vef, 2026-08-20 09:43:07.000000000) ---
+Hashtag removed: master-next
+
+--- Message (Marc Vef, 2026-08-20 09:43:08.000000000) ---
+Patch Set 1:
+
+[Marc Bot] Note: This change has been removed from master-next and is no longer considered for landing in its current form.
+
+--- Message (Marc Vef, 2026-08-20 09:43:08.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-26 10:47:35.000000000) ---
+Patch Set 1:
+
+[lander-bot:mn-conflict]
+Notice! This patch conflicts with change 68154 that was already cherry-picked to master-next, consider rebasing your patch on top of that change.
+
+--- Message (wc-checkpatch, 2026-08-30 18:55:24.000000000) ---
+Patch Set 1: Code-Review-1
+
+This change cannot be cherry-picked to master.
+Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (Oleg Drokin, 2026-08-30 22:36:26.000000000) ---
+Abandoned
+
+alternative approach has landed

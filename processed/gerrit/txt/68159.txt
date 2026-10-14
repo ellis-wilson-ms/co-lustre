@@ -1,0 +1,1536 @@
+Change:     68159
+Subject:    LU-20611 llapi: run find over a device scan
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68159
+Change-Id:  Ibf2dcf71e5444914f306ad37a551262cddd8e1de
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Hiroshi Nishida
+Created:    2026-08-19 19:55:28.000000000
+Updated:    2026-10-14 03:27:48.000000000
+Patch Set:  34
+Insertions: +1732
+Deletions:  -114
+Comments:   188 (1 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1
+
+--- Reviewers ---
+  CC: Oleg Drokin, Andreas Dilger, Lustre RISC-V Builder, Gerrit AI review for Lustre
+  REVIEWER: Artem Blagodarenko
+
+--- Commit Message ---
+LU-20611 llapi: run find over a device scan
+
+Add llapi_find_device(). It passes the records of llapi_scan_device()
+through the same checks that llapi_find() uses for a namespace walk.
+The checks are not written again: the record is presented as the
+lov_user_mds_data that every find_check_* helper already reads.
+
+A field that the scan could not answer is left out of stx_mask, as
+llite does when the MDT's answer is not authoritative. The layout and
+directory-stripe buffers live for the whole scan, so an object without
+one must say so, and not reuse the previous object's.
+
+Some searches need something that a target scan does not have. They
+are refused before the scan starts, because afterwards "no matches"
+and "cannot answer" look the same:
+- --xattr needs a mounted filesystem
+- -printf %p needs a path; the check skips the same flags and width as
+  the printer, so "%+5p" and "% 5p" are refused too
+- --maxdepth, --mindepth and --threads describe a walk
+A field that the inode format has no room for, such as a project id or
+a birth time, is counted as undecided and reported at the end. The
+negations differ: a walk sees no birth time for such an inode either,
+so ! -btime matches it, but a walk is told a project id of 0, so
+! --projid N stays undecided.
+lfsp_filter is cleared, because the scan carries this function's own
+state.
+
+--ost and --mdt are answered from the target itself. Every object in
+an MDT scan is on that MDT, and every object in an OST scan is on that
+OST. find_tgt_index() matches each name against the label that the
+backend read: a numeric index as given, and a UUID through
+llapi_uuid_match(). A name of another target never matches, so the
+predicate is false for every object, and true for every object under
+"!". This is not an error, so one --ost can be used over many devices.
+When no object on the target can match, the scan is skipped.
+
+--ost is decided before the scan, removed from the search and put back
+afterwards. check_obd_match() reads the layout, and an OST object has
+none, so it would reject every object of the requested target. --mdt
+uses check_mdt_match(), with fp_file_mdt_index set once from the
+target. --mdt over an OST and --ost over an MDT are refused: an OST
+object names its MDT only through an FLD lookup, which needs a client,
+and --ost over an MDT asks about layouts, not about the target. The
+layout options over an OST are refused for the same reason: an OST
+object has no layout, so they would compare a default never read.
+
+find_lmm_fits() checks the layout before layout_swab_lov_user_md()
+uses it, because lcm_entry_count and lcme_offset come from a target
+that may be in the middle of a write. It reads each field in the byte
+order it found, as llapi_layout_get_by_xattr() does. An object whose
+layout does not fit is undecided for the layout options.
+
+Some layouts are seen only by a target scan, and are accepted:
+- A directory default layout has a stripe count but no lmm_objects[]
+  ("lfs setstripe -c 4 dir" is 32 bytes). The object array is measured
+  by the buffer, as llapi_layout_objects_in_lum() does.
+- LOV_MAGIC_SEL is written by lod and shown to a client as COMP_V1,
+  and it is converted to that. LOV_USER_MAGIC_SPECIFIC is converted to
+  V3; a walk sees it unchanged, so --pool can match such a directory on
+  a scan and not on a walk.
+Otherwise such objects would take the no-layout path and be compared
+against the filesystem default layout.
+
+--name is tested against every name in trusted.link. A walk meets a
+hardlinked file once per link, but a scan meets the object once, so it
+must test all names. The object is still reported once.
+scan_linkea_entry() reads any entry, not only the first. A linkea
+whose first entry does not parse no longer sets LLAPI_SCAN_LINKEA. A
+linkea that ends before all its names are read makes the object
+undecided, not a non-match. Before an object is called undecided,
+find_device_prefilter() runs the other predicates, so an OST scan with
+"-name X -type d" does not warn about objects that -type rejected.
+find_prefilter() skips -name for a record with no name, because
+fnmatch() does not accept NULL.
+
+--links on a foreign directory: find_decide() read the lfm_length of a
+foreign LMV as a stripe count. It now tests lmv_is_foreign() first,
+like the --mdt-count, --hash-type and --hash-flag checks.
+find_decide() now makes that check itself, for a walk and a scan
+alike. On a walk too, -printf %Lc, %Lh, %Lp and %Lo now print nothing
+for a foreign directory. Before, they printed lfm_length as a stripe
+count and part of lfm_value as a pool name.
+
+-printf answers from the record. %LF is the record's FID, the layout
+directives read trusted.lov through llapi_layout_get_by_xattr(), %i is
+the object id on the target, and %LP needs no open.
+printf_format_want() decides the %p refusal and what a format needs to
+read, so "-printf %i" does not read a layout.
+
+Three -printf answers were wrong in a walk too. For a layout that only
+says "the default", the stripe count and size printed
+LLAPI_LAYOUT_DEFAULT. They now print nothing, except that a
+Data-on-MDT component's count prints 0, as lfs getstripe says.
+%Lo skips a component whose stripe count is not a number of objects
+(the default, or -1 for all OSTs, on a component with no objects
+yet). Before, it filled the buffer with "?," and lost the newline and
+the later components.
+A device scan has no shard FIDs, so %Lo prints nothing for a striped
+directory. %s, %b and %k print nothing for an object the scan has no
+size or blocks for, rather than 0.
+
+On a walk, "! --foreign" prints an unstriped directory without
+testing the other predicates, to save the getattr. A scan has the
+attributes already, so it goes on to the attribute tests there. The
+stripe tests (--mdt-count, --mdt-hash) stay skipped, as on a walk.
+
+-btime and -newerbY change in a walk too. An object with no birth
+time (off Lustre, or through the V1 ioctl) used to return
+-EOPNOTSUPP, which ended the walk of the whole subtree. It is now a
+non-match.
+
+When a search only prints, an object without a layout does not get
+the filesystem default layout, and the per-object layout messages are
+quiet on a scan.
+
+An object the scan delivers with no FID is printed as obj:ID: an OST
+object with no LMA (its object id is in the directory entry, not in
+the inode, so there is no IDIF to build), or an MDT object with no LMA
+outside MDT0000. On MDT0000, llapi_scan_device() already gives such an
+object its IGIF. The MDT FID in an OST object's trusted.fid is not
+read yet; that is left for a later change. llapi_find_device.3
+describes how a target scan answers differently.
+
+A foreign LMV larger than the search's buffer grows the buffer, as a
+walk does, so --foreign and the other LMV checks still see it.
+
+A size the scan did not report is undecided for -size and -blocks,
+whatever the layout says: a Data-on-MDT file's stripe count is 0, so
+it would otherwise be decided on a stx_size the scan never reported.
+The fix is Artem Blagodarenko's.
+
+Fixes: 6b8e97b76c47 ("LU-10378 utils: add formatted printf to lfs find")
+Fixes: 186b97e68abb ("LU-11971 utils: Send file creation time to clients")
+Signed-off-by: Hiroshi Nishida <hnishida@thelustrecollective.com>
+Signed-off-by: Artem Blagodarenko <ablagodarenko@thelustrecollective.com>
+Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
+Change-Id: Ibf2dcf71e5444914f306ad37a551262cddd8e1de
+
+--- Review History ---
+
+--- Message (Hiroshi Nishida, 2026-08-19 19:55:28.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-19 20:02:45.000000000) ---
+Patch Set 1:
+
+rocky8.10: Compile failed
+
+rocky9.6: Compile failed
+
+
+ Job output URL: https://testing.whamcloud.com/gerrit-janitor/68256/results.html
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-19 20:09:11.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-19 20:10:29.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-08-19 20:14:11.000000000) ---
+Uploaded patch set 2: Patch Set 1 was rebased.
+
+--- Message (jenkins, 2026-08-19 20:14:13.000000000) ---
+Patch Set 1:
+
+No Builds Executed
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-19 20:24:09.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-19 20:26:00.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-08-19 21:32:48.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129765/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-19 22:42:33.000000000) ---
+Patch Set 2:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-20 13:07:15.000000000) ---
+Patch Set 2:
+
+(6 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, comments inline. The two buffer resets and forcing fp_lazy look correct, and the stale-stripe-count bug they fix is real.
+
+That bug was introduced by the immediately preceding, unlanded patch in this series, 55c88e1300 ("LU-20611 lfs: share find's predicate parsing"), which is where llapi_find_device() and all its helpers actually arrive. Folding the two resets, the flags argument and the lustreapi.h declaration back into that patch would keep each step self-contained; as things stand the series has one commit where lfs find over a scan matches the wrong objects for --stripe-count and a second that repairs it.
+
+Nothing exercises llapi_find_device(). lustre/tests/llapi_scan_device_test.c already exists for the scanner side, and a case that scans a target holding a striped file followed by an unstriped one and a plain directory would have caught this bug directly.
+
+--- Message (Hiroshi Nishida, 2026-08-20 13:58:41.000000000) ---
+Uploaded patch set 3: Patch Set 2 was rebased.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-20 14:10:28.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-20 14:14:11.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-20 15:50:05.000000000) ---
+Patch Set 3:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Hiroshi Nishida, 2026-08-20 15:56:38.000000000) ---
+Uploaded patch set 4.
+
+--- Message (wc-checkpatch, 2026-08-20 16:00:10.000000000) ---
+Patch Set 4:
+
+Looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-08-20 16:08:52.000000000) ---
+Patch Set 4:
+
+(4 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-20 16:11:39.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-08-20 17:29:21.000000000) ---
+Uploaded patch set 5: Patch Set 4 was rebased.
+
+--- Message (wc-checkpatch, 2026-08-20 17:33:41.000000000) ---
+Patch Set 5:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-20 17:44:13.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-20 19:24:00.000000000) ---
+Patch Set 4:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-20 20:33:23.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129831/ : SUCCESS
+
+--- Message (jenkins, 2026-08-20 21:37:58.000000000) ---
+Patch Set 4: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/129842/ : FAILURE
+
+--- Message (jenkins, 2026-08-20 22:43:46.000000000) ---
+Patch Set 5: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/129853/ : FAILURE
+
+--- Message (Lustre RISC-V Builder, 2026-08-20 22:52:44.000000000) ---
+Patch Set 5:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Hiroshi Nishida, 2026-08-21 13:03:45.000000000) ---
+Patch Set 5:
+
+BUILD
+
+--- Message (jenkins, 2026-08-21 14:19:34.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129929/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-08-22 14:57:40.000000000) ---
+Patch Set 5:
+
+(6 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The directory-stripe predicates look like they change answer between a walk and a scan, and the on-disk layout reaches the find_check_* helpers unvalidated. Also: llapi_find_device() has no in-tree caller and no test - should this come with a sanity/sanity-scan case that runs a few predicates over a formatted MDT image and compares against the same search on a mount?
+
+--- Message (Hiroshi Nishida, 2026-08-23 13:18:48.000000000) ---
+Uploaded patch set 6.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-23 13:33:40.000000000) ---
+Patch Set 6:
+
+Looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-08-23 13:35:49.000000000) ---
+Patch Set 2:
+
+(2 comments)
+
+--- Message (Hiroshi Nishida, 2026-08-23 13:35:50.000000000) ---
+Patch Set 5:
+
+(6 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-23 13:36:11.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-23 14:22:46.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130048/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-23 15:47:34.000000000) ---
+Patch Set 6:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-24 02:45:13.000000000) ---
+Patch Set 6:
+
+(8 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, comments inline. One functional concern: --btime still ends the whole scan the way --projid used to. Also, llapi_scan_device() landed with lustre/tests/llapi_scan_device_test.c in this same series; should llapi_find_device() get an equivalent (a target with a known object, one predicate that matches and one that does not, plus the refused-predicate returns)?
+
+--- Message (Hiroshi Nishida, 2026-08-24 16:50:11.000000000) ---
+Uploaded patch set 7.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-08-24 16:50:56.000000000) ---
+Patch Set 7:
+
+(8 comments)
+
+--- Message (wc-checkpatch, 2026-08-24 17:03:49.000000000) ---
+Patch Set 7:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-08-24 17:56:22.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130144/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-24 18:00:49.000000000) ---
+Patch Set 7:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-25 10:12:46.000000000) ---
+Patch Set 7:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The other two API commits in this series (LU-20603, LU-20606) each landed with a test program plus a sanity.sh / conf-sanity.sh case, but llapi_find_device() adds a public API with no test and no in-tree caller. Should this add a llapi_find_device_test.c and a conf-sanity case alongside llapi_scan_device_test.c?
+
+--- Message (Hiroshi Nishida, 2026-08-25 16:42:54.000000000) ---
+Uploaded patch set 8.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-25 16:50:53.000000000) ---
+Patch Set 8:
+
+Looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-08-25 16:59:01.000000000) ---
+Patch Set 8:
+
+(5 comments)
+
+--- Message (Lustre RISC-V Builder, 2026-08-25 19:27:58.000000000) ---
+Patch Set 8:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-26 06:56:12.000000000) ---
+Patch Set 8: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130241/ : SUCCESS
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-26 07:30:40.000000000) ---
+Patch Set 8:
+
+Code-wise looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-08-26 16:04:29.000000000) ---
+Uploaded patch set 9: Patch Set 8 was rebased.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-26 16:14:16.000000000) ---
+Patch Set 9:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-26 16:23:24.000000000) ---
+Patch Set 9:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-27 04:08:52.000000000) ---
+Patch Set 9: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130404/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-27 16:34:24.000000000) ---
+Patch Set 9:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-27 20:40:14.000000000) ---
+Patch Set 9:
+
+(6 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The main one is the layout swab running before anything has bounded the buffer it walks.
+
+This adds a public API with no test, while llapi_scan_namespace() and llapi_scan_device() each landed with one in this series (llapi_scan_test.c, llapi_scan_device_test.c) - should llapi_find_device() get the same? The -btime/-newerXb hunk also changes llapi_find()'s existing walk behaviour, which would probably land better as its own patch.
+
+--- Message (Hiroshi Nishida, 2026-08-28 00:00:00.000000000) ---
+Uploaded patch set 10.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-28 00:11:49.000000000) ---
+Patch Set 10:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-28 00:38:01.000000000) ---
+Patch Set 10:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-28 01:56:07.000000000) ---
+Patch Set 10: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130490/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-28 03:36:49.000000000) ---
+Patch Set 10:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-28 20:14:41.000000000) ---
+Patch Set 10:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The main one is a big-endian gap in find_lmm_fits(); the rest are documentation that no longer matches the code.
+
+Nothing in the tree exercises llapi_find_device() yet -- the series already carries llapi_scan_test.c and llapi_scan_device_test.c, so a matching llapi_find_device case (a scan of a formatted MDT with a couple of fp_check_* predicates set, checking the FID/obj: lines that come back) would cover the record-to-lmd mapping and the ENOTSUP refusals that are the bulk of this change.
+
+--- Message (Hiroshi Nishida, 2026-08-29 13:32:34.000000000) ---
+Uploaded patch set 11.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-29 13:45:37.000000000) ---
+Patch Set 11:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-29 14:07:25.000000000) ---
+Patch Set 11:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-29 14:33:44.000000000) ---
+Patch Set 11: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130574/ : SUCCESS
+
+--- Message (Hiroshi Nishida, 2026-08-29 14:48:07.000000000) ---
+Patch Set 11:
+
+(5 comments)
+
+--- Message (Lustre RISC-V Builder, 2026-08-29 16:56:18.000000000) ---
+Patch Set 11:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Hiroshi Nishida, 2026-08-29 18:09:55.000000000) ---
+Uploaded patch set 12: Patch Set 11 was rebased.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-29 18:24:20.000000000) ---
+Patch Set 12:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-29 18:37:49.000000000) ---
+Patch Set 12:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-29 19:17:23.000000000) ---
+Patch Set 12: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130593/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-29 20:59:26.000000000) ---
+Patch Set 12:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-30 08:23:32.000000000) ---
+Patch Set 12:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The main one is find_lmm_fits() rejecting layout forms that only exist on a target, so the layout predicates end up comparing against the forged default instead.
+
+Unlike ddb34fd39d and ba4fe957a1, this change ships a new published llapi entry point with no test and no in-tree caller. Should it come with a llapi_find_device_test.c (or an addition to llapi_scan_device_test.c) and a conf-sanity case that runs a couple of predicates against a formatted MDT, so the record-to-lov_user_mds_data mapping is exercised?
+
+--- Message (Hiroshi Nishida, 2026-08-30 14:47:27.000000000) ---
+Uploaded patch set 13.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-08-30 14:48:16.000000000) ---
+Patch Set 13:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-08-30 15:02:19.000000000) ---
+Patch Set 13:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-30 15:15:45.000000000) ---
+Patch Set 13:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-30 16:20:45.000000000) ---
+Patch Set 13: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130626/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-30 17:50:12.000000000) ---
+Patch Set 13:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-31 06:12:33.000000000) ---
+Patch Set 13:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, two comments inline. llapi_find_device() is a new public library entry point and nothing in the tree exercises it -- the series already ships lustre/tests/llapi_scan_test.c and llapi_scan_device_test.c, so should this one come with an llapi_find_device_test that runs a few predicates over a formatted MDT image and checks the FID list that comes back?
+
+--- Message (Hiroshi Nishida, 2026-08-31 14:07:31.000000000) ---
+Uploaded patch set 14.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-08-31 14:08:39.000000000) ---
+Patch Set 13:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-08-31 14:22:36.000000000) ---
+Patch Set 14:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-31 14:38:31.000000000) ---
+Patch Set 14:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-31 15:53:41.000000000) ---
+Patch Set 14: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130718/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-31 17:25:58.000000000) ---
+Patch Set 14:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-09-01 05:02:13.000000000) ---
+Patch Set 14:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, comments inline. llapi_find_device() is new user-visible functionality with no coverage added -- llapi_scan_device() got lustre/tests/llapi_scan_device_test.c earlier in this series; should a companion llapi_find_device_test.c (or a case in the existing one) exercise at least the -ENOTSUP refusals, the FID/obj: output forms and one layout predicate?
+
+--- Message (Hiroshi Nishida, 2026-09-01 16:24:32.000000000) ---
+Uploaded patch set 15.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-01 16:32:03.000000000) ---
+Patch Set 15:
+
+Looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-09-01 16:36:26.000000000) ---
+Patch Set 14:
+
+(3 comments)
+
+Round 17: replies to the review comments on this patch set.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-01 16:52:37.000000000) ---
+Patch Set 15:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-01 17:13:30.000000000) ---
+Patch Set 15: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130795/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-01 19:56:55.000000000) ---
+Patch Set 15:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-09-02 22:34:18.000000000) ---
+Patch Set 15:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, minor comments inline.
+
+Nothing in the series exercises llapi_find_device(). LU-20603 landed llapi_scan_test.c with a sanity.sh case and LU-20606 landed llapi_scan_device_test.c with conf-sanity test_165; a new published API that reads a target directly and prints matches has no equivalent. Could a conf-sanity case format a small MDT, run a couple of predicates over it with llapi_find_device() and compare against the same predicates run through llapi_find() on the mounted filesystem?
+
+--- Message (Oleg Drokin, 2026-09-02 22:44:10.000000000) ---
+Patch Set 15:
+
+(1 comment)
+
+--- Message (Hiroshi Nishida, 2026-09-03 15:58:48.000000000) ---
+Uploaded patch set 16.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-03 16:32:12.000000000) ---
+Patch Set 16:
+
+Code-wise looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-09-03 18:09:55.000000000) ---
+Patch Set 15:
+
+(3 comments)
+
+--- Message (jenkins, 2026-09-03 18:23:21.000000000) ---
+Patch Set 16: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130956/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-03 18:29:24.000000000) ---
+Patch Set 16:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Hiroshi Nishida, 2026-09-03 18:41:38.000000000) ---
+Patch Set 9:
+
+(3 comments)
+
+--- Message (wc-checkpatch, 2026-09-03 20:12:48.000000000) ---
+Patch Set 16:
+
+Looks good to me.
+
+--- Message (Gerrit AI review for Lustre, 2026-09-04 09:27:23.000000000) ---
+Patch Set 16:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, comments inline. One correctness question on the size/block-count path, plus two optional documentation items.
+
+The two sibling changes in this series each landed a test with the API they added (llapi_scan_test.c with sanity.sh for llapi_scan_namespace(), llapi_scan_device_test.c with conf-sanity.sh for llapi_scan_device()); this one adds llapi_find_device() with no test at all. Should it get the same treatment - a small program under lustre/tests/ that runs a couple of predicates over a formatted MDT and checks the refusals and the undecided count - or is that deliberately left to the lfind change above it?
+
+--- Message (Hiroshi Nishida, 2026-09-04 21:56:30.000000000) ---
+Uploaded patch set 17.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-04 22:06:11.000000000) ---
+Patch Set 17:
+
+(6 comments)
+
+--- Message (wc-checkpatch, 2026-09-04 22:09:58.000000000) ---
+Patch Set 17:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-04 22:49:52.000000000) ---
+Patch Set 17:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-09-04 23:57:29.000000000) ---
+Patch Set 17:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-09-05 01:30:39.000000000) ---
+Patch Set 17: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131097/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-06 16:06:21.000000000) ---
+Patch Set 17:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Looks good overall; two optional notes inline for whenever this is next refreshed - neither is a reason to re-spin.
+
+--- Message (Hiroshi Nishida, 2026-09-08 14:13:30.000000000) ---
+Patch Set 17:
+
+(2 comments)
+
+Replies to the aireview comments on this patchset.  Every fix named is local and unpushed; "lands in the next patchset" is meant literally.
+
+--- Message (Hiroshi Nishida, 2026-09-09 03:23:05.000000000) ---
+Uploaded patch set 18.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-09 03:40:51.000000000) ---
+Patch Set 18:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-09 03:58:21.000000000) ---
+Patch Set 18:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-09 05:30:59.000000000) ---
+Patch Set 18: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131387/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-09 10:10:46.000000000) ---
+Patch Set 18:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Hiroshi Nishida, 2026-09-10 14:30:42.000000000) ---
+Uploaded patch set 19: Patch Set 18 was rebased.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-10 14:45:32.000000000) ---
+Patch Set 19:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-10 14:57:39.000000000) ---
+Patch Set 19:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-10 15:08:57.000000000) ---
+Patch Set 19: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131516/ : SUCCESS
+
+--- Message (Autotest, 2026-09-10 15:09:56.000000000) ---
+Patch Set 18:
+
+Trevis Autotest is abandoning the following sessions because: later build 131516 found
+- Enforced review-dne-part-3 on el9.7-x86_64/ldiskfs servers and clients
+
+--- Message (Lustre RISC-V Builder, 2026-09-10 17:43:10.000000000) ---
+Patch Set 19:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Andreas Dilger, 2026-09-11 00:39:08.000000000) ---
+Patch Set 19:
+
+(6 comments)
+
+--- Message (Andreas Dilger, 2026-09-11 08:15:22.000000000) ---
+Patch Set 19:
+
+(1 comment)
+
+--- Message (Hiroshi Nishida, 2026-09-11 13:48:24.000000000) ---
+Patch Set 19:
+
+(5 comments)
+
+--- Message (Gerrit AI review for Lustre, 2026-09-11 19:38:20.000000000) ---
+Patch Set 19:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Looks good. Three optional items inline for whenever this is next refreshed; none of them is a reason to re-spin on its own.
+
+--- Message (Hiroshi Nishida, 2026-09-11 22:04:37.000000000) ---
+Patch Set 19:
+
+(3 comments)
+
+--- Message (Hiroshi Nishida, 2026-09-21 19:26:59.000000000) ---
+Uploaded patch set 20.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-21 19:29:14.000000000) ---
+Patch Set 20:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-21 19:33:58.000000000) ---
+Patch Set 20:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-21 20:07:05.000000000) ---
+Patch Set 20: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132083/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-22 07:47:32.000000000) ---
+Patch Set 20:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good; the scan/walk split reads well and the layout bounding is careful. One inline concern about the new %Lo bound on the directory side, plus a pre-existing note that could ride along on the same refresh.
+
+--- Message (Hiroshi Nishida, 2026-09-22 21:36:04.000000000) ---
+Uploaded patch set 21.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-22 21:40:35.000000000) ---
+Patch Set 21:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-09-22 21:45:41.000000000) ---
+Patch Set 21:
+
+Looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-09-22 21:54:44.000000000) ---
+Uploaded patch set 22: New patch set was added with same tree, parent tree, and commit message as Patch Set 21.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-22 21:56:48.000000000) ---
+Patch Set 21:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-22 22:03:03.000000000) ---
+Patch Set 22:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-22 22:18:51.000000000) ---
+Patch Set 22:
+
+Code-wise looks good to me.
+
+--- Message (Artem Blagodarenko, 2026-09-23 14:03:54.000000000) ---
+Patch Set 22:
+
+(1 comment)
+
+One finding, from the same conf-sanity run as on 68156; the fix is in https://github.com/TheLustreCollective/lustre/commit/ae5a21241a.
+
+--- Message (Hiroshi Nishida, 2026-09-23 18:54:04.000000000) ---
+Uploaded patch set 23.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-23 18:54:51.000000000) ---
+Patch Set 22:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-09-23 19:02:20.000000000) ---
+Patch Set 23:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-23 19:15:14.000000000) ---
+Patch Set 23:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-23 19:58:30.000000000) ---
+Patch Set 23: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132227/ : SUCCESS
+
+--- Message (Artem Blagodarenko, 2026-09-24 13:15:16.000000000) ---
+Patch Set 23:
+
+(2 comments)
+
+One finding from a review of this change mirrored on the TLC GitHub (by the Claude review bot), checked against ps23.
+
+--- Message (Autotest, 2026-09-24 13:59:25.000000000) ---
+Patch Set 23:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-2 session on el10.1-x86_64/zfs servers and clients for build 132227 patch 23. Requested by Hiroshi Nishida because of LU-17891.
+
+--- Message (Autotest, 2026-09-24 14:07:21.000000000) ---
+Patch Set 23:
+
+Onyx Autotest 2 retesting enforced review-dne-part-4 session on el9.7-x86_64/ldiskfs servers and clients for build 132227 patch 23. Requested by Hiroshi Nishida because of LU-20827.
+
+--- Message (Hiroshi Nishida, 2026-09-24 14:23:20.000000000) ---
+Patch Set 17:
+
+(5 comments)
+
+--- Message (Gerrit AI review for Lustre, 2026-09-24 16:48:27.000000000) ---
+Patch Set 23:
+
+(7 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good. The risky parts hold up: find_lmm_fits() bounds every field a consumer later walks, the linkea cursor cannot run past its buffer, and the new loops all terminate. No defect found, so there is no need to re-spin for the inline items -- they are opportunistic, for whenever this is next refreshed.
+
+One whole-patch point: the walk-only fixes riding along here -- the -printf answers the body calls out, and the btime hunk -- apply to released code and arrive with no test. A sanity case for `lfs find -printf '%Lo\n'` over a PFL file with an uninstantiated `-c -1` component would cover the one that silently truncated the output, and it can run on a mount today, which the rest of this patch cannot until the --device front end lands.
+
+--- Message (Autotest, 2026-09-24 21:25:16.000000000) ---
+Patch Set 23:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-2 session on el10.1-x86_64/zfs servers and clients for build 132227 patch 23. Requested by Hiroshi Nishida because of LU-17891.
+
+--- Message (Hiroshi Nishida, 2026-09-25 01:26:14.000000000) ---
+Uploaded patch set 24.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-25 01:37:53.000000000) ---
+Patch Set 23:
+
+(9 comments)
+
+--- Message (Hiroshi Nishida, 2026-09-25 01:38:14.000000000) ---
+Patch Set 17:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-09-25 01:38:58.000000000) ---
+Patch Set 24:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-25 01:43:13.000000000) ---
+Patch Set 24:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-25 02:47:11.000000000) ---
+Patch Set 24: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/132287/ : FAILURE
+
+--- Message (Hiroshi Nishida, 2026-09-25 12:45:34.000000000) ---
+Patch Set 24:
+
+BUILD
+
+--- Message (Hiroshi Nishida, 2026-09-25 13:06:10.000000000) ---
+Patch Set 24:
+
+(1 comment)
+
+--- Message (jenkins, 2026-09-25 13:39:58.000000000) ---
+Patch Set 24: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132317/ : SUCCESS
+
+--- Message (Autotest, 2026-09-25 20:35:53.000000000) ---
+Patch Set 24:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-1 session on el10.1-x86_64/zfs servers and clients for build 132317 patch 24. Requested by Hiroshi Nishida because of LU-20834.
+
+--- Message (Autotest, 2026-09-25 22:51:32.000000000) ---
+Patch Set 24:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-1 session on el9.8-x86_64/zfs servers and clients for build 132317 patch 24. Requested by Hiroshi Nishida because of LU-20523.
+
+--- Message (Autotest, 2026-09-26 00:30:27.000000000) ---
+Patch Set 24:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-4 session on el10.1-x86_64/zfs servers and clients for build 132317 patch 24. Requested by Hiroshi Nishida because of LU-17077.
+
+--- Message (Gerrit AI review for Lustre, 2026-09-26 06:50:16.000000000) ---
+Patch Set 24:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Looks good. There are two optional style nits inline that can be picked up whenever the patch is next refreshed; there is no need to re-spin for them.
+
+--- Message (Hiroshi Nishida, 2026-09-26 21:51:10.000000000) ---
+Uploaded patch set 25.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-26 21:52:48.000000000) ---
+Patch Set 24:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-09-26 21:56:15.000000000) ---
+Patch Set 25:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-26 22:07:14.000000000) ---
+Patch Set 25:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-26 22:34:57.000000000) ---
+Patch Set 25: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132367/ : SUCCESS
+
+--- Message (Autotest, 2026-09-27 03:11:37.000000000) ---
+Patch Set 25:
+
+Trevis Autotest 2 retesting enforced review-dne-zfs-part-6 session on el10.1-x86_64/zfs servers and clients for build 132367 patch 25. Requested by Hiroshi Nishida because of LU-19372.
+
+--- Message (Autotest, 2026-09-27 03:15:06.000000000) ---
+Patch Set 25:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-5 session on el9.7-x86_64/zfs servers and clients for build 132367 patch 25. Requested by Hiroshi Nishida because of LU-9827.
+
+--- Message (Autotest, 2026-09-27 05:04:20.000000000) ---
+Patch Set 25:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-1 session on el9.8-x86_64/zfs servers and clients for build 132367 patch 25. Requested by Hiroshi Nishida because of LU-20699.
+
+--- Message (Gerrit AI review for Lustre, 2026-09-27 09:43:22.000000000) ---
+Patch Set 25:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline. A --ost/--mdt given by UUID silently matches nothing on a target whose label is in its never-mounted, writeconf or nolocallogs form. That is worth a refresh; the other item is minor.
+
+--- Message (Hiroshi Nishida, 2026-09-27 19:45:45.000000000) ---
+Uploaded patch set 26.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-27 19:46:05.000000000) ---
+Patch Set 17:
+
+(1 comment)
+
+--- Message (Hiroshi Nishida, 2026-09-27 19:46:06.000000000) ---
+Patch Set 25:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-09-27 19:47:02.000000000) ---
+Patch Set 26:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-27 20:01:44.000000000) ---
+Patch Set 26:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-27 20:39:05.000000000) ---
+Patch Set 26: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132403/ : SUCCESS
+
+--- Message (Hiroshi Nishida, 2026-09-28 13:09:10.000000000) ---
+Uploaded patch set 27: Patch Set 26 was rebased.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-28 13:20:21.000000000) ---
+Patch Set 27:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-09-28 13:49:09.000000000) ---
+Patch Set 27: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132440/ : SUCCESS
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-28 16:08:34.000000000) ---
+Patch Set 27:
+
+Code-wise looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-10-04 01:56:21.000000000) ---
+Patch Set 27:
+
+(2 comments)
+
+--- Message (Gerrit AI review for Lustre, 2026-10-05 08:21:13.000000000) ---
+Patch Set 27:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Looks good overall; a few optional items inline for whenever the patch is next refreshed. None of them needs a re-spin on its own.
+
+--- Message (Hiroshi Nishida, 2026-10-05 23:41:12.000000000) ---
+Uploaded patch set 28.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-10-05 23:41:52.000000000) ---
+Patch Set 28:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-10-05 23:48:11.000000000) ---
+Patch Set 28:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-06 00:04:53.000000000) ---
+Patch Set 28:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-06 00:26:20.000000000) ---
+Patch Set 28: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132889/ : SUCCESS
+
+--- Message (Autotest, 2026-10-06 09:33:53.000000000) ---
+Patch Set 28:
+
+Onyx Autotest retesting enforced review-dne-part-4 session on el10.1-x86_64/ldiskfs servers and clients for build 132889 patch 28. Requested by Hiroshi Nishida because of LU-16932.
+
+--- Message (Gerrit AI review for Lustre, 2026-10-06 13:45:56.000000000) ---
+Patch Set 28:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, two minor comments inline; fine to land as is, they can ride along on the next refresh. The walk-side fixes (-btime/-newerXb no longer ending the walk, %Lo on an uninstantiated -c -1 component, %Lc/%Li/%LS printing LLAPI_LAYOUT_DEFAULT) change llapi_find() output; if no later patch in the series covers them, a small sanity case for each would keep them from regressing.
+
+--- Message (Hiroshi Nishida, 2026-10-06 22:56:44.000000000) ---
+Uploaded patch set 29.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-10-06 22:57:02.000000000) ---
+Patch Set 28:
+
+(3 comments)
+
+--- Message (wc-checkpatch, 2026-10-06 23:08:29.000000000) ---
+Patch Set 29:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-06 23:19:09.000000000) ---
+Patch Set 29:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-06 23:32:17.000000000) ---
+Patch Set 29: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132979/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-07 12:09:12.000000000) ---
+Patch Set 29:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Looks good. One optional man-page item inline for whenever the patch is next refreshed; no need to re-spin for it.
+
+--- Message (Hiroshi Nishida, 2026-10-08 00:06:07.000000000) ---
+Uploaded patch set 30.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-10-08 00:06:16.000000000) ---
+Patch Set 29:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-10-08 00:16:01.000000000) ---
+Patch Set 30:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-08 00:25:18.000000000) ---
+Patch Set 30:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-08 01:05:34.000000000) ---
+Patch Set 30: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133078/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-08 17:03:51.000000000) ---
+Patch Set 30:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Looks good; one optional minor inline for whenever the patch is next refreshed, no need to re-spin for it.
+
+--- Message (Autotest, 2026-10-08 23:38:08.000000000) ---
+Patch Set 30:
+
+Onyx Autotest retesting enforced review-dne-zfs-part-4 session on el10.1-x86_64/zfs servers and clients for build 133078 patch 30. Requested by Hiroshi Nishida because of LU-20471.
+
+--- Message (Hiroshi Nishida, 2026-10-09 11:46:43.000000000) ---
+Uploaded patch set 31.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-10-09 11:46:52.000000000) ---
+Patch Set 30:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-10-09 11:51:41.000000000) ---
+Patch Set 31:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-09 12:04:57.000000000) ---
+Patch Set 31:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-09 12:13:58.000000000) ---
+Patch Set 31: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133273/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-10 11:32:56.000000000) ---
+Patch Set 31:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good. Two minor items inline; fine to land as is, they can ride along on the next refresh if there is one.
+
+--- Message (Hiroshi Nishida, 2026-10-10 23:16:28.000000000) ---
+Uploaded patch set 32.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-10-10 23:16:48.000000000) ---
+Patch Set 31:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-10-10 23:19:50.000000000) ---
+Patch Set 32:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-10 23:34:29.000000000) ---
+Patch Set 32:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-11 00:03:01.000000000) ---
+Patch Set 32: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133360/ : SUCCESS
+
+--- Message (Autotest, 2026-10-11 06:34:12.000000000) ---
+Patch Set 32:
+
+Onyx Autotest retesting enforced review-dne-zfs-part-1 session on el9.8-x86_64/zfs servers and clients for build 133360 patch 32. Requested by Hiroshi Nishida because of LU-20523.
+
+--- Message (Autotest, 2026-10-11 06:35:52.000000000) ---
+Patch Set 32:
+
+Onyx Autotest retesting enforced review-dne-zfs-part-1 session on el10.1-x86_64/zfs servers and clients for build 133360 patch 32. Requested by Hiroshi Nishida because of LU-20523.
+
+--- Message (Gerrit AI review for Lustre, 2026-10-11 11:45:54.000000000) ---
+Patch Set 32:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Looks good. There's one optional cleanup inline for whenever the patch is next refreshed. It doesn't need a re-spin.
+
+--- Message (Hiroshi Nishida, 2026-10-12 05:45:44.000000000) ---
+Uploaded patch set 33.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-10-12 05:46:03.000000000) ---
+Patch Set 32:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-10-12 05:56:21.000000000) ---
+Patch Set 33:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-12 05:58:04.000000000) ---
+Patch Set 33:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-12 06:35:41.000000000) ---
+Patch Set 33: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133429/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-13 17:12:15.000000000) ---
+Patch Set 33:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The walk-side fixes here (-btime/-newerbY no longer ending the walk with -EOPNOTSUPP; %Lc, %LS and %Lo on a default or DoM layout or a foreign directory) change plain `lfs find` output, and nothing in this patch tests them. Could a sanity.sh case cover at least the -btime and %Lo ones? The conf-sanity coverage in 68160 only exercises the device scan.
+
+Aside, pre-existing and not for this patch: the directory arm of find_check_foreign() looks inverted. Since baba1fd07a ("LU-14489 utils: fix 'lfs find --mdt-count'") changed `lfm_magic != LMV_MAGIC_FOREIGN` to `lmv_is_foreign(lfm_magic)` without negating it, `--foreign` rejects a foreign directory and accepts a striped non-foreign one. That applies to a walk and to llapi_find_device() alike, so it may deserve its own ticket.
+
+--- Message (Autotest, 2026-10-13 21:51:56.000000000) ---
+Patch Set 33:
+
+Onyx Autotest retesting enforced review-dne-part-4 session on el9.7-x86_64/ldiskfs servers and clients for build 133429 patch 33. Requested by Hiroshi Nishida because of LU-19908.
+
+--- Message (Hiroshi Nishida, 2026-10-14 02:12:00.000000000) ---
+Uploaded patch set 34.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-10-14 02:12:19.000000000) ---
+Patch Set 33:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-10-14 02:14:43.000000000) ---
+Patch Set 34:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-14 02:44:02.000000000) ---
+Patch Set 34:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-14 03:16:43.000000000) ---
+Patch Set 34: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133612/ : SUCCESS

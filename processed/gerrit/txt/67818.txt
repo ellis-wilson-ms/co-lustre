@@ -1,0 +1,363 @@
+Change:     67818
+Subject:    LU-20559 target: don't LBUG on exports of a failed mount
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67818
+Change-Id:  I31af2ca49443a729ada7ddc55a3282c225a9bc64
+Project:    fs/lustre-release
+Branch:     master
+Status:     MERGED
+Owner:      Oleg Drokin
+Created:    2026-08-07 16:51:05.000000000
+Updated:    2026-09-21 07:54:12.000000000
+Patch Set:  5
+Insertions: +110
+Deletions:  -19
+Comments:   15 (7 unresolved)
+
+--- Labels ---
+  Code-Review: Andreas Dilger: +1; Mikhail Pershin: +1; Oleg Drokin: +2
+  Verified: jenkins: +1; Maloo: +1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
+  REVIEWER: Oleg Drokin, Andreas Dilger, Mikhail Pershin
+
+--- Commit Message ---
+LU-20559 target: don't LBUG on exports of a failed mount
+
+A server mount that fails inside tgt_init() after
+tgt_server_data_init() has run leaves the target invalidated -
+tgt_init()'s out_put label zeroes obt_magic - while the recovery
+exports tgt_clients_data_init() created for the last_rcvd client slots
+are still on their way through the zombie export workqueue.  When the
+worker gets to them, mdt_destroy_export() calls
+tgt_grant_sanity_check(), whose first statement is
+obd2obt(obd)->obt_lut, and the assertion inside obd2obt() fires:
+
+  LustreError: (osd_handler.c:215:osd_trans_start()) lustre-MDT0000:
+    can't assign tx: rc = -122
+  LustreError: (tgt_lastrcvd.c:1238:tgt_client_del()) lustre-MDT0000:
+    failed to update server data, skip client ... rc -122
+  LustreError: (obd_target.h:61:obd2obt()) ASSERTION(
+    obt->obt_magic == 0xBDDECEAE ) failed:
+  Workqueue: obd_zombid obd_zombie_exp_cull [obdclass]
+    tgt_grant_sanity_check+0x58e/0x5f0 [ptlrpc]
+    mdt_destroy_export+0x245/0x340 [mdt]
+    class_export_destroy+0x114/0x580 [obdclass]
+
+A zeroed obt_magic is the intended signal that the target is gone: the
+lu_target lives inside the mdt_device that mdt_init0() frees on
+failure. class_exp2tgt(), tgt_client_free() and tgt_grant_discard()
+all honour that signal already; tgt_grant_sanity_check() and the
+tgd_tot_granted_clients decrements next to it in mdt_destroy_export()
+and ofd_destroy_export() never did.  Give them the same guard through
+a new obd2obt_or_null(), which returns NULL rather than asserting.
+
+The two decrements are only unreachable today because the exports
+rebuilt from last_rcvd have no OBD_CONNECT_GRANT; an export that did
+connect with grant would take the same freed target.
+
+This guards the consumer; it does not serialize it.  The zombie worker
+can still read a valid obt_magic just before out_put clears it and
+then touch lut_client_bitmap after out_put has freed it - a
+pre-existing window that this change narrows rather than closes, and
+that no magic flag can close.  Draining instead -
+class_disconnect_exports() to splice obd_exports away, then
+obd_exports_barrier() and obd_zombie_barrier(), the sequence
+mdt_init0()'s err_tgt label already uses - would close it, but it
+changes teardown ordering on the mount-failure path shared by every
+MDT and OST, so it belongs in its own change.  The guards are what
+stop the reported panic and are what can be backported.
+
+Before LU-8837 this was not fatal.  The NULL obt_lut was only used for
+pointer arithmetic and tgt_grant_sanity_check() returned at the
+following list_empty(&obd->obd_exports) test - and obd_exports is
+empty here, class_disconnect_exports() having spliced it away.
+Hoisting an unconditional assertion to the top of the function turned
+that into a panic in 2.15.53.
+
+tgt_client_free() took its lu_target on entry but re-read obt_magic
+before the bitmap access, so it validated one sample and dereferenced
+another.  Neither read alone is enough: obt_lut is cleared before
+obt_magic, so the entry sample can be NULL while the later magic read
+still passes, and the entry sample can equally be a pointer into an
+mdt_device that has since been freed.  Re-fetch through
+class_exp2tgt() at the guard, and test the pointer that is about to be
+used.
+
+This covers the bitmap access only.  The reply-data loop above it
+still uses the entry sample, and the helpers there guard against a
+NULL lu_target - tgt_free_reply_data() tests it before
+tgt_clear_reply_slot() - but not against a stale one, which walks past
+that test into lut->lut_obd.  Nothing here can close that: the sample
+is taken before the loop and the target can be invalidated during it.
+The drain added later in this series closes it by keeping the cull
+from outliving the target at all, so a backport of this patch without
+that one narrows the window rather than removing it.
+
+obd2obt()'s LASSERT() becomes LASSERTF() carrying the device name and
+both magic values, because the reported crash names neither.
+
+Route the lut_client_bitmap allocation failure through out_put like
+every other error in tgt_init(), so it stops leaving obt_lut pointing
+at a target the caller is about to free.  The statfs and blocksize
+failures above it move there too: they were landing on out:, which
+calls dt_txn_callback_del() on a dtc_linkage that INIT_LIST_HEAD() has
+not reached yet, so list_del_init() walked a NULL next pointer on
+kernels built without CONFIG_DEBUG_LIST.  The two out_put stores now
+go through the obt already in hand rather than obd2obt().
+
+obd2obt() keeps returning the union address for any non-NULL obd
+rather than obd2obt_or_null()'s result, so that a
+--disable-libcfs-assert build, where LASSERTF() compiles away, still
+behaves as it did instead of handing its ~50 unchecked callers a NULL.
+
+conf-sanity 138 injects the -EDQUOT that the reported failure hit - a
+ZFS MDT dataset at its quota - into the tgt_server_data_update() call
+that follows tgt_clients_data_init(), so the real error path runs.
+
+The injected failure replaces only the return value, so the real
+transaction still runs; the mount_count it commits is bumped again by
+the next mount attempt either way, and the error path under test is
+the same one -EDQUOT reaches.
+
+obd2obt_or_null() tolerates only the zero tgt_init() writes, and still
+asserts on any other non-magic value.  obd->u is a union, so on a
+device that is not a target obt_magic aliases another type's first
+field - client_obd's cl_sem, for one - and a value that is neither
+OBT_MAGIC nor zero means either that or a corrupted target.  Both are
+bugs that should be reported rather than silently skipped, and every
+caller reached here is a server target, so neither is legitimate.
+
+obd2obt_or_null() is used only by tgt_grant_sanity_check(), which
+takes an obd from ofd and mdt and has nothing to do when there is no
+target. class_exp2tgt() keeps its plain magic test: 4b3cea8249
+("LU-4698 target: check for NULL tgt before deref") added that for an
+echo server during obdfilter-survey, and tgt_handler_find_check() and
+tgt_blocking_ast() still answer its NULL by logging "No target for
+connected export" and failing the request.  Asserting there would turn
+a handled error on a request path into a dead server, which is not
+something to backport - and obd->u is overlaid by types whose first
+field is a pointer (ost_obd, echo_client_obd), so such a device reads
+as garbage magic rather than the zero obdecho leaves.
+
+The case calls stopall before setup: it needs a stopped MDT to mount
+one of its own, and on zfs the cases between 123aj and it are all
+ldiskfs only, so it inherits a mounted filesystem and setup fails with
+EEXIST rather than the case running at all.
+
+Fixes: 888962496078 ("LU-8837 lustre: remove target declarations from obd.h")
+Fixes: 0d3a07a8aa46 ("LU-7430 mdt: better handle MDT recovery error path")
+Fixes: 0697cf73c74d ("LU-3285 mdt: use generic grant code at MDT")
+Signed-off-by: Oleg Drokin <green@whamcloud.com>
+Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
+Change-Id: I31af2ca49443a729ada7ddc55a3282c225a9bc64
+Reviewed-on: https://review.whamcloud.com/c/fs/lustre-release/+/67818
+Tested-by: jenkins <devops@whamcloud.com>
+Tested-by: Maloo <maloo@whamcloud.com>
+Reviewed-by: Andreas Dilger <adilger@thelustrecollective.com>
+Reviewed-by: Mikhail Pershin <mpershin@whamcloud.com>
+
+--- Review History ---
+
+--- Message (Oleg Drokin, 2026-08-07 16:51:05.000000000) ---
+Uploaded patch set 1.
+
+--- Message (wc-checkpatch, 2026-08-07 16:57:27.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-07 17:02:54.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-07 18:41:33.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128905/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-07 18:43:19.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-08 10:37:25.000000000) ---
+Patch Set 1:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good; the guards themselves check out and the failure paths in tgt_init() are traced correctly. Two small comments inline, neither blocking.
+
+--- Message (Oleg Drokin, 2026-08-08 15:56:39.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-08 16:08:24.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-08 16:11:46.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-08-08 16:41:28.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128954/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-08 17:17:42.000000000) ---
+Patch Set 2:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-09 04:22:05.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (Oleg Drokin, 2026-08-09 19:01:14.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-09 19:05:58.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-09 19:23:46.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-09 19:28:37.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128982/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-09 21:38:22.000000000) ---
+Patch Set 3:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-10 07:10:01.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Looks good - the guards close the reported LBUG and the reasoning in the message checks out against the code. One note on the Fixes: attribution inline.
+
+--- Message (Autotest, 2026-08-11 23:22:06.000000000) ---
+Patch Set 3:
+
+Trevis Autotest retesting enforced review-dne-zfs-part-7 session on el9.7-x86_64/zfs servers and clients for build 128982 patch 3. Requested by Andreas Dilger because of LU-20277.
+
+--- Message (Autotest, 2026-08-11 23:27:07.000000000) ---
+Patch Set 3:
+
+Trevis Autotest retesting enforced review-dne-part-1 session on el9.7-x86_64/ldiskfs servers and clients for build 128982 patch 3. Requested by Andreas Dilger because of LU-17601.
+
+--- Message (Andreas Dilger, 2026-08-11 23:27:24.000000000) ---
+Patch Set 3: Code-Review+1
+
+(1 comment)
+
+--- Message (Oleg Drokin, 2026-08-12 00:14:55.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+--- Message (Marc Vef, 2026-08-13 13:19:38.000000000) ---
+Hashtag added: master-next
+
+--- Message (Marc Vef, 2026-08-13 13:19:39.000000000) ---
+Patch Set 3:
+
+[Marc Bot] Note: This change has been cherry-picked to master-next and is considered for landing. Please avoid updates unless required while the master-next hashtag is set; doing so may cause the patch to be removed from master-next and not landed. Note: AI review comments should be addressed/responded to.
+
+--- Message (Marc Vef, 2026-08-13 13:19:39.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Andreas Dilger, 2026-08-14 00:10:45.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-08-21 18:10:19.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+--- Message (Marc Vef, 2026-08-24 08:08:44.000000000) ---
+Hashtag removed: master-next
+
+--- Message (Marc Vef, 2026-08-24 08:08:44.000000000) ---
+Patch Set 3:
+
+[Marc Bot] Note: This change has been removed from master-next and is no longer considered for landing in its current form.
+
+--- Message (Marc Vef, 2026-08-24 08:08:45.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Marc Vef, 2026-08-31 10:55:11.000000000) ---
+Hashtag added: master-next
+
+--- Message (Marc Vef, 2026-08-31 10:55:12.000000000) ---
+Patch Set 3:
+
+[Marc Bot] Note: This change has been cherry-picked to master-next and is considered for landing. Please avoid updates unless required while the master-next hashtag is set; doing so may cause the patch to be removed from master-next and not landed. Note: AI review comments should be addressed/responded to.
+
+--- Message (Marc Vef, 2026-08-31 10:55:12.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Andreas Dilger, 2026-09-03 20:05:31.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+--- Message (Mikhail Pershin, 2026-09-03 21:28:27.000000000) ---
+Patch Set 3: Code-Review+1
+
+(4 comments)
+
+--- Message (Oleg Drokin, 2026-09-18 17:00:13.000000000) ---
+Patch Set 4: Commit message was updated.
+
+Copied Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR **changekind:NO_CODE_CHANGE** OR changekind:TRIVIAL_REBASE OR **changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE** OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR **changekind:NO_CODE_CHANGE**")
+
+--- Message (Oleg Drokin, 2026-09-18 17:00:16.000000000) ---
+Patch Set 4: Code-Review+2
+
+--- Message (Oleg Drokin, 2026-09-18 17:00:19.000000000) ---
+Change has been successfully cherry-picked as 2fd8273337b8da5dedf1f09c3b56c59db03f2868
+
+--- Message (Marc Vef, 2026-09-21 07:54:12.000000000) ---
+Hashtag removed: master-next

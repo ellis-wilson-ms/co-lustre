@@ -7,18 +7,18 @@ Branch:     master
 Status:     NEW
 Owner:      Etienne AUJAMES
 Created:    2023-08-22 09:41:50.000000000
-Updated:    2026-04-22 15:42:14.000000000
-Patch Set:  9
-Insertions: +866
-Deletions:  -154
-Comments:   197 (5 unresolved)
+Updated:    2026-09-19 23:14:19.000000000
+Patch Set:  12
+Insertions: +910
+Deletions:  -156
+Comments:   290 (0 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
   Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
-  CC: Nathan Rutman, DELBARY Gael
+  CC: Nathan Rutman, DELBARY Gael, Lustre RISC-V Builder
   REVIEWER: Andreas Dilger, James Simmons, Nikitas Angelinas, Chris Horn, Qian Yingjin, Etienne AUJAMES
 
 --- Commit Message ---
@@ -35,19 +35,20 @@ Extend the existing heap-based scheduler with a second token bucket
 per class for minimum-rate accounting. The existing bucket continues
 to enforce the configured rate ceiling, while the new bucket tracks
 saved minrate credit for classes that are falling behind their
-guaranteed share. That floor credit only changes heap priority for
-classes that are already eligible to run under the ceiling, so minrate
-cannot bypass the configured cap. Explicit minrate rules also bound
-the amount of saved floor credit so an idle class can recover its
-guaranteed share after becoming active under load without accumulating
-enough priority to starve other traffic.
+guaranteed share. That floor credit boosts heap priority; the ceiling
+is enforced separately at dequeue, so a floor-prioritized class still
+throttles to its rate. Floor credit is bounded so that an idle class
+can recover its guaranteed share after becoming active under load
+without accumulating enough priority to starve other traffic.
 
-Add a tbf_mindepth module parameter (default -1, meaning adaptive)
-that controls the maximum number of saved guaranteed tokens for
-explicit minrate rules. The adaptive default is 8x the minrate for
-realtime rules and 2x the minrate for non-realtime rules. Operators
-can override this to a fixed value to tune how much priority an idle
-class accumulates before re-entering the scheduler under load.
+Add a tbf_mindepth parameter (default -1, meaning adaptive) that
+controls the maximum number of saved guaranteed tokens for any rule
+with a floor (explicit minrate or legacy realtime). The adaptive
+default is 8x the floor rate for realtime rules and 2x the floor rate
+for non-realtime rules. For legacy realtime, the floor rate is the
+configured rate itself. Operators can override this to a fixed value
+to tune how much priority an idle class accumulates before re-entering
+the scheduler under load.
 
 Add an explicit minrate= parameter to TBF rules and thread it through
 the parser, rule update paths, and rule dumps. start and change
@@ -70,6 +71,17 @@ Two issues found during testing/review and are fixed here:
    globally and checked without regard to which policy owns the queued
    work.
 
+Three new sanityn tests cover the minrate= parameter. 77t and 77u
+check parsing, start/change, input validation, etc. 77v is a live
+functional test:
+ - Throttle OST to known max rate via OBD_FAIL_PTLRPC_PAUSE_REQ.
+ - Measure baseline rate under congestion.
+ - Set minrate TBF rule for secondary UID running under load.
+ - Assert protected UID hits within 10% of its floor while background
+   load still gets headroom.
+ - Repeat with realtime=1 to cover realtime-minrate interaction.
+ - Repeat with legacy realtime rule (no explicit minrate)
+
 Heap comparison and dequeue changes:
 
 The single scheduler heap now uses a two-tier comparison. When either
@@ -84,26 +96,38 @@ deadlines cannot oscillate indefinitely (resolving a pre-existing TODO
 in the old comparator).
 
 The dequeue path (nrs_tbf_req_get) takes a single frozen ktime_get()
-snapshot and then runs a retry loop bounded by binheap_size + 1 to
-lazily refresh stale per-class token state before selecting the heap
-root. This replaces the old recursive self-call that realtime mode
-used when a refreshed class moved off the root. Per-dequeue cost is
-O(log n) in the common case but O(n log n) in the worst case when
-every class needs a refresh in the same pass.
+snapshot and runs a retry loop bounded by min(binheap_size + 1,
+NRS_TBF_REFRESH_MAX_PASSES) to lazily refresh stale per-class token
+state before selecting the heap root. NRS_TBF_REFRESH_MAX_PASSES is a
+small constant (currently 32). If the loop exhausts its pass budget
+without converging, it arms the throttle timer at the current root's
+deadline and returns NULL, deferring to the next dequeue. This
+replaces the old recursive self-call that realtime mode used when a
+refreshed class moved off the root. Per-dequeue cost is O(log n) in
+the common case, hard-capped at O(NRS_TBF_REFRESH_MAX_PASSES * log n)
+in the worst case.
 
 Floor bucket initialization:
 
-Legacy realtime rules (without minrate=) start with preloaded floor
-tokens (ti_ntoken = tr_depth) to preserve existing behavior where rate
-acts as both floor and ceiling. Explicit minrate rules start with zero
-floor tokens because the heap comparator treats any non-zero floor
-token count as a priority signal: when either class in a comparison
-has floor tokens, both are ranked on their min-bucket deadlines. If a
-newly created minrate class started with preloaded floor tokens it
-would immediately jump ahead of all non-floor traffic in the heap
-without having actually fallen behind its guaranteed share. Starting
-empty ensures that floor priority is only earned while a class is
-genuinely being underserved.
+Both legacy realtime rules (without minrate=) and explicit minrate
+rules cap saved floor credit at tr_min_depth (the adaptive
+nrs_tbf_min_depth value, or tbf_mindepth when set). Sizing the cap
+from the floor rate, rather than from tr_max_depth, gives a class
+enough room to accumulate overdue token credit when it has been losing
+the heap to another class with older queued requests, so the realtime
+deadline-in-the-past mechanism can actually pull it back to the front.
+
+Legacy realtime rules additionally start with a small preloaded floor
+bucket (ti_ntoken = tr_max_depth) to preserve existing behavior where
+rate acts as both floor and ceiling. Explicit minrate rules start with
+zero floor tokens because the heap comparator treats any non-zero
+floor token count as a priority signal: when either class in a
+comparison has floor tokens, both are ranked on their min-bucket
+deadlines. If a newly created minrate class started with preloaded
+floor tokens it would immediately jump ahead of all non-floor traffic
+in the heap without having actually fallen behind its guaranteed
+share. Starting empty ensures that floor priority is only earned while
+a class is genuinely being underserved.
 
 Realtime flag interaction with explicit minrate:
 
@@ -1392,3 +1416,627 @@ Passed enforced test review-ldiskfs-dne on RHEL 9.5 / x86_64 uploaded by Onyx Au
 Patch Set 9:
 
 (1 comment)
+
+--- Message (Chris Horn, 2026-05-07 15:17:00.000000000) ---
+Patch Set 9:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-05-07 16:25:05.000000000) ---
+Patch Set 9:
+
+(10 comments)
+
+--- Message (Qian Yingjin, 2026-05-07 16:55:02.000000000) ---
+Patch Set 9:
+
+(1 comment)
+
+--- Message (Chris Horn, 2026-05-07 20:01:45.000000000) ---
+Patch Set 9:
+
+(1 comment)
+
+--- Message (Chris Horn, 2026-05-07 20:30:21.000000000) ---
+Uploaded patch set 10.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Chris Horn, 2026-05-07 20:30:35.000000000) ---
+Patch Set 9:
+
+(7 comments)
+
+--- Message (Lustre Gerrit Janitor, 2026-05-07 20:33:41.000000000) ---
+Patch Set 10:
+
+(1 comment)
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/63392/results.html
+
+ Commencing initial testing: conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity-special1@ldiskfs+DNE conf-sanity-special1@ldiskfs conf-sanity-special2@ldiskfs+DNE conf-sanity-special2@ldiskfs conf-sanity-special3@ldiskfs+DNE conf-sanity-special3@ldiskfs conf-sanity-special4@ldiskfs+DNE conf-sanity-special4@ldiskfs conf-sanity-special5@ldiskfs+DNE conf-sanity-special5@ldiskfs conf-sanity-special6@ldiskfs+DNE conf-sanity-special6@ldiskfs conf-sanity-special7@ldiskfs+DNE conf-sanity-special7@ldiskfs conf-sanity-special8@ldiskfs+DNE conf-sanity-special8@ldiskfs conf-sanity-special9@ldiskfs+DNE conf-sanity-special9@ldiskfs conf-sanity-special10@ldiskfs+DNE conf-sanity-special10@ldiskfs conf-sanity-special1@ldiskfs+DNE conf-sanity-special1@ldiskfs conf-sanity-special2@ldiskfs+DNE conf-sanity-special2@ldiskfs conf-sanity-special3@ldiskfs+DNE conf-sanity-special3@ldiskfs conf-sanity-special4@ldiskfs+DNE conf-sanity-special4@ldiskfs conf-sanity-special5@ldiskfs+DNE conf-sanity-special5@ldiskfs conf-sanity-special6@ldiskfs+DNE conf-sanity-special6@ldiskfs conf-sanity-special7@ldiskfs+DNE conf-sanity-special7@ldiskfs conf-sanity-special8@ldiskfs+DNE conf-sanity-special8@ldiskfs conf-sanity-special9@ldiskfs+DNE conf-sanity-special9@ldiskfs conf-sanity-special10@ldiskfs+DNE conf-sanity-special10@ldiskfs conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs conf-sanity-special1@zfs conf-sanity-special1@zfs+DNE conf-sanity-special2@zfs conf-sanity-special2@zfs+DNE conf-sanity-special3@zfs conf-sanity-special3@zfs+DNE conf-sanity-special4@zfs conf-sanity-special4@zfs+DNE conf-sanity-special5@zfs conf-sanity-special5@zfs+DNE conf-sanity-special6@zfs conf-sanity-special6@zfs+DNE conf-sanity-special7@zfs conf-sanity-special7@zfs+DNE conf-sanity-special8@zfs conf-sanity-special8@zfs+DNE conf-sanity-special9@zfs conf-sanity-special9@zfs+DNE conf-sanity-special10@zfs conf-sanity-special10@zfs+DNE conf-sanity-special1@zfs conf-sanity-special1@zfs+DNE conf-sanity-special2@zfs conf-sanity-special2@zfs+DNE conf-sanity-special3@zfs conf-sanity-special3@zfs+DNE conf-sanity-special4@zfs conf-sanity-special4@zfs+DNE conf-sanity-special5@zfs conf-sanity-special5@zfs+DNE conf-sanity-special6@zfs conf-sanity-special6@zfs+DNE conf-sanity-special7@zfs conf-sanity-special7@zfs+DNE conf-sanity-special8@zfs conf-sanity-special8@zfs+DNE conf-sanity-special9@zfs conf-sanity-special9@zfs+DNE conf-sanity-special10@zfs conf-sanity-special10@zfs+DNE runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanityn@ldiskfs+DNE sanityn-special1@ldiskfs+DNE sanityn-special1@ldiskfs sanityn-special2@ldiskfs+DNE sanityn-special2@ldiskfs sanityn-special3@ldiskfs+DNE sanityn-special3@ldiskfs sanityn-special4@ldiskfs+DNE sanityn-special4@ldiskfs sanityn-special5@ldiskfs+DNE sanityn-special5@ldiskfs sanityn-special6@ldiskfs+DNE sanityn-special6@ldiskfs sanityn-special7@ldiskfs+DNE sanityn-special7@ldiskfs sanityn-special8@ldiskfs+DNE sanityn-special8@ldiskfs sanityn-special9@ldiskfs+DNE sanityn-special9@ldiskfs sanityn-special10@ldiskfs+DNE sanityn-special10@ldiskfs sanityn@zfs sanityn-special1@zfs sanityn-special1@zfs+DNE sanityn-special2@zfs sanityn-special2@zfs+DNE sanityn-special3@zfs sanityn-special3@zfs+DNE sanityn-special4@zfs sanityn-special4@zfs+DNE sanityn-special5@zfs sanityn-special5@zfs+DNE sanityn-special6@zfs sanityn-special6@zfs+DNE sanityn-special7@zfs sanityn-special7@zfs+DNE sanityn-special8@zfs sanityn-special8@zfs+DNE sanityn-special9@zfs sanityn-special9@zfs+DNE sanityn-special10@zfs sanityn-special10@zfs+DNE
+
+--- Message (wc-checkpatch, 2026-05-07 20:38:33.000000000) ---
+Patch Set 10:
+
+(16 comments)
+
+18 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre Gerrit Janitor, 2026-05-07 20:42:30.000000000) ---
+Patch Set 10:
+
+Test script sanityn subtest test_77t that was touched by this patch failed with 'test_77t failed with 22'. This is just a heads up on first fatal failure and a full report would be posted on test completion. See the results link above if you want intermediate results.
+
+--- Message (Lustre Gerrit Janitor, 2026-05-07 20:42:33.000000000) ---
+Patch Set 10:
+
+Test script sanityn subtest test_77t that was touched by this patch failed with 'test_77t failed with 22'. This is just a heads up on first fatal failure and a full report would be posted on test completion. See the results link above if you want intermediate results.
+
+--- Message (jenkins, 2026-05-07 20:56:53.000000000) ---
+Patch Set 10: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/124718/ : SUCCESS
+
+--- Message (Maloo, 2026-05-07 20:58:53.000000000) ---
+Patch Set 10:
+
+#### The following sessions will be run for Build 124718 (patch #10):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- custom on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- custom on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-ldiskfs-dne on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=124718&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=124718#redirect
+
+--- Message (Maloo, 2026-05-07 21:22:52.000000000) ---
+Patch Set 10:
+
+Failed enforced test review-dne-subtest-change on RHEL 8.10 / x86_64 uploaded by Trevis Autotest from trevis-155vm65: https://testing.whamcloud.com/test_sessions/0dffb978-c6cd-451c-b95c-ae36a693fe5b ran 3 tests.  1 tests failed: sanityn.
+
+--- Message (Maloo, 2026-05-07 21:23:24.000000000) ---
+Patch Set 10:
+
+Failed enforced test review-dne-zfs-subtest-change on RHEL 8.10 / x86_64 uploaded by Onyx Autotest from onyx-157vm15: https://testing.whamcloud.com/test_sessions/06e30162-5b3c-40e3-b572-1afd34fe44a2 ran 3 tests.  1 tests failed: sanityn.
+
+--- Message (Maloo, 2026-05-07 21:23:52.000000000) ---
+Patch Set 10:
+
+Failed enforced test review-dne-subtest-change on RHEL 8.10 / x86_64 uploaded by Trevis Autotest from trevis-152vm160: https://testing.whamcloud.com/test_sessions/c0abd1da-b53b-4347-8898-853c6a4f226f ran 3 tests.  1 tests failed: sanityn.
+
+--- Message (Maloo, 2026-05-07 21:24:25.000000000) ---
+Patch Set 10:
+
+Failed enforced test review-dne-zfs-subtest-change on RHEL 8.10 / x86_64 uploaded by Onyx Autotest from onyx-156vm1: https://testing.whamcloud.com/test_sessions/e50120b8-d7eb-4642-81ed-b7741262e625 ran 3 tests.  1 tests failed: sanityn.
+
+--- Message (Lustre Gerrit Janitor, 2026-05-07 23:01:32.000000000) ---
+Patch Set 10: Code-Review-1
+
+Newly added or changed test failed in initial testing:
+IMPORTANT: these tests appear to be new failures unique to this patch
+- sanityn@ldiskfs+DNE:test_77t(NEW unique failure for this branch in the last 30 days, and was seen 0 times across 0 other branches 0 reviews), test_77u(NEW unique failure for this branch in the last 30 days, and was seen 0 times across 0 other branches 0 reviews)
+- sanityn@zfs:test_77t(NEW unique failure for this branch in the last 30 days, and was seen 0 times across 0 other branches 0 reviews), test_77u(NEW unique failure for this branch in the last 30 days, and was seen 0 times across 0 other branches 0 reviews)
+
+
+> sanityn@ldiskfs+DNE Failure(7735s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special1@ldiskfs+DNE Failure(571s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special1@ldiskfs Failure(516s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special2@ldiskfs+DNE Failure(591s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special2@ldiskfs Failure(531s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special3@ldiskfs+DNE Failure(581s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special3@ldiskfs Failure(516s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special4@ldiskfs+DNE Failure(601s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special4@ldiskfs Failure(506s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special5@ldiskfs+DNE Failure(586s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special5@ldiskfs Failure(526s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special6@ldiskfs+DNE Failure(576s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special6@ldiskfs Failure(546s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special7@ldiskfs+DNE Failure(601s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special7@ldiskfs Failure(531s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special8@ldiskfs+DNE Failure(641s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special8@ldiskfs Failure(546s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special9@ldiskfs+DNE Failure(576s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special9@ldiskfs Failure(541s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special10@ldiskfs+DNE Failure(516s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special10@ldiskfs Failure(566s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn@zfs Failure(6507s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special1@zfs Failure(1057s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special1@zfs+DNE Failure(481s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special2@zfs Failure(556s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special2@zfs+DNE Failure(546s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special3@zfs Failure(463s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special3@zfs+DNE Failure(611s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special4@zfs Failure(506s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special4@zfs+DNE Failure(591s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special5@zfs Failure(511s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special5@zfs+DNE Failure(591s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special6@zfs Failure(561s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special6@zfs+DNE Failure(511s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special7@zfs Failure(526s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special7@zfs+DNE Failure(631s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special8@zfs Failure(466s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special8@zfs+DNE Failure(526s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special9@zfs Failure(454s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special9@zfs+DNE Failure(581s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special10@zfs Failure(521s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+> sanityn-special10@zfs+DNE Failure(516s)
+- 77t(test_77t failed with 22) 77u(test_77u returned 2) 
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity-special1@ldiskfs+DNE conf-sanity-special1@ldiskfs conf-sanity-special2@ldiskfs+DNE conf-sanity-special2@ldiskfs conf-sanity-special3@ldiskfs+DNE conf-sanity-special3@ldiskfs conf-sanity-special4@ldiskfs+DNE conf-sanity-special4@ldiskfs conf-sanity-special5@ldiskfs+DNE conf-sanity-special5@ldiskfs conf-sanity-special6@ldiskfs+DNE conf-sanity-special6@ldiskfs conf-sanity-special7@ldiskfs+DNE conf-sanity-special7@ldiskfs conf-sanity-special8@ldiskfs+DNE conf-sanity-special8@ldiskfs conf-sanity-special9@ldiskfs+DNE conf-sanity-special9@ldiskfs conf-sanity-special10@ldiskfs+DNE conf-sanity-special10@ldiskfs conf-sanity-special1@ldiskfs+DNE conf-sanity-special1@ldiskfs conf-sanity-special2@ldiskfs+DNE conf-sanity-special2@ldiskfs conf-sanity-special3@ldiskfs+DNE conf-sanity-special3@ldiskfs conf-sanity-special4@ldiskfs+DNE conf-sanity-special4@ldiskfs conf-sanity-special5@ldiskfs+DNE conf-sanity-special5@ldiskfs conf-sanity-special6@ldiskfs+DNE conf-sanity-special6@ldiskfs conf-sanity-special7@ldiskfs+DNE conf-sanity-special7@ldiskfs conf-sanity-special8@ldiskfs+DNE conf-sanity-special8@ldiskfs conf-sanity-special9@ldiskfs+DNE conf-sanity-special9@ldiskfs conf-sanity-special10@ldiskfs+DNE conf-sanity-special10@ldiskfs conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs conf-sanity-special1@zfs conf-sanity-special1@zfs+DNE conf-sanity-special2@zfs conf-sanity-special2@zfs+DNE conf-sanity-special3@zfs conf-sanity-special3@zfs+DNE conf-sanity-special4@zfs conf-sanity-special4@zfs+DNE conf-sanity-special5@zfs conf-sanity-special5@zfs+DNE conf-sanity-special6@zfs conf-sanity-special6@zfs+DNE conf-sanity-special7@zfs conf-sanity-special7@zfs+DNE conf-sanity-special8@zfs conf-sanity-special8@zfs+DNE conf-sanity-special9@zfs conf-sanity-special9@zfs+DNE conf-sanity-special10@zfs conf-sanity-special10@zfs+DNE conf-sanity-special1@zfs conf-sanity-special1@zfs+DNE conf-sanity-special2@zfs conf-sanity-special2@zfs+DNE conf-sanity-special3@zfs conf-sanity-special3@zfs+DNE conf-sanity-special4@zfs conf-sanity-special4@zfs+DNE conf-sanity-special5@zfs conf-sanity-special5@zfs+DNE conf-sanity-special6@zfs conf-sanity-special6@zfs+DNE conf-sanity-special7@zfs conf-sanity-special7@zfs+DNE conf-sanity-special8@zfs conf-sanity-special8@zfs+DNE conf-sanity-special9@zfs conf-sanity-special9@zfs+DNE conf-sanity-special10@zfs conf-sanity-special10@zfs+DNE runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/63392/results.html
+
+--- Message (Qian Yingjin, 2026-05-08 02:25:30.000000000) ---
+Patch Set 10:
+
+(1 comment)
+
+--- Message (Chris Horn, 2026-05-08 02:28:36.000000000) ---
+Patch Set 10:
+
+(1 comment)
+
+--- Message (Qian Yingjin, 2026-05-08 02:45:01.000000000) ---
+Patch Set 10:
+
+(1 comment)
+
+--- Message (Chris Horn, 2026-05-08 03:16:00.000000000) ---
+Patch Set 10:
+
+(1 comment)
+
+--- Message (Maloo, 2026-05-08 03:44:32.000000000) ---
+Patch Set 10:
+
+Failed enforced test review-ldiskfs-dne-arm on RHEL 8.10 / x86_64, Rocky 9.5 / aarch64 uploaded by Onyx Autotest from onyx-180vm45: https://testing.whamcloud.com/test_sessions/28834f50-8f91-4bb4-8672-9cd0eee037ad ran 5 tests.  1 tests failed: sanity.
+
+--- Message (Maloo, 2026-05-08 08:17:41.000000000) ---
+Patch Set 10: Verified-1
+
+Failed enforced test custom-1001 on RHEL 8.10 / x86_64 uploaded by Trevis Autotest from trevis-153vm285: https://testing.whamcloud.com/test_sessions/a78a9f4b-4adf-40b2-8a59-ace8fe88a2a5 ran 4 tests.  1 tests failed: sanityn.
+
+--- Message (Chris Horn, 2026-05-08 20:17:32.000000000) ---
+Uploaded patch set 11.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-05-08 20:17:47.000000000) ---
+Patch Set 11:
+
+(17 comments)
+
+17 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Chris Horn, 2026-05-08 20:18:53.000000000) ---
+Patch Set 11:
+
+(2 comments)
+
+--- Message (Lustre Gerrit Janitor, 2026-05-08 20:22:08.000000000) ---
+Patch Set 11:
+
+(1 comment)
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/63435/results.html
+
+ Commencing initial testing: conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity-special1@ldiskfs+DNE conf-sanity-special1@ldiskfs conf-sanity-special2@ldiskfs+DNE conf-sanity-special2@ldiskfs conf-sanity-special3@ldiskfs+DNE conf-sanity-special3@ldiskfs conf-sanity-special4@ldiskfs+DNE conf-sanity-special4@ldiskfs conf-sanity-special5@ldiskfs+DNE conf-sanity-special5@ldiskfs conf-sanity-special6@ldiskfs+DNE conf-sanity-special6@ldiskfs conf-sanity-special7@ldiskfs+DNE conf-sanity-special7@ldiskfs conf-sanity-special8@ldiskfs+DNE conf-sanity-special8@ldiskfs conf-sanity-special9@ldiskfs+DNE conf-sanity-special9@ldiskfs conf-sanity-special10@ldiskfs+DNE conf-sanity-special10@ldiskfs conf-sanity-special1@ldiskfs+DNE conf-sanity-special1@ldiskfs conf-sanity-special2@ldiskfs+DNE conf-sanity-special2@ldiskfs conf-sanity-special3@ldiskfs+DNE conf-sanity-special3@ldiskfs conf-sanity-special4@ldiskfs+DNE conf-sanity-special4@ldiskfs conf-sanity-special5@ldiskfs+DNE conf-sanity-special5@ldiskfs conf-sanity-special6@ldiskfs+DNE conf-sanity-special6@ldiskfs conf-sanity-special7@ldiskfs+DNE conf-sanity-special7@ldiskfs conf-sanity-special8@ldiskfs+DNE conf-sanity-special8@ldiskfs conf-sanity-special9@ldiskfs+DNE conf-sanity-special9@ldiskfs conf-sanity-special10@ldiskfs+DNE conf-sanity-special10@ldiskfs conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs conf-sanity-special1@zfs conf-sanity-special1@zfs+DNE conf-sanity-special2@zfs conf-sanity-special2@zfs+DNE conf-sanity-special3@zfs conf-sanity-special3@zfs+DNE conf-sanity-special4@zfs conf-sanity-special4@zfs+DNE conf-sanity-special5@zfs conf-sanity-special5@zfs+DNE conf-sanity-special6@zfs conf-sanity-special6@zfs+DNE conf-sanity-special7@zfs conf-sanity-special7@zfs+DNE conf-sanity-special8@zfs conf-sanity-special8@zfs+DNE conf-sanity-special9@zfs conf-sanity-special9@zfs+DNE conf-sanity-special10@zfs conf-sanity-special10@zfs+DNE conf-sanity-special1@zfs conf-sanity-special1@zfs+DNE conf-sanity-special2@zfs conf-sanity-special2@zfs+DNE conf-sanity-special3@zfs conf-sanity-special3@zfs+DNE conf-sanity-special4@zfs conf-sanity-special4@zfs+DNE conf-sanity-special5@zfs conf-sanity-special5@zfs+DNE conf-sanity-special6@zfs conf-sanity-special6@zfs+DNE conf-sanity-special7@zfs conf-sanity-special7@zfs+DNE conf-sanity-special8@zfs conf-sanity-special8@zfs+DNE conf-sanity-special9@zfs conf-sanity-special9@zfs+DNE conf-sanity-special10@zfs conf-sanity-special10@zfs+DNE runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanityn@ldiskfs+DNE sanityn-special1@ldiskfs+DNE sanityn-special1@ldiskfs sanityn-special2@ldiskfs+DNE sanityn-special2@ldiskfs sanityn-special3@ldiskfs+DNE sanityn-special3@ldiskfs sanityn-special4@ldiskfs+DNE sanityn-special4@ldiskfs sanityn-special5@ldiskfs+DNE sanityn-special5@ldiskfs sanityn-special6@ldiskfs+DNE sanityn-special6@ldiskfs sanityn-special7@ldiskfs+DNE sanityn-special7@ldiskfs sanityn-special8@ldiskfs+DNE sanityn-special8@ldiskfs sanityn-special9@ldiskfs+DNE sanityn-special9@ldiskfs sanityn-special10@ldiskfs+DNE sanityn-special10@ldiskfs sanityn@zfs sanityn-special1@zfs sanityn-special1@zfs+DNE sanityn-special2@zfs sanityn-special2@zfs+DNE sanityn-special3@zfs sanityn-special3@zfs+DNE sanityn-special4@zfs sanityn-special4@zfs+DNE sanityn-special5@zfs sanityn-special5@zfs+DNE sanityn-special6@zfs sanityn-special6@zfs+DNE sanityn-special7@zfs sanityn-special7@zfs+DNE sanityn-special8@zfs sanityn-special8@zfs+DNE sanityn-special9@zfs sanityn-special9@zfs+DNE sanityn-special10@zfs sanityn-special10@zfs+DNE
+
+--- Message (jenkins, 2026-05-08 20:43:13.000000000) ---
+Patch Set 11: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/124760/ : SUCCESS
+
+--- Message (Maloo, 2026-05-08 20:44:31.000000000) ---
+Patch Set 11:
+
+#### The following sessions will be run for Build 124760 (patch #11):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- custom on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- custom on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-ldiskfs-dne on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=124760&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=124760#redirect
+
+--- Message (Maloo, 2026-05-08 21:09:37.000000000) ---
+Patch Set 11:
+
+Failed enforced test review-dne-subtest-change on RHEL 8.10 / x86_64 uploaded by Trevis Autotest from trevis-153vm14: https://testing.whamcloud.com/test_sessions/80a83d67-fb58-43e4-b101-7f0133fee0de ran 3 tests.  1 tests failed: sanityn.
+
+--- Message (Maloo, 2026-05-08 21:10:17.000000000) ---
+Patch Set 11:
+
+Failed enforced test custom-1002 on RHEL 8.10 / x86_64 uploaded by Onyx Autotest from onyx-156vm32: https://testing.whamcloud.com/test_sessions/341c4d28-535a-424d-a978-6947ab64abd4 ran 3 tests.  1 tests failed: sanityn.
+
+--- Message (Maloo, 2026-05-08 21:11:18.000000000) ---
+Patch Set 11:
+
+Failed enforced test review-dne-zfs-subtest-change on RHEL 8.10 / x86_64 uploaded by Onyx Autotest from onyx-156vm27: https://testing.whamcloud.com/test_sessions/d820f09c-03e6-405d-af59-58fdd7e3c90c ran 3 tests.  1 tests failed: sanityn.
+
+--- Message (Lustre Gerrit Janitor, 2026-05-08 23:01:21.000000000) ---
+Patch Set 11:
+
+Initial testing succeeded.
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity-special1@ldiskfs+DNE conf-sanity-special1@ldiskfs conf-sanity-special2@ldiskfs+DNE conf-sanity-special2@ldiskfs conf-sanity-special3@ldiskfs+DNE conf-sanity-special3@ldiskfs conf-sanity-special4@ldiskfs+DNE conf-sanity-special4@ldiskfs conf-sanity-special5@ldiskfs+DNE conf-sanity-special5@ldiskfs conf-sanity-special6@ldiskfs+DNE conf-sanity-special6@ldiskfs conf-sanity-special7@ldiskfs+DNE conf-sanity-special7@ldiskfs conf-sanity-special8@ldiskfs+DNE conf-sanity-special8@ldiskfs conf-sanity-special9@ldiskfs+DNE conf-sanity-special9@ldiskfs conf-sanity-special10@ldiskfs+DNE conf-sanity-special10@ldiskfs conf-sanity-special1@ldiskfs+DNE conf-sanity-special1@ldiskfs conf-sanity-special2@ldiskfs+DNE conf-sanity-special2@ldiskfs conf-sanity-special3@ldiskfs+DNE conf-sanity-special3@ldiskfs conf-sanity-special4@ldiskfs+DNE conf-sanity-special4@ldiskfs conf-sanity-special5@ldiskfs+DNE conf-sanity-special5@ldiskfs conf-sanity-special6@ldiskfs+DNE conf-sanity-special6@ldiskfs conf-sanity-special7@ldiskfs+DNE conf-sanity-special7@ldiskfs conf-sanity-special8@ldiskfs+DNE conf-sanity-special8@ldiskfs conf-sanity-special9@ldiskfs+DNE conf-sanity-special9@ldiskfs conf-sanity-special10@ldiskfs+DNE conf-sanity-special10@ldiskfs conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs conf-sanity-special1@zfs conf-sanity-special1@zfs+DNE conf-sanity-special2@zfs conf-sanity-special2@zfs+DNE conf-sanity-special3@zfs conf-sanity-special3@zfs+DNE conf-sanity-special4@zfs conf-sanity-special4@zfs+DNE conf-sanity-special5@zfs conf-sanity-special5@zfs+DNE conf-sanity-special6@zfs conf-sanity-special6@zfs+DNE conf-sanity-special7@zfs conf-sanity-special7@zfs+DNE conf-sanity-special8@zfs conf-sanity-special8@zfs+DNE conf-sanity-special9@zfs conf-sanity-special9@zfs+DNE conf-sanity-special10@zfs conf-sanity-special10@zfs+DNE conf-sanity-special1@zfs conf-sanity-special1@zfs+DNE conf-sanity-special2@zfs conf-sanity-special2@zfs+DNE conf-sanity-special3@zfs conf-sanity-special3@zfs+DNE conf-sanity-special4@zfs conf-sanity-special4@zfs+DNE conf-sanity-special5@zfs conf-sanity-special5@zfs+DNE conf-sanity-special6@zfs conf-sanity-special6@zfs+DNE conf-sanity-special7@zfs conf-sanity-special7@zfs+DNE conf-sanity-special8@zfs conf-sanity-special8@zfs+DNE conf-sanity-special9@zfs conf-sanity-special9@zfs+DNE conf-sanity-special10@zfs conf-sanity-special10@zfs+DNE runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanityn@ldiskfs+DNE sanityn-special1@ldiskfs+DNE sanityn-special1@ldiskfs sanityn-special2@ldiskfs+DNE sanityn-special2@ldiskfs sanityn-special3@ldiskfs+DNE sanityn-special3@ldiskfs sanityn-special4@ldiskfs+DNE sanityn-special4@ldiskfs sanityn-special5@ldiskfs+DNE sanityn-special5@ldiskfs sanityn-special6@ldiskfs+DNE sanityn-special6@ldiskfs sanityn-special7@ldiskfs+DNE sanityn-special7@ldiskfs sanityn-special8@ldiskfs+DNE sanityn-special8@ldiskfs sanityn-special9@ldiskfs+DNE sanityn-special9@ldiskfs sanityn-special10@ldiskfs+DNE sanityn-special10@ldiskfs sanityn@zfs sanityn-special1@zfs sanityn-special1@zfs+DNE sanityn-special2@zfs sanityn-special2@zfs+DNE sanityn-special3@zfs sanityn-special3@zfs+DNE sanityn-special4@zfs sanityn-special4@zfs+DNE sanityn-special5@zfs sanityn-special5@zfs+DNE sanityn-special6@zfs sanityn-special6@zfs+DNE sanityn-special7@zfs sanityn-special7@zfs+DNE sanityn-special8@zfs sanityn-special8@zfs+DNE sanityn-special9@zfs sanityn-special9@zfs+DNE sanityn-special10@zfs sanityn-special10@zfs+DNE 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/63435/results.html
+Commencing standard testing: 
+- insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs
+
+--- Message (Maloo, 2026-05-09 01:48:05.000000000) ---
+Patch Set 11:
+
+Failed enforced test review-ldiskfs-dne on RHEL 8.10 / x86_64 uploaded by Onyx Autotest from onyx-157vm1: https://testing.whamcloud.com/test_sessions/cd78a95f-d091-4212-b6e8-475ed9c7ff89 ran 5 tests.  1 tests failed: sanity.
+
+--- Message (Maloo, 2026-05-09 02:39:22.000000000) ---
+Patch Set 11:
+
+Failed optional test review-ldiskfs-dne on RHEL 10.1 / x86_64 uploaded by Trevis Autotest from trevis-154vm5: https://testing.whamcloud.com/test_sessions/d7abbd7d-3725-4de8-9973-0df4c2c81524 ran 5 tests.  1 tests failed: sanity.
+
+--- Message (Maloo, 2026-05-09 02:48:28.000000000) ---
+Patch Set 11:
+
+Failed enforced test review-ldiskfs-dne-arm on RHEL 8.10 / x86_64, Rocky 9.5 / aarch64 uploaded by Onyx Autotest from onyx-154vm1: https://testing.whamcloud.com/test_sessions/f871ce2e-f122-420b-aa9f-dd1eec279072 ran 5 tests.  1 tests failed: sanity.
+
+--- Message (Lustre Gerrit Janitor, 2026-05-09 02:51:43.000000000) ---
+Patch Set 11:
+
+Even though "Test-Parameters: trivial" was detected, this deeply suspicious bot still run some testing
+
+Testing has completed with errors!
+
+> racer@ldiskfs+DNE Timeout(1620s)
+> replay-single2@ldiskfs+DNE Failure(2536s)
+- 135(Unexpected sync success) 
+> sanity-quota@zfs Failure(9629s)
+- 86(succeed to create files, expect failed) 
+
+Succeeded:
+- insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/63435/results.html
+
+--- Message (Maloo, 2026-05-09 07:53:26.000000000) ---
+Patch Set 11: Verified-1
+
+Failed enforced test custom-1001 on RHEL 8.10 / x86_64 uploaded by Trevis Autotest from trevis-154vm31: https://testing.whamcloud.com/test_sessions/93689667-fddd-4825-be92-4f91bfccdab1 ran 4 tests.  1 tests failed: sanityn.
+
+--- Message (Chris Horn, 2026-05-09 17:09:08.000000000) ---
+Uploaded patch set 12.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-05-09 17:13:10.000000000) ---
+Patch Set 12:
+
+(17 comments)
+
+17 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre Gerrit Janitor, 2026-05-09 17:14:25.000000000) ---
+Patch Set 12:
+
+(1 comment)
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/63484/results.html
+
+ Commencing initial testing: conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity-special1@ldiskfs+DNE conf-sanity-special1@ldiskfs conf-sanity-special2@ldiskfs+DNE conf-sanity-special2@ldiskfs conf-sanity-special3@ldiskfs+DNE conf-sanity-special3@ldiskfs conf-sanity-special4@ldiskfs+DNE conf-sanity-special4@ldiskfs conf-sanity-special5@ldiskfs+DNE conf-sanity-special5@ldiskfs conf-sanity-special6@ldiskfs+DNE conf-sanity-special6@ldiskfs conf-sanity-special7@ldiskfs+DNE conf-sanity-special7@ldiskfs conf-sanity-special8@ldiskfs+DNE conf-sanity-special8@ldiskfs conf-sanity-special9@ldiskfs+DNE conf-sanity-special9@ldiskfs conf-sanity-special10@ldiskfs+DNE conf-sanity-special10@ldiskfs conf-sanity-special1@ldiskfs+DNE conf-sanity-special1@ldiskfs conf-sanity-special2@ldiskfs+DNE conf-sanity-special2@ldiskfs conf-sanity-special3@ldiskfs+DNE conf-sanity-special3@ldiskfs conf-sanity-special4@ldiskfs+DNE conf-sanity-special4@ldiskfs conf-sanity-special5@ldiskfs+DNE conf-sanity-special5@ldiskfs conf-sanity-special6@ldiskfs+DNE conf-sanity-special6@ldiskfs conf-sanity-special7@ldiskfs+DNE conf-sanity-special7@ldiskfs conf-sanity-special8@ldiskfs+DNE conf-sanity-special8@ldiskfs conf-sanity-special9@ldiskfs+DNE conf-sanity-special9@ldiskfs conf-sanity-special10@ldiskfs+DNE conf-sanity-special10@ldiskfs conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs conf-sanity-special1@zfs conf-sanity-special1@zfs+DNE conf-sanity-special2@zfs conf-sanity-special2@zfs+DNE conf-sanity-special3@zfs conf-sanity-special3@zfs+DNE conf-sanity-special4@zfs conf-sanity-special4@zfs+DNE conf-sanity-special5@zfs conf-sanity-special5@zfs+DNE conf-sanity-special6@zfs conf-sanity-special6@zfs+DNE conf-sanity-special7@zfs conf-sanity-special7@zfs+DNE conf-sanity-special8@zfs conf-sanity-special8@zfs+DNE conf-sanity-special9@zfs conf-sanity-special9@zfs+DNE conf-sanity-special10@zfs conf-sanity-special10@zfs+DNE conf-sanity-special1@zfs conf-sanity-special1@zfs+DNE conf-sanity-special2@zfs conf-sanity-special2@zfs+DNE conf-sanity-special3@zfs conf-sanity-special3@zfs+DNE conf-sanity-special4@zfs conf-sanity-special4@zfs+DNE conf-sanity-special5@zfs conf-sanity-special5@zfs+DNE conf-sanity-special6@zfs conf-sanity-special6@zfs+DNE conf-sanity-special7@zfs conf-sanity-special7@zfs+DNE conf-sanity-special8@zfs conf-sanity-special8@zfs+DNE conf-sanity-special9@zfs conf-sanity-special9@zfs+DNE conf-sanity-special10@zfs conf-sanity-special10@zfs+DNE runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanityn@ldiskfs+DNE sanityn-special1@ldiskfs+DNE sanityn-special1@ldiskfs sanityn-special2@ldiskfs+DNE sanityn-special2@ldiskfs sanityn-special3@ldiskfs+DNE sanityn-special3@ldiskfs sanityn-special4@ldiskfs+DNE sanityn-special4@ldiskfs sanityn-special5@ldiskfs+DNE sanityn-special5@ldiskfs sanityn-special6@ldiskfs+DNE sanityn-special6@ldiskfs sanityn-special7@ldiskfs+DNE sanityn-special7@ldiskfs sanityn-special8@ldiskfs+DNE sanityn-special8@ldiskfs sanityn-special9@ldiskfs+DNE sanityn-special9@ldiskfs sanityn-special10@ldiskfs+DNE sanityn-special10@ldiskfs sanityn@zfs sanityn-special1@zfs sanityn-special1@zfs+DNE sanityn-special2@zfs sanityn-special2@zfs+DNE sanityn-special3@zfs sanityn-special3@zfs+DNE sanityn-special4@zfs sanityn-special4@zfs+DNE sanityn-special5@zfs sanityn-special5@zfs+DNE sanityn-special6@zfs sanityn-special6@zfs+DNE sanityn-special7@zfs sanityn-special7@zfs+DNE sanityn-special8@zfs sanityn-special8@zfs+DNE sanityn-special9@zfs sanityn-special9@zfs+DNE sanityn-special10@zfs sanityn-special10@zfs+DNE
+
+--- Message (jenkins, 2026-05-09 17:35:07.000000000) ---
+Patch Set 12: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/124807/ : SUCCESS
+
+--- Message (Maloo, 2026-05-09 17:37:16.000000000) ---
+Patch Set 12:
+
+#### The following sessions will be run for Build 124807 (patch #12):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- custom on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- custom on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-ldiskfs-dne on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=124807&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=124807#redirect
+
+--- Message (Maloo, 2026-05-09 18:02:58.000000000) ---
+Patch Set 12:
+
+Failed enforced test review-dne-subtest-change on RHEL 8.10 / x86_64 uploaded by Onyx Autotest from onyx-157vm21: https://testing.whamcloud.com/test_sessions/61d4c7d1-afd1-45c1-a4b6-67440eb0e8a1 ran 3 tests.  1 tests failed: sanityn.
+
+--- Message (Lustre Gerrit Janitor, 2026-05-09 19:26:14.000000000) ---
+Patch Set 12:
+
+Initial testing succeeded.
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity-special1@ldiskfs+DNE conf-sanity-special1@ldiskfs conf-sanity-special2@ldiskfs+DNE conf-sanity-special2@ldiskfs conf-sanity-special3@ldiskfs+DNE conf-sanity-special3@ldiskfs conf-sanity-special4@ldiskfs+DNE conf-sanity-special4@ldiskfs conf-sanity-special5@ldiskfs+DNE conf-sanity-special5@ldiskfs conf-sanity-special6@ldiskfs+DNE conf-sanity-special6@ldiskfs conf-sanity-special7@ldiskfs+DNE conf-sanity-special7@ldiskfs conf-sanity-special8@ldiskfs+DNE conf-sanity-special8@ldiskfs conf-sanity-special9@ldiskfs+DNE conf-sanity-special9@ldiskfs conf-sanity-special10@ldiskfs+DNE conf-sanity-special10@ldiskfs conf-sanity-special1@ldiskfs+DNE conf-sanity-special1@ldiskfs conf-sanity-special2@ldiskfs+DNE conf-sanity-special2@ldiskfs conf-sanity-special3@ldiskfs+DNE conf-sanity-special3@ldiskfs conf-sanity-special4@ldiskfs+DNE conf-sanity-special4@ldiskfs conf-sanity-special5@ldiskfs+DNE conf-sanity-special5@ldiskfs conf-sanity-special6@ldiskfs+DNE conf-sanity-special6@ldiskfs conf-sanity-special7@ldiskfs+DNE conf-sanity-special7@ldiskfs conf-sanity-special8@ldiskfs+DNE conf-sanity-special8@ldiskfs conf-sanity-special9@ldiskfs+DNE conf-sanity-special9@ldiskfs conf-sanity-special10@ldiskfs+DNE conf-sanity-special10@ldiskfs conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs conf-sanity-special1@zfs conf-sanity-special1@zfs+DNE conf-sanity-special2@zfs conf-sanity-special2@zfs+DNE conf-sanity-special3@zfs conf-sanity-special3@zfs+DNE conf-sanity-special4@zfs conf-sanity-special4@zfs+DNE conf-sanity-special5@zfs conf-sanity-special5@zfs+DNE conf-sanity-special6@zfs conf-sanity-special6@zfs+DNE conf-sanity-special7@zfs conf-sanity-special7@zfs+DNE conf-sanity-special8@zfs conf-sanity-special8@zfs+DNE conf-sanity-special9@zfs conf-sanity-special9@zfs+DNE conf-sanity-special10@zfs conf-sanity-special10@zfs+DNE conf-sanity-special1@zfs conf-sanity-special1@zfs+DNE conf-sanity-special2@zfs conf-sanity-special2@zfs+DNE conf-sanity-special3@zfs conf-sanity-special3@zfs+DNE conf-sanity-special4@zfs conf-sanity-special4@zfs+DNE conf-sanity-special5@zfs conf-sanity-special5@zfs+DNE conf-sanity-special6@zfs conf-sanity-special6@zfs+DNE conf-sanity-special7@zfs conf-sanity-special7@zfs+DNE conf-sanity-special8@zfs conf-sanity-special8@zfs+DNE conf-sanity-special9@zfs conf-sanity-special9@zfs+DNE conf-sanity-special10@zfs conf-sanity-special10@zfs+DNE runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanityn@ldiskfs+DNE sanityn-special1@ldiskfs+DNE sanityn-special1@ldiskfs sanityn-special2@ldiskfs+DNE sanityn-special2@ldiskfs sanityn-special3@ldiskfs+DNE sanityn-special3@ldiskfs sanityn-special4@ldiskfs+DNE sanityn-special4@ldiskfs sanityn-special5@ldiskfs+DNE sanityn-special5@ldiskfs sanityn-special6@ldiskfs+DNE sanityn-special6@ldiskfs sanityn-special7@ldiskfs+DNE sanityn-special7@ldiskfs sanityn-special8@ldiskfs+DNE sanityn-special8@ldiskfs sanityn-special9@ldiskfs+DNE sanityn-special9@ldiskfs sanityn-special10@ldiskfs+DNE sanityn-special10@ldiskfs sanityn@zfs sanityn-special1@zfs sanityn-special1@zfs+DNE sanityn-special2@zfs sanityn-special2@zfs+DNE sanityn-special3@zfs sanityn-special3@zfs+DNE sanityn-special4@zfs sanityn-special4@zfs+DNE sanityn-special5@zfs sanityn-special5@zfs+DNE sanityn-special6@zfs sanityn-special6@zfs+DNE sanityn-special7@zfs sanityn-special7@zfs+DNE sanityn-special8@zfs sanityn-special8@zfs+DNE sanityn-special9@zfs sanityn-special9@zfs+DNE sanityn-special10@zfs sanityn-special10@zfs+DNE 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/63484/results.html
+Commencing standard testing: 
+- insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs
+
+--- Message (Maloo, 2026-05-09 22:13:10.000000000) ---
+Patch Set 12:
+
+Failed enforced test review-ldiskfs-dne-arm on RHEL 8.10 / x86_64, Rocky 9.5 / aarch64 uploaded by Onyx Autotest from onyx-180vm1: https://testing.whamcloud.com/test_sessions/b6c10f80-d122-459e-b433-b9ab92fa74aa ran 5 tests.  1 tests failed: sanity.
+
+--- Message (Maloo, 2026-05-09 23:53:18.000000000) ---
+Patch Set 12:
+
+Failed optional test review-ldiskfs-dne on RHEL 10.1 / x86_64 uploaded by Onyx Autotest from onyx-141vm1: https://testing.whamcloud.com/test_sessions/8f2c472b-181b-49f3-b705-2483fc8d108e ran 5 tests.  1 tests failed: sanity.
+
+--- Message (Lustre Gerrit Janitor, 2026-05-10 00:27:02.000000000) ---
+Patch Set 12:
+
+Even though "Test-Parameters: trivial" was detected, this deeply suspicious bot still run some testing
+
+Testing has completed with errors!
+
+> racer@ldiskfs+DNE Timeout(1510s)
+> sanity3@ldiskfs+DNE Timeout(6477s)
+
+Succeeded:
+- insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/63484/results.html
+
+--- Message (Maloo, 2026-05-10 04:42:02.000000000) ---
+Patch Set 12: Verified-1
+
+Passed enforced test custom-1001 on RHEL 8.10 / x86_64 uploaded by Onyx Autotest from onyx-156vm26: https://testing.whamcloud.com/test_sessions/8026f36e-34be-4809-bf47-f735aa367997 ran 4 tests.
+
+--- Message (Autotest, 2026-05-11 15:58:59.000000000) ---
+Patch Set 12:
+
+Onyx Autotest retesting non-enforced review-ldiskfs-dne session on el10.1-x86_64/ldiskfs servers and clients for build 124807 patch 12. Requested by Chris Horn because of LU-19914.
+
+--- Message (Autotest, 2026-05-11 15:59:29.000000000) ---
+Patch Set 12:
+
+Onyx Autotest retesting enforced review-ldiskfs-dne-arm session on el8.10-x86_64/ldiskfs servers and rocky9.5-aarch64/ldiskfs clients for build 124807 patch 12. Requested by Chris Horn because of LU-20117.
+
+--- Message (Autotest, 2026-05-11 18:31:53.000000000) ---
+Patch Set 12:
+
+Onyx Autotest retesting enforced review-dne-subtest-change session on el8.10-x86_64/ldiskfs servers and clients for build 124807 patch 12. Requested by Chris Horn because of LU-20243.
+
+--- Message (Maloo, 2026-05-11 19:24:06.000000000) ---
+Patch Set 12:
+
+Passed enforced test review-dne-subtest-change on RHEL 8.10 / x86_64 uploaded by Onyx Autotest from onyx-158vm45: https://testing.whamcloud.com/test_sessions/f8e85e27-d808-4ee5-a61d-0b9b215229fc ran 3 tests.
+
+--- Message (Maloo, 2026-05-11 21:10:48.000000000) ---
+Patch Set 12: Verified+1
+
+Passed enforced test review-ldiskfs-dne-arm on RHEL 8.10 / x86_64, Rocky 9.5 / aarch64 uploaded by Onyx Autotest from onyx-180vm5: https://testing.whamcloud.com/test_sessions/e1972a97-60e1-497a-92bb-ba1e3ed097df ran 5 tests.
+
+--- Message (Chris Horn, 2026-05-12 03:08:42.000000000) ---
+Patch Set 12:
+
+(1 comment)
+
+--- Message (Chris Horn, 2026-05-19 15:23:55.000000000) ---
+Patch Set 12:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-05-20 09:36:44.000000000) ---
+Patch Set 12:
+
+(1 comment)
+
+--- Message (Qian Yingjin, 2026-05-20 15:35:06.000000000) ---
+Patch Set 12:
+
+(2 comments)
+
+--- Message (Chris Horn, 2026-05-20 19:55:31.000000000) ---
+Patch Set 12:
+
+(2 comments)
+
+--- Message (Qian Yingjin, 2026-05-21 01:44:48.000000000) ---
+Patch Set 12:
+
+(1 comment)
+
+--- Message (Qian Yingjin, 2026-05-21 02:02:30.000000000) ---
+Patch Set 12:
+
+(1 comment)
+
+--- Message (Chris Horn, 2026-05-22 20:07:44.000000000) ---
+Patch Set 12:
+
+(1 comment)
+
+--- Message (Lustre RISC-V Builder, 2026-05-22 20:08:29.000000000) ---
+Patch Set 12:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-06-21 16:12:07.000000000) ---
+Patch Set 12:
+
+(3 comments)
+
+4 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (Chris Horn, 2026-09-08 16:48:08.000000000) ---
+Patch Set 12:
+
+(1 comment)
+
+--- Message (Lustre RISC-V Builder, 2026-09-08 17:07:19.000000000) ---
+Patch Set 12:
+
+RISC-V Client Builder: build succesful

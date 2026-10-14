@@ -1,0 +1,1800 @@
+Change:     66588
+Subject:    LU-20350 o2iblnd: Bounce cross-NUMA bulk via NIC-local pool
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/66588
+Change-Id:  Icf39b39a7a3f3f3fdfdaa886edf9695af28eb48f
+Project:    fs/lustre-release
+Branch:     master
+Status:     MERGED
+Owner:      Chris Horn
+Created:    2026-06-10 20:10:02.000000000
+Updated:    2026-10-13 04:26:53.000000000
+Patch Set:  16
+Insertions: +1347
+Deletions:  -19
+Comments:   605 (3 unresolved)
+Hashtags:   master-next
+
+--- Labels ---
+  Code-Review: Cyril Bordage: +1; Manish Regmi: +1; Xinxia Qu: +1; Oleg Drokin: +2
+  Verified: jenkins: +1; Maloo: +1
+
+--- Reviewers ---
+  CC: Shuichi Ihara, Janitor Bot, Lustre RISC-V Builder, Gerrit AI review for Lustre
+  REVIEWER: Oleg Drokin, Li Xi, Qian Yingjin, Cyril Bordage, Manish Regmi, Xinxia Qu
+
+--- Commit Message ---
+LU-20350 o2iblnd: Bounce cross-NUMA bulk via NIC-local pool
+
+On a dual-socket client the HCA hangs off one socket's PCIe root
+complex, so any RDMA against memory on the other socket crosses the
+inter-socket link. Without PCIe Relaxed Ordering that path serializes
+toward single-outstanding-write and burns link bandwidth shared with
+the CPUs. Lustre lands the bulk in the application buffer, placed
+wherever the job ran, so a cross-socket job pays this on every bulk.
+
+The client bulk is passive and connection-bound: the server drives the
+RDMA over the connection the request arrived on, so the only per-I/O
+client lever is which NI the request egressed on, since the server
+bulk-backs to that NID. Stock LNet already steers that egress by the
+bulk buffer's NUMA node. The request MD carries LNET_MD_BULK_HANDLE
+(niobuf.c) and lnet_cpt_of_md() ranks the egress NI by the bulk
+buffer's own first page via lnet_get_first_page() (lib-md.c). So on a
+multi-rail client with a healthy buffer-local rail the bulk already
+lands NIC-local and this patch changes nothing there.
+
+The gap is any client whose HCAs do not cover every NUMA node a job
+can land a buffer on, that is fewer rails than NUMA nodes. A
+single-HCA dual-socket client is the extreme case, but a multi-rail
+client is stranded the same way whenever a buffer lands on a node with
+no local rail: there is no buffer-local NI to select and the bulk
+crosses to whatever rail the server picks. numactl can avoid that by
+binding the job's memory to an HCA-local node, but only by
+surrendering the application's own NUMA locality, and for O_DIRECT the
+job has to place the buffer itself. The bounce gives HCA-local DMA
+without constraining where the job allocates.
+
+Stage the bulk through a per-HCA arena allocated on the HCA's own NUMA
+node and pay a CPU copy for the last hop. A cross-socket CPU copy is
+cheaper than a cross-socket NIC DMA and is immune to the ordering
+penalty. The bounce lives entirely in ko2iblnd, so it is transparent
+to ptlrpc/osc/llite and to the server, with no wire change. We bounce
+the read path: advertise the slot's REMOTE_WRITE rkey as the PUT sink
+and run the slot->app copy-out off the CQ poller on an HCA-CPT-bound
+workqueue, with lnet_finalize() deferred behind the copy. Peer-to-peer
+pages, GPUDirect included, bypass the bounce.
+
+The predicate keys on the sink buffer, not on the caller, so an LNet
+router that lands a forwarded PUT in a routing buffer remote from its
+own HCA stages that transfer too. That buffer pays the same penalised
+cross-socket write, so the trade there is the one measured here.
+
+The workqueue belongs to the pool and shares its lifetime, so an
+ib-bonding failover that moves the interface to a different HCA gets a
+worker on the new HCA's node together with the new pool, and the old
+pool keeps its own worker for as long as a transfer still holds one of
+its slots. The consumer reaches the worker through the slot it already
+holds, so it always finds the one on that slot's node. The deferred
+copy-out takes a connection reference of its own, dropped only once
+kiblnd_tx_done() has returned, so a copy-out is visible to anything
+that waits on ibn_nconns and the slot's pool and worker stay pinned
+through the HCA the connection holds.
+
+bounce_enable is tristate (0 off, 1 auto, 2 force) and defaults off.
+auto allocates the arena only on a multi-node NUMA box and engages
+only when the buffer is NUMA-remote (node_distance > LOCAL_DISTANCE),
+so local I/O stays zero-copy. The distance test is only sound if we
+know the HCA's own node, so when the platform won't report one auto
+warns and declines to allocate. force engages unconditionally and
+allocates even on a single-socket box, for selftests.
+
+HCA reads are barely penalized, so for a Lustre write the added
+copy-in costs more than it saves. I measured a 16% throughput loss for
+writes, so the write path stays direct.
+
+|  read buffer  |  mode  |  throughput  |  % of LOCAL       |
+|  placement    |        |              |  ceiling          |
+|---------------|--------|--------------|-------------------|
+|  LOCAL        |  off   |  8707 MiB/s  |  100% (baseline)  |
+|  FAR          |  off   |  1847 MiB/s  |  ~21%             |
+|  FAR          |  on    |  7422 MiB/s  |  ~85%             |
+|  FAR          |  *on   |  8382 MiB/s  |  ~96%             |
+* With bounce_scrub=0 (disabled)
+
+The above numbers were generated with fio running on a single-HCA,
+dual-socket client against two single-HCA OSSes, each hosting two
+OSTs (all HCAs 200 Gbps, IB).
+
+Because a slot is recycled, a non-conformant peer that RDMA-writes
+fewer bytes than advertised yet reports success could leak the slot's
+prior-transfer bytes in the untransferred tail. Zero each slot on
+release to close this; the copy-out fuses the zero into the read-out
+while the line is cache-hot, so the common path adds no separate pass.
+bounce_scrub (default on) gates the zeroing so a trusted fabric can
+drop it. It is writable. A slot released while it was off keeps its
+contents and is marked dirty, and the pool scrubs such a slot when it
+hands it out again, so turning the tunable back on restores the
+guarantee before the next transfer can land in that slot.
+
+The new module parameters are bounce_enable, bounce_pool_mb (64),
+bounce_min_nob (65536), bounce_scrub (on) and
+bounce_copyout_max_active (2), which sets the copy-out workqueue
+concurrency. A pool belongs to an HCA, and ko2iblnd builds one HCA
+per configured o2ib interface, so bounce_pool_mb is the footprint per
+interface: a card configured as ib0 and ib1 gets two arenas. Slot size
+is fixed at LNET_MTU. Read
+/sys/kernel/debug/lnet/o2iblnd_bounce_stats for the engaged,
+exhausted, inflight, fallback and byte counters.
+
+sanity-lnet 313 covers an intact bounced read with bounce_enable=2,
+314 covers the bounced->direct fallback with fail_loc
+CFS_FAIL_O2IBLND_BOUNCE_RD, and 315 covers the pool and worker rebuild
+with dev_failover=2.
+
+Two supporting refactors come with this. The kiov skip loop at the top
+of kiblnd_setup_rd_kiov() becomes kiblnd_kiov_skip(), so the sink
+rd-build and the copy-out walk the sink the same way.
+kiblnd_alloc_pages() grows a kiblnd_alloc_pages_node() variant, since
+cfs_page_cpt_alloc() rotates over every node of a CPT and cannot pin
+the arena to the HCA's node; that variant passes __GFP_THISNODE,
+because alloc_pages_node() only prefers a node and would otherwise
+leave the arena off-node under memory pressure, which defeats the
+purpose of this feature.
+
+At bounce_enable=0 the sink rd-build reads the tunable, branches and
+reroutes nothing; kiblnd_should_bounce() makes that its first test, so
+a disabled build never walks the sink kiov.
+
+Assisted-by: Claude:claude-opus-5
+Test-Parameters: trivial testlist=sanity-lnet
+Signed-off-by: Chris Horn <chorn@ddn.com>
+Change-Id: Icf39b39a7a3f3f3fdfdaa886edf9695af28eb48f
+Reviewed-on: https://review.whamcloud.com/c/fs/lustre-release/+/66588
+Reviewed-by: Manish Regmi <mregmi@ddn.com>
+Tested-by: jenkins <devops@whamcloud.com>
+Reviewed-by: Cyril Bordage <cbordage@whamcloud.com>
+Reviewed-by: Oleg Drokin <green@whamcloud.com>
+Tested-by: Maloo <maloo@whamcloud.com>
+Reviewed-by: Xinxia Qu <xqu@ddn.com>
+
+--- Review History ---
+
+--- Message (Chris Horn, 2026-06-10 20:10:02.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-06-10 20:12:54.000000000) ---
+Patch Set 1:
+
+Cannot build patch due to 14, messages:
+
+ make[5]: *** [scripts/Makefile.build:249: /home/green/git/lustre-release/lnet/klnds/in-kernel-o2iblnd/o2iblnd_cb.o] Error 1
+make[4]: *** [scripts/Makefile.build:478: /home/green/git/lustre-release/lnet/klnds/in-kernel-o2iblnd] Error 2
+make[3]: *** [scripts/Makefile.build:478: /home/green/git/lustre-release/lnet/klnds] Error 2
+make[2]: *** [scripts/Makefile.build:478: /home/green/git/lustre-release/lnet] Error 2
+make[1]: *** [Makefile:1944: /home/green/git/lustre-release] Error 2
+make: *** [autoMakefile:1296: modules] Error 2
+ /home/green/git/lustre-release/lnet/klnds/in-kernel-o2iblnd/o2iblnd_cb.c: In function âkiblnd_setup_rd_kiovâ:
+ /home/green/git/lustre-release/lnet/klnds/in-kernel-o2iblnd/o2iblnd_cb.c:791:26: error: passing argument 1 of âkiblnd_kiov_skipâ from incompatible pointer type [-Werror=incompatible-pointer-types]
+   791 |         kiblnd_kiov_skip(&kiov, &nkiov, &offset);
+       |                          ^~~~~
+       |                          |
+       |                          const struct bio_vec **
+ In file included from /home/green/git/lustre-release/lnet/klnds/in-kernel-o2iblnd/o2iblnd_cb.c:14:
+ /home/green/git/lustre-release/lnet/klnds/in-kernel-o2iblnd/o2iblnd.h:1191:35: note: expected âstruct bio_vec **â but argument is of type âconst struct bio_vec **â
+  1191 | kiblnd_kiov_skip(struct bio_vec **kiov, int *niov, int *offset)
+       |                  ~~~~~~~~~~~~~~~~~^~~~
+ /home/green/git/lustre-release/lnet/klnds/in-kernel-o2iblnd/o2iblnd_cb.c: In function âkiblnd_recvâ:
+ /home/green/git/lustre-release/lnet/klnds/in-kernel-o2iblnd/o2iblnd_cb.c:2266:60: warning: passing argument 6 of âkiblnd_recv_build_sinkâ discards âconstâ qualifier from pointer target type [-Wdiscarded-qualifiers]
+  2266 |                                             to->nr_segs, to->bvec,
+       |                                                          ~~^~~~~~
+ /home/green/git/lustre-release/lnet/klnds/in-kernel-o2iblnd/o2iblnd_cb.c:2135:50: note: expected âstruct bio_vec *â but argument is of type âconst struct bio_vec *â
+  2135 |                        int niov, struct bio_vec *kiov, int offset, int nob)
+       |                                  ~~~~~~~~~~~~~~~~^~~~
+ cc1: some warnings being treated as errors
+
+--- Message (Lustre Gerrit Janitor, 2026-06-10 20:14:00.000000000) ---
+Patch Set 1:
+
+rocky8.10: Compile failed
+lnet/klnds/in-kernel-o2iblnd/o2iblnd_cb.c:791:19: error: passing argument 1 of ‘kiblnd_kiov_skip’ from incompatible pointer type [-Werror=incompatible-pointer-types]
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd.h:1191:35: note: expected ‘struct bio_vec **’ but argument is of type ‘const struct bio_vec **’
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_cb.c:2266:25: warning: passing argument 6 of ‘kiblnd_recv_build_sink’ discards ‘const’ qualifier from pointer target type [-Wdiscarded-qualifiers]
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_cb.c:2135:36: note: expected ‘struct bio_vec *’ but argument is of type ‘const struct bio_vec *’
+ 
+rocky9.6: Compile failed
+lnet/klnds/in-kernel-o2iblnd/o2iblnd_cb.c:791:26: error: passing argument 1 of ‘kiblnd_kiov_skip’ from incompatible pointer type [-Werror=incompatible-pointer-types]
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd.h:1191:35: note: expected ‘struct bio_vec **’ but argument is of type ‘const struct bio_vec **’
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_cb.c:2266:60: warning: passing argument 6 of ‘kiblnd_recv_build_sink’ discards ‘const’ qualifier from pointer target type [-Wdiscarded-qualifiers]
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_cb.c:2135:50: note: expected ‘struct bio_vec *’ but argument is of type ‘const struct bio_vec *’
+ 
+
+ Job output URL: https://testing.whamcloud.com/gerrit-janitor/64950/results.html
+
+--- Message (Janitor Bot, 2026-06-10 20:17:37.000000000) ---
+Patch Set 2: Published edit on patch set 1.
+
+--- Message (Janitor Bot, 2026-06-10 20:17:38.000000000) ---
+Patch Set 1:
+
+I attempted to fix the build errors present in this patch and succeeded. Yay! Now, keep in mind I barely have any idea what I am doing, so please doublecheck the changes I made to make sure they make sense.
+
+This service is only provided in hopes to be useful and reduce latency from push to getting actual results in the face of trivial code errors
+
+Here's summary of my changes:
+Perfect! Now let me provide a summary of the fix:
+
+## Summary
+
+### The Compile Errors
+
+The patch introduced two compilation errors related to **const-correctness**:
+
+1. **Error in `kiblnd_setup_rd_kiov`**: Passing `const struct bio_vec **` to `kiblnd_kiov_skip()` which expected non-const `struct bio_vec **`
+2. **Warning in `kiblnd_recv`**: Passing `const struct bio_vec *` (from `to->bvec`) to `kiblnd_recv_build_sink()` which expected non-const `struct bio_vec *`
+
+### Root Cause
+
+The existing function signatures in the codebase use `const struct bio_vec *kiov` parameters (e.g., in `kiblnd_setup_rd_kiov`), but the new bounce pool code introduced helper functions that didn't respect this const-ness. This violated C's type safety rules when these helpers were called from const-aware contexts.
+
+### The Fix
+
+I added `const` qualifiers throughout the bounce code chain:
+
+1. **`kiblnd_kiov_skip()`** helper: Changed parameter from `struct bio_vec **kiov` to `const struct bio_vec **kiov`
+   
+2. **`kiblnd_bounce_copy_in()`**: Changed from `struct bio_vec *kiov` to `const struct bio_vec *kiov`
+
+3. **`kiblnd_bounce_copy_out()`**: Changed from `struct bio_vec *kiov` to `const struct bio_vec *kiov`
+
+4. **`kiblnd_bounce_first_page()`**: Changed from `struct bio_vec *kiov` to `const struct bio_vec *kiov`
+
+5. **`kiblnd_reply_build_src()`**: Changed from `struct bio_vec *kiov` to `const struct bio_vec *kiov`
+
+6. **`kiblnd_recv_build_sink()`**: Changed from `struct bio_vec *kiov` to `const struct bio_vec *kiov`
+
+### Rationale
+
+This fix is **correct and safe** because:
+
+- These functions only **read** from the `bio_vec` arrays (they iterate and copy data, but never modify the bio_vec structures themselves)
+- The const qualifier accurately documents this read-only contract
+- It allows the functions to be called from both const and non-const contexts
+- No functionality is changed—only type safety is improved
+
+
+Request ID: de7886e6-7a6c-4928-b134-490adce33f85
+
+--- Message (jenkins, 2026-06-10 20:17:43.000000000) ---
+Patch Set 1: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/126294/ : ABORTED
+
+--- Message (wc-checkpatch, 2026-06-10 20:19:01.000000000) ---
+Patch Set 1:
+
+(140 comments)
+
+153 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre Gerrit Janitor, 2026-06-10 20:30:51.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/64964/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (wc-checkpatch, 2026-06-10 20:34:22.000000000) ---
+Patch Set 2:
+
+(142 comments)
+
+155 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-06-10 20:42:53.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+4 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (Lustre Gerrit Janitor, 2026-06-10 21:11:41.000000000) ---
+Patch Set 2:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/64964/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (jenkins, 2026-06-10 22:04:09.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/126308/ : SUCCESS
+
+--- Message (Maloo, 2026-06-10 22:05:34.000000000) ---
+Patch Set 2:
+
+#### The following sessions will be run for Build 126308 (patch #2):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-ldiskfs-dne on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=126308&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=126308#redirect
+
+--- Message (Chris Horn, 2026-06-11 04:26:34.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-06-11 04:27:46.000000000) ---
+Patch Set 3:
+
+(22 comments)
+
+28 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-06-11 04:29:44.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+4 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (Lustre Gerrit Janitor, 2026-06-11 04:30:49.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/64981/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (Lustre Gerrit Janitor, 2026-06-11 04:51:36.000000000) ---
+Patch Set 3:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/64981/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (jenkins, 2026-06-11 04:54:12.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/126329/ : SUCCESS
+
+--- Message (Autotest, 2026-06-11 04:54:55.000000000) ---
+Patch Set 2:
+
+Onyx Autotest is abandoning the following sessions because: later build 126329 found
+- Enforced review-ldiskfs-dne-arm on el8.10-x86_64/ldiskfs servers and rocky9.5-aarch64/ldiskfs clients
+
+--- Message (Autotest, 2026-06-11 04:55:16.000000000) ---
+Patch Set 2:
+
+Trevis Autotest is abandoning the following sessions because: later build 126329 found
+- Enforced review-ldiskfs-dne on el8.10-x86_64/ldiskfs servers and clients
+- Enforced review-ldiskfs-dne on el9.7-x86_64/ldiskfs servers and clients
+
+--- Message (Maloo, 2026-06-11 04:55:42.000000000) ---
+Patch Set 3:
+
+#### The following sessions will be run for Build 126329 (patch #3):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-ldiskfs-dne on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=126329&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=126329#redirect
+
+--- Message (Maloo, 2026-06-11 10:31:38.000000000) ---
+Patch Set 3: Verified+1
+
+Passed enforced test review-ldiskfs-dne on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-157vm38: https://testing.whamcloud.com/test_sessions/ea5d67ca-69db-437a-b483-ebd5d6a3d300 ran 5 tests.
+
+--- Message (Lustre Gerrit Janitor, 2026-06-11 10:43:57.000000000) ---
+Patch Set 3:
+
+Even though "Test-Parameters: trivial" was detected, this deeply suspicious bot still run some testing
+
+Testing has completed with errors!
+IMPORTANT: these tests appear to be new failures unique to this patch
+- sanity1@zfs:test_56ab(Seen in reviews: 65914 65838 65771 65512 65414 65140 65094 65083 64429 64408 64321 64314 63981 58508 58493 58456 58275 55770 49732 37246)
+
+
+> recovery-small@zfs Failure(8341s)
+- 155(ls1 != ls2) 
+> sanity1@zfs Failure(9193s)
+- 56ab(>1M blocks files 3 isn't 1 as expected) 
+> sanity-pcc@ldiskfs+DNE Failure(2712s)
+- 1c(expected /mnt/pcc.d1c.sanity-pcc/d1c.sanity-pcc/0bd3/0x200000bd1:0x2:0x0 size: 7654321 got: 0) 1d(expected /mnt/pcc.d1d.sanity-pcc/d1d.sanity-pcc/13a3/0x2000013a1:0x2:0x0 size: 7654321 got: 0) 
+> sanity-pcc@zfs Failure(2356s)
+- 1c(expected /mnt/pcc.d1c.sanity-pcc/d1c.sanity-pcc/0bd3/0x200000bd1:0x2:0x0 size: 7654321 got: 0) 1d(expected /mnt/pcc.d1d.sanity-pcc/d1d.sanity-pcc/13a3/0x2000013a1:0x2:0x0 size: 7654321 got: 0) 
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/64981/results.html
+
+--- Message (Chris Horn, 2026-06-25 20:40:12.000000000) ---
+Uploaded patch set 4.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-06-25 20:41:39.000000000) ---
+Patch Set 4:
+
+(15 comments)
+
+20 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-06-25 20:42:45.000000000) ---
+Patch Set 4:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (Lustre Gerrit Janitor, 2026-06-25 20:49:50.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/65573/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (Chris Horn, 2026-06-25 20:56:06.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+--- Message (Lustre RISC-V Builder, 2026-06-25 21:04:28.000000000) ---
+Patch Set 4:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Lustre Gerrit Janitor, 2026-06-25 21:14:57.000000000) ---
+Patch Set 4:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/65573/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (jenkins, 2026-06-25 21:23:31.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/126964/ : SUCCESS
+
+--- Message (Maloo, 2026-06-25 21:24:53.000000000) ---
+Patch Set 4:
+
+#### The following sessions will be run for Build 126964 (patch #4):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-ldiskfs-dne on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=126964&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=126964#redirect
+
+--- Message (Lustre Gerrit Janitor, 2026-06-26 00:34:18.000000000) ---
+Patch Set 4:
+
+Even though "Test-Parameters: trivial" was detected, this deeply suspicious bot still run some testing
+
+Testing has completed with errors!
+
+> sanity-pcc@ldiskfs+DNE Failure(3449s)
+- 1c(/mnt/lustre/d1c.sanity-pcc/f1c.sanity-pcc expected pcc state: readwrite, but got: none) 1d(expected /mnt/pcc.d1d.sanity-pcc/d1d.sanity-pcc/13a3/0x2000013a1:0x2:0x0 size: 7654321 got: 0) 
+> sanity-pcc@zfs Failure(2481s)
+- 1c(expected /mnt/pcc.d1c.sanity-pcc/d1c.sanity-pcc/0bd3/0x200000bd1:0x2:0x0 size: 7654321 got: 0) 1d(expected /mnt/pcc.d1d.sanity-pcc/d1d.sanity-pcc/13a3/0x2000013a1:0x2:0x0 size: 7654321 got: 0) 
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/65573/results.html
+
+--- Message (Maloo, 2026-06-26 02:29:22.000000000) ---
+Patch Set 4: Verified+1
+
+Passed enforced test review-ldiskfs-dne on RHEL 9.7 / x86_64 uploaded by Trevis Autotest from trevis-154vm100: https://testing.whamcloud.com/test_sessions/53a8d81b-e013-4836-acc0-8dd1b3f461a6 ran 5 tests.
+
+--- Message (Chris Horn, 2026-07-08 18:03:43.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-07-10 18:37:43.000000000) ---
+Patch Set 4: Code-Review-1
+
+This change cannot be cherry-picked to master.
+Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (Chris Horn, 2026-07-13 20:04:37.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-13 20:08:12.000000000) ---
+Patch Set 5:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (Lustre Gerrit Janitor, 2026-07-13 20:09:53.000000000) ---
+Patch Set 5:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/66124/results.html
+
+ This was detected as a build-only change, no further testing would be performed by this bot.
+
+--- Message (wc-checkpatch, 2026-07-13 20:14:19.000000000) ---
+Patch Set 5:
+
+(15 comments)
+
+20 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre RISC-V Builder, 2026-07-13 20:37:11.000000000) ---
+Patch Set 5:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-07-13 20:41:51.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/127532/ : SUCCESS
+
+--- Message (Maloo, 2026-07-13 20:43:31.000000000) ---
+Patch Set 5:
+
+#### The following sessions will be run for Build 127532 (patch #5):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-ldiskfs-dne on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=127532&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=127532#redirect
+
+--- Message (Maloo, 2026-07-14 02:26:38.000000000) ---
+Patch Set 5: Verified+1
+
+Passed enforced test review-ldiskfs-dne-arm on RHEL 8.10 / x86_64, Rocky 9.5 / aarch64 uploaded by Onyx Autotest 2 from onyx-180vm3: https://testing.whamcloud.com/test_sessions/bd71ed8e-bb42-4479-a21a-fbfe16b4dc40 ran 5 tests.
+
+--- Message (Chris Horn, 2026-07-14 14:20:02.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+--- Message (Manish Regmi, 2026-07-14 15:35:35.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+--- Message (Chris Horn, 2026-07-14 15:42:21.000000000) ---
+Uploaded patch set 6: Patch Set 5 was rebased. Commit message was updated.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Chris Horn, 2026-07-14 15:42:23.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+--- Message (Lustre Gerrit Janitor, 2026-07-14 15:46:51.000000000) ---
+Patch Set 6:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/66161/results.html
+
+ This was detected as a build-only change, no further testing would be performed by this bot.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-14 15:47:44.000000000) ---
+Patch Set 6:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-07-14 15:50:42.000000000) ---
+Patch Set 6:
+
+(15 comments)
+
+20 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Chris Horn, 2026-07-14 15:53:15.000000000) ---
+Patch Set 6:
+
+(2 comments)
+
+--- Message (Chris Horn, 2026-07-14 15:53:26.000000000) ---
+Patch Set 6:
+
+(2 comments)
+
+--- Message (Lustre RISC-V Builder, 2026-07-14 16:10:26.000000000) ---
+Patch Set 6:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-07-14 19:36:03.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/127575/ : SUCCESS
+
+--- Message (Maloo, 2026-07-14 19:36:52.000000000) ---
+Patch Set 6:
+
+#### The following sessions will be run for Build 127575 (patch #6):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-ldiskfs-dne on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=127575&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=127575#redirect
+
+--- Message (Maloo, 2026-07-15 01:07:07.000000000) ---
+Patch Set 6: Verified+1
+
+Passed enforced test review-ldiskfs-dne on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-155vm1: https://testing.whamcloud.com/test_sessions/900b7a84-02e2-4357-8f5b-2126289901ea ran 5 tests.
+
+--- Message (Chris Horn, 2026-07-22 22:22:14.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+--- Message (Xinxia Qu, 2026-07-24 09:39:41.000000000) ---
+Patch Set 6: Code-Review+1
+
+(1 comment)
+
+--- Message (Manish Regmi, 2026-07-24 20:17:09.000000000) ---
+Patch Set 6: Code-Review+1
+
+--- Message (Chris Horn, 2026-07-24 20:19:03.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+--- Message (Gerrit AI review for Lustre, 2026-07-28 07:24:40.000000000) ---
+Patch Set 6:
+
+(9 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The pool-locality and slot-initialisation points below are the ones that matter; the rest are minor. This adds a whole new datapath plus two fail_locs described as being "for selftests", but no test in lustre/tests uses them - could a sanity-lnet or lnet-selftest case be added that sets bounce_enable=2 and drives a bulk read through the engaged, exhausted-fallback and rd-build-failure paths? That is the only way the copy-out and the fallback get covered on a box without a second NUMA node.
+
+--- Message (Cyril Bordage, 2026-07-30 08:16:37.000000000) ---
+Patch Set 6: Code-Review+1
+
+(1 comment)
+
+--- Message (Chris Horn, 2026-08-04 00:57:55.000000000) ---
+Uploaded patch set 7.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Chris Horn, 2026-08-04 00:58:57.000000000) ---
+Patch Set 7:
+
+(10 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-04 01:01:55.000000000) ---
+Patch Set 7:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (Chris Horn, 2026-08-04 01:03:00.000000000) ---
+Patch Set 7:
+
+(2 comments)
+
+--- Message (Lustre Gerrit Janitor, 2026-08-04 01:05:14.000000000) ---
+Patch Set 7:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/67196/results.html
+
+ Commencing initial testing: runtests-ssk@ldiskfs+SharedKey sanity-lnet@ldiskfs+DNE sanity-lnet-special1@ldiskfs+DNE sanity-lnet-special1@ldiskfs sanity-lnet-special2@ldiskfs+DNE sanity-lnet-special2@ldiskfs sanity-lnet-special3@ldiskfs+DNE sanity-lnet-special3@ldiskfs sanity-lnet-special4@ldiskfs+DNE sanity-lnet-special4@ldiskfs sanity-lnet-special5@ldiskfs+DNE sanity-lnet-special5@ldiskfs sanity-lnet-special6@ldiskfs+DNE sanity-lnet-special6@ldiskfs sanity-lnet-special7@ldiskfs+DNE sanity-lnet-special7@ldiskfs sanity-lnet-special8@ldiskfs+DNE sanity-lnet-special8@ldiskfs sanity-lnet-special9@ldiskfs+DNE sanity-lnet-special9@ldiskfs sanity-lnet-special10@ldiskfs+DNE sanity-lnet-special10@ldiskfs sanity-lnet@zfs sanity-lnet-special1@zfs sanity-lnet-special1@zfs+DNE sanity-lnet-special2@zfs sanity-lnet-special2@zfs+DNE sanity-lnet-special3@zfs sanity-lnet-special3@zfs+DNE sanity-lnet-special4@zfs sanity-lnet-special4@zfs+DNE sanity-lnet-special5@zfs sanity-lnet-special5@zfs+DNE sanity-lnet-special6@zfs sanity-lnet-special6@zfs+DNE sanity-lnet-special7@zfs sanity-lnet-special7@zfs+DNE sanity-lnet-special8@zfs sanity-lnet-special8@zfs+DNE sanity-lnet-special9@zfs sanity-lnet-special9@zfs+DNE sanity-lnet-special10@zfs sanity-lnet-special10@zfs+DNE
+
+--- Message (wc-checkpatch, 2026-08-04 01:06:02.000000000) ---
+Patch Set 7:
+
+(18 comments)
+
+20 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre RISC-V Builder, 2026-08-04 01:28:42.000000000) ---
+Patch Set 7:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-04 01:33:11.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128621/ : SUCCESS
+
+--- Message (Maloo, 2026-08-04 01:34:51.000000000) ---
+Patch Set 7:
+
+#### The following sessions will be run for Build 128621 (patch #7):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-ldiskfs-dne on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=128621&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=128621#redirect
+
+--- Message (Lustre Gerrit Janitor, 2026-08-04 02:15:14.000000000) ---
+Patch Set 7:
+
+Initial testing failed:
+
+> sanity-lnet-special7@zfs+DNE Timeout(3580s)
+
+Succeeded:
+- runtests-ssk@ldiskfs+SharedKey sanity-lnet@ldiskfs+DNE sanity-lnet-special1@ldiskfs+DNE sanity-lnet-special1@ldiskfs sanity-lnet-special2@ldiskfs+DNE sanity-lnet-special2@ldiskfs sanity-lnet-special3@ldiskfs+DNE sanity-lnet-special3@ldiskfs sanity-lnet-special4@ldiskfs+DNE sanity-lnet-special4@ldiskfs sanity-lnet-special5@ldiskfs+DNE sanity-lnet-special5@ldiskfs sanity-lnet-special6@ldiskfs+DNE sanity-lnet-special6@ldiskfs sanity-lnet-special7@ldiskfs+DNE sanity-lnet-special7@ldiskfs sanity-lnet-special8@ldiskfs+DNE sanity-lnet-special8@ldiskfs sanity-lnet-special9@ldiskfs+DNE sanity-lnet-special9@ldiskfs sanity-lnet-special10@ldiskfs+DNE sanity-lnet-special10@ldiskfs sanity-lnet@zfs sanity-lnet-special1@zfs sanity-lnet-special1@zfs+DNE sanity-lnet-special2@zfs sanity-lnet-special2@zfs+DNE sanity-lnet-special3@zfs sanity-lnet-special3@zfs+DNE sanity-lnet-special4@zfs sanity-lnet-special4@zfs+DNE sanity-lnet-special5@zfs sanity-lnet-special5@zfs+DNE sanity-lnet-special6@zfs sanity-lnet-special6@zfs+DNE sanity-lnet-special7@zfs sanity-lnet-special8@zfs sanity-lnet-special8@zfs+DNE sanity-lnet-special9@zfs sanity-lnet-special9@zfs+DNE sanity-lnet-special10@zfs sanity-lnet-special10@zfs+DNE 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/67196/results.html
+
+--- Message (Maloo, 2026-08-04 08:07:33.000000000) ---
+Patch Set 7: Verified+1
+
+Passed enforced test review-ldiskfs-dne on RHEL 8.10 / x86_64 uploaded by Onyx Autotest from onyx-158vm164: https://testing.whamcloud.com/test_sessions/126ec12a-4eee-4a3c-b5d6-5628fb572645 ran 5 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-08-04 08:35:06.000000000) ---
+Patch Set 7:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, two minor comments inline. The bounced-read lifetime argument holds up under tracing: the extra kiblnd_conn_addref() in kiblnd_tx_done() pins conn->ibc_hdev (taken in kiblnd_create_conn(), dropped in kiblnd_destroy_conn()), so the slot's pool, its workqueue, the tx pool and the sink kiov all outlive the deferred copy-out, and it also keeps kiblnd_pool_free_node()->kiblnd_unmap_tx_pool()->kiblnd_hdev_decref() from reaching zero and calling destroy_workqueue() from inside a work item of that same queue.
+
+--- Message (Chris Horn, 2026-08-04 16:37:45.000000000) ---
+Uploaded patch set 8.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-04 16:40:23.000000000) ---
+Patch Set 8:
+
+(19 comments)
+
+21 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-04 16:41:50.000000000) ---
+Patch Set 8:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-04 16:43:26.000000000) ---
+Patch Set 8:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/67227/results.html
+
+ Commencing initial testing: runtests-ssk@ldiskfs+SharedKey sanity-lnet@ldiskfs+DNE sanity-lnet-special1@ldiskfs+DNE sanity-lnet-special1@ldiskfs sanity-lnet-special2@ldiskfs+DNE sanity-lnet-special2@ldiskfs sanity-lnet-special3@ldiskfs+DNE sanity-lnet-special3@ldiskfs sanity-lnet-special4@ldiskfs+DNE sanity-lnet-special4@ldiskfs sanity-lnet-special5@ldiskfs+DNE sanity-lnet-special5@ldiskfs sanity-lnet-special6@ldiskfs+DNE sanity-lnet-special6@ldiskfs sanity-lnet-special7@ldiskfs+DNE sanity-lnet-special7@ldiskfs sanity-lnet-special8@ldiskfs+DNE sanity-lnet-special8@ldiskfs sanity-lnet-special9@ldiskfs+DNE sanity-lnet-special9@ldiskfs sanity-lnet-special10@ldiskfs+DNE sanity-lnet-special10@ldiskfs sanity-lnet@zfs sanity-lnet-special1@zfs sanity-lnet-special1@zfs+DNE sanity-lnet-special2@zfs sanity-lnet-special2@zfs+DNE sanity-lnet-special3@zfs sanity-lnet-special3@zfs+DNE sanity-lnet-special4@zfs sanity-lnet-special4@zfs+DNE sanity-lnet-special5@zfs sanity-lnet-special5@zfs+DNE sanity-lnet-special6@zfs sanity-lnet-special6@zfs+DNE sanity-lnet-special7@zfs sanity-lnet-special7@zfs+DNE sanity-lnet-special8@zfs sanity-lnet-special8@zfs+DNE sanity-lnet-special9@zfs sanity-lnet-special9@zfs+DNE sanity-lnet-special10@zfs sanity-lnet-special10@zfs+DNE
+
+--- Message (Chris Horn, 2026-08-04 16:46:15.000000000) ---
+Patch Set 8:
+
+(4 comments)
+
+--- Message (jenkins, 2026-08-04 17:48:34.000000000) ---
+Patch Set 8: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/128658/ : FAILURE
+
+--- Message (Chris Horn, 2026-08-04 17:50:15.000000000) ---
+Patch Set 8:
+
+(1 comment)
+
+--- Message (Lustre Gerrit Janitor, 2026-08-04 18:10:51.000000000) ---
+Patch Set 8:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests-ssk@ldiskfs+SharedKey sanity-lnet@ldiskfs+DNE sanity-lnet-special1@ldiskfs+DNE sanity-lnet-special1@ldiskfs sanity-lnet-special2@ldiskfs+DNE sanity-lnet-special2@ldiskfs sanity-lnet-special3@ldiskfs+DNE sanity-lnet-special3@ldiskfs sanity-lnet-special4@ldiskfs+DNE sanity-lnet-special4@ldiskfs sanity-lnet-special5@ldiskfs+DNE sanity-lnet-special5@ldiskfs sanity-lnet-special6@ldiskfs+DNE sanity-lnet-special6@ldiskfs sanity-lnet-special7@ldiskfs+DNE sanity-lnet-special7@ldiskfs sanity-lnet-special8@ldiskfs+DNE sanity-lnet-special8@ldiskfs sanity-lnet-special9@ldiskfs+DNE sanity-lnet-special9@ldiskfs sanity-lnet-special10@ldiskfs+DNE sanity-lnet-special10@ldiskfs sanity-lnet@zfs sanity-lnet-special1@zfs sanity-lnet-special1@zfs+DNE sanity-lnet-special2@zfs sanity-lnet-special2@zfs+DNE sanity-lnet-special3@zfs sanity-lnet-special3@zfs+DNE sanity-lnet-special4@zfs sanity-lnet-special4@zfs+DNE sanity-lnet-special5@zfs sanity-lnet-special5@zfs+DNE sanity-lnet-special6@zfs sanity-lnet-special6@zfs+DNE sanity-lnet-special7@zfs sanity-lnet-special7@zfs+DNE sanity-lnet-special8@zfs sanity-lnet-special8@zfs+DNE sanity-lnet-special9@zfs sanity-lnet-special9@zfs+DNE sanity-lnet-special10@zfs sanity-lnet-special10@zfs+DNE 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/67227/results.html
+No additional testing was requested
+
+--- Message (jenkins, 2026-08-04 19:32:55.000000000) ---
+Patch Set 8: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128673/ : SUCCESS
+
+--- Message (Maloo, 2026-08-04 19:34:04.000000000) ---
+Patch Set 8:
+
+#### The following sessions will be run for Build 128673 (patch #8):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-ldiskfs-dne on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=128673&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=128673#redirect
+
+--- Message (Lustre RISC-V Builder, 2026-08-04 20:34:40.000000000) ---
+Patch Set 8:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Maloo, 2026-08-05 06:14:22.000000000) ---
+Patch Set 8: Verified+1
+
+Passed enforced test review-ldiskfs-dne on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-146vm26: https://testing.whamcloud.com/test_sessions/2af7e443-922b-4993-8ec9-ef2fe26c3dc7 ran 5 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-08-05 06:45:25.000000000) ---
+Patch Set 8:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, minor comments inline. The bounce lifetime argument holds up: the slot is reachable only through a tx that holds a connection reference, the connection pins its kib_hca_dev, and the pool hangs off that hdev, so neither the arena nor the copy-out workqueue can be torn down under an in-flight or queued copy-out. The kiov handed to kiblnd_bounce_copy_out() also stays valid because lnet_finalize() runs last.
+
+--- Message (Chris Horn, 2026-08-05 22:11:15.000000000) ---
+Uploaded patch set 9.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Chris Horn, 2026-08-05 22:11:25.000000000) ---
+Patch Set 8:
+
+(5 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-05 22:14:51.000000000) ---
+Patch Set 9:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-05 22:15:56.000000000) ---
+Patch Set 9:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/67321/results.html
+
+ Commencing initial testing: runtests-ssk@ldiskfs+SharedKey sanity-lnet@ldiskfs+DNE sanity-lnet-special1@ldiskfs+DNE sanity-lnet-special1@ldiskfs sanity-lnet-special2@ldiskfs+DNE sanity-lnet-special2@ldiskfs sanity-lnet-special3@ldiskfs+DNE sanity-lnet-special3@ldiskfs sanity-lnet-special4@ldiskfs+DNE sanity-lnet-special4@ldiskfs sanity-lnet-special5@ldiskfs+DNE sanity-lnet-special5@ldiskfs sanity-lnet-special6@ldiskfs+DNE sanity-lnet-special6@ldiskfs sanity-lnet-special7@ldiskfs+DNE sanity-lnet-special7@ldiskfs sanity-lnet-special8@ldiskfs+DNE sanity-lnet-special8@ldiskfs sanity-lnet-special9@ldiskfs+DNE sanity-lnet-special9@ldiskfs sanity-lnet-special10@ldiskfs+DNE sanity-lnet-special10@ldiskfs sanity-lnet@zfs sanity-lnet-special1@zfs sanity-lnet-special1@zfs+DNE sanity-lnet-special2@zfs sanity-lnet-special2@zfs+DNE sanity-lnet-special3@zfs sanity-lnet-special3@zfs+DNE sanity-lnet-special4@zfs sanity-lnet-special4@zfs+DNE sanity-lnet-special5@zfs sanity-lnet-special5@zfs+DNE sanity-lnet-special6@zfs sanity-lnet-special6@zfs+DNE sanity-lnet-special7@zfs sanity-lnet-special7@zfs+DNE sanity-lnet-special8@zfs sanity-lnet-special8@zfs+DNE sanity-lnet-special9@zfs sanity-lnet-special9@zfs+DNE sanity-lnet-special10@zfs sanity-lnet-special10@zfs+DNE
+
+--- Message (Chris Horn, 2026-08-05 22:16:37.000000000) ---
+Patch Set 9:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-08-05 22:22:44.000000000) ---
+Patch Set 9:
+
+(18 comments)
+
+19 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre RISC-V Builder, 2026-08-05 22:27:46.000000000) ---
+Patch Set 9:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-05 22:56:10.000000000) ---
+Patch Set 9: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128762/ : SUCCESS
+
+--- Message (Maloo, 2026-08-05 22:57:21.000000000) ---
+Patch Set 9:
+
+#### The following sessions will be run for Build 128762 (patch #9):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-ldiskfs-dne on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=128762&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=128762#redirect
+
+--- Message (Lustre Gerrit Janitor, 2026-08-05 23:40:10.000000000) ---
+Patch Set 9:
+
+Initial testing failed:
+
+> sanity-lnet-special5@ldiskfs Timeout(3581s)
+
+Succeeded:
+- runtests-ssk@ldiskfs+SharedKey sanity-lnet@ldiskfs+DNE sanity-lnet-special1@ldiskfs+DNE sanity-lnet-special1@ldiskfs sanity-lnet-special2@ldiskfs+DNE sanity-lnet-special2@ldiskfs sanity-lnet-special3@ldiskfs+DNE sanity-lnet-special3@ldiskfs sanity-lnet-special4@ldiskfs+DNE sanity-lnet-special4@ldiskfs sanity-lnet-special5@ldiskfs+DNE sanity-lnet-special6@ldiskfs+DNE sanity-lnet-special6@ldiskfs sanity-lnet-special7@ldiskfs+DNE sanity-lnet-special7@ldiskfs sanity-lnet-special8@ldiskfs+DNE sanity-lnet-special8@ldiskfs sanity-lnet-special9@ldiskfs+DNE sanity-lnet-special9@ldiskfs sanity-lnet-special10@ldiskfs+DNE sanity-lnet-special10@ldiskfs sanity-lnet@zfs sanity-lnet-special1@zfs sanity-lnet-special1@zfs+DNE sanity-lnet-special2@zfs sanity-lnet-special2@zfs+DNE sanity-lnet-special3@zfs sanity-lnet-special3@zfs+DNE sanity-lnet-special4@zfs sanity-lnet-special4@zfs+DNE sanity-lnet-special5@zfs sanity-lnet-special5@zfs+DNE sanity-lnet-special6@zfs sanity-lnet-special6@zfs+DNE sanity-lnet-special7@zfs sanity-lnet-special7@zfs+DNE sanity-lnet-special8@zfs sanity-lnet-special8@zfs+DNE sanity-lnet-special9@zfs sanity-lnet-special9@zfs+DNE sanity-lnet-special10@zfs sanity-lnet-special10@zfs+DNE 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/67321/results.html
+
+--- Message (Maloo, 2026-08-06 06:58:19.000000000) ---
+Patch Set 9: Verified+1
+
+Passed enforced test review-ldiskfs-dne-arm on RHEL 8.10 / x86_64, Rocky 9.5 / aarch64 uploaded by Onyx Autotest from onyx-180vm7: https://testing.whamcloud.com/test_sessions/873267ed-017f-413b-a3b9-63bbf211b98f ran 5 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-08-06 07:30:16.000000000) ---
+Patch Set 9:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, a few minor comments inline. The bounce lifetime reasoning holds up: the extra connection reference taken at defer time keeps the tx pool alive across kiblnd_net_fini_pools() (via the ibn_nconns wait) and keeps the slot's pool and workqueue alive through conn->ibc_hdev, so destroy_workqueue() in kiblnd_bounce_pool_destroy() can never run from one of its own work items. The scrub state machine across a runtime bounce_scrub flip also checks out in both directions.
+
+--- Message (Chris Horn, 2026-08-14 20:40:04.000000000) ---
+Patch Set 9:
+
+(1 comment)
+
+--- Message (Chris Horn, 2026-08-14 20:57:59.000000000) ---
+Uploaded patch set 10.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Chris Horn, 2026-08-14 20:58:02.000000000) ---
+Patch Set 9:
+
+(2 comments)
+
+--- Message (Lustre Gerrit Janitor, 2026-08-14 21:02:28.000000000) ---
+Patch Set 10:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/67975/results.html
+
+ Commencing initial testing: runtests-ssk@ldiskfs+SharedKey sanity-lnet@ldiskfs+DNE sanity-lnet-special1@ldiskfs+DNE sanity-lnet-special1@ldiskfs sanity-lnet-special2@ldiskfs+DNE sanity-lnet-special2@ldiskfs sanity-lnet-special3@ldiskfs+DNE sanity-lnet-special3@ldiskfs sanity-lnet-special4@ldiskfs+DNE sanity-lnet-special4@ldiskfs sanity-lnet-special5@ldiskfs+DNE sanity-lnet-special5@ldiskfs sanity-lnet-special6@ldiskfs+DNE sanity-lnet-special6@ldiskfs sanity-lnet-special7@ldiskfs+DNE sanity-lnet-special7@ldiskfs sanity-lnet-special8@ldiskfs+DNE sanity-lnet-special8@ldiskfs sanity-lnet-special9@ldiskfs+DNE sanity-lnet-special9@ldiskfs sanity-lnet-special10@ldiskfs+DNE sanity-lnet-special10@ldiskfs sanity-lnet@zfs sanity-lnet-special1@zfs sanity-lnet-special1@zfs+DNE sanity-lnet-special2@zfs sanity-lnet-special2@zfs+DNE sanity-lnet-special3@zfs sanity-lnet-special3@zfs+DNE sanity-lnet-special4@zfs sanity-lnet-special4@zfs+DNE sanity-lnet-special5@zfs sanity-lnet-special5@zfs+DNE sanity-lnet-special6@zfs sanity-lnet-special6@zfs+DNE sanity-lnet-special7@zfs sanity-lnet-special7@zfs+DNE sanity-lnet-special8@zfs sanity-lnet-special8@zfs+DNE sanity-lnet-special9@zfs sanity-lnet-special9@zfs+DNE sanity-lnet-special10@zfs sanity-lnet-special10@zfs+DNE
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-14 21:04:10.000000000) ---
+Patch Set 10:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-08-14 21:10:16.000000000) ---
+Patch Set 10:
+
+(18 comments)
+
+19 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre Gerrit Janitor, 2026-08-14 22:14:37.000000000) ---
+Patch Set 10:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests-ssk@ldiskfs+SharedKey sanity-lnet@ldiskfs+DNE sanity-lnet-special1@ldiskfs+DNE sanity-lnet-special1@ldiskfs sanity-lnet-special2@ldiskfs+DNE sanity-lnet-special2@ldiskfs sanity-lnet-special3@ldiskfs+DNE sanity-lnet-special3@ldiskfs sanity-lnet-special4@ldiskfs+DNE sanity-lnet-special4@ldiskfs sanity-lnet-special5@ldiskfs+DNE sanity-lnet-special5@ldiskfs sanity-lnet-special6@ldiskfs+DNE sanity-lnet-special6@ldiskfs sanity-lnet-special7@ldiskfs+DNE sanity-lnet-special7@ldiskfs sanity-lnet-special8@ldiskfs+DNE sanity-lnet-special8@ldiskfs sanity-lnet-special9@ldiskfs+DNE sanity-lnet-special9@ldiskfs sanity-lnet-special10@ldiskfs+DNE sanity-lnet-special10@ldiskfs sanity-lnet@zfs sanity-lnet-special1@zfs sanity-lnet-special1@zfs+DNE sanity-lnet-special2@zfs sanity-lnet-special2@zfs+DNE sanity-lnet-special3@zfs sanity-lnet-special3@zfs+DNE sanity-lnet-special4@zfs sanity-lnet-special4@zfs+DNE sanity-lnet-special5@zfs sanity-lnet-special5@zfs+DNE sanity-lnet-special6@zfs sanity-lnet-special6@zfs+DNE sanity-lnet-special7@zfs sanity-lnet-special7@zfs+DNE sanity-lnet-special8@zfs sanity-lnet-special8@zfs+DNE sanity-lnet-special9@zfs sanity-lnet-special9@zfs+DNE sanity-lnet-special10@zfs sanity-lnet-special10@zfs+DNE 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/67975/results.html
+No additional testing was requested
+
+--- Message (Lustre RISC-V Builder, 2026-08-14 22:16:45.000000000) ---
+Patch Set 10:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Chris Horn, 2026-08-14 23:04:21.000000000) ---
+Patch Set 10:
+
+(2 comments)
+
+--- Message (jenkins, 2026-08-15 00:35:46.000000000) ---
+Patch Set 10: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129424/ : SUCCESS
+
+--- Message (Maloo, 2026-08-15 00:36:51.000000000) ---
+Patch Set 10:
+
+#### The following sessions will be run for Build 129424 (patch #10):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-ldiskfs-dne on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=129424&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=129424#redirect
+
+--- Message (Maloo, 2026-08-15 07:10:22.000000000) ---
+Patch Set 10: Verified+1
+
+Passed enforced test review-ldiskfs-dne on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-158vm104: https://testing.whamcloud.com/test_sessions/15aa6de2-bb6f-438f-986f-135a5fb39b31 ran 5 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-08-15 07:45:19.000000000) ---
+Patch Set 10:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good. The slot lifetime, the scrub state machine and the connection reference that pins the pool across the deferred copy-out all hold up; two minor points inline.
+
+--- Message (Cyril Bordage, 2026-08-19 17:12:57.000000000) ---
+Patch Set 10: Code-Review+1
+
+--- Message (Chris Horn, 2026-08-25 15:16:25.000000000) ---
+Patch Set 10:
+
+(3 comments)
+
+--- Message (Xinxia Qu, 2026-08-26 01:41:30.000000000) ---
+Patch Set 10: Code-Review+1
+
+--- Message (Qian Yingjin, 2026-08-26 03:21:14.000000000) ---
+Patch Set 10: Code-Review+1
+
+--- Message (Marc Vef, 2026-08-26 18:08:42.000000000) ---
+Hashtag added: master-next
+
+--- Message (Marc Vef, 2026-08-26 18:08:43.000000000) ---
+Patch Set 10:
+
+[Marc Bot] Note: This change has been cherry-picked to master-next and is considered for landing. Please avoid updates unless required while the master-next hashtag is set; doing so may cause the patch to be removed from master-next and not landed. Note: AI review comments should be addressed/responded to.
+
+--- Message (Marc Vef, 2026-08-26 18:08:43.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-31 01:16:09.000000000) ---
+Patch Set 10:
+
+[lander-bot:mn-conflict]
+Notice! This patch conflicts with commit 247316e59e LU-20438 lnd: Support PCI P2P DMA mapping that was already cherry-picked to master-next, consider rebasing your patch on top of that change.
+
+--- Message (Marc Vef, 2026-08-31 10:55:26.000000000) ---
+Hashtag removed: master-next
+
+--- Message (Marc Vef, 2026-08-31 10:55:27.000000000) ---
+Patch Set 10:
+
+[Marc Bot] Note: This change has been removed from master-next and is no longer considered for landing in its current form.
+
+--- Message (Marc Vef, 2026-08-31 10:55:27.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (wc-checkpatch, 2026-09-03 20:39:23.000000000) ---
+Patch Set 10: Code-Review-1
+
+This change cannot be cherry-picked to master.
+Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (Chris Horn, 2026-09-04 15:06:17.000000000) ---
+Uploaded patch set 11.
+
+Outdated Votes:
+* Code-Review+1, Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-04 15:07:08.000000000) ---
+Patch Set 11:
+
+(18 comments)
+
+19 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-04 15:32:18.000000000) ---
+Patch Set 11: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/131043/ : FAILURE
+
+--- Message (Lustre RISC-V Builder, 2026-09-04 15:34:02.000000000) ---
+Patch Set 11:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Chris Horn, 2026-09-04 15:43:15.000000000) ---
+Uploaded patch set 12.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-04 15:48:06.000000000) ---
+Patch Set 12:
+
+Cannot build patch due to 14, messages:
+
+ make[5]: *** [scripts/Makefile.build:249: /home/green/git/lustre-release/lnet/klnds/in-kernel-o2iblnd/o2iblnd_cb.o] Error 1
+make[5]: *** [scripts/Makefile.build:249: /home/green/git/lustre-release/lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.o] Error 1
+make[4]: *** [scripts/Makefile.build:478: /home/green/git/lustre-release/lnet/klnds/in-kernel-o2iblnd] Error 2
+make[3]: *** [scripts/Makefile.build:478: /home/green/git/lustre-release/lnet/klnds] Error 2
+make[2]: *** [scripts/Makefile.build:478: /home/green/git/lustre-release/lnet] Error 2
+make[1]: *** [Makefile:1944: /home/green/git/lustre-release] Error 2
+make: *** [Makefile:144: __modules] Error 2
+ config/Makefile.codetags:29: warning: overriding recipe for target 'cscope'
+ autoMakefile:819: warning: ignoring old recipe for target 'cscope'
+ /home/green/git/lustre-release/lnet/klnds/in-kernel-o2iblnd/o2iblnd_cb.c: In function âkiblnd_recv_build_sinkâ:
+ /home/green/git/lustre-release/lnet/klnds/in-kernel-o2iblnd/o2iblnd_cb.c:2087:38: error: âstruct kib_txâ has no member named âtx_gpuâ; did you mean âtx_gapsâ?
+  2087 |                                  tx->tx_gpu)) {
+       |                                      ^~~~~~
+       |                                      tx_gaps
+
+--- Message (Lustre Gerrit Janitor, 2026-09-04 15:48:20.000000000) ---
+Patch Set 12:
+
+rocky8.10: Compile failed
+lnet/klnds/in-kernel-o2iblnd/o2iblnd_cb.c:2087:10: error: ‘struct kib_tx’ has no member named ‘tx_gpu’; did you mean ‘tx_gaps’?
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:19: error: implicit declaration of function ‘cfs_proc_handler’; did you mean ‘rdma_lock_handler’? [-Werror=implicit-function-declaration]
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:19: error: initialization of ‘int (*)(struct ctl_table *, int,  void *, size_t *, loff_t *)’ {aka ‘int (*)(struct ctl_table *, int,  void *, long unsigned int *, long long int *)’} from ‘int’ makes pointer from integer without a cast [-Werror=int-conversion]
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:19: note: (near initialization for ‘kiblnd_bounce_ctl_table[0].proc_handler’)
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:19: error: initializer element is not constant
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:19: note: (near initialization for ‘kiblnd_bounce_ctl_table[0].proc_handler’)
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:649:22: error: passing argument 1 of ‘lnet_insert_debugfs’ from incompatible pointer type [-Werror=incompatible-pointer-types]
+ include/linux/libcfs/libcfs.h:48:59: note: expected ‘const struct lnet_debugfs_table *’ but argument is of type ‘struct ctl_table *’
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:656:22: error: passing argument 1 of ‘lnet_remove_debugfs’ from incompatible pointer type [-Werror=incompatible-pointer-types]
+ include/linux/libcfs/libcfs.h:50:59: note: expected ‘const struct lnet_debugfs_table *’ but argument is of type ‘struct ctl_table *’
+ 
+rocky9.6: Compile failed
+lnet/klnds/in-kernel-o2iblnd/o2iblnd_cb.c:2087:38: error: ‘struct kib_tx’ has no member named ‘tx_gpu’; did you mean ‘tx_gaps’?
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:35: error: implicit declaration of function ‘cfs_proc_handler’ [-Werror=implicit-function-declaration]
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:35: error: initialization of ‘int (*)(struct ctl_table *, int,  void *, size_t *, loff_t *)’ {aka ‘int (*)(struct ctl_table *, int,  void *, long unsigned int *, long long int *)’} from ‘int’ makes pointer from integer without a cast [-Werror=int-conversion]
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:35: note: (near initialization for ‘kiblnd_bounce_ctl_table[0].proc_handler’)
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:35: error: initializer element is not constant
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:35: note: (near initialization for ‘kiblnd_bounce_ctl_table[0].proc_handler’)
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:649:29: error: passing argument 1 of ‘lnet_insert_debugfs’ from incompatible pointer type [-Werror=incompatible-pointer-types]
+ include/linux/libcfs/libcfs.h:48:59: note: expected ‘const struct lnet_debugfs_table *’ but argument is of type ‘struct ctl_table *’
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:656:29: error: passing argument 1 of ‘lnet_remove_debugfs’ from incompatible pointer type [-Werror=incompatible-pointer-types]
+ include/linux/libcfs/libcfs.h:50:59: note: expected ‘const struct lnet_debugfs_table *’ but argument is of type ‘struct ctl_table *’
+ 
+
+ Job output URL: https://testing.whamcloud.com/gerrit-janitor/69557/results.html
+
+--- Message (Lustre Gerrit Janitor, 2026-09-04 15:48:21.000000000) ---
+Patch Set 12:
+
+rocky8.10: Compile failed
+lnet/klnds/in-kernel-o2iblnd/o2iblnd_cb.c:2087:10: error: ‘struct kib_tx’ has no member named ‘tx_gpu’; did you mean ‘tx_gaps’?
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:19: error: implicit declaration of function ‘cfs_proc_handler’; did you mean ‘rdma_lock_handler’? [-Werror=implicit-function-declaration]
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:19: error: initialization of ‘int (*)(struct ctl_table *, int,  void *, size_t *, loff_t *)’ {aka ‘int (*)(struct ctl_table *, int,  void *, long unsigned int *, long long int *)’} from ‘int’ makes pointer from integer without a cast [-Werror=int-conversion]
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:19: note: (near initialization for ‘kiblnd_bounce_ctl_table[0].proc_handler’)
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:19: error: initializer element is not constant
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:19: note: (near initialization for ‘kiblnd_bounce_ctl_table[0].proc_handler’)
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:649:22: error: passing argument 1 of ‘lnet_insert_debugfs’ from incompatible pointer type [-Werror=incompatible-pointer-types]
+ include/linux/libcfs/libcfs.h:48:59: note: expected ‘const struct lnet_debugfs_table *’ but argument is of type ‘struct ctl_table *’
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:656:22: error: passing argument 1 of ‘lnet_remove_debugfs’ from incompatible pointer type [-Werror=incompatible-pointer-types]
+ include/linux/libcfs/libcfs.h:50:59: note: expected ‘const struct lnet_debugfs_table *’ but argument is of type ‘struct ctl_table *’
+ 
+rocky9.6: Compile failed
+lnet/klnds/in-kernel-o2iblnd/o2iblnd_cb.c:2087:38: error: ‘struct kib_tx’ has no member named ‘tx_gpu’; did you mean ‘tx_gaps’?
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:35: error: implicit declaration of function ‘cfs_proc_handler’ [-Werror=implicit-function-declaration]
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:35: error: initialization of ‘int (*)(struct ctl_table *, int,  void *, size_t *, loff_t *)’ {aka ‘int (*)(struct ctl_table *, int,  void *, long unsigned int *, long long int *)’} from ‘int’ makes pointer from integer without a cast [-Werror=int-conversion]
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:35: note: (near initialization for ‘kiblnd_bounce_ctl_table[0].proc_handler’)
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:35: error: initializer element is not constant
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:35: note: (near initialization for ‘kiblnd_bounce_ctl_table[0].proc_handler’)
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:649:29: error: passing argument 1 of ‘lnet_insert_debugfs’ from incompatible pointer type [-Werror=incompatible-pointer-types]
+ include/linux/libcfs/libcfs.h:48:59: note: expected ‘const struct lnet_debugfs_table *’ but argument is of type ‘struct ctl_table *’
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:656:29: error: passing argument 1 of ‘lnet_remove_debugfs’ from incompatible pointer type [-Werror=incompatible-pointer-types]
+ include/linux/libcfs/libcfs.h:50:59: note: expected ‘const struct lnet_debugfs_table *’ but argument is of type ‘struct ctl_table *’
+ 
+
+ Job output URL: https://testing.whamcloud.com/gerrit-janitor/69557/results.html
+
+--- Message (wc-checkpatch, 2026-09-04 15:53:10.000000000) ---
+Patch Set 12:
+
+(18 comments)
+
+19 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-04 16:00:25.000000000) ---
+Patch Set 12: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/131045/ : FAILURE
+
+--- Message (Lustre RISC-V Builder, 2026-09-04 16:18:43.000000000) ---
+Patch Set 12:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Chris Horn, 2026-09-04 16:48:36.000000000) ---
+Uploaded patch set 13.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-04 16:52:35.000000000) ---
+Patch Set 13:
+
+Cannot build patch due to 14, messages:
+
+ make[5]: *** [scripts/Makefile.build:249: /home/green/git/lustre-release/lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.o] Error 1
+make[4]: *** [scripts/Makefile.build:478: /home/green/git/lustre-release/lnet/klnds/in-kernel-o2iblnd] Error 2
+make[3]: *** [scripts/Makefile.build:478: /home/green/git/lustre-release/lnet/klnds] Error 2
+make[2]: *** [scripts/Makefile.build:478: /home/green/git/lustre-release/lnet] Error 2
+make[1]: *** [Makefile:1944: /home/green/git/lustre-release] Error 2
+make: *** [Makefile:144: __modules] Error 2
+ config/Makefile.codetags:29: warning: overriding recipe for target 'cscope'
+ autoMakefile:819: warning: ignoring old recipe for target 'cscope'
+ /home/green/git/lustre-release/lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:35: error: implicit declaration of function âcfs_proc_handlerâ [-Werror=implicit-function-declaration]
+   639 |                 .proc_handler   = cfs_proc_handler(&kiblnd_bounce_stats_proc),
+       |                                   ^~~~~~~~~~~~~~~~
+ /home/green/git/lustre-release/lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:35: error: initialization of âint (*)(struct ctl_table *, int,  void *, size_t *, loff_t *)â {aka âint (*)(struct ctl_table *, int,  void *, long unsigned int *, long long int *)â} from âintâ makes pointer from integer without a cast [-Werror=int-conversion]
+ /home/green/git/lustre-release/lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:35: note: (near initialization for âkiblnd_bounce_ctl_table[0].proc_handlerâ)
+ /home/green/git/lustre-release/lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:35: error: initializer element is not constant
+ /home/green/git/lustre-release/lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:35: note: (near initialization for âkiblnd_bounce_ctl_table[0].proc_handlerâ)
+ /home/green/git/lustre-release/lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c: In function âkiblnd_bounce_debugfs_initâ:
+ /home/green/git/lustre-release/lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:649:29: error: passing argument 1 of âlnet_insert_debugfsâ from incompatible pointer type [-Werror=incompatible-pointer-types]
+   649 |         lnet_insert_debugfs(kiblnd_bounce_ctl_table, THIS_MODULE,
+       |                             ^~~~~~~~~~~~~~~~~~~~~~~
+       |                             |
+       |                             struct ctl_table *
+ In file included from /home/green/git/lustre-release/lustre/include/lprocfs_status.h:29,
+                  from /home/green/git/lustre-release/lustre/include/obd_support.h:28,
+                  from /home/green/git/lustre-release/lustre/include/lustre_compat.h:36,
+                  from /home/green/git/lustre-release/lnet/klnds/in-kernel-o2iblnd/o2iblnd.h:58,
+                  from /home/green/git/lustre-release/lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:17:
+ /home/green/git/lustre-release/include/linux/libcfs/libcfs.h:48:59: note: expected âconst struct lnet_debugfs_table *â but argument is of type âstruct ctl_table *â
+    48 | void lnet_insert_debugfs(const struct lnet_debugfs_table *table,
+       |                          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+ /home/green/git/lustre-release/lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c: In function âkiblnd_bounce_debugfs_finiâ:
+ /home/green/git/lustre-release/lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:656:29: error: passing argument 1 of âlnet_remove_debugfsâ from incompatible pointer type [-Werror=incompatible-pointer-types]
+   656 |         lnet_remove_debugfs(kiblnd_bounce_ctl_table);
+       |                             ^~~~~~~~~~~~~~~~~~~~~~~
+       |                             |
+       |                             struct ctl_table *
+ In file included from /home/green/git/lustre-release/lustre/include/lprocfs_status.h:29,
+                  from /home/green/git/lustre-release/lustre/include/obd_support.h:28,
+                  from /home/green/git/lustre-release/lustre/include/lustre_compat.h:36,
+                  from /home/green/git/lustre-release/lnet/klnds/in-kernel-o2iblnd/o2iblnd.h:58,
+                  from /home/green/git/lustre-release/lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:17:
+ /home/green/git/lustre-release/include/linux/libcfs/libcfs.h:50:59: note: expected âconst struct lnet_debugfs_table *â but argument is of type âstruct ctl_table *â
+    50 | void lnet_remove_debugfs(const struct lnet_debugfs_table *table);
+       |                          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~
+
+--- Message (Lustre Gerrit Janitor, 2026-09-04 16:54:00.000000000) ---
+Patch Set 13:
+
+rocky8.10: Compile failed
+lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:19: error: implicit declaration of function ‘cfs_proc_handler’; did you mean ‘rdma_lock_handler’? [-Werror=implicit-function-declaration]
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:19: error: initialization of ‘int (*)(struct ctl_table *, int,  void *, size_t *, loff_t *)’ {aka ‘int (*)(struct ctl_table *, int,  void *, long unsigned int *, long long int *)’} from ‘int’ makes pointer from integer without a cast [-Werror=int-conversion]
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:19: note: (near initialization for ‘kiblnd_bounce_ctl_table[0].proc_handler’)
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:19: error: initializer element is not constant
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:19: note: (near initialization for ‘kiblnd_bounce_ctl_table[0].proc_handler’)
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:649:22: error: passing argument 1 of ‘lnet_insert_debugfs’ from incompatible pointer type [-Werror=incompatible-pointer-types]
+ include/linux/libcfs/libcfs.h:48:59: note: expected ‘const struct lnet_debugfs_table *’ but argument is of type ‘struct ctl_table *’
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:656:22: error: passing argument 1 of ‘lnet_remove_debugfs’ from incompatible pointer type [-Werror=incompatible-pointer-types]
+ include/linux/libcfs/libcfs.h:50:59: note: expected ‘const struct lnet_debugfs_table *’ but argument is of type ‘struct ctl_table *’
+ 
+rocky9.6: Compile failed
+lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:35: error: implicit declaration of function ‘cfs_proc_handler’ [-Werror=implicit-function-declaration]
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:35: error: initialization of ‘int (*)(struct ctl_table *, int,  void *, size_t *, loff_t *)’ {aka ‘int (*)(struct ctl_table *, int,  void *, long unsigned int *, long long int *)’} from ‘int’ makes pointer from integer without a cast [-Werror=int-conversion]
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:35: note: (near initialization for ‘kiblnd_bounce_ctl_table[0].proc_handler’)
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:35: error: initializer element is not constant
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:639:35: note: (near initialization for ‘kiblnd_bounce_ctl_table[0].proc_handler’)
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:649:29: error: passing argument 1 of ‘lnet_insert_debugfs’ from incompatible pointer type [-Werror=incompatible-pointer-types]
+ include/linux/libcfs/libcfs.h:48:59: note: expected ‘const struct lnet_debugfs_table *’ but argument is of type ‘struct ctl_table *’
+ lnet/klnds/in-kernel-o2iblnd/o2iblnd_bounce.c:656:29: error: passing argument 1 of ‘lnet_remove_debugfs’ from incompatible pointer type [-Werror=incompatible-pointer-types]
+ include/linux/libcfs/libcfs.h:50:59: note: expected ‘const struct lnet_debugfs_table *’ but argument is of type ‘struct ctl_table *’
+ 
+
+ Job output URL: https://testing.whamcloud.com/gerrit-janitor/69561/results.html
+
+--- Message (wc-checkpatch, 2026-09-04 16:54:32.000000000) ---
+Patch Set 13:
+
+(18 comments)
+
+19 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-04 17:08:58.000000000) ---
+Patch Set 13: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/131049/ : FAILURE
+
+--- Message (Lustre RISC-V Builder, 2026-09-04 17:53:02.000000000) ---
+Patch Set 13:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Chris Horn, 2026-09-06 15:30:51.000000000) ---
+Uploaded patch set 14.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-06 15:34:27.000000000) ---
+Patch Set 14:
+
+Code-wise looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-09-06 15:36:39.000000000) ---
+Patch Set 14:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/69696/results.html
+
+ Commencing initial testing: runtests-ssk@ldiskfs+SharedKey sanity-lnet@ldiskfs+DNE sanity-lnet-special1@ldiskfs+DNE sanity-lnet-special1@ldiskfs sanity-lnet-special2@ldiskfs+DNE sanity-lnet-special2@ldiskfs sanity-lnet-special3@ldiskfs+DNE sanity-lnet-special3@ldiskfs sanity-lnet-special4@ldiskfs+DNE sanity-lnet-special4@ldiskfs sanity-lnet-special5@ldiskfs+DNE sanity-lnet-special5@ldiskfs sanity-lnet-special6@ldiskfs+DNE sanity-lnet-special6@ldiskfs sanity-lnet-special7@ldiskfs+DNE sanity-lnet-special7@ldiskfs sanity-lnet-special8@ldiskfs+DNE sanity-lnet-special8@ldiskfs sanity-lnet-special9@ldiskfs+DNE sanity-lnet-special9@ldiskfs sanity-lnet-special10@ldiskfs+DNE sanity-lnet-special10@ldiskfs sanity-lnet@zfs sanity-lnet-special1@zfs sanity-lnet-special1@zfs+DNE sanity-lnet-special2@zfs sanity-lnet-special2@zfs+DNE sanity-lnet-special3@zfs sanity-lnet-special3@zfs+DNE sanity-lnet-special4@zfs sanity-lnet-special4@zfs+DNE sanity-lnet-special5@zfs sanity-lnet-special5@zfs+DNE sanity-lnet-special6@zfs sanity-lnet-special6@zfs+DNE sanity-lnet-special7@zfs sanity-lnet-special7@zfs+DNE sanity-lnet-special8@zfs sanity-lnet-special8@zfs+DNE sanity-lnet-special9@zfs sanity-lnet-special9@zfs+DNE sanity-lnet-special10@zfs sanity-lnet-special10@zfs+DNE
+
+--- Message (wc-checkpatch, 2026-09-06 15:37:49.000000000) ---
+Patch Set 14:
+
+(18 comments)
+
+19 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre Gerrit Janitor, 2026-09-06 16:06:08.000000000) ---
+Patch Set 14:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests-ssk@ldiskfs+SharedKey sanity-lnet@ldiskfs+DNE sanity-lnet-special1@ldiskfs+DNE sanity-lnet-special1@ldiskfs sanity-lnet-special2@ldiskfs+DNE sanity-lnet-special2@ldiskfs sanity-lnet-special3@ldiskfs+DNE sanity-lnet-special3@ldiskfs sanity-lnet-special4@ldiskfs+DNE sanity-lnet-special4@ldiskfs sanity-lnet-special5@ldiskfs+DNE sanity-lnet-special5@ldiskfs sanity-lnet-special6@ldiskfs+DNE sanity-lnet-special6@ldiskfs sanity-lnet-special7@ldiskfs+DNE sanity-lnet-special7@ldiskfs sanity-lnet-special8@ldiskfs+DNE sanity-lnet-special8@ldiskfs sanity-lnet-special9@ldiskfs+DNE sanity-lnet-special9@ldiskfs sanity-lnet-special10@ldiskfs+DNE sanity-lnet-special10@ldiskfs sanity-lnet@zfs sanity-lnet-special1@zfs sanity-lnet-special1@zfs+DNE sanity-lnet-special2@zfs sanity-lnet-special2@zfs+DNE sanity-lnet-special3@zfs sanity-lnet-special3@zfs+DNE sanity-lnet-special4@zfs sanity-lnet-special4@zfs+DNE sanity-lnet-special5@zfs sanity-lnet-special5@zfs+DNE sanity-lnet-special6@zfs sanity-lnet-special6@zfs+DNE sanity-lnet-special7@zfs sanity-lnet-special7@zfs+DNE sanity-lnet-special8@zfs sanity-lnet-special8@zfs+DNE sanity-lnet-special9@zfs sanity-lnet-special9@zfs+DNE sanity-lnet-special10@zfs sanity-lnet-special10@zfs+DNE 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/69696/results.html
+No additional testing was requested
+
+--- Message (jenkins, 2026-09-06 17:33:16.000000000) ---
+Patch Set 14: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131191/ : SUCCESS
+
+--- Message (Maloo, 2026-09-06 17:33:31.000000000) ---
+Patch Set 14:
+
+#### The following sessions will be run for Build 131191 (patch #14):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-ldiskfs-dne on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=131191&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=131191#redirect
+
+--- Message (Lustre RISC-V Builder, 2026-09-06 20:53:05.000000000) ---
+Patch Set 14:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Maloo, 2026-09-07 01:00:14.000000000) ---
+Patch Set 14: Verified+1
+
+Passed enforced test review-ldiskfs-dne on RHEL 8.10 / x86_64 uploaded by Trevis Autotest from trevis-156vm117: https://testing.whamcloud.com/test_sessions/2514d0ee-36d7-49ae-8fc6-492e76f71403 ran 5 tests.
+
+--- Message (Maloo, 2026-09-07 01:00:15.000000000) ---
+Patch Set 14:
+
+Passed enforced test review-ldiskfs-dne on RHEL 9.8 / x86_64 uploaded by Trevis Autotest from trevis-154vm202: https://testing.whamcloud.com/test_sessions/9a83c106-97e4-441a-a304-a34622a3e10a ran 5 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-09-07 01:18:48.000000000) ---
+Patch Set 14:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The GPUDirect exclusion the commit message describes does not appear to be wired up after the rebase over LU-20438, so a refresh looks warranted.
+
+--- Message (Chris Horn, 2026-09-07 02:07:38.000000000) ---
+Uploaded patch set 15.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Chris Horn, 2026-09-07 02:07:48.000000000) ---
+Patch Set 15:
+
+(2 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-07 02:11:50.000000000) ---
+Patch Set 15:
+
+Code-wise looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-09-07 02:13:15.000000000) ---
+Patch Set 15:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/69729/results.html
+
+ Commencing initial testing: runtests-ssk@ldiskfs+SharedKey sanity-lnet@ldiskfs+DNE sanity-lnet-special1@ldiskfs+DNE sanity-lnet-special1@ldiskfs sanity-lnet-special2@ldiskfs+DNE sanity-lnet-special2@ldiskfs sanity-lnet-special3@ldiskfs+DNE sanity-lnet-special3@ldiskfs sanity-lnet-special4@ldiskfs+DNE sanity-lnet-special4@ldiskfs sanity-lnet-special5@ldiskfs+DNE sanity-lnet-special5@ldiskfs sanity-lnet-special6@ldiskfs+DNE sanity-lnet-special6@ldiskfs sanity-lnet-special7@ldiskfs+DNE sanity-lnet-special7@ldiskfs sanity-lnet-special8@ldiskfs+DNE sanity-lnet-special8@ldiskfs sanity-lnet-special9@ldiskfs+DNE sanity-lnet-special9@ldiskfs sanity-lnet-special10@ldiskfs+DNE sanity-lnet-special10@ldiskfs sanity-lnet@zfs sanity-lnet-special1@zfs sanity-lnet-special1@zfs+DNE sanity-lnet-special2@zfs sanity-lnet-special2@zfs+DNE sanity-lnet-special3@zfs sanity-lnet-special3@zfs+DNE sanity-lnet-special4@zfs sanity-lnet-special4@zfs+DNE sanity-lnet-special5@zfs sanity-lnet-special5@zfs+DNE sanity-lnet-special6@zfs sanity-lnet-special6@zfs+DNE sanity-lnet-special7@zfs sanity-lnet-special7@zfs+DNE sanity-lnet-special8@zfs sanity-lnet-special8@zfs+DNE sanity-lnet-special9@zfs sanity-lnet-special9@zfs+DNE sanity-lnet-special10@zfs sanity-lnet-special10@zfs+DNE
+
+--- Message (wc-checkpatch, 2026-09-07 02:20:42.000000000) ---
+Patch Set 15:
+
+(18 comments)
+
+19 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre Gerrit Janitor, 2026-09-07 03:03:37.000000000) ---
+Patch Set 15:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests-ssk@ldiskfs+SharedKey sanity-lnet@ldiskfs+DNE sanity-lnet-special1@ldiskfs+DNE sanity-lnet-special1@ldiskfs sanity-lnet-special2@ldiskfs+DNE sanity-lnet-special2@ldiskfs sanity-lnet-special3@ldiskfs+DNE sanity-lnet-special3@ldiskfs sanity-lnet-special4@ldiskfs+DNE sanity-lnet-special4@ldiskfs sanity-lnet-special5@ldiskfs+DNE sanity-lnet-special5@ldiskfs sanity-lnet-special6@ldiskfs+DNE sanity-lnet-special6@ldiskfs sanity-lnet-special7@ldiskfs+DNE sanity-lnet-special7@ldiskfs sanity-lnet-special8@ldiskfs+DNE sanity-lnet-special8@ldiskfs sanity-lnet-special9@ldiskfs+DNE sanity-lnet-special9@ldiskfs sanity-lnet-special10@ldiskfs+DNE sanity-lnet-special10@ldiskfs sanity-lnet@zfs sanity-lnet-special1@zfs sanity-lnet-special1@zfs+DNE sanity-lnet-special2@zfs sanity-lnet-special2@zfs+DNE sanity-lnet-special3@zfs sanity-lnet-special3@zfs+DNE sanity-lnet-special4@zfs sanity-lnet-special4@zfs+DNE sanity-lnet-special5@zfs sanity-lnet-special5@zfs+DNE sanity-lnet-special6@zfs sanity-lnet-special6@zfs+DNE sanity-lnet-special7@zfs sanity-lnet-special7@zfs+DNE sanity-lnet-special8@zfs sanity-lnet-special8@zfs+DNE sanity-lnet-special9@zfs sanity-lnet-special9@zfs+DNE sanity-lnet-special10@zfs sanity-lnet-special10@zfs+DNE 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/69729/results.html
+No additional testing was requested
+
+--- Message (jenkins, 2026-09-07 03:51:39.000000000) ---
+Patch Set 15: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131220/ : SUCCESS
+
+--- Message (Maloo, 2026-09-07 03:52:36.000000000) ---
+Patch Set 15:
+
+#### The following sessions will be run for Build 131220 (patch #15):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-ldiskfs-dne on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=131220&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=131220#redirect
+
+--- Message (Lustre RISC-V Builder, 2026-09-07 04:17:31.000000000) ---
+Patch Set 15:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Maloo, 2026-09-07 14:01:55.000000000) ---
+Patch Set 15: Verified+1
+
+Passed enforced test review-ldiskfs-dne on RHEL 8.10 / x86_64 uploaded by Onyx Autotest from onyx-159vm74: https://testing.whamcloud.com/test_sessions/5065e679-8456-4c1f-8ed4-7e13ab002056 ran 5 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-09-07 15:27:10.000000000) ---
+Patch Set 15:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Looks good; the deferral and slot lifetime hold up under tracing (the copy-out's own connection reference pins the slot's pool and worker through kiblnd_hdev_destroy(), and lnet_finalize() runs behind the copy for both a matched MD and a router's rb_kiov). Only optional nits inline for whenever it is next refreshed, no need to re-spin for them. One coverage thought: 313/314/315 cover the happy path, the rd-build fallback and the failover rebuild, but nothing exercises the bounce_scrub 0 -> 1 recycle, which is the trickiest state in the change and the one the security argument rests on. A subtest that flips bounce_scrub around an LST read with -C would cover the dirty-slot path in kiblnd_bounce_get().
+
+--- Message (Chris Horn, 2026-09-10 18:43:15.000000000) ---
+Patch Set 15:
+
+(1 comment)
+
+--- Message (Cyril Bordage, 2026-09-11 08:00:14.000000000) ---
+Patch Set 15: Code-Review+1
+
+--- Message (Manish Regmi, 2026-09-28 16:03:41.000000000) ---
+Patch Set 15: Code-Review+1
+
+--- Message (Xinxia Qu, 2026-09-28 17:09:48.000000000) ---
+Patch Set 15: Code-Review+1
+
+--- Message (Marc Vef, 2026-09-29 09:48:36.000000000) ---
+Hashtag added: master-next
+
+--- Message (Marc Vef, 2026-09-29 09:48:37.000000000) ---
+Patch Set 15:
+
+[Marc Bot] Note: This change has been cherry-picked to master-next and is considered for landing. Please avoid updates unless required while the master-next hashtag is set; doing so may cause the patch to be removed from master-next and not landed. Note: AI review comments should be addressed/responded to.
+
+--- Message (Marc Vef, 2026-09-29 09:48:38.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Oleg Drokin, 2026-10-13 04:26:49.000000000) ---
+Patch Set 15: Code-Review+2
+
+--- Message (Oleg Drokin, 2026-10-13 04:26:53.000000000) ---
+Change has been successfully cherry-picked as 46e10319f209991ec77a2f28d0dd4d830f70be71

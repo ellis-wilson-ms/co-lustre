@@ -1,0 +1,781 @@
+Change:     68453
+Subject:    LU-12669 ec: create lock placeholder for reconstructed pages
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68453
+Change-Id:  I57453459ec3aee4de72c012ffa5258153cf4b408
+Project:    fs/lustre-release
+Branch:     master
+Status:     ABANDONED
+Owner:      Zhenyu Xu
+Created:    2026-08-28 12:04:27.000000000
+Updated:    2026-10-08 07:14:12.000000000
+Patch Set:  15
+Insertions: +899
+Deletions:  -68
+Comments:   305 (13 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: -1
+
+--- Reviewers ---
+  CC: Andreas Dilger, Lustre RISC-V Builder, Gerrit AI review for Lustre
+  REVIEWER: Mikhail Pershin, Keguang Xu
+
+--- Commit Message ---
+LU-12669 ec: create lock placeholder for reconstructed pages
+
+Create client-only ldlm_lock placeholders for sub-locks on
+unavailable OSTs (LSS_READ_ERR) during CIT_EC_RD, so reconstructed
+pages stay cached and Uptodate across reads instead of being
+discarded after each read.  The ldlm_lock is granted locally without
+an RPC and attached to the osc_lock via osc_lock_granted.
+
+A stripe is converted only while its target is inactive
+(OBDF_INACTIVE).  If the target is already active, an LSS_READ_ERR
+recorded before it recovered is stale: lov_lock_sub_init() clears the
+flag and enqueues a normal sub-lock instead of publishing a
+placeholder for a healthy target, keeping the creation trigger and
+the import-level cleanup consistent.
+
+osc_lock_cancel() only detaches the ldlm_lock (osc_lock_detach)
+without cancelling it, so the ldlm_lock survives the EC read loop and
+keeps pages cached for concurrent readers.  When the OST recovers,
+osc_import_event(IMP_EVENT_ACTIVE) cancels the placeholders with
+ldlm_cli_cancel_unused_async(LCF_LOCAL | LCF_PLACEHOLDER): every
+unreferenced placeholder is queued for the blocking-AST path
+(osc_ldlm_blocking_ast -> __osc_dlm_blocking_ast -> osc_lock_flush),
+flushing its stale pages.  A placeholder still referenced by an
+in-flight EC read cannot be cancelled yet, so
+ldlm_prepare_resource_list() marks it LDLM_FL_CBPENDING instead: the
+last ldlm_lock_decref() (osc_lock_detach() at cl_io_unlock()) then
+queues the same flush, and lock_matches() refuses to hand the
+CBPENDING placeholder to a new referencing lookup meanwhile, so no
+reader can extend its lifetime.
+
+The async variant is used because IMP_EVENT_ACTIVE runs from the
+import RPC reply-interpret context (ptlrpc_connect_interpret() ->
+ptlrpc_activate_import()), where osc_lock_flush() must not block: it
+takes page locks, and a concurrent degraded read owns those pages
+while waiting for a BRW reply that ptlrpcd itself interprets, so
+flushing inline there deadlocks the reply path.
+ldlm_cli_cancel_unused_async() only prepares the matching locks
+(ldlm_prepare_resource_list(), factored out of
+ldlm_cancel_resource_local()) and hands them to the ldlm blocking
+threads (ldlm_bl_to_thread_list()), where the cancel and blocking AST
+run.
+
+Placeholder creation is fenced against the activation sweep so an EC
+read that started before or during recovery cannot publish a
+placeholder after the sweep has passed its resource.  Add
+cl_ec_placeholder_sem and cl_ec_placeholder_gen to client_obd:
+osc_lock_init() records the current generation for CIT_EC_RD locks;
+osc_lock_to_placeholder() takes the read side of the rwsem and refuses
+with -EAGAIN if the generation is odd (an activation is in progress)
+or has advanced since the lock was initialized; and
+osc_import_event(IMP_EVENT_ACTIVE) holds the write side across gen++,
+the cancel scan and OBD_NOTIFY_ACTIVE, then gen++ again.  A refused
+conversion leaves the sub-lock normal, and its enqueue failure is
+tolerated as an unprotected recovery.
+
+There is deliberately no per-stripe flush from lov_lock_enqueue().  A
+successful sub-lock enqueue proves the lock path (LDLM) works, not the
+data path: under a BRW-only failure such as OBD_FAIL_OST_BRW_READ_BULK
+lock RPCs keep succeeding while the stripe's data path is still
+broken, so flushing there tears down a placeholder whose reconstructed
+pages are still needed.  A successful enqueue therefore never converts
+a stripe, and the flush is driven solely by the import-level
+IMP_EVENT_ACTIVE path above.  Conversely, a sub-lock enqueue that
+actually fails is data-path evidence, and lov_lock_enqueue() does
+retry the conversion on that failure -- which is what covers the
+transient case where the import stays FULL.
+
+Placeholders are normal LRU citizens: once detached with no readers
+they are added to the LRU, so reclaim (cancel_lru_locks, the shrinker,
+memory pressure) can cancel them and drop the reconstructed pages --
+they are re-recovered from parity on the next read.  Pinning them
+until the OST recovers would hold too much memory.
+
+check_and_discard_cb() must not treat a placeholder as an extra lock
+covering a page: a placeholder is client-only state that exists only
+to hold reconstructed pages, so counting it as coverage makes the
+flush skip exactly the pages it is meant to discard.
+
+That lookup must also be able to see the placeholder it is flushing:
+ldlm_prepare_resource_list() and ldlm_cli_cancel_local() mark the lock
+CBPENDING before the blocking AST runs, and lock_matches() rejects a
+CBPENDING lock with 0 readers/writers.  The placeholder would be
+invisible, so only a real lock granted concurrently by a racing read
+- after the OST recovered but before the bl thread flushed -- would
+be found and the reconstructed page kept, as if that lock vouched for
+data reconstructed before it existed.  lock_matches() therefore lets
+LDLM_FL_TEST_LOCK probes observe CBPENDING placeholders, and hides
+them from every ordinary (referencing) lookup -- which also stops a
+new reader from attaching to a placeholder whose flush is already
+pending.  Real CBPENDING locks stay unmatched, so the ordinary
+lock-cancel flush is unaffected.
+
+Placeholder locks must not satisfy a normal request: a placeholder is
+client-only, so a request reusing one would believe it holds a
+server-granted lock.  osc_enqueue_base() and osc_object_fiemap()
+therefore skip LDLM_FL_PLACEHOLDER locks via the skip_flags argument
+of ldlm_lock_match_with_skip().  Besides, both search with
+LDLM_FL_LVB_READY, and matching a placeholder there would block for
+obd_timeout, as a placeholder has no completion AST to make it
+LVB-ready.
+
+Add ldlm_lock flag LDLM_FL_PLACEHOLDER to indicate a lock is a
+placeholder lock.  It lives in client-only flag space (bit 33), above
+the 32-bit on-wire mask, so it can never leak into a transmitted flag
+set.  Add ldlm_cancel_flags LCF_PLACEHOLDER to scope the cancel to
+placeholder locks only.
+
+Placeholder locks are never replayed: ldlm_chain_lock_for_replay()
+skips them.  A placeholder is client-only, granted locally without an
+RPC (the server has no record of it) and marked LDLM_FL_LOCAL_ONLY, so
+replaying one would leave a phantom grant on the OST after the silent
+cancel.  They are dropped, and their possibly-stale reconstructed
+pages flushed, by the existing osc_import_event(IMP_EVENT_ACTIVE) path
+after recovery.
+
+When a failed sub-lock enqueue cannot be converted to a placeholder,
+the enqueue failure is tolerated as before, and the new
+ci_ec.ec_unprotected_recovery flag tells vvp_io_ec_rd_end() to drop
+Uptodate on the reconstructed pages at IO end, since nothing would
+flush them later.
+
+Export symbol ldlm_lock_create/ldlm_lock_destroy/ldlm_lock_enqueue/
+ldlm_cli_cancel_unused/ldlm_cli_cancel_unused_async for use in other
+modules.
+
+Add cl_lock_cancel() before cl_lock_fini() in the lov_lock_sub_init
+error path so initialized sub-locks are properly cleaned up.
+lov_lock_cancel() also calls cl_lock_cancel() with every sublock with
+sub_initialized set rather than only sub_is_enqueued, so that
+placeholder locks are cancelled and normal locks w/o enqueue are
+also cancelled.
+
+Placeholder locks are client-only with no LVB data (lvb_len 0), so
+prune only needs to clear l_ast_data.
+
+Add test_49a checks: a second read of the degraded file must not touch
+the OSTs (the reconstructed pages stay cached), reactivating an OST
+must invalidate those pages, and a stripe whose stale LSS_READ_ERR
+outlives recovery must not leave stale reconstructed pages behind
+after a second mount rewrites the file.
+
+Assisted-by: Augment Agent:DeepSeek V4.1 Flash
+Signed-off-by: Bobi Jam <bobijam@whamcloud.com>
+Change-Id: I57453459ec3aee4de72c012ffa5258153cf4b408
+
+--- Review History ---
+
+--- Message (Zhenyu Xu, 2026-08-28 12:04:27.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-28 12:07:02.000000000) ---
+Patch Set 1:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-08-28 12:17:48.000000000) ---
+Patch Set 1:
+
+(5 comments)
+
+5 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-08-28 13:37:18.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130538/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-28 14:40:51.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-29 08:08:05.000000000) ---
+Patch Set 1:
+
+(14 comments)
+
+AI code review results below, please doublecheck
+
+Problematic, see inline comments. The core mechanism does not appear to work as described: on a client namespace ldlm_lock_enqueue() with LDLM_FL_BLOCK_GRANTED puts the lock on lr_waiting rather than granting it, the lock has no l_conn_export and no extent policy, and LDLM has an explicit LASSERTF against locally-created locks in a client namespace (ldlm_cli_enqueue_local()). Since the placeholder never functions, the ClearPageUptodate() removal in vvp_io_ec_rd_end() leaves reconstructed pages Uptodate with nothing able to invalidate them. It would help to build this on ldlm_cli_enqueue_local()'s pattern (policy assignment, addref, ldlm_set_local(), the final ldlm_lock_put()) rather than open-coding it, and to exercise the recovery path with a real OSC import deactivate/reactivate so IMP_EVENT_ACTIVE is actually delivered.
+
+--- Message (Zhenyu Xu, 2026-09-01 10:47:33.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-01 10:51:42.000000000) ---
+Patch Set 2:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-09-01 10:52:30.000000000) ---
+Patch Set 2:
+
+(3 comments)
+
+3 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Zhenyu Xu, 2026-09-01 11:02:18.000000000) ---
+Patch Set 1:
+
+(16 comments)
+
+--- Message (Lustre RISC-V Builder, 2026-09-01 11:03:24.000000000) ---
+Patch Set 2:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-09-01 12:14:50.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130772/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-02 16:20:33.000000000) ---
+Patch Set 2:
+
+(9 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments.
+
+--- Message (Zhenyu Xu, 2026-09-03 04:23:56.000000000) ---
+Patch Set 2:
+
+(11 comments)
+
+--- Message (Zhenyu Xu, 2026-09-03 04:24:37.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-03 04:28:20.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-09-03 04:31:57.000000000) ---
+Patch Set 3:
+
+(6 comments)
+
+6 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre RISC-V Builder, 2026-09-03 04:41:41.000000000) ---
+Patch Set 3:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-09-03 04:52:09.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130885/ : SUCCESS
+
+--- Message (Zhenyu Xu, 2026-09-03 05:23:37.000000000) ---
+Uploaded patch set 4.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-03 05:26:23.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-03 05:34:31.000000000) ---
+Patch Set 4:
+
+(6 comments)
+
+6 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-03 06:31:14.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130896/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-03 07:00:15.000000000) ---
+Patch Set 4:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Zhenyu Xu, 2026-09-03 16:15:24.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-03 16:37:42.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (Zhenyu Xu, 2026-09-03 17:16:50.000000000) ---
+Uploaded patch set 6.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-03 17:20:13.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-03 19:35:14.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130968/ : SUCCESS
+
+--- Message (jenkins, 2026-09-03 20:07:56.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130974/ : SUCCESS
+
+--- Message (wc-checkpatch, 2026-09-03 20:08:49.000000000) ---
+Patch Set 6:
+
+(7 comments)
+
+7 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre RISC-V Builder, 2026-09-03 20:17:51.000000000) ---
+Patch Set 5:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Lustre RISC-V Builder, 2026-09-04 01:26:12.000000000) ---
+Patch Set 6:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-09-04 15:32:49.000000000) ---
+Patch Set 6:
+
+(9 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The per-stripe recovery path looks like it defeats itself: the placeholder sub-locks created in lov_lock_sub_init() come back from cl_lock_enqueue() with rc == 0, so cl_object_ec_flush() runs during the degraded read and leaves oo_has_ec_placeholder false, which makes the flush after real recovery a no-op. Worth confirming with a test that isolates the per-stripe path from the import-level fallback.
+
+--- Message (Zhenyu Xu, 2026-09-08 07:16:49.000000000) ---
+Uploaded patch set 7.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Zhenyu Xu, 2026-09-08 07:17:18.000000000) ---
+Patch Set 6:
+
+(10 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-08 07:19:28.000000000) ---
+Patch Set 7:
+
+(4 comments)
+
+4 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-09-08 07:23:16.000000000) ---
+Patch Set 7:
+
+(6 comments)
+
+6 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre RISC-V Builder, 2026-09-08 07:30:22.000000000) ---
+Patch Set 7:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-09-08 07:48:50.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131304/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-10 03:31:47.000000000) ---
+Patch Set 7:
+
+(6 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. Two of them are in the placeholder lifecycle in osc_lock_to_placeholder() and look like they need a respin; the remaining items are minor and can ride along on that refresh.
+
+--- Message (Zhenyu Xu, 2026-09-10 16:14:59.000000000) ---
+Uploaded patch set 8.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-10 16:18:19.000000000) ---
+Patch Set 8:
+
+(4 comments)
+
+4 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-09-10 16:18:32.000000000) ---
+Patch Set 8:
+
+(6 comments)
+
+6 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-10 16:59:32.000000000) ---
+Patch Set 8: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131534/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-10 19:38:11.000000000) ---
+Patch Set 8:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Zhenyu Xu, 2026-09-11 07:09:51.000000000) ---
+Patch Set 8:
+
+(14 comments)
+
+--- Message (Andreas Dilger, 2026-09-11 07:38:56.000000000) ---
+Patch Set 8:
+
+(1 comment)
+
+--- Message (Gerrit AI review for Lustre, 2026-09-12 06:55:28.000000000) ---
+Patch Set 8:
+
+(7 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The main one is that the new test_49a checks do not appear able to fail, so neither the per-stripe cl_object_ec_flush() path nor the import-level fallback is actually exercised; it would be good to get real coverage for the headline mechanism before this lands. The rest are optional nits for the same refresh.
+
+--- Message (Zhenyu Xu, 2026-09-16 02:32:47.000000000) ---
+Patch Set 8:
+
+(1 comment)
+
+--- Message (Zhenyu Xu, 2026-09-17 11:28:52.000000000) ---
+Uploaded patch set 9.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-17 11:31:42.000000000) ---
+Patch Set 9:
+
+(4 comments)
+
+4 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-09-17 11:39:43.000000000) ---
+Patch Set 9:
+
+(6 comments)
+
+6 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-17 17:39:17.000000000) ---
+Patch Set 9: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131906/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-18 12:38:00.000000000) ---
+Patch Set 9:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. Two of them look like they need a refresh: EC placeholder locks are not excluded from LDLM lock replay, and the placeholder mode is assumed to be LCK_PR when CIT_EC_RD can ask for CLM_GROUP.
+
+--- Message (Zhenyu Xu, 2026-09-20 06:06:22.000000000) ---
+Patch Set 9:
+
+(16 comments)
+
+--- Message (Zhenyu Xu, 2026-09-20 06:54:11.000000000) ---
+Uploaded patch set 10.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-20 06:56:58.000000000) ---
+Patch Set 10:
+
+(4 comments)
+
+4 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-09-20 07:08:07.000000000) ---
+Patch Set 10:
+
+(6 comments)
+
+6 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-20 07:18:46.000000000) ---
+Patch Set 10: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132031/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-20 23:23:20.000000000) ---
+Patch Set 10:
+
+(8 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The main one is that the new unprotected-recovery fallback looks like it can never fire, so the case it was added for is untested - a case that forces a stripe which cannot get a placeholder (e.g. a group-locked EC file, where osc_lock_to_placeholder() returns -EOPNOTSUPP) and then checks the pages are not served from cache afterwards would exercise it.
+
+--- Message (Zhenyu Xu, 2026-09-21 09:13:36.000000000) ---
+Patch Set 10:
+
+(12 comments)
+
+--- Message (Zhenyu Xu, 2026-09-21 10:00:16.000000000) ---
+Uploaded patch set 11.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-21 10:01:25.000000000) ---
+Patch Set 11:
+
+(6 comments)
+
+6 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-21 10:03:45.000000000) ---
+Patch Set 11:
+
+(4 comments)
+
+4 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (jenkins, 2026-09-21 10:47:04.000000000) ---
+Patch Set 11: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132060/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-22 00:01:57.000000000) ---
+Patch Set 11:
+
+(6 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The main one is that the pre-replay placeholder cancel added to __ldlm_replay_locks() does not cover a placeholder that an in-flight EC read still holds a reference on, which is the case the commit message says is handled. The rest are minor and can ride along on the same refresh.
+
+--- Message (Zhenyu Xu, 2026-09-22 04:45:01.000000000) ---
+Patch Set 11:
+
+(10 comments)
+
+--- Message (Zhenyu Xu, 2026-09-22 08:56:55.000000000) ---
+Uploaded patch set 12.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-22 09:00:42.000000000) ---
+Patch Set 12:
+
+(4 comments)
+
+4 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-09-22 09:12:15.000000000) ---
+Patch Set 12:
+
+(6 comments)
+
+6 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-22 09:33:10.000000000) ---
+Patch Set 12: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132110/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-22 21:30:10.000000000) ---
+Patch Set 12:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The main one is the execution context of the new import-event cancel; the rest are optional items for whenever the patch is next refreshed.
+
+--- Message (Zhenyu Xu, 2026-09-24 07:10:28.000000000) ---
+Patch Set 12:
+
+(9 comments)
+
+--- Message (Zhenyu Xu, 2026-09-24 07:28:37.000000000) ---
+Uploaded patch set 13.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-24 07:31:58.000000000) ---
+Patch Set 13:
+
+(7 comments)
+
+7 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-24 07:32:25.000000000) ---
+Patch Set 13:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (jenkins, 2026-09-24 07:59:15.000000000) ---
+Patch Set 13: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132255/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-25 05:46:10.000000000) ---
+Patch Set 13:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The lock_matches() exemption looks like it can crash a client, and a placeholder held by a reader when the OST comes back is never flushed. The minor comment fixes can ride along with the refresh.
+
+--- Message (Zhenyu Xu, 2026-09-28 11:59:47.000000000) ---
+Uploaded patch set 14.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-28 12:02:49.000000000) ---
+Patch Set 14:
+
+(12 comments)
+
+12 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-28 12:25:38.000000000) ---
+Patch Set 14: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132434/ : SUCCESS
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-28 15:51:29.000000000) ---
+Patch Set 14:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (Zhenyu Xu, 2026-09-29 07:25:30.000000000) ---
+Uploaded patch set 15: Patch Set 14 was rebased.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-29 07:29:03.000000000) ---
+Patch Set 15:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-09-29 07:41:05.000000000) ---
+Patch Set 15:
+
+(12 comments)
+
+12 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-29 07:58:58.000000000) ---
+Patch Set 15: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132492/ : SUCCESS
+
+--- Message (Andreas Dilger, 2026-10-01 12:11:03.000000000) ---
+Patch Set 15:
+
+(1 comment)
+
+--- Message (Gerrit AI review for Lustre, 2026-10-05 08:01:00.000000000) ---
+Patch Set 15:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments; the generation-fence race needs a refresh, the rest are optional. The latest reviewer comment says this change has been replaced by 69350 — if that patch carries the same lov_lock_sub_init() logic, the first comment applies there too.
+
+--- Message (Zhenyu Xu, 2026-10-08 07:14:12.000000000) ---
+Abandoned
+
+replaced with https://review.whamcloud.com/69350

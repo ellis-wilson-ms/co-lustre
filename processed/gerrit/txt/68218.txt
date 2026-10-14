@@ -1,0 +1,193 @@
+Change:     68218
+Subject:    LU-12571 obdclass: wait for lu_object_free() at site fini
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68218
+Change-Id:  I76bd88a1e0aa54f1e64e5d9b4e34ec5e6a8db3f2
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Oleg Drokin
+Created:    2026-08-22 23:05:20.000000000
+Updated:    2026-09-06 06:49:04.000000000
+Patch Set:  2
+Insertions: +101
+Deletions:  -1
+Comments:   9 (6 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: -1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
+
+--- Commit Message ---
+LU-12571 obdclass: wait for lu_object_free() at site fini
+
+A lu_site is torn down by lu_site_fini(), and its callers free the memory
+it sits in immediately afterwards -- the LOV site is embedded in the
+lov_device that lov_device_free() then frees.  Nothing checks that the
+site is unused first, and it need not be: lu_object_free() keeps using it
+after the object's last slice has handed its device reference back, to
+wake a bucket waitqueue, which is a pointer into the site's own ls_bkts[].
+Every cl object header carries LU_OBJECT_DFREE, so lu_object_put() runs
+that inline in whichever thread dropped the last reference, which on a
+client is an ldlm callback thread rather than the umounting one.
+
+Give lu_site a count of the objects alive on it, ls_obj_alive, taken in
+lu_object_alloc() and given back at the very end of lu_object_free().
+Zero therefore means both that every lu_device_put() an object owes has
+been made -- which is what lu_device_fini() asserts on -- and that nobody
+is still inside lu_object_free() using the site to get there.  It costs
+one atomic pair per object, on a field placed next to rhashtable's own
+nelems, which is an atomic already updated per insert and per removal on
+the same path.
+
+Then wait for it in lu_site_fini(), via lu_site_wait_idle(), once the site
+is off lu_sites and with no lock held.  The wait purges on every pass, and
+has to: an object whose last reference goes away is parked on a bucket LRU
+rather than freed, on lsb_lru or lsb_free, and by this point no shrinker
+or flush worker can reach the site to reclaim either list, since both find
+sites by walking lu_sites.  Without the purge a late release would leave
+the count non-zero for good.  If it does give up, it dumps the site first:
+that names an object that leaked a reference and is therefore still
+hashed, though not one that is merely slow to free, which is already out
+of the hash by the time lu_object_free() runs.
+
+The purge runs under an lu_env of its own rather than lu_free_env.  That
+one belongs to lu_objects_flush(), which uses it under lu_sites_guard,
+and this runs after lu_site_fini() has dropped that rwsem; sharing it
+would let the two threads scribble on the same env-keyed scratch inside
+the teardown callbacks, such as osd_quota_refresh()'s oti_qi.
+
+It gives up after 30s with a console warning naming the device and the
+count.  Giving up is no worse than the previous behaviour of not waiting at
+all, and a plain atomic keeps it that way: a straggler that decrements it
+after the site is freed is writing to the same freed memory it already
+wakes a waitqueue in, rather than a new failure mode.  A teardown that
+hangs instead would be harder to report than the crash this ticket is
+about.
+
+On a client the wait runs from ll_put_super() -> cl_sb_fini() ->
+lu_stack_fini() -> vvp_device_free() -> cl_site_fini(), and the sleep is
+uninterruptible, so a site that is slow to go idle would otherwise be a
+silent umount stall with nothing on the console until it had already
+expired.  It says so once, five seconds in, while it is still happening.
+
+lu_object_put() also has to move its percpu_counter_inc() on
+ls_lru_len_counter under the bucket lock, where every other update of that
+counter already is.  Dropping the lock first makes the object reachable to
+a purge, so the purge this adds can free it and bring the count to zero
+while the putting thread has not reached the counter yet -- and
+lu_site_fini() runs percpu_counter_destroy() two statements later.  The
+window predates this, but nothing used to sit between the last purge and
+the destroy.
+
+The count spans the objects and the body of lu_object_free(), not every
+use of the site.  lu_object_put() still reads ls_bkts[] to wake a bucket
+after it has given up its reference and holding no count, and
+lov_subobject_kill() waits on the bucket after its own cl_object_put();
+both are older than this and stay open.  cl_object_put_last() is not one
+of them -- it holds its reference across the wait and only then puts, so
+its object is still counted while it touches the queue.
+
+This does not address the ld_ref assertion the ticket is filed against.
+That fires in lu_device_fini() during lu_stack_fini(), long before any
+lu_site_fini(), and is the subject of the llite change that follows.
+
+No Fixes: tag: the exposure is not the product of one commit.  The
+site-embedded bucket array arrived with commit e6f7f8a7b349 ("LU-8130
+lu_object: factor out extra per-bucket data"), but that only moved the
+waitqueue out of cfs_hash's per-bucket extra data, which was site-owned
+too and had the same shape.
+
+The window is a few instructions wide and no reproducer opens it: the ones
+in change 67547 release everything from one thread, so each sub-object's
+free is nested inside the lov object's own free and the two never split.
+Opening it wants a second, independently timed release of a sub-object
+reference held across lov_subobject_kill().  So this is verified by
+inspection, and by measuring that it costs nothing on the path where the
+count is already zero -- which is every teardown that is not racing, and
+which returns before even building an lu_env.
+
+Signed-off-by: Oleg Drokin <green@whamcloud.com>
+Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
+Change-Id: I76bd88a1e0aa54f1e64e5d9b4e34ec5e6a8db3f2
+
+--- Review History ---
+
+--- Message (Oleg Drokin, 2026-08-22 23:05:20.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-22 23:10:51.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-22 23:17:11.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-08-22 23:36:40.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130009/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-23 00:30:47.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-23 11:45:13.000000000) ---
+Patch Set 1:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, two small comments inline. The reasoning in the commit message holds up against the code: the bucket waitqueue really is a pointer into the site's own ls_bkts[], cl object headers all get LU_OBJECT_DFREE in cl_object_header_init(), and both lu_cache_shrink_scan() and lu_objects_flush() find sites only by walking lu_sites, so delisting under lu_sites_guard before the wait does keep them away. The remaining lu_object_put() and lov_subobject_kill() windows are correctly described as still open.
+
+--- Message (Oleg Drokin, 2026-09-04 21:33:44.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-04 21:43:55.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-04 21:49:13.000000000) ---
+Patch Set 2:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-04 23:00:48.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131073/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-05 07:27:50.000000000) ---
+Patch Set 2:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-09-06 06:49:04.000000000) ---
+Patch Set 2:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Looks good - the reasoning holds up against the code: ls_obj_alive is taken in lu_object_alloc() and dropped at the tail of lu_object_free() with no path that allocates without one or frees without the other, the site is off lu_sites before the wait so the purge really is the only thing that can drain lsb_lru/lsb_free, and moving percpu_counter_inc() under the bucket lock matches the three existing updates of that counter. A few optional nits inline for whenever it is next refreshed - no need to re-spin for them.

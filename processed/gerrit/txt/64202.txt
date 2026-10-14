@@ -1,5 +1,5 @@
 Change:     64202
-Subject:    LU-19916 mgs: start MGS replicas on MDTs/OSTs
+Subject:    LU-19916 mgs: start MGS follower on MDTs/OSTs
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/64202
 Change-Id:  I7c4778763ec18ce11d513bc6e2b2cce51acb5a70
 Project:    fs/lustre-release
@@ -7,49 +7,112 @@ Branch:     master
 Status:     NEW
 Owner:      Lai Siyao
 Created:    2026-02-24 03:41:41.000000000
-Updated:    2026-04-29 06:23:34.000000000
-Patch Set:  12
-Insertions: +393
-Deletions:  -88
-Comments:   58 (3 unresolved)
+Updated:    2026-10-14 12:06:46.000000000
+Patch Set:  44
+Insertions: +721
+Deletions:  -117
+Comments:   617 (0 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: jenkins: +1
 
 --- Reviewers ---
-  REVIEWER: Andreas Dilger, Mikhail Pershin, Hongchao Zhang
+  CC: Lustre RISC-V Builder, Gerrit AI review for Lustre, patrick bot
+  REVIEWER: Lai Siyao, Oleg Drokin, Andreas Dilger, Mikhail Pershin, Hongchao Zhang
 
 --- Commit Message ---
-LU-19916 mgs: start MGS replicas on MDTs/OSTs
+LU-19916 mgs: start MGS follower on MDTs/OSTs
 
-Start MGS replicas on MDTs/OSTs which are not located on the MGS0
-primary and failover hosts.  The MGS replica is a readonly backup
-of MGS0, any configuration change should be done on MGS0.
+Start an MGS follower on one MDT or OST of each server node, to serve
+the configuration it has a copy of - the <fsname>-client, params and
+sptlrpc logs - to the clients attached to it; imperative recovery is
+wired up in the next patch.  MGS0 is the leader; MDTs and OSTs still
+connect to it, and a follower rejects them with -ENODEV.  MGS0, on its
+own MGT or combined with MDT0, takes over from a follower another
+target on the host already started.  The follower is optional: an MDT
+or OST mounts without it.  Once the MGS is stopped the MGC requeue
+thread starts a follower on another target if it can.
 
-Once a MGS replica is stopped, wake up ll_cfg_requeue thread to start
-MGS replica on another target if possible.
+IS_MGS0() is what now means "holds the MGT".  Which target runs the
+follower is kept by its MGS mount registration, server_mgs_runs_on(),
+rather than in lsi_flags, which other threads update without a lock.
 
-Register MGS replica as observer of MGC, so that it can be notified
-when the config is changed.
+A follower is a readonly backup of MGS0: no ioctls, and no nodemap
+config file - it refuses a nodemap config read rather than serving one
+it does not have.  Replicating the nodemap configuration, so that it
+too survives the loss of MGS0, is left to a later patch, and so is
+replicating _mgs-sptlrpc.  A follower refuses a client that connects
+with an sptlrpc flavor, which MGS0 then serves instead.
 
-Add an argument for obd_notify() to pass data.
+A follower writes no config log into CONFIGS/, which on a follower
+belongs to the MDT or OST it runs on and holds that target's local
+copy of the logs, and it builds its fsdb without reading
+<fsname>-client, since it edits no config.  For the same reason it
+leaves that target's lu_site cache alone, and only the leader sends
+LCFG_PRE_CLEANUP, which would stop the OI scrub of a target that is
+still serving.
 
-Disable ioctl on MGS replica.
+MGS followers are off by default: an MDT or OST starts one only if
+mounted with the new "mgs_follower" option, and
+LUSTRE_MGS_FOLLOWER_DEFAULT turns them on everywhere at compile time.
+test-framework mounts every MDT and OST with "mgs_follower", unless
+MGS_FOLLOWER=false, so the feature is still tested.  "nomgs", "nosvc"
+and a read-only mount all keep the follower off a target; the last so
+that an lsnapshot mount does not serve the snapshot's configuration.
 
-Add debugfs entry mgs/MGS/replica as indicator of  MGS replica, and
-is_mgs() in liblustreapi should check this because MGS replica is
-readonly, and doesn't handle ioctl.
+That target is already serving and the site is shared, so
+mgs_fs_setup() no longer publishes itself as ls_top_dev and clears it
+afterwards: that left the live MDT/OST with a NULL top device,
+crashing the next mdt_object_find() or ofd_object_find().  Nothing
+there needs it - local storage resolves through ls_locate() and the
+root through dt_locate_at() - which is also why mgc_fs_setup() does
+the same work without it.  For the same reason mgs_fs_setup() and
+nidtbl_read_version() resolve their objects through the local storage
+device rather than through the MGS layer, which would leave an
+MGS-layer object pinned in a site only that target can purge.
 
-If MGC import connection count is more than 2, it means the MGS nid
-list are MGS replicas, shuffle connections so that clients are
-distributed among all MGS replicas evenly.  Caveat: this doesn't
-distribute load if there are 2 MGS replicas, because it can't tell
-these 2 MGS's are replicas, or are primary and failover of MGS0, but
-after some time (clients reconnect happened), clients will be
-distributed evenly.
+Leaving ls_top_dev alone also fixes the index backup at umount of a
+standalone MGT: lustre_index_backup() skips it when ls_top_dev is
+NULL, which is how mgs_fs_setup() has always left it.
 
+Telling a follower about config changes, so that it can revoke its
+clients' config locks, and applying the mgs.srpc.flavor.* rules of
+MGS0 are left to the next patch; until then a follower's clients see
+config changes only when they reconnect.
+
+OBD_CONNECT_FTM, set only by a client mount, is what a follower
+accepts a connection on.  A target that reuses the MGC a client mount
+started drops the flag and reconnects, so no follower serves it.  The
+follow-on patch gives the server MGC its own device name, so a client
+and a target on one node never share a connection's flags.
+
+server_mgs_lock() serializes starting and stopping the MGS between
+mounts and the MGC requeue thread.  It nests outside cld_lock, which
+cld_start_mgs() takes under it.  server_fill_super() does not hold
+it across lustre_start_mgc(): the cleanup of the node's last MGC
+waits for the requeue thread, which can be waiting for that lock in
+cld_start_mgs().
+
+Add parameter mgs.MGS.state, "leader" or "follower", which is_mgs()
+in liblustreapi checks because a follower handles no ioctl.
+
+conf-sanity test_5b starts its OST with "nomgs": it checks that a
+client cannot mount with no MGS, and an OST that starts a follower
+here has no MGS0 to feed it, so the OST's own MGC is refused by that
+follower for as long as the test runs.  replay-single test_61d drops
+CFS_FAIL_ONCE from its llog_setup failure, which a follower started
+on another target of that node would otherwise spend before the mount
+under test reaches it.
+
+Test-Parameters: mdtcount=4 testlist=conf-sanity serverversion=2.17 env=CONF_SANITY_EXCEPT="73e 88a 250"
+Test-Parameters: mdtcount=4 testlist=conf-sanity clientversion=2.17 env=CONF_SANITY_EXCEPT=104a
+Test-Parameters: mdtcount=4 testlist=replay-single env=ONLY=61,ONLY_REPEAT=20
+Fixes: 6ff16309a006 ("LU-10193 osd-zfs: backup index object with plain format")
 Signed-off-by: Lai Siyao <lai.siyao@whamcloud.com>
+Signed-off-by: Oleg Drokin <green@whamcloud.com>
+Signed-off-by: Andreas Dilger <adilger@thelustrecollective.com>
+Assisted-by: ClaudeCode:claude-opus-5.5 ltvm,llm_code_and_review_tools
 Change-Id: I7c4778763ec18ce11d513bc6e2b2cce51acb5a70
 
 --- Review History ---
@@ -396,3 +459,1379 @@ Onyx Autotest retesting enforced review-dne-part-4 session on el8.10-x86_64/ldis
 Patch Set 12:
 
 Onyx Autotest retesting enforced review-zfs session on el8.10-x86_64/zfs servers and clients for build 124412 patch 12. Requested by Lai Siyao because of LU-6142.
+
+--- Message (Lai Siyao, 2026-05-19 09:12:40.000000000) ---
+Uploaded patch set 13.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-05-19 09:25:54.000000000) ---
+Patch Set 13:
+
+(10 comments)
+
+12 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-05-19 10:50:31.000000000) ---
+Patch Set 13: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/125311/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-05-24 12:49:58.000000000) ---
+Patch Set 13:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Lai Siyao, 2026-05-25 11:26:19.000000000) ---
+Uploaded patch set 14.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-05-25 11:39:57.000000000) ---
+Patch Set 14:
+
+(10 comments)
+
+12 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-05-25 11:54:06.000000000) ---
+Patch Set 14: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/125515/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-05-26 16:50:34.000000000) ---
+Patch Set 14:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-05-29 03:15:01.000000000) ---
+Patch Set 14:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (Lai Siyao, 2026-06-08 13:57:46.000000000) ---
+Uploaded patch set 15.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-06-08 14:06:46.000000000) ---
+Patch Set 15:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-06-08 14:12:04.000000000) ---
+Patch Set 15:
+
+(11 comments)
+
+13 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-06-08 14:26:18.000000000) ---
+Patch Set 15: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/126138/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-06-09 01:46:39.000000000) ---
+Patch Set 15:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Lai Siyao, 2026-06-11 09:32:00.000000000) ---
+Uploaded patch set 16.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andreas Dilger, 2026-06-11 09:34:38.000000000) ---
+Patch Set 15:
+
+(5 comments)
+
+--- Message (wc-checkpatch, 2026-06-11 09:36:55.000000000) ---
+Patch Set 16:
+
+(12 comments)
+
+14 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-06-11 09:39:41.000000000) ---
+Patch Set 16:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (jenkins, 2026-06-11 10:03:03.000000000) ---
+Patch Set 16: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/126361/ : FAILURE
+
+--- Message (Lai Siyao, 2026-06-12 02:09:18.000000000) ---
+Patch Set 16:
+
+(4 comments)
+
+--- Message (Lai Siyao, 2026-06-12 08:59:28.000000000) ---
+Uploaded patch set 17.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-06-12 09:09:40.000000000) ---
+Patch Set 17:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-06-12 09:11:21.000000000) ---
+Patch Set 17:
+
+(10 comments)
+
+10 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-06-12 10:01:20.000000000) ---
+Patch Set 17: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/126461/ : FAILURE
+
+--- Message (Andreas Dilger, 2026-06-14 07:01:29.000000000) ---
+Patch Set 18: Patch Set 17 was rebased
+
+The following files contain Git conflicts:
+* lustre/lmv/lmv_obd.c
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Lustre Gerrit Janitor, 2026-06-14 07:04:34.000000000) ---
+Patch Set 18:
+
+(8 comments)
+
+rocky8.10: Compile failed
+
+rocky9.6: Compile failed
+
+
+ Job output URL: https://testing.whamcloud.com/gerrit-janitor/65170/results.html
+
+--- Message (Andreas Dilger, 2026-06-14 07:06:11.000000000) ---
+Patch Set 19: Published edit on patch set 18.
+
+--- Message (jenkins, 2026-06-14 07:06:18.000000000) ---
+Patch Set 18: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/126527/ : ABORTED
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-06-14 07:09:01.000000000) ---
+Patch Set 19:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-06-14 07:09:51.000000000) ---
+Patch Set 19:
+
+(10 comments)
+
+10 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Andreas Dilger, 2026-06-14 07:22:35.000000000) ---
+Patch Set 19:
+
+(1 comment)
+
+--- Message (jenkins, 2026-06-14 08:11:27.000000000) ---
+Patch Set 19: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/126528/ : SUCCESS
+
+--- Message (Andreas Dilger, 2026-06-15 05:50:32.000000000) ---
+Patch Set 19:
+
+(1 comment)
+
+--- Message (Lai Siyao, 2026-06-17 14:02:11.000000000) ---
+Uploaded patch set 20.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-06-17 14:07:54.000000000) ---
+Patch Set 20:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-06-17 14:10:21.000000000) ---
+Patch Set 20:
+
+(10 comments)
+
+10 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-06-17 14:31:27.000000000) ---
+Patch Set 20: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/126673/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-06-17 16:31:12.000000000) ---
+Patch Set 20:
+
+RISC-V Client Builder: Cannot build patch due to 10, messages:
+
+ b'git checkout error!\n'
+
+--- Message (Lai Siyao, 2026-06-20 02:55:08.000000000) ---
+Patch Set 20: Code-Review-1
+
+(1 comment)
+
+This change is ready for review.
+
+--- Message (Lustre RISC-V Builder, 2026-06-20 17:16:56.000000000) ---
+Patch Set 20:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Lai Siyao, 2026-06-21 03:35:43.000000000) ---
+Uploaded patch set 21.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-06-21 03:38:15.000000000) ---
+Patch Set 21:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-06-21 03:44:06.000000000) ---
+Patch Set 21:
+
+(10 comments)
+
+10 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-06-21 03:59:45.000000000) ---
+Patch Set 21: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/126786/ : SUCCESS
+
+--- Message (Andreas Dilger, 2026-06-21 16:02:37.000000000) ---
+Patch Set 21:
+
+(10 comments)
+
+--- Message (Andreas Dilger, 2026-06-21 16:04:28.000000000) ---
+Patch Set 21:
+
+(1 comment)
+
+--- Message (Lai Siyao, 2026-06-22 15:37:35.000000000) ---
+Patch Set 21: Code-Review-1
+
+(8 comments)
+
+--- Message (Lai Siyao, 2026-06-22 15:40:42.000000000) ---
+Uploaded patch set 22.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-06-22 15:44:35.000000000) ---
+Patch Set 22:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-06-22 15:47:52.000000000) ---
+Patch Set 22:
+
+(10 comments)
+
+10 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-06-22 18:30:05.000000000) ---
+Patch Set 22: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/126833/ : SUCCESS
+
+--- Message (Andreas Dilger, 2026-06-22 22:00:51.000000000) ---
+Patch Set 22:
+
+(5 comments)
+
+--- Message (Lustre RISC-V Builder, 2026-06-23 20:45:17.000000000) ---
+Patch Set 22:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Lai Siyao, 2026-06-24 05:08:05.000000000) ---
+Uploaded patch set 23.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-06-24 05:10:40.000000000) ---
+Patch Set 23:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-06-24 05:12:52.000000000) ---
+Patch Set 23:
+
+(11 comments)
+
+11 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-06-24 05:38:33.000000000) ---
+Patch Set 23: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/126908/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-06-24 09:37:25.000000000) ---
+Patch Set 23:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Lai Siyao, 2026-06-24 12:36:22.000000000) ---
+Uploaded patch set 24.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-06-24 12:39:14.000000000) ---
+Patch Set 24:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-06-24 12:51:19.000000000) ---
+Patch Set 24:
+
+(10 comments)
+
+10 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-06-24 13:01:37.000000000) ---
+Patch Set 24: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/126922/ : SUCCESS
+
+--- Message (Autotest, 2026-06-24 13:02:31.000000000) ---
+Patch Set 23:
+
+Trevis Autotest is abandoning the following sessions because: later build 126922 found
+- Enforced review-zfs on el8.10-x86_64/zfs servers and clients
+
+--- Message (Lustre RISC-V Builder, 2026-06-24 15:37:14.000000000) ---
+Patch Set 24:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Lai Siyao, 2026-06-25 07:25:14.000000000) ---
+Uploaded patch set 25.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-06-25 07:26:43.000000000) ---
+Patch Set 25:
+
+(10 comments)
+
+10 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-06-25 07:27:58.000000000) ---
+Patch Set 25:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (Lustre RISC-V Builder, 2026-06-25 07:39:27.000000000) ---
+Patch Set 25:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-06-25 07:52:49.000000000) ---
+Patch Set 25: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/126941/ : SUCCESS
+
+--- Message (Lai Siyao, 2026-06-26 14:23:11.000000000) ---
+Uploaded patch set 26.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-06-26 14:26:39.000000000) ---
+Patch Set 26:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-06-26 14:32:56.000000000) ---
+Patch Set 26:
+
+(10 comments)
+
+10 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-06-26 15:25:54.000000000) ---
+Patch Set 26: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/127001/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-06-26 15:50:42.000000000) ---
+Patch Set 26:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Lai Siyao, 2026-06-27 04:21:03.000000000) ---
+Patch Set 26:
+
+(3 comments)
+
+--- Message (Andreas Dilger, 2026-06-29 01:14:01.000000000) ---
+Patch Set 26: Code-Review+1
+
+(1 comment)
+
+--- Message (Lai Siyao, 2026-07-03 02:35:03.000000000) ---
+Patch Set 26:
+
+(1 comment)
+
+--- Message (Hongchao Zhang, 2026-07-06 09:00:54.000000000) ---
+Patch Set 26:
+
+(3 comments)
+
+--- Message (Lai Siyao, 2026-07-06 15:53:59.000000000) ---
+Patch Set 26:
+
+(2 comments)
+
+--- Message (Hongchao Zhang, 2026-07-07 08:54:03.000000000) ---
+Patch Set 26:
+
+(2 comments)
+
+--- Message (Hongchao Zhang, 2026-07-08 02:46:44.000000000) ---
+Patch Set 26:
+
+(1 comment)
+
+--- Message (Lai Siyao, 2026-07-08 06:57:10.000000000) ---
+Patch Set 26:
+
+(2 comments)
+
+--- Message (Hongchao Zhang, 2026-07-08 08:27:45.000000000) ---
+Patch Set 26:
+
+(1 comment)
+
+--- Message (Lai Siyao, 2026-07-08 09:50:10.000000000) ---
+Patch Set 26:
+
+(1 comment)
+
+--- Message (Hongchao Zhang, 2026-07-08 10:24:12.000000000) ---
+Patch Set 26: Code-Review+1
+
+(1 comment)
+
+--- Message (Lai Siyao, 2026-07-09 15:21:13.000000000) ---
+Uploaded patch set 27.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-09 15:28:08.000000000) ---
+Patch Set 27:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-07-09 15:35:40.000000000) ---
+Patch Set 27:
+
+(10 comments)
+
+10 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-07-09 16:00:36.000000000) ---
+Patch Set 27: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/127363/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-07-09 16:46:55.000000000) ---
+Patch Set 27:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Autotest, 2026-07-10 00:51:29.000000000) ---
+Patch Set 27:
+
+Onyx Autotest 2 retesting enforced review-dne-part-5 session on el9.7-x86_64/ldiskfs servers and clients for build 127363 patch 27. Requested by Lai Siyao because of LU-9827.
+
+--- Message (Lai Siyao, 2026-07-10 06:58:33.000000000) ---
+Patch Set 27:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-07-14 17:39:03.000000000) ---
+Patch Set 27: Code-Review+1
+
+(3 comments)
+
+--- Message (Andreas Dilger, 2026-07-14 18:18:00.000000000) ---
+Patch Set 27: Code-Review-1
+
+(1 comment)
+
+--- Message (Lai Siyao, 2026-07-15 15:05:18.000000000) ---
+Uploaded patch set 28.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-15 15:10:55.000000000) ---
+Patch Set 28:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-07-15 15:17:00.000000000) ---
+Patch Set 28:
+
+(10 comments)
+
+10 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-07-15 15:36:45.000000000) ---
+Patch Set 28: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/127625/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-07-15 15:48:00.000000000) ---
+Patch Set 28:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Lai Siyao, 2026-07-16 02:25:53.000000000) ---
+Patch Set 28:
+
+(1 comment)
+
+--- Message (Lai Siyao, 2026-07-22 02:12:22.000000000) ---
+Patch Set 28:
+
+(2 comments)
+
+--- Message (Lai Siyao, 2026-07-22 02:37:08.000000000) ---
+Uploaded patch set 29.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-22 02:43:00.000000000) ---
+Patch Set 29:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-07-22 02:43:46.000000000) ---
+Patch Set 29:
+
+(10 comments)
+
+10 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-07-22 03:07:51.000000000) ---
+Patch Set 29: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/127894/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-07-22 03:39:36.000000000) ---
+Patch Set 29:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Andreas Dilger, 2026-07-23 00:50:32.000000000) ---
+Uploaded patch set 30.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andreas Dilger, 2026-07-23 00:50:32.000000000) ---
+Patch Set 30:
+
+(3 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-23 00:53:06.000000000) ---
+Patch Set 30:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (Andreas Dilger, 2026-07-23 00:58:02.000000000) ---
+Patch Set 29:
+
+(3 comments)
+
+--- Message (Andreas Dilger, 2026-07-23 00:58:37.000000000) ---
+Patch Set 30:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-07-23 01:00:43.000000000) ---
+Patch Set 30:
+
+(10 comments)
+
+10 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre RISC-V Builder, 2026-07-23 01:13:00.000000000) ---
+Patch Set 30:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-07-23 01:17:11.000000000) ---
+Patch Set 30: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/127964/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-07-27 22:05:58.000000000) ---
+Patch Set 30:
+
+(15 comments)
+
+AI code review results below, please doublecheck
+
+Some significant concerns, see inline comments. Two of the three headline behaviours described in the commit message do not appear to work as written: no MGC ever sets OBD_CONNECT_FTM, so a follower rejects every connection including clients, and the log-name match in cld_should_start_mgs() is lower-case while target config log names are upper-case, so a follower is never restarted on another target. This is a large piece of new user-visible functionality (MGS followers on every target, a new mgs.MGS.state parameter, a new connect-time rejection) with no test exercising it - the only conf-sanity change disables an existing test. Could conf-sanity gain a case that mounts an MDT/OST, checks a follower came up, mounts a client against it, and then unmounts the MGS0 to verify the follower migrates?
+
+--- Message (Oleg Drokin, 2026-08-27 03:36:14.000000000) ---
+Uploaded patch set 31.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-27 03:42:28.000000000) ---
+Patch Set 31:
+
+(11 comments)
+
+11 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-27 03:45:17.000000000) ---
+Patch Set 31:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-27 07:36:18.000000000) ---
+Patch Set 31: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130433/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-27 08:27:10.000000000) ---
+Patch Set 31:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-27 23:25:21.000000000) ---
+Patch Set 31:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The follower started from the MGC requeue thread runs mgs_fs_setup() against the lu_site of an already-running MDT/OST, which looks like it leaves that target with a NULL ls_top_dev.
+
+This adds a whole new service, a new mgs.MGS.state parameter and changes the meaning of "nomgs", but there is no new conf-sanity case. Could the patch add one that mounts two targets on a node, unmounts the one running the MGS and checks that the follower migrates and that mgs.MGS.state reports leader/follower as expected?
+
+--- Message (Oleg Drokin, 2026-08-29 20:25:41.000000000) ---
+Uploaded patch set 32.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-29 20:27:56.000000000) ---
+Patch Set 32:
+
+(12 comments)
+
+12 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-29 20:38:01.000000000) ---
+Patch Set 32:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-29 21:25:15.000000000) ---
+Patch Set 32: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130606/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-29 23:53:10.000000000) ---
+Patch Set 32:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-30 13:00:48.000000000) ---
+Patch Set 32:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The new follower is user-visible (a service started by default on every MDT/OST, a new mgs.MGS.state parameter, and changed nomgs/nosvc semantics) but no test exercises it - should conf-sanity get a case that mounts an OST/MDT, checks mgs.MGS.state=follower, and covers the MGS0-takes-over-from-a-follower path?
+
+--- Message (Andreas Dilger, 2026-08-31 02:32:11.000000000) ---
+Patch Set 32:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-08-31 20:07:37.000000000) ---
+Patch Set 32:
+
+(1 comment)
+
+--- Message (Oleg Drokin, 2026-09-01 01:03:09.000000000) ---
+Uploaded patch set 33.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-01 01:09:22.000000000) ---
+Patch Set 33:
+
+(10 comments)
+
+10 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-01 01:16:06.000000000) ---
+Patch Set 33:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-01 01:36:27.000000000) ---
+Patch Set 33: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130750/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-01 02:20:04.000000000) ---
+Patch Set 33:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Andreas Dilger, 2026-09-01 07:48:24.000000000) ---
+Patch Set 33: Code-Review+1
+
+(3 comments)
+
+--- Message (Gerrit AI review for Lustre, 2026-09-02 14:02:10.000000000) ---
+Patch Set 33:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The patch adds a lot of new user-visible behaviour - an MGS device now appears on every MDT/OST, `mgs.MGS.state` is new, and "nomgs"/"nosvc"/"rdonly_dev" now gate it - but no test exercises any of it. Should conf-sanity get a case that mounts a plain OST, checks `mgs.MGS.state` is "follower", verifies the MGS0 takeover and the requeue-thread restart after MGS0 stops, and confirms "-o nomgs" keeps the follower off? Also worth checking that suites which key off `lctl dl` output or `do_facet mgs` still behave now that every server node has an "MGS" device.
+
+--- Message (Andreas Dilger, 2026-09-02 22:26:48.000000000) ---
+Patch Set 33: Code-Review-1
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-09-02 22:33:37.000000000) ---
+Patch Set 33:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-09-02 23:08:07.000000000) ---
+Patch Set 33:
+
+(5 comments)
+
+--- Message (Oleg Drokin, 2026-09-03 07:14:33.000000000) ---
+Uploaded patch set 34.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-03 07:23:20.000000000) ---
+Patch Set 34:
+
+(11 comments)
+
+11 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-03 07:26:24.000000000) ---
+Patch Set 34:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-09-03 08:10:42.000000000) ---
+Patch Set 34:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-09-03 10:58:51.000000000) ---
+Patch Set 34: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/130905/ : FAILURE
+
+--- Message (jenkins, 2026-09-03 14:44:38.000000000) ---
+Patch Set 34:
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/130927/ : FAILURE
+
+--- Message (Andreas Dilger, 2026-09-03 19:43:30.000000000) ---
+Patch Set 35: Published edit on patch set 34.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andreas Dilger, 2026-09-03 19:43:37.000000000) ---
+Patch Set 36: Patch Set 35 was rebased
+
+--- Message (jenkins, 2026-09-03 19:43:57.000000000) ---
+Patch Set 35:
+
+No Builds Executed
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-03 19:46:20.000000000) ---
+Patch Set 36:
+
+Code-wise looks good to me.
+
+--- Message (Andreas Dilger, 2026-09-03 19:53:14.000000000) ---
+Patch Set 36: Code-Review+1
+
+(4 comments)
+
+--- Message (wc-checkpatch, 2026-09-03 20:07:43.000000000) ---
+Patch Set 36:
+
+(11 comments)
+
+11 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-03 21:41:22.000000000) ---
+Patch Set 34: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130987/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-03 21:54:20.000000000) ---
+Patch Set 36:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-09-03 22:55:09.000000000) ---
+Patch Set 36: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130996/ : SUCCESS
+
+--- Message (Oleg Drokin, 2026-09-04 05:57:59.000000000) ---
+Patch Set 36:
+
+(1 comment)
+
+--- Message (Gerrit AI review for Lustre, 2026-09-05 05:29:24.000000000) ---
+Patch Set 36:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good. The one point worth settling before this lands is the sptlrpc question inline in mgs_handler.c, since it changes what an OSS/MDS node exposes to clients; the rest are a commit-message matter, an undescribed leader-path behaviour change, and a carried-over review point that can ride along on a refresh.
+
+--- Message (Andreas Dilger, 2026-09-12 04:42:44.000000000) ---
+Patch Set 36:
+
+(2 comments)
+
+--- Message (Andreas Dilger, 2026-09-22 00:53:49.000000000) ---
+Patch Set 36:
+
+(29 comments)
+
+--- Message (Andreas Dilger, 2026-09-22 00:54:38.000000000) ---
+Uploaded patch set 37.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-22 00:57:54.000000000) ---
+Patch Set 37:
+
+Code-wise looks good to me.
+
+--- Message (Andreas Dilger, 2026-09-22 00:58:33.000000000) ---
+Patch Set 37:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-09-22 01:03:50.000000000) ---
+Patch Set 37:
+
+(11 comments)
+
+11 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-22 01:21:06.000000000) ---
+Patch Set 37: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132092/ : SUCCESS
+
+--- Message (Lai Siyao, 2026-09-22 02:00:23.000000000) ---
+Patch Set 37:
+
+(2 comments)
+
+--- Message (Andreas Dilger, 2026-09-22 08:38:53.000000000) ---
+Patch Set 37:
+
+(1 comment)
+
+--- Message (Gerrit AI review for Lustre, 2026-09-22 12:48:14.000000000) ---
+Patch Set 37:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good; only optional nits inline, and nothing here warrants a re-spin on its own. One coverage question: this adds a whole new service mode (a read-only MGS on every MDT/OST) plus the new mgs.MGS.state parameter, but the only test changes are the two that keep existing subtests passing. Does the series grow a conf-sanity case that drives the follower directly - state reporting, MGS0 taking over from a running follower, the requeue-thread restart after the MGS is stopped - or is that all left to the later changes in the chain that touch lustre/tests/?
+
+--- Message (Andreas Dilger, 2026-09-28 04:09:57.000000000) ---
+Patch Set 37:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-09-28 04:11:08.000000000) ---
+Patch Set 37:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-09-28 04:11:52.000000000) ---
+Patch Set 37:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-09-28 05:22:22.000000000) ---
+Uploaded patch set 38.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (patrick bot, 2026-09-28 05:22:32.000000000) ---
+Patch Set 38:
+
+(10 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-28 05:25:18.000000000) ---
+Patch Set 38:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-09-28 05:25:42.000000000) ---
+Patch Set 38:
+
+(11 comments)
+
+11 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (patrick bot, 2026-09-28 05:30:14.000000000) ---
+Patch Set 38:
+
+(12 comments)
+
+--- Message (jenkins, 2026-09-28 05:49:14.000000000) ---
+Patch Set 38: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132421/ : SUCCESS
+
+--- Message (Autotest, 2026-09-28 12:56:59.000000000) ---
+Patch Set 38:
+
+Trevis Autotest 2 retesting enforced review-dne-zfs-part-2 session on el10.1-x86_64/zfs servers and clients for build 132421 patch 38. Requested by Patrickbot because of LU-17891.
+
+--- Message (patrick bot, 2026-10-01 05:28:18.000000000) ---
+Patch Set 38:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-10-05 09:51:12.000000000) ---
+Uploaded patch set 39: Patch Set 38 was rebased.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-10-05 10:00:42.000000000) ---
+Patch Set 39:
+
+(11 comments)
+
+11 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-10-05 10:08:04.000000000) ---
+Patch Set 39: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/132822/ : FAILURE
+
+--- Message (Andreas Dilger, 2026-10-07 09:29:38.000000000) ---
+Patch Set 39:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-10-07 09:35:01.000000000) ---
+Patch Set 38:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-10-07 12:24:12.000000000) ---
+Uploaded patch set 40.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-10-07 12:24:47.000000000) ---
+Patch Set 40:
+
+(11 comments)
+
+11 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-07 12:28:38.000000000) ---
+Patch Set 40:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (jenkins, 2026-10-07 12:57:54.000000000) ---
+Patch Set 40: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133022/ : SUCCESS
+
+--- Message (Andreas Dilger, 2026-10-07 18:29:40.000000000) ---
+Uploaded patch set 41: Commit message was updated.
+
+Copied Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR **changekind:NO_CODE_CHANGE**")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-07 18:33:24.000000000) ---
+Patch Set 41:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-10-07 18:35:40.000000000) ---
+Patch Set 41:
+
+(11 comments)
+
+11 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Andreas Dilger, 2026-10-07 20:51:40.000000000) ---
+Uploaded patch set 42.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-10-07 20:54:31.000000000) ---
+Patch Set 42:
+
+(12 comments)
+
+12 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-07 20:55:42.000000000) ---
+Patch Set 42:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (jenkins, 2026-10-07 21:16:31.000000000) ---
+Patch Set 42: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133062/ : SUCCESS
+
+--- Message (patrick bot, 2026-10-08 06:29:35.000000000) ---
+Patch Set 42:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-10-08 06:31:21.000000000) ---
+Patch Set 42:
+
+(1 comment)
+
+--- Message (Autotest, 2026-10-08 06:33:43.000000000) ---
+Patch Set 42:
+
+Onyx Autotest retesting enforced review-dne-zfs-part-2 session on el10.1-x86_64/zfs servers and clients for build 133062 patch 42. Requested by Patrickbot because of LU-20477.
+
+--- Message (Autotest, 2026-10-08 07:46:32.000000000) ---
+Patch Set 42:
+
+Trevis Autotest retesting enforced review-dne-zfs-part-2 session on el10.1-x86_64/zfs servers and clients for build 133062 patch 42. Requested by Patrickbot because of LU-20477.
+
+--- Message (Gerrit AI review for Lustre, 2026-10-08 09:54:26.000000000) ---
+Patch Set 42:
+
+(7 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The <fsname>-client notify gap in mgc_process_cfg_log() is worth fixing before landing; the other comments are minor and can go in the same refresh.
+
+--- Message (Andreas Dilger, 2026-10-09 10:17:24.000000000) ---
+Uploaded patch set 43.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-09 10:28:47.000000000) ---
+Patch Set 43:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-09 10:32:40.000000000) ---
+Patch Set 43:
+
+(8 comments)
+
+8 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Andreas Dilger, 2026-10-09 10:38:51.000000000) ---
+Patch Set 15:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-10-09 10:38:59.000000000) ---
+Patch Set 36:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-10-09 10:39:00.000000000) ---
+Patch Set 40:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-10-09 10:39:02.000000000) ---
+Patch Set 41:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-10-09 10:39:03.000000000) ---
+Patch Set 42:
+
+(8 comments)
+
+--- Message (jenkins, 2026-10-09 10:48:49.000000000) ---
+Patch Set 43: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133261/ : SUCCESS
+
+--- Message (Autotest, 2026-10-10 04:36:22.000000000) ---
+Patch Set 43:
+
+Trevis Autotest retesting enforced review-dne-zfs-part-1 session on el10.1-x86_64/zfs servers and clients for build 133261 patch 43. Requested by Patrickbot because of LU-20523.
+
+--- Message (Gerrit AI review for Lustre, 2026-10-10 11:11:01.000000000) ---
+Patch Set 43:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good; two minor comments inline about server_mgs_lock(). Neither needs a re-spin on its own, but both are worth folding into the next refresh.
+
+--- Message (Andreas Dilger, 2026-10-13 07:31:04.000000000) ---
+Patch Set 43:
+
+(2 comments)
+
+--- Message (Andreas Dilger, 2026-10-13 08:47:25.000000000) ---
+Uploaded patch set 44.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andreas Dilger, 2026-10-13 08:47:42.000000000) ---
+Patch Set 43:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-10-13 08:57:06.000000000) ---
+Patch Set 44:
+
+(8 comments)
+
+8 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-13 14:49:08.000000000) ---
+Patch Set 44:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-13 15:30:00.000000000) ---
+Patch Set 44: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133537/ : SUCCESS
+
+--- Message (Autotest, 2026-10-14 12:06:46.000000000) ---
+Patch Set 44:
+
+Onyx Autotest retesting enforced review-dne-zfs-part-1 session on el9.8-x86_64/zfs servers and clients for build 133537 patch 44. Requested by Patrickbot because of LU-15566.

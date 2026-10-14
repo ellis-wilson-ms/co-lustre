@@ -1,5 +1,5 @@
 Change:     64919
-Subject:    LU-12668 lov: proactive dead-OST detection for degraded reads
+Subject:    LU-12669 lov: slow and dead OST detection for degraded reads
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/64919
 Change-Id:  I0913e1ee977c9850193c92835edb185b0aedc6d4
 Project:    fs/lustre-release
@@ -7,42 +7,93 @@ Branch:     master
 Status:     NEW
 Owner:      Maximilian Dilger
 Created:    2026-03-26 17:09:22.000000000
-Updated:    2026-04-25 12:10:26.000000000
-Patch Set:  36
-Insertions: +143
-Deletions:  -5
-Comments:   54 (1 unresolved)
+Updated:    2026-10-13 17:02:37.000000000
+Patch Set:  50
+Insertions: +2325
+Deletions:  -79
+Comments:   199 (2 unresolved)
 Hashtags:   pt_ecro
 
 --- Labels ---
-  Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Code-Review: Andreas Dilger: +1
+  Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
-  CC: Patrick Farrell, Abdul Halim
-  REVIEWER: Andreas Dilger
+  CC: Patrick Farrell, Marc Vef, Abdul Halim, Lustre RISC-V Builder, Gerrit AI review for Lustre, patrick bot
+  REVIEWER: Zhenyu Xu, Andreas Dilger, Ronnie Sahlberg
 
 --- Commit Message ---
-LU-12668 lov: proactive dead-OST detection for degraded reads
+LU-12669 lov: slow and dead OST detection for degraded reads
 
-Instead of letting I/O proceed to an inactive OST and failing deep
-in the BRW/lock path, detect dead imports early and route to the EC
-recovery path immediately.
+A read of an EC file whose data stripe is on a dead OST waits for
+the RPC's adaptive timeout, 7 s in production, before it is
+reconstructed from parity; a slow OSS extends that with early
+replies, and even a dead import costs the FLR retry rounds first.
 
-- Check for deactivated/invalid imports in lov_io_mirror_init() and
-  switch to CIT_EC_RD before starting normal read I/O.
-- Mark dead stripes as errored upfront in lov_ecio_add_data_sub()
-  so the recovery loop knows which stripes to reconstruct without
-  attempting I/O to them.
-- Force buffered reads in vvp_io_ec_rd_end() so that after EC
-  recovery populates the page cache, direct I/O does not bypass it
-  and re-issue reads to the dead OST.
+Give such reads a soft deadline and route around the OST.  A
+request past it fails with -ETIMEDOUT without failing the import or
+touching the adaptive timeout.  Each OSC keeps a smoothed OST_READ
+latency and deviation per RPC size, as for the TCP retransmission
+timer, and a top-level no-delay read of an EC or mirrored file gets
+a deadline, counted from its send, of the largest of
+osc.*.slow_read_pct (default 300) percent of the smoothed latency,
+that latency plus four deviations, and osc.*.slow_read_min_ms
+(default 250 ms for a non-rotational OST, 2 s otherwise).  An
+abandoned read marks the import slow for four times its deadline;
+each further soft timeout before a successful read doubles the
+deadline and the mark, up to the adaptive timeout.
 
-Created with the aid of claude. This patch enables the ability to
-run the EC failure orchestrator which will be in a patch following
-this one.
+LOV treats a deactivated, invalid, disconnected or slow-marked import
+as unavailable, but not one reconnecting from idle.  A read of a dead
+stripe is reconstructed at once when its raid set's own parity covers
+its dead stripes, and of a slow-marked one only when it covers all of
+its unavailable stripes; otherwise the read waits for them, e.g.
+until an OSS failover completes.  With no in-sync parity the file
+reads like a plain mirror.  A read of part of a raid set, whose
+reconstruction reads many times its size, gets no soft deadline and is
+not reconstructed around a slow stripe when most of the set's other
+stripes are on OSTs running at over twice their median latency since
+mount and over an eighth of slow_read_min_ms.  A plain mirror's
+buffered reads get the same deadline and rotate mirrors on expiry,
+unless no other mirror can serve the read.  An EC read skips the lock
+and read of a stripe it reconstructs by having no sub-IO for it,
+rather than through the lso_status shared with other readers.
+osc.*.slow_read_stats shows the estimates and counters.
 
+A 1MiB read of stripe 0 of a 4+2 EC file on an 8-OST VM, with one
+30s stall of its OST (OBD_FAIL_OST_BRW_PAUSE_BULK), then 200 1MiB
+direct and 200 4KiB buffered random reads while 4 writers load all
+OSTs:
+
+  slow_read_pct            0 (off)    300 (default)
+  direct read, stall       30053ms    2069ms
+  buffered read, stall     30055ms    2048ms
+  reads under load: 0 soft timeouts, no extra parity or survivor reads
+
+Also fix lov_io_set_range() rounding the reconstruction range end
+past its component, which LBUGged "uncovered page!"; the
+ra_cur_pages leak in ll_readahead_handle_work() when
+cl_io_rw_init() fails, which stopped readahead for the mount; and
+do_file_read_iter() never clearing via_hybrid_switched, which ran
+later O_DIRECT AIO reads on the same lu_env synchronously.  Also fix
+ll_readahead_handle_work() passing a page index and count to
+cl_io_rw_init() as bytes, which routed async readahead of FLR and EC
+files by the wrong extent, and the client io_latency_stats arrays
+being one size short for a maximum-size RPC.
+
+Add sanity-ec 77a-77j, and change test_29a to check that a read with
+more stripes lost than parity waits for their OSTs.
+
+Test-Parameters: testlist=sanity-ec ostcount=8
+Test-Parameters: testlist=sanity-ec ostcount=8 fstype=zfs
+Test-Parameters: testlist=sanity,sanity-flr ostcount=8
+Fixes: c2791674260b ("LU-12043 llite: improve single-thread read performance")
+Fixes: 3fc4243da7ef ("LU-13802 llite: tag switched hybrid IOs")
+Fixes: 783c13bb0b8f ("LU-12669 ec: recover data from parity")
+Fixes: d67cf23fb18a ("LU-18993 osc: Add IO RPC latency statistics by size")
 Signed-off-by: Maximilian Dilger <mdilger@whamcloud.com>
+Signed-off-by: Andreas Dilger <adilger@thelustrecollective.com>
+Assisted-by: ClaudeCode:claude-opus-5.5 ltvm,llm_code_and_review_tools
 Change-Id: I0913e1ee977c9850193c92835edb185b0aedc6d4
 
 --- Review History ---
@@ -914,3 +965,540 @@ Patch Set 36: Verified+1
 Build Successful 
 
 https://build.whamcloud.com/job/lustre-reviews/124372/ : SUCCESS
+
+--- Message (Maximilian Dilger, 2026-05-04 22:34:38.000000000) ---
+Uploaded patch set 37.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-05-04 22:44:12.000000000) ---
+Patch Set 37:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-05-04 23:04:24.000000000) ---
+Patch Set 37: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/124574/ : SUCCESS
+
+--- Message (Andreas Dilger, 2026-05-05 15:35:00.000000000) ---
+Patch Set 37:
+
+(1 comment)
+
+--- Message (Maximilian Dilger, 2026-05-05 15:52:38.000000000) ---
+Patch Set 37:
+
+(1 comment)
+
+--- Message (Marc Vef, 2026-05-20 14:33:31.000000000) ---
+Uploaded patch set 38.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-05-20 14:35:33.000000000) ---
+Patch Set 38:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-05-20 16:22:23.000000000) ---
+Patch Set 38: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/125369/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-05-22 01:13:20.000000000) ---
+Patch Set 38:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Ronnie Sahlberg, 2026-06-04 06:01:53.000000000) ---
+Uploaded patch set 39: Patch Set 38 was rebased.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-06-04 06:10:16.000000000) ---
+Patch Set 39:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-06-04 06:15:37.000000000) ---
+Patch Set 39:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (jenkins, 2026-06-04 07:15:14.000000000) ---
+Patch Set 39: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/125984/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-06-04 20:14:37.000000000) ---
+Patch Set 39:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Marc Vef, 2026-07-13 16:28:22.000000000) ---
+Uploaded patch set 40.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Lustre Gerrit Janitor, 2026-07-13 16:34:54.000000000) ---
+Patch Set 40:
+
+(1 comment)
+
+rocky8.10: Compile failed
+
+rocky9.6: Compile failed
+
+
+ Job output URL: https://testing.whamcloud.com/gerrit-janitor/66106/results.html
+
+--- Message (Marc Vef, 2026-07-13 16:38:25.000000000) ---
+Uploaded patch set 41.
+
+--- Message (jenkins, 2026-07-13 16:38:28.000000000) ---
+Patch Set 40:
+
+No Builds Executed
+
+--- Message (wc-checkpatch, 2026-07-13 16:39:07.000000000) ---
+Patch Set 41:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-13 16:49:00.000000000) ---
+Patch Set 41:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (Lustre RISC-V Builder, 2026-07-13 17:33:36.000000000) ---
+Patch Set 41:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Marc Vef, 2026-07-13 17:42:29.000000000) ---
+Uploaded patch set 42: Patch Set 41 was rebased.
+
+--- Message (jenkins, 2026-07-13 17:42:50.000000000) ---
+Patch Set 41: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/127520/ : ABORTED
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-13 17:52:34.000000000) ---
+Patch Set 42:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-07-13 17:56:24.000000000) ---
+Patch Set 42:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-07-13 18:42:44.000000000) ---
+Patch Set 42: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/127526/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-07-13 19:06:22.000000000) ---
+Patch Set 42:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Marc Vef, 2026-07-15 17:44:34.000000000) ---
+Uploaded patch set 43: Patch Set 42 was rebased.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-07-15 17:50:00.000000000) ---
+Patch Set 43:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-15 17:53:46.000000000) ---
+Patch Set 43:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (Lustre RISC-V Builder, 2026-07-15 18:12:24.000000000) ---
+Patch Set 43:
+
+RISC-V Client Builder: Cannot build patch due to 10, messages:
+
+ b'git checkout error!\n'
+
+--- Message (jenkins, 2026-07-15 19:05:22.000000000) ---
+Patch Set 43: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/127635/ : SUCCESS
+
+--- Message (Autotest, 2026-07-16 10:42:12.000000000) ---
+Patch Set 43:
+
+Trevis Autotest 2 retesting enforced review-dne-zfs-part-5 session on el9.7-x86_64/zfs servers and clients for build 127635 patch 43. Requested by Marc Vef because of LU-16489.
+
+--- Message (Autotest, 2026-07-16 10:42:33.000000000) ---
+Patch Set 43:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-2 session on el9.7-x86_64/zfs servers and clients for build 127635 patch 43. Requested by Marc Vef because of LU-19747.
+
+--- Message (Marc Vef, 2026-07-17 15:03:22.000000000) ---
+Patch Set 43:
+
+(5 comments)
+
+[AI review - fable] Some concerns, see inline comments. The two standalone EC read fixes bundled here (parity stripe selection in lov_ec_read_parity_stripe() and the eoff clamp in lov_io_ec_rd_start()) might be better squashed into the series patches that introduced that code.
+
+--- Message (Marc Vef, 2026-07-26 10:21:49.000000000) ---
+Uploaded patch set 44: Patch Set 43 was rebased.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Marc Vef, 2026-07-26 10:29:00.000000000) ---
+Uploaded patch set 45: Patch Set 44 was rebased.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-26 10:31:35.000000000) ---
+Patch Set 44:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-07-26 10:36:31.000000000) ---
+Patch Set 45:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-26 10:44:10.000000000) ---
+Patch Set 45:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (jenkins, 2026-07-26 10:57:23.000000000) ---
+Patch Set 44: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/128117/ : FAILURE
+
+--- Message (Lustre RISC-V Builder, 2026-07-26 11:01:34.000000000) ---
+Patch Set 44:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-07-26 11:30:05.000000000) ---
+Patch Set 45: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/128122/ : FAILURE
+
+--- Message (Lustre RISC-V Builder, 2026-07-26 12:50:25.000000000) ---
+Patch Set 45:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Marc Vef, 2026-07-28 02:17:43.000000000) ---
+Patch Set 45:
+
+(1 comment)
+
+--- Message (jenkins, 2026-07-28 02:53:26.000000000) ---
+Patch Set 45: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128193/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-07-28 16:35:33.000000000) ---
+Patch Set 45:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Mostly minor and style comments inline; nothing new on the functional side beyond what is already open on the change.
+
+--- Message (Maximilian Dilger, 2026-08-04 22:06:27.000000000) ---
+Uploaded patch set 46.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-04 22:12:10.000000000) ---
+Patch Set 46:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-04 22:17:43.000000000) ---
+Patch Set 46:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-04 22:34:14.000000000) ---
+Patch Set 46:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Maximilian Dilger, 2026-08-04 22:40:06.000000000) ---
+Patch Set 46:
+
+(9 comments)
+
+--- Message (jenkins, 2026-08-04 22:43:18.000000000) ---
+Patch Set 46: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128679/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-08-05 12:45:22.000000000) ---
+Patch Set 46:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The ll_readahead_handle_work() reservation fix is independent of EC and repairs a bug in long-landed code -- would it be better as its own patch with its own Change-Id, so it can land and be backported on its own schedule?
+
+--- Message (Maximilian Dilger, 2026-08-06 17:41:20.000000000) ---
+Patch Set 46:
+
+(1 comment)
+
+--- Message (Maximilian Dilger, 2026-08-19 02:58:47.000000000) ---
+Uploaded patch set 47.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-19 03:09:20.000000000) ---
+Patch Set 47:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-19 03:09:50.000000000) ---
+Patch Set 47:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-08-19 03:46:15.000000000) ---
+Patch Set 47: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129693/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-19 03:48:24.000000000) ---
+Patch Set 47:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-19 15:33:26.000000000) ---
+Patch Set 47:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good; the three code changes trace correctly. Two whole-patch points. First, this bundles three independent concerns, and the ll_readahead_handle_work() reservation leak is the odd one out: it is a fix for landed code (c2791674260b), has nothing to do with erasure coding, and could review and land on its own Change-Id instead of waiting behind the EC series. Second, neither of the two bugs fixed here gets a test. The commit message even names a reproducer layout for the client panic (-E 4M -c 3 --ec 2+1, -E -1 -c 5 --ec 4+1); turning that into a sanity-ec case, plus one that deactivates an OST and reads a degraded EC file, would keep both from coming back.
+
+--- Message (Autotest, 2026-08-19 16:56:41.000000000) ---
+Patch Set 47:
+
+Trevis Autotest 2 retesting enforced review-dne-part-2 session on el9.7-x86_64/ldiskfs servers and clients for build 129693 patch 47. Requested by Max Dilger because of TIMEOUT.
+
+--- Message (Autotest, 2026-08-19 16:57:51.000000000) ---
+Patch Set 47:
+
+Trevis Autotest 2 retesting enforced review-dne-zfs-part-2 session on el10.1-x86_64/zfs servers and clients for build 129693 patch 47. Requested by Max Dilger because of LU-19730.
+
+--- Message (Maximilian Dilger, 2026-08-20 00:10:17.000000000) ---
+Patch Set 47:
+
+(4 comments)
+
+--- Message (Maximilian Dilger, 2026-08-20 00:58:57.000000000) ---
+Patch Set 47:
+
+(11 comments)
+
+--- Message (Maximilian Dilger, 2026-09-26 17:51:56.000000000) ---
+Uploaded patch set 48.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-26 17:55:22.000000000) ---
+Patch Set 48:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-26 18:07:05.000000000) ---
+Patch Set 48:
+
+(30 comments)
+
+30 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-26 18:15:44.000000000) ---
+Patch Set 48: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132355/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-27 06:38:19.000000000) ---
+Patch Set 48:
+
+(6 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. Separately: the ll_readahead_handle_work() reservation leak and the via_hybrid_switched reset are llite fixes unrelated to EC, each with its own Fixes: tag. Putting them in their own patches would let them land and be backported without waiting for this feature.
+
+--- Message (Andreas Dilger, 2026-10-01 05:44:01.000000000) ---
+Patch Set 48:
+
+(14 comments)
+
+--- Message (Andreas Dilger, 2026-10-02 09:18:36.000000000) ---
+Patch Set 48:
+
+(5 comments)
+
+Looking at the case where an OST dies or turns slow while reads are in flight.  An OST that is already known to be down (import DISCONN/inactive) is handled well by the early imp_unreachable() check.  The in-flight case depends entirely on the soft deadline, which is off by default, has no deadline until this OSC has an average for the RPC size, and is measured against the OST's own history so a persistently slow OST stops tripping it.  Comments inline, mostly about the trigger; the ptlrpc soft deadline plumbing and the routing of known-dead OSTs look like the right base to build the raidset-relative deadline on.
+
+There are no numbers yet for the expected improvement.  Before this is enabled by default it needs a measurement of read latency with one OST stopped mid-read, and of the extra parity/survivor read traffic (and soft timeout count) for EC reads under a background load that raises latency on all OSTs, to show the false positive rate.
+
+--- Message (Andreas Dilger, 2026-10-05 04:51:00.000000000) ---
+Uploaded patch set 49.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andreas Dilger, 2026-10-05 04:52:12.000000000) ---
+Patch Set 49:
+
+(21 comments)
+
+--- Message (wc-checkpatch, 2026-10-05 04:53:23.000000000) ---
+Patch Set 49:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-10-05 05:18:13.000000000) ---
+Patch Set 49: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132803/ : SUCCESS
+
+--- Message (Andreas Dilger, 2026-10-05 05:33:14.000000000) ---
+Patch Set 49:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-10-05 05:38:01.000000000) ---
+Patch Set 49:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-10-05 06:02:11.000000000) ---
+Uploaded patch set 50.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andreas Dilger, 2026-10-05 06:02:19.000000000) ---
+Patch Set 50:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-10-05 06:09:30.000000000) ---
+Patch Set 50:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Andreas Dilger, 2026-10-05 06:13:45.000000000) ---
+Patch Set 50: Code-Review+1
+
+--- Message (jenkins, 2026-10-05 06:27:02.000000000) ---
+Patch Set 50: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132805/ : SUCCESS
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-05 06:28:35.000000000) ---
+Patch Set 49:
+
+Code-wise looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-05 06:36:17.000000000) ---
+Patch Set 50:
+
+Code-wise looks good to me.
+
+--- Message (Gerrit AI review for Lustre, 2026-10-05 18:53:07.000000000) ---
+Patch Set 50:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The soft-deadline plumbing and dead-OST routing look sound; one routing case for reads spanning several raid sets does not wait as described, and the io_latency_stats overflow fix would be easier to backport as its own patch.
+
+--- Message (Andreas Dilger, 2026-10-07 20:07:29.000000000) ---
+Patch Set 50:
+
+(5 comments)
+
+--- Message (Andreas Dilger, 2026-10-07 20:07:45.000000000) ---
+Patch Set 50: -Code-Review
+
+--- Message (Andreas Dilger, 2026-10-13 17:02:37.000000000) ---
+Patch Set 50: Code-Review+1

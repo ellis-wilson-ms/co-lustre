@@ -1,32 +1,80 @@
 Change:     64250
-Subject:    LU-19932 osc: restore interruptible waits on client
+Subject:    LU-19932 osc: allow killing a write waiting on an extent
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/64250
 Change-Id:  I140bdd6cdea3ccd985b457ee4b6bf415a542c669
 Project:    fs/lustre-release
 Branch:     master
-Status:     NEW
+Status:     MERGED
 Owner:      Andreas Dilger
 Created:    2026-02-26 21:36:49.000000000
-Updated:    2026-03-09 21:39:37.000000000
-Patch Set:  4
-Insertions: +28
-Deletions:  -29
-Comments:   9 (0 unresolved)
+Updated:    2026-10-13 04:20:08.000000000
+Patch Set:  7
+Insertions: +65
+Deletions:  -39
+Comments:   28 (0 unresolved)
+Hashtags:   master-next
 
 --- Labels ---
-  Code-Review: Jinshan Xiong: +1; Andreas Dilger: -1
-  Verified: jenkins: +1; Maloo: -1
+  Code-Review: Jinshan Xiong: +1; Oleg Drokin: +2; Vitaliy Kuznetsov: +1
+  Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
-  REVIEWER: Andreas Dilger, James Simmons, Jinshan Xiong
+  CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
+  REVIEWER: Oleg Drokin, Andreas Dilger, James Simmons, Jinshan Xiong, Patrick Farrell, Vitaliy Kuznetsov
 
 --- Commit Message ---
-LU-19932 osc: restore interruptible waits on client
+LU-19932 osc: allow killing a write waiting on an extent
 
-Some interruptible wait conditions were lost in translation to
-kernel wait primitives.  Change some wait_event_idle() calls back
-to l_wait_event_abortable() so that user processes can be killed
-if the server is unresponsive.
+A process writing to a file can block indefinitely in
+osc_extent_wait() while an extent it needs is in flight to an
+unresponsive server, with no way to kill it.  Make that wait abortable
+on the two paths that queue a page, osc_extent_find() and
+osc_queue_async_io(), which hand the error back to the writer.
+
+The wait stays uninterruptible wherever the caller goes on to flush,
+discard or truncate the pages, which must not happen on top of an
+incomplete drain: osc_cache_wait_range() for osc_lock_flush() and the
+fsync drain, osc_cache_writeback_range(), osc_object_invalidate(), and
+the truncate handshake between osc_extent_release() and
+osc_cache_truncate_start(), which has to reach OES_TRUNC before
+osc_extent_truncate() asserts on it.  That is what LU-2779 made this
+wait uninterruptible for.  osc_queue_dio_pages() stays uninterruptible
+for its own reason: returning early would leave its pages counted in
+the DIO sync anchor.
+
+The hang reported in LU-19932 is in that fsync drain and is not one of
+the ones this makes killable.  Making the drain killable would not fix
+it either: the writer returns into filemap_write_and_wait_range(),
+which then waits uninterruptibly in folio_wait_writeback() for the
+same pages, since cl_page_make_ready() marks every page of a write RPC
+PG_writeback.  Measured against an OST stalled with
+OBD_FAIL_OST_BRW_PAUSE_BULK, SIGKILL does not free a writer from that
+second wait.
+
+Only the second wait becomes abortable, the one entered after the
+initial 600s wait has already reported the extent as stalled.  An
+ordinary wait for an extent that is merely still in flight must not be
+cut short by a SIGALRM or a SIGINT.
+
+An mmap store reaches osc_queue_async_io() through page_mkwrite(),
+which maps an interrupted wait to VM_FAULT_SIGBUS.  Use a killable
+wait for mkwrite so a caught SIGTERM cannot cause an unexpected
+SIGBUS. After the initial 600s timeout, fatal signals can still abort
+this wait; caught signals remain pending until the wait completes.
+Normal writes retain the abortable wait.  This avoids introducing a
+refault, which needs the kernel-mode fault case worked out: a fault
+taken from inside a syscall does not dequeue the signal and would
+re-execute rather than end the syscall.
+
+Release the current page's dirty-cache reservation if the wait in
+osc_queue_async_io() fails.  The page has not joined the extent yet,
+so RPC completion cannot release its per-OSC and global dirty-page
+accounting.  This also covers the existing RPC-error exit.
+
+osc_extent_wait() returns only 0 or a negative errno.  The leftover
+jiffies from wait_event_idle_timeout() must not reach the callers:
+osc_queue_async_io() only calls osc_extent_find() when rc is zero, and
+on a non-zero rc walks the extent pointer it has just released.
 
 Simplify ldlm_completion_ast() to only call l_wait_event_abortable()
 once instead of in two separate branches to avoid code duplication.
@@ -35,10 +83,16 @@ Simplify osc_extent::oe_rc usage to only hold 0 (success) or a
 negative errno.  Storing the number of pages there isn't used for
 anything, and it complicates its usage elsewhere.
 
-Fixes: fa9c4d0fee ("LU-10467 lustre: use wait_event_idle() where appropriate.")
-Fixes: d6ce546eb7 ("LU-10467 obdclass: convert waiting in cl_sync_io_wait().")
+Fixes: 26345bee6b04 ("LU-2779 osc: osc_extent_wait() shouldn't be interruptible")
 Signed-off-by: Andreas Dilger <adilger@thelustrecollective.com>
+Signed-off-by: Oleg Drokin <green@whamcloud.com>
+Signed-off-by: Vitaliy Kuznetsov <vkuznetsov@ddn.com>
+Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
 Change-Id: I140bdd6cdea3ccd985b457ee4b6bf415a542c669
+Reviewed-on: https://review.whamcloud.com/c/fs/lustre-release/+/64250
+Reviewed-by: Jinshan Xiong <jinshanx@google.com>
+Tested-by: jenkins <devops@whamcloud.com>
+Tested-by: Maloo <maloo@whamcloud.com>
 
 --- Review History ---
 
@@ -165,3 +219,143 @@ Patch Set 4: Code-Review+1
 Patch Set 4: Code-Review-1
 
 (1 comment)
+
+--- Message (Oleg Drokin, 2026-09-04 02:56:56.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Code-Review+1, Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-04 03:04:22.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-04 03:07:34.000000000) ---
+Patch Set 5:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-04 03:28:19.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131022/ : SUCCESS
+
+--- Message (Andreas Dilger, 2026-09-04 07:21:21.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+--- Message (Lustre RISC-V Builder, 2026-09-04 07:43:23.000000000) ---
+Patch Set 5:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-09-05 12:48:21.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Looks good - the extent-state handshake, the oe_rc simplification and the ldlm_completion_ast() rework all check out, and the reachable abortable path (osc_extent_find() conflict wait) cleans up after itself. One pre-existing accounting gap that this change makes routinely reachable is noted inline; it is not a reason to re-spin a patch that has already passed testing, and could equally be a separate change.
+
+--- Message (Vitaliy Kuznetsov, 2026-09-05 22:54:16.000000000) ---
+Uploaded patch set 6.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Vitaliy Kuznetsov, 2026-09-05 22:57:22.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-05 22:57:30.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-05 23:06:36.000000000) ---
+Patch Set 6:
+
+(3 comments)
+
+3 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-05 23:47:17.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131162/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-06 14:20:39.000000000) ---
+Patch Set 6:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-09-07 05:53:33.000000000) ---
+Patch Set 6:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good. The extent-wait rework, the return-value normalisation and the dirty-page release on the new error path all trace out correctly, and the commit message matches what the code does. Only optional comments inline - no need to re-spin for them.
+
+The one whole-patch thought is test coverage: nothing in the suites exercises the new killable path, and because it only engages once the 600s wait has expired, a sanity case would have to sit for ten minutes. Worth deciding whether that is acceptable or whether the first wait should carry the killable state too (inline note on that line).
+
+--- Message (Vitaliy Kuznetsov, 2026-09-07 11:46:16.000000000) ---
+Patch Set 6: Code-Review+1
+
+(2 comments)
+
+--- Message (Autotest, 2026-09-07 11:48:42.000000000) ---
+Patch Set 6:
+
+Onyx Autotest retesting enforced review-dne-part-2 session on el9.7-x86_64/ldiskfs servers and clients for build 131162 patch 6. Requested by Vitaliy K because of LU-17891.
+
+--- Message (Vitaliy Kuznetsov, 2026-09-07 18:19:49.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-09-16 20:16:49.000000000) ---
+Patch Set 6:
+
+(3 comments)
+
+--- Message (Andreas Dilger, 2026-09-19 00:05:50.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+--- Message (Jinshan Xiong, 2026-09-19 03:14:41.000000000) ---
+Patch Set 6: Code-Review+1
+
+(1 comment)
+
+--- Message (Marc Vef, 2026-09-29 09:48:23.000000000) ---
+Hashtag added: master-next
+
+--- Message (Marc Vef, 2026-09-29 09:48:24.000000000) ---
+Patch Set 6:
+
+[Marc Bot] Note: This change has been cherry-picked to master-next and is considered for landing. Please avoid updates unless required while the master-next hashtag is set; doing so may cause the patch to be removed from master-next and not landed. Note: AI review comments should be addressed/responded to.
+
+--- Message (Marc Vef, 2026-09-29 09:48:24.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Oleg Drokin, 2026-10-13 04:20:04.000000000) ---
+Patch Set 6: Code-Review+2
+
+--- Message (Oleg Drokin, 2026-10-13 04:20:08.000000000) ---
+Change has been successfully cherry-picked as 501d772c4638ed26c613b022d08ec7947f56300d
