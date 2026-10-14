@@ -8,28 +8,15 @@ Resolution: Unresolved
 Assignee:   Yang Sheng
 Reporter:   Yang Sheng
 Created:    Fri, 30 Jan 2026 02:12:48 +0000
-Updated:    Thu, 19 Feb 2026 03:51:13 +0000
+Updated:    Fri, 7 Aug 2026 22:00:18 +0000
 
 --- Description ---
 This ASSERTION should be replaced to return a EINVAL since the invalid value could be caused by some unstable network environment.
 
---- Comment (gerrit, Fri, 13 Feb 2026 01:23:20 +0000) ---
-"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/63820/
+--- Comment (gerrit, Fri, 30 Jan 2026 06:15:12 +0000) ---
+"Yang Sheng " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/63664
 
-Subject:  md_packed )" class="issue-link" data-issue-key="LU-19841">LU-19841 mdt: reset md_packed after buffer shrink
-
-Project: fs/lustre-release
-
-Branch: master
-
-Current Patch Set: 
-
-Commit: 599cbfd8507dded5b6904cd79389b03e515722a7
-
---- Comment (gerrit, Thu, 5 Feb 2026 16:53:12 +0000) ---
-"Alex Zhuravlev " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/63820
-
-Subject:  md_packed )" class="issue-link" data-issue-key="LU-19841">LU-19841 mdt: reset md_packed after buffer shrink
+Subject:  md_packed )" class="issue-link" data-issue-key="LU-19841">LU-19841 mdt: check md_size value
 
 Project: fs/lustre-release
 
@@ -37,7 +24,99 @@ Branch: master
 
 Current Patch Set: 1
 
-Commit: e390456683581b9576d5bdc8879b424cad06de79
+Commit: fb4d1ac9f2627eacf999f2103a9f59470e467508
+
+--- Comment (bzzz, Fri, 30 Jan 2026 11:11:07 +0000) ---
+can you please clarify how this happens?
+
+--- Comment (ys, Fri, 30 Jan 2026 11:57:13 +0000) ---
+Hi, Alex, It is instance from customer:
+
+regarding all the occurrences of this bug, we find a relation between the crashes and the state of an infiniband switch and operation on this infiniband switch .
+
+So the root cause is not lustre. No more crash since the bad switch has been repaired
+
+ 
+So just conclude the value could be corrupted while network transfer.
+
+--- Comment (bzzz, Sun, 1 Feb 2026 14:33:37 +0000) ---
+hmm, then what exactly will happen when this error is returned to the client?
+
+--- Comment (icostelloddn, Mon, 2 Feb 2026 14:31:56 +0000) ---
+Is it possible to test fault injection into the packet stream to see if this is the reason for the assertion, and as Alex mentioned how the client deals with EINVAL?
+
+--- Comment (bzzz, Mon, 2 Feb 2026 18:40:13 +0000) ---
+I find it unlikely that we hit exactly the same corrupted field (and no other) in RPC many times in few hours like happened to the system.
+
+rather this is some disagreement on the client side about number of active/configured OSTs leading to a small buffer to receive large LOV EA.
+
+--- Comment (ys, Tue, 3 Feb 2026 00:41:07 +0000) ---
+Hi, Alex, So do you mean we need add more data verification on client too? Maybe some generic way to verify package directly is more effective, like CRC?
+
+--- Comment (bzzz, Tue, 3 Feb 2026 05:43:56 +0000) ---
+So do you mean we need add more data verification on client too? {quote}
+
+I mean that we don't understand what happened, what the values were and why they are considered wrong.
+
+this problem has been reported many times already, in different tickets - not a random issue.
+
+at least we need to analyze the crash dumps.
+
+--- Comment (ys, Tue, 3 Feb 2026 06:02:56 +0000) ---
+I have finished a analysis in DDN-5403. You can take a look for detail.
+
+--- Comment (bzzz, Tue, 3 Feb 2026 11:11:02 +0000) ---
+I have finished a analysis in DDN-5403. You can take a look for detail.{quote}
+
+thanks, I did. and now this is even more confusing IMO.
+
+I've got two questions:
+
+1) md_size is actual LOV EA size, md_packed is size of reply buffer (LOVEA part), if md_size 2) what's wrong with sending back a small LOV EA using a larger buffer? why do we need to return -EINVAL leading to something like EIO to app potentially?
+
+--- Comment (bzzz, Tue, 3 Feb 2026 11:19:18 +0000) ---
+also, I find the following confusing:
+
+if (info->mti_big_lmm_used) {	
+        /* big_lmm buffer may be used even without packing the result
+         * into reply, just for internal server needs */
+        if (req_capsule_has_field(pill, &RMF_MDT_MD, RCL_SERVER))
+		md_packed = req_capsule_get_size(pill, &RMF_MDT_MD, RCL_SERVER);
+ 
+
+so mti_big_lmm_used=1 doesn't mean we really need to return LOVEA, and the following lines confirm that:
+
+ /* now we need to pack right LOV/LMV EA */
+lmm = req_capsule_server_get(pill, &RMF_MDT_MD);
+if (info->mti_attr.ma_valid & MA_LOV) {
+        memcpy(lmm, info->mti_attr.ma_lmm,
+		info->mti_attr.ma_lmm_size);
+
+thus it could be that we didn't even need to pack LOVEA into the reply, but still hit LASSERT()
+
+one reason to skip LOVEA is a race with a mirror creation/removal when we can't get LAYOUT lock, but we still fetch LOVEA before lock enqueue.
+
+--- Comment (bzzz, Tue, 3 Feb 2026 14:28:19 +0000) ---
+I added a simple check;
+
+@@ -1095,8 +1095,13 @@ static int mdt_refetch_lovea(struct mdt_thread_info *info,
+        struct mdt_body *repbody;
+        int rc;
+ 
+-       if ((ibits & MDS_INODELOCK_LAYOUT) == 0)
++       if ((ibits & MDS_INODELOCK_LAYOUT) == 0) {
++               LASSERTF(info->mti_big_lov_used == 0,
++                       "%s %s\n",
++                       S_ISREG(lu_object_attr(&o->mot_obj)) ? "reg" : "nonreg",
++                       (ma->ma_valid & MA_LOV) ? "LOVEA" : "");
+                return 0;
++       }
+
+and I can hit the assertion quite easily:
+
+ LustreError: 6820:0:(mdt_open.c:1099:mdt_refetch_lovea()) ASSERTION( info->mti_big_lov_used == 0 ) failed: reg LOVEA
+
+literally this means that we may have LOVEA fetched into a big buffer without layout lock, i.e. there was another thread modifying LOV EA (e.g. shrinking it)
 
 --- Comment (bzzz, Thu, 5 Feb 2026 15:10:36 +0000) ---
 I'm able to reproduce using this test:
@@ -134,102 +213,10 @@ the result:
 [   82.625748]  ? ptlrpc_watchdog_init+0xb0/0xb0 [ptlrpc]
 [   82.625979]  kthread+0xce/0xf0
 
---- Comment (bzzz, Tue, 3 Feb 2026 14:28:19 +0000) ---
-I added a simple check;
+--- Comment (gerrit, Thu, 5 Feb 2026 16:53:12 +0000) ---
+"Alex Zhuravlev " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/63820
 
-@@ -1095,8 +1095,13 @@ static int mdt_refetch_lovea(struct mdt_thread_info *info,
-        struct mdt_body *repbody;
-        int rc;
- 
--       if ((ibits & MDS_INODELOCK_LAYOUT) == 0)
-+       if ((ibits & MDS_INODELOCK_LAYOUT) == 0) {
-+               LASSERTF(info->mti_big_lov_used == 0,
-+                       "%s %s\n",
-+                       S_ISREG(lu_object_attr(&o->mot_obj)) ? "reg" : "nonreg",
-+                       (ma->ma_valid & MA_LOV) ? "LOVEA" : "");
-                return 0;
-+       }
-
-and I can hit the assertion quite easily:
-
- LustreError: 6820:0:(mdt_open.c:1099:mdt_refetch_lovea()) ASSERTION( info->mti_big_lov_used == 0 ) failed: reg LOVEA
-
-literally this means that we may have LOVEA fetched into a big buffer without layout lock, i.e. there was another thread modifying LOV EA (e.g. shrinking it)
-
---- Comment (bzzz, Tue, 3 Feb 2026 11:19:18 +0000) ---
-also, I find the following confusing:
-
-if (info->mti_big_lmm_used) {	
-        /* big_lmm buffer may be used even without packing the result
-         * into reply, just for internal server needs */
-        if (req_capsule_has_field(pill, &RMF_MDT_MD, RCL_SERVER))
-		md_packed = req_capsule_get_size(pill, &RMF_MDT_MD, RCL_SERVER);
- 
-
-so mti_big_lmm_used=1 doesn't mean we really need to return LOVEA, and the following lines confirm that:
-
- /* now we need to pack right LOV/LMV EA */
-lmm = req_capsule_server_get(pill, &RMF_MDT_MD);
-if (info->mti_attr.ma_valid & MA_LOV) {
-        memcpy(lmm, info->mti_attr.ma_lmm,
-		info->mti_attr.ma_lmm_size);
-
-thus it could be that we didn't even need to pack LOVEA into the reply, but still hit LASSERT()
-
-one reason to skip LOVEA is a race with a mirror creation/removal when we can't get LAYOUT lock, but we still fetch LOVEA before lock enqueue.
-
---- Comment (bzzz, Tue, 3 Feb 2026 11:11:02 +0000) ---
-I have finished a analysis in DDN-5403. You can take a look for detail.{quote}
-
-thanks, I did. and now this is even more confusing IMO.
-
-I've got two questions:
-
-1) md_size is actual LOV EA size, md_packed is size of reply buffer (LOVEA part), if md_size 2) what's wrong with sending back a small LOV EA using a larger buffer? why do we need to return -EINVAL leading to something like EIO to app potentially?
-
---- Comment (ys, Tue, 3 Feb 2026 06:02:56 +0000) ---
-I have finished a analysis in DDN-5403. You can take a look for detail.
-
---- Comment (bzzz, Tue, 3 Feb 2026 05:43:56 +0000) ---
-So do you mean we need add more data verification on client too? {quote}
-
-I mean that we don't understand what happened, what the values were and why they are considered wrong.
-
-this problem has been reported many times already, in different tickets - not a random issue.
-
-at least we need to analyze the crash dumps.
-
---- Comment (ys, Tue, 3 Feb 2026 00:41:07 +0000) ---
-Hi, Alex, So do you mean we need add more data verification on client too? Maybe some generic way to verify package directly is more effective, like CRC?
-
---- Comment (bzzz, Mon, 2 Feb 2026 18:40:13 +0000) ---
-I find it unlikely that we hit exactly the same corrupted field (and no other) in RPC many times in few hours like happened to the system.
-
-rather this is some disagreement on the client side about number of active/configured OSTs leading to a small buffer to receive large LOV EA.
-
---- Comment (icostelloddn, Mon, 2 Feb 2026 14:31:56 +0000) ---
-Is it possible to test fault injection into the packet stream to see if this is the reason for the assertion, and as Alex mentioned how the client deals with EINVAL?
-
---- Comment (bzzz, Sun, 1 Feb 2026 14:33:37 +0000) ---
-hmm, then what exactly will happen when this error is returned to the client?
-
---- Comment (ys, Fri, 30 Jan 2026 11:57:13 +0000) ---
-Hi, Alex, It is instance from customer:
-
-regarding all the occurrences of this bug, we find a relation between the crashes and the state of an infiniband switch and operation on this infiniband switch .
-
-So the root cause is not lustre. No more crash since the bad switch has been repaired
-
- 
-So just conclude the value could be corrupted while network transfer.
-
---- Comment (bzzz, Fri, 30 Jan 2026 11:11:07 +0000) ---
-can you please clarify how this happens?
-
---- Comment (gerrit, Fri, 30 Jan 2026 06:15:12 +0000) ---
-"Yang Sheng " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/63664
-
-Subject:  md_packed )" class="issue-link" data-issue-key="LU-19841">LU-19841 mdt: check md_size value
+Subject:  md_packed )" class="issue-link" data-issue-key="LU-19841">LU-19841 mdt: reset md_packed after buffer shrink
 
 Project: fs/lustre-release
 
@@ -237,4 +224,22 @@ Branch: master
 
 Current Patch Set: 1
 
-Commit: fb4d1ac9f2627eacf999f2103a9f59470e467508
+Commit: e390456683581b9576d5bdc8879b424cad06de79
+
+--- Comment (gerrit, Fri, 13 Feb 2026 01:23:20 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/63820/
+
+Subject:  md_packed )" class="issue-link" data-issue-key="LU-19841">LU-19841 mdt: reset md_packed after buffer shrink
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 599cbfd8507dded5b6904cd79389b03e515722a7
+
+--- Comment (bzzz, Mon, 9 Mar 2026 09:20:16 +0000) ---
+Is there any remaining work on this ticket? 
+
+I've just pushed exa7 version

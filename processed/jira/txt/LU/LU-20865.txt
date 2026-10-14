@@ -1,0 +1,37 @@
+Key:        LU-20865
+Summary:    FLR-EC: reconstruct degraded EC reads in readahead
+Link:       https://jira.whamcloud.com/browse/LU-20865
+Type:       Technical task
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Andreas Dilger
+Created:    Fri, 2 Oct 2026 11:19:09 +0000
+Updated:    Fri, 2 Oct 2026 12:17:31 +0000
+
+--- Description ---
+When a data stripe of an EC file is on a slow or failed OST, the client reconstructs the data from parity only when a synchronous read restarts as CIT_EC_RD, so the application waits for the soft deadline, then for the survivor and parity reads and the decode.  Buffered reads are typically sequential, so this work could instead be done by readahead, hiding both the detection and the reconstruction latency from the application.
+
+Proposed design, from the review of https://review.whamcloud.com/64919 ("LU-12669 lov: slow and dead OST detection for degraded reads"):
+
+	Align the readahead window on raid set boundaries (k data stripes x stripe size from the component start), so that readahead reads whole raid sets.
+
+	Track completion of each raid set's data stripe reads in the readahead.  When k-m of the k data stripes have completed at time t(k-m) after the raid set read started, at most m stripes are outstanding and the parity can always stand in for them, so give the remaining stripe reads a soft deadline of max(slow_read_min_ms, t(k-m) * slow_read_pct / 100).  This adapts to the current load (if all OSTs are slow nothing trips), has no cold start, catches persistently slow OSTs, and only fires when reconstruction can succeed.
+
+	When the deadline passes, read the needed parity stripes and decode the missing data in the background, without blocking the application.  The decoded data is identical to the data being read, so the decode can write directly into the same page cache pages as the outstanding RPC.  The page completion and unlock stay with the RPC: once the decode is finished, abandon the outstanding RPC (unlink its bulk, as ptlrpc_soft_expire_one_request() does) and have its completion keep the decoded data (a "data valid" flag on the page) instead of discarding the page on error.  Whichever finishes first wins.
+
+	Re-use survivor stripe pages already in the page cache, including readahead pages that are not yet marked Uptodate (cp_defer_uptodate), rather than reading them again.
+
+	For buffered reads smaller than a raid set that need reconstruction, keep the survivor stripes read for the decode in the page cache as readahead pages, so they are re-used if the application reads them later.
+
+	O_DIRECT reads (to be decided): survivor stripes already fetched to the client for a reconstruction could be kept and copied into a later DIO read buffer while the DLM lock covers them, instead of being read again.
+
+This depends on 64919, on https://review.whamcloud.com/69346 ("LU-12669 lov: keep EC read stripe errors per IO") for per-IO stripe error state, and on a follow-on patch adding the same t(k-m) peer-relative deadline for synchronous full-raid-set reads.  Rough estimate 1.7k-2.8k lines including tests, so it should be done as its own series.
+
+--- Comment (adilger, Fri, 2 Oct 2026 12:17:31 +0000) ---
+This came up while I was reviewing Max's patch https://review.whamcloud.com/64919 ("LU-12668 lov: slow and dead OST detection for degraded reads").  It totally makes sense that we do parity reconstruction for unavailable OSTs during readahead, so that the rebuild can avoid slowing down the application before it gets to the unavailable stripe(s).
+
+It might make sense for readahead to allow a longer deadline for rebuilds than synchronous reads to avoid unnecessary read inflation.
+
+There are already parts of this being implemented in and on 64919, but the readahead changes seemed significant enough that I didn't want to just blast ahead with it before there was some discussion.

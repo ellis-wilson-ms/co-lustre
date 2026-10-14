@@ -1,0 +1,75 @@
+Key:        LU-20807
+Summary:    double free possibility in cl_sub_dio cleanup for vectorless iterators
+Link:       https://jira.whamcloud.com/browse/LU-20807
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Sonia Sharma
+Reporter:   Sonia Sharma
+Created:    Tue, 22 Sep 2026 23:53:38 +0000
+Updated:    Fri, 25 Sep 2026 17:33:54 +0000
+Attachments: lci-s9-client1.log
+
+--- Environment ---
+2.15.8 ARM64 Clients
+
+--- Description ---
+cl_sub_dio_alloc() intentionally permits sub-DIO requests without a duplicated iterator vector. In particular, XARRAY and DISC discard iterators do not require id_vec duplication:
+
+/* xarray and discard do not need vec to be dup'd */
+if (!v_sz)
+  goto out; 
+
+However, the normal completion path unconditionally frees the duplicate state:
+
+cl_sub_dio_end()
+  -> csd_dup_free()
+  -> OBD_FREE(tmp, ...) 
+
+csd_dup_free() currently assumes dup->id_vec is non-NULL. This triggers the OBD_FREE() assertion when completion reaches a valid vectorless sub-DIO request.The issue was exposed while running Lustre client tests on Ubuntu 24 ARM64 with Linux 6.17, but the same alloc/free mismatch exists in current lustre-master
+
+--- Comment (JIRAUSER19584, Wed, 23 Sep 2026 16:21:59 +0000) ---
+I hit this on x86_64 with a RHEL-type kernel too. Client is 2.17.0 built with DKMS on AlmaLinux 9.8, kernel 5.14.0-687.49.1.el9_8. Servers are 2.17.0 on el9.7 ldiskfs, DNE with 4 MDTs.
+
+Reproducer is parallel-scale test_fs_test, 4 ranks on 2 clients:
+
+mpirun -np 4 fs_test.x -nodb -g /mnt/lustre/d0.fs_test/fs_test -t 1 -n 2 -z 104857600 -d 10000 -C 3 -collective -s 1 -T 3 -o write -b bopen,bwrite,bclose -i mpi -S 1
+
+Here it goes further than the OBD_FREE assertion. The bad free in cl_sub_dio_end() corrupts the slab. More warnings follow from ptlrpcd, cl_page objects are left behind at umount, and the node panics on a libcfs assertion when the modules unload. The test itself passes, so without the console log it looks like a clean run.
+
+WARNING: CPU: 4 PID: 127940 at mm/slub.c:4370 free_large_kmalloc+0x57/0x90
+CPU: 4 PID: 127940 Comm: fs_test.x Tainted: G OE 5.14.0-687.49.1.el9_8.x86_64
+ free_large_kmalloc+0x57/0x90
+ cl_sub_dio_end+0x152/0x380 [obdclass]
+ __cl_sync_io_note+0x25f/0x320 [obdclass]
+ ll_direct_IO_impl+0x7b7/0xc80 [lustre]
+ generic_file_direct_write+0x74/0x100
+ vvp_io_write_start+0x578/0xfe0 [lustre]
+ cl_io_loop+0x99/0x220 [obdclass]
+ ll_file_io_generic+0x5da/0x11c0 [lustre]
+
+WARNING: CPU: 7 PID: 109008 at mm/slub.c:4335 cache_from_obj+0xe3/0x110
+CPU: 7 PID: 109008 Comm: ptlrpcd_00_05
+
+LustreError: (lov_obd.c:780:lov_cleanup()) lustre-clilov-...: lov tgt 0 not cleaned! deathrow=0, lovrc=1
+kmem_cache_destroy cl_page_kmem-216: Slab cache still has objects when called from cl_global_fini+0x24/0x170 [obdclass]
+LNetError: (tracefile.c:971:cfs_trace_flush_pages()) ASSERTION(page_count(tage->page) > 0) failed
+Kernel panic - not syncing: Lustre debug assertion failure
+ cfs_trace_flush_pages+0x265/0x2b0 [libcfs]
+ cfs_tracefile_exit+0x4c/0xb0 [libcfs]
+ libcfs_exit+0x51/0x140 [libcfs]
+
+Full console log attached lci-s9-client1.log. Happy to test a patch here.
+
+--- Comment (JIRAUSER19573, Thu, 24 Sep 2026 18:13:01 +0000) ---
+markus.hilger - Thanks for sharing your insights on a similar problem. But I think the issue you encountered might already have a fix here (please try and confirm, would be very helpful) - 
+
+https://review.whamcloud.com/c/fs/lustre-release/+/64331/
+
+In my 2.15.8 tree, I already took this above fix and still saw the issue I described.
+
+--- Comment (JIRAUSER19584, Fri, 25 Sep 2026 17:33:54 +0000) ---
+sonia.sh.sharma thanks, that was it!
+
+With https://review.whamcloud.com/c/fs/lustre-release/+/64331 (LU-19536) backported onto our 2.17.0 client, the same fs_test reproducer passes with no warnings, and sanity test_398t passes too. So mine was the cdp_pages double free, not the issue in this ticket.

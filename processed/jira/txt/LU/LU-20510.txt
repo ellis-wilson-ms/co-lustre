@@ -1,0 +1,138 @@
+Key:        LU-20510
+Summary:    osc_io_fsync_start(): OST_SYNC RPC issued but not waited for on the error path, corrupting osc_session_kmem (use-after-free)
+Link:       https://jira.whamcloud.com/browse/LU-20510
+Type:       Bug
+Priority:   Medium
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Oleg Drokin
+Reporter:   Oleg Drokin
+Created:    Wed, 22 Jul 2026 07:05:51 +0000
+Updated:    Wed, 19 Aug 2026 13:49:21 +0000
+Resolved:   Wed, 19 Aug 2026 13:49:21 +0000
+
+--- Description ---
+While debugging LU-17364, the testcase there exposed a latent bug with sync io, example crashes are in https://testing.whamcloud.com/gerrit-janitor/66489/results.html
+
+Below is mostly from claude:
+
+osc_io_fsync_start() issues an asynchronous OST_SYNC RPC unconditionally, but
+
+only records that the RPC is in flight when no earlier error has been latched:
+
+    rc = osc_fsync_ost(env, osc, fio);
+    if (result == 0) {
+            cbargs->opc_rpc_sent = 1;
+            result = rc;
+    }
+
+ 
+
+osc_fsync_ost() does init_completion(&cbargs->opc_sync) and then
+
+osc_sync_base(obj, oa, osc_async_upcall, cbargs, PTLRPCD_SET) – i.e. the RPC is
+
+already queued and its completion callback will write into @cbargs.
+
+osc_io_fsync_end() only waits when the flag is set:
+
+    } else if (cbargs->opc_rpc_sent && (fio->fi_mode == CL_FSYNC_ALL ||
+                                        fio->fi_mode == CL_FSYNC_RECLAIM)) {
+            wait_for_completion(&cbargs->opc_sync);
+
+So when osc_cache_writeback_range() (or osc_cache_wait_range()) has already
+
+failed, @result is non-zero, opc_rpc_sent stays 0, nobody waits, and the io is
+
+torn down while the RPC is still in flight.
+
+@cbargs is &oio->oi_cbarg, which lives inside
+
+    struct osc_session { struct osc_io os_io; };
+
+allocated by osc_session_init() from osc_session_kmem. When the RPC completes,
+
+osc_async_upcall() writes opc_rc and calls complete() on memory that has already
+
+been freed back to that slab cache – freelist corruption.
+
+The corruption is silent until an unrelated allocation trips over the poisoned
+
+freelist, so it typically manifests far from the origin, e.g.:
+
+  general protection fault: 0000 [#1] SMP DEBUG_PAGEALLOC
+  RIP: 0010:memset_erms+0x9/0x10
+   kmem_cache_alloc+0x307/0x430
+   osc_session_init+0x31/0x150 [osc]
+   keys_fill+0xac/0x1c0 [obdclass]
+   lu_context_init+0xcc/0x230 [obdclass]
+   cl_env_new+0x223/0x2e0 [obdclass]
+   cl_env_get+0xe3/0x3a0 [obdclass]
+
+It may also surface as deactivate_slab() faults, or as corruption of whatever
+
+object happens to share the slab page. Note that because slab corruption
+
+detonates wherever the next consumer touches the poisoned freelist, the crash
+
+signature is not a reliable fingerprint for this bug.
+
+WHY IT IS NORMALLY LATENT
+Reaching the bug requires an fsync in CL_FSYNC_ALL or CL_FSYNC_RECLAIM mode
+
+whose writeback has already returned an error. In practice nothing makes
+
+osc_cache_writeback_range() fail on a healthy client, so the path is rarely
+
+exercised. It becomes reachable whenever OST writeback genuinely fails –
+
+client eviction, OST I/O errors – and CL_FSYNC_RECLAIM (added by the same
+
+commit, see below) makes it reachable from ordinary background reclaim
+
+writeback under memory pressure, which is why occurrences are intermittent and
+
+load-dependent.
+
+INTRODUCED BY
+  8aa231a99468 ("LU-16713 llite: writeback/commit pages under memory pressure")
+
+Before that commit osc_io_fsync_end() waited unconditionally for CL_FSYNC_ALL:
+
+    } else if (fio->fi_mode == CL_FSYNC_ALL) {
+            wait_for_completion(&cbargs->opc_sync);
+
+LU-16713 added the opc_rpc_sent gate (and CL_FSYNC_RECLAIM) but set the flag
+
+only in the result == 0 branch, while osc_fsync_ost() is still called
+
+unconditionally.
+
+--- Comment (gerrit, Wed, 22 Jul 2026 07:12:05 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/67446
+
+Subject: LU-20510 osc: wait for OST_SYNC issued on the fsync error path
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 4c9f70512cb9800d738b2444209cd05c71bf8dc6
+
+--- Comment (gerrit, Wed, 19 Aug 2026 01:14:03 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/67446/
+
+Subject: LU-20510 osc: wait for OST_SYNC issued on the fsync error path
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: cb3a238c39c171a7a6835808538541ccce375dee
+
+--- Comment (pjo, Wed, 19 Aug 2026 13:49:21 +0000) ---
+Merged for 2.18

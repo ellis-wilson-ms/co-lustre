@@ -5,12 +5,12 @@ Type:       Improvement
 Priority:   Minor
 Status:     Resolved
 Resolution: Fixed
-Assignee:   Vitaly Fertman
+Assignee:   Peter - TLC
 Reporter:   Patrick Farrell
 Created:    Mon, 9 Sep 2019 19:19:36 +0000
-Updated:    Thu, 18 Dec 2025 08:22:26 +0000
+Updated:    Fri, 18 Sep 2026 22:43:25 +0000
 Resolved:   Tue, 16 Dec 2025 00:19:13 +0000
-Links:      Cloners: is cloned by LU-19722; Related: is related to  LU-9479; Related: is related to  LU-9341; Related: is related to LU-17403; Related: is related to LUDOC-512; Related: is related to LU-17159
+Links:      Cloners: is cloned by LU-19722; Related: is related to  LU-9479; Related: is related to  LU-9341; Related: is related to LU-19900; Related: is related to LU-17403; Related: is related to LUDOC-512; Related: is related to LU-9344; Related: is related to LU-17159
 
 --- Description ---
 This is a continuation of LU-9341, created to track related work which has not been completed yet.
@@ -43,107 +43,50 @@ This combination of things should allow not instantiating the full layout and lo
 
 Note of course that this is a split client/server solution, so it will need a compatibility flag so the client knows it can use the O_APPEND flag.  The good news is that this should interop safely with older clients - The older clients simply instantiate and lock everything for O_APPEND, which will give the correct exclusion vs newer clients.
 
---- Comment (adilger, Tue, 16 Dec 2025 11:17:48 +0000) ---
-There is still some more work to be done for the feature.
+--- Comment (peggy, Tue, 14 Jun 2022 17:52:58 +0000) ---
+Any activity or update on this issue?
 
-The new OBD_CONNECT2_NO_APPEND flag needs to be sent by the new clients, and checked by the MDS when creating files, to force append_stripe_count=1 (if =0) when files are created with open(O_APPEND) by clients that do not have it in their export.
+I've seen recent cases of small files showing the full PFL layout, where 100+ empty OST objects are allocated.  Not sure yet whether this append issue is the problem, but it seems more serious than minor to have hundreds of ost inodes consumed for no apparent reason.
 
---- Comment (gerrit, Tue, 16 Dec 2025 00:14:04 +0000) ---
-"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/63067/
+--- Comment (adilger, Mon, 29 Apr 2024 18:01:36 +0000) ---
+peggy, since commit v2_12_58-61-ge2ac6e1eaa (v2_12_3-73-gd0767ae660 on b2_12) for files opened with O_APPEND the layout will be taken from "mdd.*.append_stripe_count" (default =1) and "mdd.*.append_pool" (default unset) to avoid creating many-striped files for files that are typically small log files, so this should largely be a "non-issue" for any recent release. 
 
-Subject: LU-12738 mdd: enable append_stripe_count=1 by default
+This ticket is only open to track potential alternate solutions to having a dedicated append_stripe_count setting, and avoid a full-file layout instantiation when taking a full-file DLM lock.  This also happens when group locks are taken, so having a mechanism to lock the whole file while preventing new component instantiation is still of some interest.
 
-Project: fs/lustre-release
+It should be uncommon for applications to have both large files and concurrent access using O_APPEND for their IO, because this is super inefficient due to O_APPEND by necessity serializing all writes to the file.  Writing with O_APPEND must lock the entire file from the current i_size to OBD_OBJECT_EOF to ensure that only one thread is writing at the current end-of-file, or data corruption will result.  At that point, having multiple stripes on the file is pure overhead because it just multiplies the number of DLM locks that each client must take to do any write to the file.
 
-Branch: master
+--- Comment (adilger, Mon, 29 Apr 2024 19:38:35 +0000) ---
+Another potential solution that avoids the incompatibility of adding a new MDS_INODELOCK_APPEND bit was proposed in comment-223905, which paf seemed to agree with, but it was dropped when discussion moved over to actual issues seen in the field.
 
-Current Patch Set: 
+The appending client DLM locks the "near append" region of the file current_file_size+N*write_size, and then verifies that (a) the current_file_size under lock is still within the locked range (i.e. no racing truncate() or multiple appends), and (b) current_file_size+write_size does not extend into an uninitialized component before any writes are done, otherwise drop the locks and retry.  The DLM locking will guarantee serialization against truncate() and any racing O_APPEND writes (which would also need to lock current_file_size).  If the write is close to the end of the current component the expanded locking region should also trigger instantiation of the next component before any data write has been submitted, and avoid the significant complication of instantiating a component while holding locks.  
 
-Commit: f0fa8173c136b990de9f8df18b700c7901a99f4e
+The expanded DLM locking region N could be selected by the number of cores on the client (e.g. to handle all cores simultaneously trying to append to the log file), number of stripes in the file, or potentially max(current_file_size+N*write_size, component_end) to provide the "maximum serialization" and minimize the number of unlock/retry loops in case of racing appends.  If the DLM lock expansion is to component_end, then the number of retries ever would be limited to the number of components.
 
---- Comment (gerrit, Mon, 15 Dec 2025 14:36:37 +0000) ---
-"Vitaly Fertman " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/63067
+We don't care about racing non-O_APPEND write() syscalls that happen at any offset because they can (and will) overwrite any data they want at their specified location.   The existing lustre/tests/mpi/write_append_truncate.c test (run via parallel-scale) is exercising this behavior.
 
-Subject: LU-12738 mdd: enable append_stripe_count=1 by default
+--- Comment (peggy, Tue, 9 Jul 2024 22:27:22 +0000) ---
+Funny, this topic came up again recently from a customer preferring the old behavior, where O_APPEND files do use the default pfl layout.
 
-Project: fs/lustre-release
+From the customer ticket:
 
-Branch: master
+We've found that a lot of files on our filesystem are not inheriting the PFL layout. These files (called "output files") come from PBS and they can be huge - some are > 450GB...
 
-Current Patch Set: 1
+...We have a "hook" in PBS that is written in Python. This hook alters the "output file" so that ... can tail them actively while the job is running.
 
-Commit: f35b973b63855cb7f82bc88944ab668fa5a8f01b
+It seems the 'tail' ability is required by the customer. I gather that append_stripe_count was recently set to 1, or maybe the change was recently introduced by a system upgrade.
 
---- Comment (gerrit, Thu, 11 Dec 2025 14:16:42 +0000) ---
-"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/63010/
+Are there any good alternatives, any way to designate that a certain O_APPEND file should use default pfl?
 
-Subject: LU-12738 idl: reserve flag for O_APPEND fix
+--- Comment (adilger, Tue, 9 Jul 2024 22:58:29 +0000) ---
+peggy if the tunable is set "mdd.*.append_stripe_count=0" then this behavior is disabled, and all O_APPEND files will instantiate the full/default layout as with normal file creation.
 
-Project: fs/lustre-release
+Alternately, they could just "touch" these files to create them initially without O_APPEND (or Python open()+close() equivalent) so that they inherit the default (PFL) file layout at creation.  This means that all of the file components would be instantiated by the first open(O_APPEND) call on the file, but that would be OK for such large files, and not a major issue if there are not huge numbers of such files, and the stripe count of the later components is not outrageous.
 
-Branch: master
+--- Comment (adilger, Tue, 30 Sep 2025 10:31:20 +0000) ---
+One issue that was raised at LUG with the append-only layouts is that they are confusing for users, since they don't follow normal per-directory layouts. An option to improve this behavior would be for the append file to grab the layout from the first component and extend it to EOF, to avoid the "instantiate many stripes", while keeping some semblance of control in the hands of the users and consistency with other files in the directory (pool, etc.).  Together with the append flag in the layout, it would be (more) clear to users why this is happening, instead of the file layout suddenly changing to some random layout defined only on the MDS.
 
-Current Patch Set: 
-
-Commit: a1c11e7ace62c00fc2bfeb450b90ab8c9f36eefe
-
---- Comment (gerrit, Thu, 11 Dec 2025 06:24:30 +0000) ---
-"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/63011
-
-Subject: LU-12738 mdd: enable append_stripe_count=1 by default
-
-Project: fs/lustre-release
-
-Branch: master
-
-Current Patch Set: 1
-
-Commit: 3c741137e1cdab4a567a34c5d7a872fe79ab6eb6
-
---- Comment (gerrit, Thu, 11 Dec 2025 06:04:50 +0000) ---
-"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/63010
-
-Subject: LU-12738 idl: reserve flag for O_APPEND fix
-
-Project: fs/lustre-release
-
-Branch: master
-
-Current Patch Set: 1
-
-Commit: dc712ff4662f5ca8ff4c0f5d38f49b175913bf1a
-
---- Comment (adilger, Thu, 11 Dec 2025 04:15:52 +0000) ---
-For 2.17.0 we might consider a quick patch to re-enable mdd_append_stripe_count=1 by default, which would maintain compatibility, and then add a separate patch to implement for connect flag handling, which might be more complex.
-
---- Comment (adilger, Thu, 11 Dec 2025 04:02:41 +0000) ---
-I realized while looking at this patch again (due to thread on lustre-discuss about the append layout causing confusion) that there is an interop issue here. 
-
-If an old client (without the changes from this patch)  is appending to a file with the new MDS (that has mdd_append_stripe_count=0 from this patch), then the file will again instantiate the full layout for every file because the client will always lock to EOF.  For new clients and old MDS, this is not harmful, because the MDS will still create O_APPEND files with mdd_append_stripe_count=1 by default, regardless of how the client is locking the file. 
-
-One option to handle this would be a new OBD_CONNECT2_NO_APPEND=0x40000000000 flag, or similar, so that the client can notify the MDS that it will handle the locking properly.  I'm not sure that the MDS could auto detect this, because the create is already finished by the time the DLM locks are held.
-
---- Comment (pjo, Tue, 2 Dec 2025 04:11:02 +0000) ---
-Merged for 2.17
-
---- Comment (adilger, Tue, 2 Dec 2025 04:02:26 +0000) ---
-Vitaly, how does the new patch https://review.whamcloud.com/61688 ("LU-12738 pfl: do not instantiate full PFL layout on append") interact with the mdd.*.append_pool and mdd.*.append_stripe_count parameters?  Are these still enforced (i.e. files using open(O_APPEND) will override the file layout and use the parameters from mdd.*.append_*, or will files now use the normal layout that non-append files use?
-
---- Comment (gerrit, Tue, 2 Dec 2025 03:43:05 +0000) ---
-"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/61688/
-
-Subject: LU-12738 pfl: do not instantiate full PFL layout on append
-
-Project: fs/lustre-release
-
-Branch: master
-
-Current Patch Set: 
-
-Commit: 0f21e02f17a998fe4ebd61b7bf8261d7308d98d8
-
---- Comment (gerrit, Wed, 22 Oct 2025 22:57:00 +0000) ---
-"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/61687/
+--- Comment (gerrit, Sun, 5 Oct 2025 19:06:15 +0000) ---
+"Vitaly Fertman " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/61687
 
 Subject: LU-12738  test: improve write-append-truncate
 
@@ -151,9 +94,22 @@ Project: fs/lustre-release
 
 Branch: master
 
-Current Patch Set: 
+Current Patch Set: 1
 
-Commit: f7753e70c79e20d83cfb76af6c6ca50f2ce9f6f7
+Commit: 28f55e39aa0231b7ce274aeb3f81fbcc39f56b3d
+
+--- Comment (gerrit, Sun, 5 Oct 2025 19:06:26 +0000) ---
+"Vitaly Fertman " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/61688
+
+Subject: LU-12738 pfl: do not instantiate full PFL layout on append
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 8c8d6e29a2a4e1dba7df0b075dfda9721ad593c5
 
 --- Comment (vitaly_fertman, Sun, 5 Oct 2025 19:26:01 +0000) ---
 Let’s get back here and consider the following approach: append locks only already instantiated components and no more.
@@ -174,21 +130,8 @@ what does not look very much related for the 1st sight.
 
 As the result, that my failure disappeared as only I disabled ci_verify_layout for trunc. however, I am not sure what do we want here?
 
---- Comment (gerrit, Sun, 5 Oct 2025 19:06:26 +0000) ---
-"Vitaly Fertman " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/61688
-
-Subject: LU-12738 pfl: do not instantiate full PFL layout on append
-
-Project: fs/lustre-release
-
-Branch: master
-
-Current Patch Set: 1
-
-Commit: 8c8d6e29a2a4e1dba7df0b075dfda9721ad593c5
-
---- Comment (gerrit, Sun, 5 Oct 2025 19:06:15 +0000) ---
-"Vitaly Fertman " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/61687
+--- Comment (gerrit, Wed, 22 Oct 2025 22:57:00 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/61687/
 
 Subject: LU-12738  test: improve write-append-truncate
 
@@ -196,48 +139,105 @@ Project: fs/lustre-release
 
 Branch: master
 
+Current Patch Set: 
+
+Commit: f7753e70c79e20d83cfb76af6c6ca50f2ce9f6f7
+
+--- Comment (gerrit, Tue, 2 Dec 2025 03:43:05 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/61688/
+
+Subject: LU-12738 pfl: do not instantiate full PFL layout on append
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 0f21e02f17a998fe4ebd61b7bf8261d7308d98d8
+
+--- Comment (adilger, Tue, 2 Dec 2025 04:02:26 +0000) ---
+Vitaly, how does the new patch https://review.whamcloud.com/61688 ("LU-12738 pfl: do not instantiate full PFL layout on append") interact with the mdd.*.append_pool and mdd.*.append_stripe_count parameters?  Are these still enforced (i.e. files using open(O_APPEND) will override the file layout and use the parameters from mdd.*.append_*, or will files now use the normal layout that non-append files use?
+
+--- Comment (pjo, Tue, 2 Dec 2025 04:11:02 +0000) ---
+Merged for 2.17
+
+--- Comment (adilger, Thu, 11 Dec 2025 04:02:41 +0000) ---
+I realized while looking at this patch again (due to thread on lustre-discuss about the append layout causing confusion) that there is an interop issue here. 
+
+If an old client (without the changes from this patch)  is appending to a file with the new MDS (that has mdd_append_stripe_count=0 from this patch), then the file will again instantiate the full layout for every file because the client will always lock to EOF.  For new clients and old MDS, this is not harmful, because the MDS will still create O_APPEND files with mdd_append_stripe_count=1 by default, regardless of how the client is locking the file. 
+
+One option to handle this would be a new OBD_CONNECT2_NO_APPEND=0x40000000000 flag, or similar, so that the client can notify the MDS that it will handle the locking properly.  I'm not sure that the MDS could auto detect this, because the create is already finished by the time the DLM locks are held.
+
+--- Comment (adilger, Thu, 11 Dec 2025 04:15:52 +0000) ---
+For 2.17.0 we might consider a quick patch to re-enable mdd_append_stripe_count=1 by default, which would maintain compatibility, and then add a separate patch to implement for connect flag handling, which might be more complex.
+
+--- Comment (gerrit, Thu, 11 Dec 2025 06:04:50 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/63010
+
+Subject: LU-12738 idl: reserve flag for O_APPEND fix
+
+Project: fs/lustre-release
+
+Branch: master
+
 Current Patch Set: 1
 
-Commit: 28f55e39aa0231b7ce274aeb3f81fbcc39f56b3d
+Commit: dc712ff4662f5ca8ff4c0f5d38f49b175913bf1a
 
---- Comment (adilger, Tue, 30 Sep 2025 10:31:20 +0000) ---
-One issue that was raised at LUG with the append-only layouts is that they are confusing for users, since they don't follow normal per-directory layouts. An option to improve this behavior would be for the append file to grab the layout from the first component and extend it to EOF, to avoid the "instantiate many stripes", while keeping some semblance of control in the hands of the users and consistency with other files in the directory (pool, etc.).  Together with the append flag in the layout, it would be (more) clear to users why this is happening, instead of the file layout suddenly changing to some random layout defined only on the MDS.
+--- Comment (gerrit, Thu, 11 Dec 2025 06:24:30 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/63011
 
---- Comment (adilger, Tue, 9 Jul 2024 22:58:29 +0000) ---
-peggy if the tunable is set "mdd.*.append_stripe_count=0" then this behavior is disabled, and all O_APPEND files will instantiate the full/default layout as with normal file creation.
+Subject: LU-12738 mdd: enable append_stripe_count=1 by default
 
-Alternately, they could just "touch" these files to create them initially without O_APPEND (or Python open()+close() equivalent) so that they inherit the default (PFL) file layout at creation.  This means that all of the file components would be instantiated by the first open(O_APPEND) call on the file, but that would be OK for such large files, and not a major issue if there are not huge numbers of such files, and the stripe count of the later components is not outrageous.
+Project: fs/lustre-release
 
---- Comment (peggy, Tue, 9 Jul 2024 22:27:22 +0000) ---
-Funny, this topic came up again recently from a customer preferring the old behavior, where O_APPEND files do use the default pfl layout.
+Branch: master
 
-From the customer ticket:
+Current Patch Set: 1
 
-We've found that a lot of files on our filesystem are not inheriting the PFL layout. These files (called "output files") come from PBS and they can be huge - some are > 450GB...
+Commit: 3c741137e1cdab4a567a34c5d7a872fe79ab6eb6
 
-...We have a "hook" in PBS that is written in Python. This hook alters the "output file" so that ... can tail them actively while the job is running.
+--- Comment (gerrit, Thu, 11 Dec 2025 14:16:42 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/63010/
 
-It seems the 'tail' ability is required by the customer. I gather that append_stripe_count was recently set to 1, or maybe the change was recently introduced by a system upgrade.
+Subject: LU-12738 idl: reserve flag for O_APPEND fix
 
-Are there any good alternatives, any way to designate that a certain O_APPEND file should use default pfl?
+Project: fs/lustre-release
 
---- Comment (adilger, Mon, 29 Apr 2024 19:38:35 +0000) ---
-Another potential solution that avoids the incompatibility of adding a new MDS_INODELOCK_APPEND bit was proposed in comment-223905, which paf seemed to agree with, but it was dropped when discussion moved over to actual issues seen in the field.
+Branch: master
 
-The appending client DLM locks the "near append" region of the file current_file_size+N*write_size, and then verifies that (a) the current_file_size under lock is still within the locked range (i.e. no racing truncate() or multiple appends), and (b) current_file_size+write_size does not extend into an uninitialized component before any writes are done, otherwise drop the locks and retry.  The DLM locking will guarantee serialization against truncate() and any racing O_APPEND writes (which would also need to lock current_file_size).  If the write is close to the end of the current component the expanded locking region should also trigger instantiation of the next component before any data write has been submitted, and avoid the significant complication of instantiating a component while holding locks.  
+Current Patch Set: 
 
-The expanded DLM locking region N could be selected by the number of cores on the client (e.g. to handle all cores simultaneously trying to append to the log file), number of stripes in the file, or potentially max(current_file_size+N*write_size, component_end) to provide the "maximum serialization" and minimize the number of unlock/retry loops in case of racing appends.  If the DLM lock expansion is to component_end, then the number of retries ever would be limited to the number of components.
+Commit: a1c11e7ace62c00fc2bfeb450b90ab8c9f36eefe
 
-We don't care about racing non-O_APPEND write() syscalls that happen at any offset because they can (and will) overwrite any data they want at their specified location.   The existing lustre/tests/mpi/write_append_truncate.c test (run via parallel-scale) is exercising this behavior.
+--- Comment (gerrit, Mon, 15 Dec 2025 14:36:37 +0000) ---
+"Vitaly Fertman " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/63067
 
---- Comment (adilger, Mon, 29 Apr 2024 18:01:36 +0000) ---
-peggy, since commit v2_12_58-61-ge2ac6e1eaa (v2_12_3-73-gd0767ae660 on b2_12) for files opened with O_APPEND the layout will be taken from "mdd.*.append_stripe_count" (default =1) and "mdd.*.append_pool" (default unset) to avoid creating many-striped files for files that are typically small log files, so this should largely be a "non-issue" for any recent release. 
+Subject: LU-12738 mdd: enable append_stripe_count=1 by default
 
-This ticket is only open to track potential alternate solutions to having a dedicated append_stripe_count setting, and avoid a full-file layout instantiation when taking a full-file DLM lock.  This also happens when group locks are taken, so having a mechanism to lock the whole file while preventing new component instantiation is still of some interest.
+Project: fs/lustre-release
 
-It should be uncommon for applications to have both large files and concurrent access using O_APPEND for their IO, because this is super inefficient due to O_APPEND by necessity serializing all writes to the file.  Writing with O_APPEND must lock the entire file from the current i_size to OBD_OBJECT_EOF to ensure that only one thread is writing at the current end-of-file, or data corruption will result.  At that point, having multiple stripes on the file is pure overhead because it just multiplies the number of DLM locks that each client must take to do any write to the file.
+Branch: master
 
---- Comment (peggy, Tue, 14 Jun 2022 17:52:58 +0000) ---
-Any activity or update on this issue?
+Current Patch Set: 1
 
-I've seen recent cases of small files showing the full PFL layout, where 100+ empty OST objects are allocated.  Not sure yet whether this append issue is the problem, but it seems more serious than minor to have hundreds of ost inodes consumed for no apparent reason.
+Commit: f35b973b63855cb7f82bc88944ab668fa5a8f01b
+
+--- Comment (gerrit, Tue, 16 Dec 2025 00:14:04 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/63067/
+
+Subject: LU-12738 mdd: enable append_stripe_count=1 by default
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: f0fa8173c136b990de9f8df18b700c7901a99f4e
+
+--- Comment (adilger, Tue, 16 Dec 2025 11:17:48 +0000) ---
+There is still some more work to be done for the feature.
+
+The new OBD_CONNECT2_NO_APPEND flag needs to be sent by the new clients, and checked by the MDS when creating files, to force append_stripe_count=1 (if =0) when files are created with open(O_APPEND) by clients that do not have it in their export.

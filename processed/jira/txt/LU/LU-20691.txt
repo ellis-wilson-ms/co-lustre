@@ -1,0 +1,234 @@
+Key:        LU-20691
+Summary:    Allow hsm coordinator to move timedout restores to ARS_WAITING
+Link:       https://jira.whamcloud.com/browse/LU-20691
+Type:       New Feature
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   Praveen Solanki
+Reporter:   Praveen Solanki
+Created:    Thu, 3 Sep 2026 17:32:15 +0000
+Updated:    Thu, 8 Oct 2026 15:58:44 +0000
+
+--- Description ---
+Allow hsm coordinator to move timedout restores to ARS_WAITING. Today all these requests are marked as failed. We should be able to re-use the same mechanism as intentional retry since those do get reassigned. 
+
+It need not be default behavior, can be enabled/disabled via policy flags.
+
+--- Comment (JIRAUSER19549, Thu, 3 Sep 2026 17:33:16 +0000) ---
+adilger adegremont_nvda 
+
+let me know what you guys think about this. I haven't looked at the implementation bits yet but is this something Lustre should support.
+
+--- Comment (adilger, Sat, 5 Sep 2026 04:56:47 +0000) ---
+praveen.solanki, I'm probably not the best person to ask about HSM features, better to discuss with some of the other HSM developers (CC'd).
+
+--- Comment (JIRAUSER18483, Mon, 7 Sep 2026 15:52:52 +0000) ---
+praveen.solanki have you considered turning the Retry Policy on?
+
+$ lctl set_param mdt.$FSNAME-MDT*.hsm.policy=-NRA
+
+See https://doc.lustre.org/lustre_manual.xhtml#hsmpolicy
+
+--- Comment (JIRAUSER19549, Tue, 8 Sep 2026 15:39:08 +0000) ---
+adegremont_nvda Yes, so the current behavior seems to honor this policy only when action is explicitly marked for retry. If there is a timeout, that action is not retried. I have confirmed this in 2.15.x.
+
+--- Comment (JIRAUSER19549, Wed, 9 Sep 2026 14:13:37 +0000) ---
+Verified that the behavior is same in 2.17.54_419
+
+--- Comment (eaujames, Wed, 9 Sep 2026 14:49:28 +0000) ---
+What is your use case?
+
+The HSM timeout exists to prevent this. This is to avoid llog queue to fill up (e.g: no copytool to handle the request).
+
+At the CEA the retry is implemented with robinhood: an FAILED/SUCCEED changelog is emitted when the action ended,  rbh will update the database record according the result so the policy can re-schedule the action.
+
+Do you want an client to wait forever a file RESTORE?
+
+--- Comment (JIRAUSER19549, Wed, 9 Sep 2026 15:00:45 +0000) ---
+If I have multiple copy tools registered one of them crashing/isolated should not lead to a client visible error. I should be able to chose to have a policy where I can explicitly reassign timed out restore requests. I understand this should not be default behavior. If there is none to assign, the request is anyway just going to sit in the queue. As for client remaining stuck forever, we do wish the client to stay blocked until restore completes. As I said I want this to be policy based intentional behavior.
+
+--- Comment (JIRAUSER18483, Wed, 9 Sep 2026 15:18:42 +0000) ---
+I'm not against having a policy to explicitly retry the restore, but I'm wondering if https://jira.whamcloud.com/browse/LU-18238 could not help?
+
+--- Comment (eaujames, Wed, 9 Sep 2026 15:31:24 +0000) ---
+praveen.solanki, can you check the: 59067: LU-18238 llite: deregister HSM agent on close() | https://review.whamcloud.com/c/fs/lustre-release/+/59067
+
+We are now able to detect if a client hang/disconnect or if the user-space copytool crashed. For those cases this will deregister the agent. This should mark the active requests to FAILED. For those cases we can re-schedule the request.
+
+Would something like this work for you?
+
+I have not checked the current behavior with retry policy.
+
+--- Comment (eaujames, Wed, 9 Sep 2026 15:32:22 +0000) ---
+adegremont_nvda +1
+
+--- Comment (JIRAUSER19549, Wed, 9 Sep 2026 17:07:38 +0000) ---
+The linked fix, unfortunately won't work for my use case. It might be the case that the host itself is wedged it won't be able to close the fd in that case. 
+
+I did test with recent tip of the master which contains this fix by the way.
+
+--- Comment (eaujames, Wed, 9 Sep 2026 18:44:10 +0000) ---
+The linked fix, unfortunately won't work for my use case...
+
+I know. My question was:
+
+Is the following solution works for you?
+
+	Retry policy on: hsm.policy=-NRA
+
+	copytool crash
+
+	Lustre client detect the crash and inform the server (59067: LU-18238 llite: deregister HSM agent on close())
+
+	The server deregister the crash agent
+
+	For each (old) active request, the server set the on disk state to ARS_WAITING to re-schedule the action
+
+--- Comment (JIRAUSER19549, Wed, 9 Sep 2026 18:52:12 +0000) ---
+Can you elaborate on "Lustre client detect the crash and inform the server " part? If you mean the agent client on the host which had copy tool running, I am afraid it is not a reliable enough method for me. 
+
+What is the major concern if we just introduce a new policy to enable this new behavior to put timedout restores in ars_waiting ?
+
+--- Comment (eaujames, Wed, 9 Sep 2026 19:09:16 +0000) ---
+It might be the case that the host itself is wedged it won't be able to close the fd in that case
+
+If your copy tool is stuck (possibly due to a backend issue), retries won't resolve it.
+
+	resources for the action can be locked by your zombie copytool so running on another one will propagate the issue
+
+	if your zombie copytool still accept requests, the copytool will accumulate unfinished requests. If max_requests limit is reached, the coordinator stop sending requests to any copytool agents.
+
+	if the action is resend to the zombie copytool it will fail anyway.
+
+--- Comment (eaujames, Wed, 9 Sep 2026 19:28:41 +0000) ---
+Can you elaborate on...
+
+This is the purpose of https://review.whamcloud.com/c/fs/lustre-release/+/59067. 
+
+llapi_hsm_copytool_register() open a fd on the Lustre mountpoint to communicate with the kernel. If the copytool crash, llapi_hsm_copytool_deregister is not called but linux will cleanup the fd (it closes the fd). On close(), the patch checks if an agent is still registered. If true, the Lustre client will automatically deregister the agent by sending an MDS_HSM_CT_UNREGISTER RPC to the MDT coordinator.
+
+--- Comment (eaujames, Wed, 9 Sep 2026 19:41:14 +0000) ---
+Note: If the entire copytool node becomes unresponsive, the server will evict it and automatically deregister the agent.
+
+This case is handle by: 59251: LU-18238 mdt: ghost hsm fix | https://review.whamcloud.com/c/fs/lustre-release/+/59251
+
+--- Comment (JIRAUSER19549, Tue, 15 Sep 2026 15:58:20 +0000) ---
+What if active_request_timeout is shorter than the adaptive client-eviction interval? At the action timeout, the copytool’s export may still be alive, so LU-18238 has not necessarily unregistered or fenced it. Waiting for eviction therefore does not provide a bounded recovery time.
+
+Since the proposed ARS_STARTED → ARS_WAITING transition is explicitly policy-controlled, administrators can choose between the current terminal behavior and automatic redispatch. I am still not hearing a strong reason against providing that option. If duplicate execution is the concern, could we identify the concrete restore failure mode that makes an opt-in retry unsafe?
+
+--- Comment (JIRAUSER18483, Wed, 16 Sep 2026 08:01:52 +0000) ---
+As I said, i'm not against, we can have a policy where timeout request are eventually rescheduled. Just keep in mind that a stale restore could still be running somewhere and it should not interfere with the new restore. (ie: the old restore eventually finishing, sending a successfull progress, and be sure no swap or related thing happens).
+
+--- Comment (JIRAUSER19549, Wed, 16 Sep 2026 12:01:36 +0000) ---
+Yes adegremont_nvda thats a valid concern.The duplicate data transfer itself should be safe because each restore writes to a separate volatile object; the original file is unchanged until successful completion causes the layout swap. Once the new request is bound to its volatile FID, progress from the old restore’s different volatile FID should be rejected. We do have a gap where either copytools can still bind so will handle this in implementation to make sure after timeout previous copy tool it not binding its volatile FID.
+
+--- Comment (eaujames, Wed, 16 Sep 2026 13:06:43 +0000) ---
+My concern with your proposal is that it presents a solution rather than addressing the underlying issue. I need to fully grasp the problem and its implications before moving forward. The key question we need to address is: Why are there timeout requests in the first place?.
+
+For example, copytool can reset active request timer on the coordinator by sending hsm_progress request if the data transfer is long.
+
+You seems to argue that a timeout request have more chance to succeed on another copytool, but that is not always the case. If the backend resource is not accessible, it could pause all the actions for that ressource. In such cases, you shouldn’t immediately reschedule timeout actions, as this could cause actions involving accessible resources to be unnecessarily delayed (or failed). You want the jobs accessing the unreachable resource to fail so that others can proceed.
+
+If duplicate execution is the concern, could we identify the concrete restore failure mode that makes an opt-in retry unsafe?
+
+Its depends of your backend, if an action is still running on a copytool it can lock the resource and prevents an another copytool to access it. If no protection are implemented, It can corrupt your backend (more for archive retry, but if you trigger some backend action on restore it can do unexpected things).
+
+That why I tried to distinguish a stuck copytool/client from a stuck global backend resource.
+
+--- Comment (eaujames, Wed, 16 Sep 2026 13:18:04 +0000) ---
+What if active_request_timeout is shorter than the adaptive client-eviction interval
+
+This is a configuration issue.
+
+--- Comment (JIRAUSER19549, Wed, 16 Sep 2026 13:25:19 +0000) ---
+eaujames 
+
+"it presents a solution rather than addressing the underlying issue. " 
+
+Intention is to fix a gap with current design. 
+
+"Why are there timeout requests in the first place?"
+
+Host crash, network isolation, wedged process etc. 
+
+"You seems to argue that a timeout request have more chance to succeed on another copytool"
+
+I am arguing that some other copytool might be able to make progress or determine that the action should be failed if existing copytool is not able to provide any update
+
+" if an action is still running on a copytool it can lock the resource and prevents an another copytool to access it."
+
+Are you referring to volatile FID? Can you explain how that prevents another copytool to complete its write? Might be something I need to handle in implementation. ( I was intending this policy for only restores but I don't see an issue with archives as well )
+
+--- Comment (JIRAUSER19549, Wed, 16 Sep 2026 13:26:33 +0000) ---
+eaujames 
+
+"This is a configuration issue."
+
+Why do I need to depend on these seemingly unrelated configs to reason about my failure cases when I can be more intentional in my approach.
+
+--- Comment (courrier, Wed, 16 Sep 2026 14:04:18 +0000) ---
+Hi,
+
+I'm not sure I understand the actual issue.
+
+Assuming there is a feature to enable retry when the coordinator sees that a copytool/HSM agent is down (which does not exist yet), I think most of the issues you mention are solved. On client eviction (crash or network split) or copytool crash, the requests would be rescheduled. The only thing which would not be rescheduled is a timeout when a copytool is actually stuck (internal deadlock for instance) but this is a bug in the copytool so I'm not sure this is a good argument for this feature. As Aurélien, I'm not against the feature but I agree with Etienne that it seems to be a solution to a non existing problem. I'd much rather spend energy on implementing a "retry on agent crash" feature. As for the case where eviction timeout is longer than action timeout, I agree with Etienne, I would consider this a configuration issue. HSM progress is tracked through the call to `llapi_hsm_action_progress` which sends an RPC to the MDS so if the timeout of HSM requests is shorter than the request timeout, you will have more timeouts than necessary.
+
+--- Comment (eaujames, Wed, 16 Sep 2026 14:17:41 +0000) ---
+Intention is to fix a gap with current design. 
+
+I already said that this is intentional, we want to failed actions on inaccessible backend resources. Keep in mind that HSM have been implemented primarily  for tapes archiving.
+
+But I agree that the design can be improved, that why asked questions. For me, blindly resend request to a random copytool is more a workaround than an fix (and if you hide it inside a specific policy, it might not been used).
+
+I will reach out to the CEA copytool developers and backend maintainers to get their input on this.
+
+Host crash, network isolation, wedged process etc. 
+
+Host crash, network isolation -> Handle by Lustre timeout -> deregister
+
+wedged process -> inaccessible from Lustre, this have to be managed outside (HA monitoring?). We still can deregister/evict the copytool on active request timeout but this is expensive and will not solve completely the issue (external resources can still be locked).
+
+Are you referring to volatile FID....
+
+I talk about accessing to the backend resource (e.g: HPSS). Lustre have no way to know if the backend resource is busy.
+
+--- Comment (eaujames, Wed, 16 Sep 2026 15:54:29 +0000) ---
+Why do I need to depend on these seemingly unrelated configs to reason about my failure cases when I can be more intentional in my approach.
+
+HSM, bulk IO, LDLM... RPCs depend of Lustre adaptive timeout. So set a timeout lower than this one make no sense.
+
+For example, in another context, you can set Lustre timeout (at_min/at_max/timeout) lower than lnd_timeout (network timeout) but you could get unwanted client evictions/reconnexions...
+
+In your context, it could lead to unwanted retries and flood your backend.
+
+--- Comment (JIRAUSER19549, Thu, 8 Oct 2026 15:56:35 +0000) ---
+Hi courrier 
+
+ 
+
+Assuming there is a feature to enable retry when the coordinator sees that a copytool/HSM agent is down (which does not exist yet), I think most of the issues you mention are solved. 
+
+On client eviction (crash or network split) or copytool crash, the requests would be rescheduled. 
+
+This is not a clean design in my opinion if I need to rely a seemingly unrelated config to reason about a different sub-system. We already have a timeout for actions, I would like to stick to that to design the flow instead of linking with a different thing like client eviction policy. Also note that copytool crash will not impact the client eviction in anyway. Which means now I have to look at two things. A timeout encapsulates a lot of scenarios and its a simpler design. 
+
+ 
+
+The only thing which would not be rescheduled is a timeout when a copytool is actually stuck (internal deadlock for instance) but this is a bug in the copytool so I'm not sure this is a good argument for this feature. 
+
+You assumption is wrong here, there could be local system related issues which might not be the case with a different copy tool instance. Bugs can still occur but they get fixed over time. 
+
+ 
+
+As Aurélien, I'm not against the feature but I agree with Etienne that it seems to be a solution to a non existing problem. I'd much rather spend energy on implementing a "retry on agent crash" feature. 
+
+It is a real problem for my usage. I don't agree with your design to marry client/copytool evictions with action retry. 
+
+As for the case where eviction timeout is longer than action timeout, I agree with Etienne, I would consider this a configuration issue. HSM progress is tracked through the call to `llapi_hsm_action_progress` which sends an RPC to the MDS so if the timeout of HSM requests is shorter than the request timeout, you will have more timeouts than necessary.
+
+ok, seems like you are recommending to keep action timeout larger than client eviction duration. Isn't client eviction adaptive and not static ? In any case I would the discusison to focus on above points.
+
+--- Comment (JIRAUSER19549, Thu, 8 Oct 2026 15:58:44 +0000) ---
+eaujames can you point me to some developers  who can provide their input in this discussion?

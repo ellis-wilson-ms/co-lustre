@@ -1,0 +1,435 @@
+Key:        LU-20632
+Summary:    libcfs and obdclass size several CPU-id-indexed arrays by num_possible_cpus(), so a sparse cpu_possible_mask overflows them
+Link:       https://jira.whamcloud.com/browse/LU-20632
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Oleg Drokin
+Created:    Mon, 24 Aug 2026 07:38:08 +0000
+Updated:    Mon, 24 Aug 2026 07:38:08 +0000
+
+--- Description ---
+I am mostly filing this as a curiosity noted by Claude reviewing other code since I don't think anything could be triggerigntihs now. But future might change.
+
+I also have patches for it but not sure if I'll post them.
+
+Below is AI generated content:
+
+   * On x86 (including Xen PV), sparc, mips and PowerPC the possible mask is
+
+    dense by construction, so those platforms cannot hit any of these
+
+    defects at all.
+
+	arm64 CAN produce a hole (mechanism quoted below), but no real machine
+
+    that does was found or demonstrated, and no failure has been reported.
+
+	If the precondition does occur, defect 4 is unbounded heap corruption on
+
+    the debug fast path of libcfs.ko - a spin_lock() and a list_add() on
+
+    memory past the end of the allocation, on every CDEBUG/CERROR issued
+
+    from a CPU whose id is >= cpumask_weight(cpu_possible_mask).  libcfs.ko
+
+    is loaded by every Lustre module on both client and server, so this is
+
+    the broadest and hottest of the four; that is why the ticket is Major
+
+    rather than Minor.
+
+	Defects 1 and 2 are also out-of-bounds heap writes on normal paths - one
+
+    at every obdclass module load, one on the lprocfs stats path.  Defect 3
+
+    is an LBUG, but it needs an allocation failure on top of the sparse
+
+    mask.
+
+Reproduced: NO.  Demonstrated statically only; see "Steps to reproduce".
+
+Runtime testing on x86 (4 CPUs, cpu_possible_mask = 0-3, KASAN kernel)
+
+exercised the patched code but cannot exercise the defect, because with a
+
+dense mask nr_cpu_ids == num_possible_cpus() and the fixes are no-ops there.
+
+For defect 4 that run was libcfs loaded with debug=-1 and debug_mb=200, I/O
+
+pinned to each of the four CPUs, repeated "lctl dk" drains and a
+
+lustre_rmmod: no KASAN report, no "trace pages aren't empty", and the
+
+debug_mb round-trip still reported the same value as before the patch,
+
+confirming the new walk visits exactly num_possible_cpus() tcds per type.
+
+That demonstrates no regression, not the defect.
+
+Environment:
+
+master, 2.17.57.  All four defects are long-standing; see "Introduced by".
+
+Description:
+
+All four come from the same mistake: cpu_possible_mask is treated as if its
+
+set bits were 0..N-1, so an array indexed by CPU id is sized by the count
+
+of possible CPUs.
+
+DEFECT 1 - out-of-bounds write into cl_envs[]  (fires at module load)
+
+  lustre/obdclass/cl_object.c:1160 (cl_global_init())
+      OBD_ALLOC_PTR_ARRAY(cl_envs, num_possible_cpus());
+
+  num_possible_cpus() is cpumask_weight(cpu_possible_mask)
+
+  (include/linux/cpumask.h:1111) and OBD_ALLOC_PTR_ARRAY(ptr, n) allocates
+
+  exactly n elements (lustre/include/obd_support.h:868).  Every use indexes
+
+  by CPU id:
+
+      cl_object.c:974-976   cl_envs[i] inside for_each_possible_cpu(i)
+      cl_object.c:756-780   cl_envs[cpu], cpu = get_cpu()   (cl_env_get)
+      cl_object.c:930-938   cl_envs[cpu], cpu = smp_processor_id()
+      cl_object.c:879-893   cl_envs[i] inside for_each_possible_cpu(i)
+
+  With possible = 
+
+{0, 2, 3} the array holds 3 entries but
+
+  cl_env_percpu_init() writes cl_envs[3] during module load - a heap
+
+  overflow on the success path, with no allocation failure required.
+
+  cl_global_fini() then frees the wrong size too (:1184, :1205).
+
+DEFECT 2 - out-of-bounds access on lprocfs ls_percpu[]  (fires on the stats
+
+path, the hottest of the three)
+
+  lustre/obdclass/lprocfs_status.c:1445/1448 (lprocfs_stats_alloc())
+
+      num_entry = num_possible_cpus();
+
+      LIBCFS_ALLOC(stats, offsetof(typeof(*stats), ls_percpu[num_entry]));
+
+  but the array is indexed by CPU id:
+
+      lprocfs_status.c:540-542  ls_percpu[cpuid], cpuid = get_cpu(), read on
+
+                                every stats update via
+
+                                lprocfs_stats_lock(LPROCFS_GET_SMP_ID)
+
+      lprocfs_status.c:1407-11  lprocfs_stats_alloc_one() writes
+
+                                ls_percpu[cpuid] the first time a CPU is seen
+
+      lprocfs_status.h:500      lprocfs_stats_counter_get() dereferences
+
+                                ls_percpu[cpuid]
+
+  and the iteration bound is also in id space: lprocfs_stats_alloc_one()
+
+  sets ls_biggest_alloc_num = cpuid + 1, which LPROCFS_GET_NUM_CPU returns,
+
+  so lprocfs_stats_collect() (:614), lprocfs_stats_collector() (:1693),
+
+  lprocfs_stats_clear() (:1716) and __lprocfs_counter_init_units() (:1960)
+
+  all walk past the end as well.  stats_free() (:1541/1544/1561) frees with
+
+  the weight, so on a sparse mask it would also fail to free the slots whose
+
+  id is >= the weight.
+
+DEFECT 3 - cl_env_percpu_init() error unwind  (needs an allocation failure)
+
+  lustre/obdclass/cl_object.c:961
+
+      static struct cl_env cl_env_percpu[NR_CPUS];   /* indexed by CPU id */
+
+  cl_object.c:970..995 initialises cl_env_percpu[i] under
+
+  for_each_possible_cpu and breaks on the first failure, but
+
+  cl_object.c:996..1005 unwinds over dense indices:
+
+      if (rc != 0) {
+              /* Indices 0 to i (excluding i) were correctly initialized,
+               * thus we must uninitialize up to i, the rest are undefined. */
+              for (j = 0; j ce_ses);
+                      lu_context_fini(&cle->ce_ses);
+                      lu_env_fini(&cle->ce_lu);
+              }
+      }
+
+  cl_env_percpu_fini() gets this right (it uses for_each_possible_cpu());
+
+  only the error unwind does not.  Note [0, i) is a superset of the
+
+  initialised entries, so nothing above the failing CPU is missed - the bug
+
+  is that holes below i are finalised even though they were never
+
+  initialised.
+
+DEFECT 4 - out-of-bounds access on cfs_trace_data[]  (fires on every
+
+CDEBUG/CERROR; the hottest and broadest of the four)
+
+  lnet/libcfs/tracefile.c:1288 (cfs_tracefile_init())
+
+      cfs_trace_data[i] = kmalloc_array(num_possible_cpus(),
+
+                                        sizeof(union cfs_trace_data_union),
+
+                                        GFP_KERNEL);
+
+  but every consumer indexes it by CPU id:
+
+      tracefile.c:108-112   cfs_trace_get_tcd() ->
+
+                            (*cfs_trace_data[type])[get_cpu()].tcd,
+
+                            called from libcfs_debug_msg() for every
+
+                            CDEBUG/CERROR/CWARN in the whole stack
+
+      tracefile.c:94-97     cfs_tcd_for_each_type_lock(tcd, i, cpu) ->
+
+                            (*cfs_trace_data[i])[cpu].tcd, used at :762
+
+                            (collect_pages_on_all_cpus), :788
+
+                            (put_pages_back_on_all_cpus) and :1348
+
+                            (trace_cleanup_on_all_cpus), all three under
+
+                            for_each_possible_cpu(cpu)
+
+  and the page ownership tag is a CPU id too: tracefile.c:211 sets
+
+  tage->cpu = smp_processor_id(), which :797 matches against the
+
+  for_each_possible_cpu() id.  So CPU-id indexing is the intended
+
+  semantics of the array throughout.
+
+  With possible = {0, 2, 3}
+ the array holds 3 entries.  A CDEBUG on CPU 3
+
+  takes spin_lock() on, and list_add()s trace pages onto, memory one entry
+
+  past the end of the kmalloc object.  That is unbounded heap corruption
+
+  from a spin_lock and a doubly-linked-list insertion, not a bounded
+
+  overwrite, and it happens on the debug path that every Lustre module
+
+  uses.  The same slot is then touched out of bounds again by
+
+  collect_pages_on_all_cpus() on every "lctl dk" and by
+
+  trace_cleanup_on_all_cpus() at libcfs unload.
+
+  This one is NOT fixed by resizing the allocation alone.  The
+
+  initialisation walk is the odd one out - it is dense:
+
+      tracefile.c:88-92
+
+        #define cfs_tcd_for_each(tcd, i, j)                             \
+                for (i = 0; i 
+
+  cfs_tracefile_init() (:1297) is the only place the tcds are initialised
+
+  and it uses that macro, so it initialises entries 0..weight-1.  Resizing
+
+  the allocation to nr_cpu_ids without touching the walk would replace the
+
+  out-of-bounds access with an access to an allocated but *never
+
+  initialised* tcd (kmalloc_array does not zero) - CPU 3's first CDEBUG
+
+  would spin_lock() a garbage lock word and splice pages onto a garbage
+
+  list_head, and that tcd would never be drained by tracefiled either.
+
+  That is not better than the overflow, so the array must be sized by
+
+  nr_cpu_ids AND the walk must move to CPU-id space.  cfs_tcd_for_each()
+
+  is also used by panic_collect_pages() (:751),
+
+  cfs_trace_set_debug_mb() (:1103) and cfs_trace_get_debug_mb() (:1121);
+
+  moving it to id space keeps get_debug_mb()'s sum consistent with
+
+  set_debug_mb()'s division by num_possible_cpus(), which a dense walk
+
+  over nr_cpu_ids would not.
+
+  Minor, same file: the "trace pages aren't empty" diagnostic at :1221
+
+  prints CPU ids 0..num_possible_cpus()-1, so on a sparse mask it reports
+
+  CPUs that do not exist and omits the ones that do.
+
+Supporting facts, all read from the kernel tree Lustre builds against
+
+(RHEL 9.7, 5.14.0-611.13.1.el9_7):
+
+1. for_each_possible_cpu() makes no contiguity promise.
+
+     include/linux/cpumask.h:1010
+
+       #define for_each_possible_cpu(cpu) for_each_cpu((cpu), cpu_possible_mask)
+
+     include/linux/cpumask.h:294
+
+       #define for_each_cpu(cpu, mask) \
+
+               for_each_set_bit(cpu, cpumask_bits(mask), small_cpumask_bits)
+
+   It walks the set bits in increasing order, gaps included.
+
+2. Can the mask actually be sparse?
+
+	x86: NO.  arch/x86/kernel/cpu/topology.c does
+
+       init_cpu_possible(cpumask_of(0));
+
+       for (cpu = 0; cpu sparc (smp_fill_in_cpu_possible_map), mips (prefill_possible_map),
+
+     PowerPC (assign_threads / smp_setup_cpu_maps): dense.
+
+	arm64: YES, possible.  arch/arm64/kernel/smp.c smp_init_cpus():
+
+       for (i = 1; i 
+
+     smp_cpu_setup() calls set_cpu_possible(cpu, true) only after
+
+     init_cpu_ops() and ops->cpu_init() both succeed.  A DT/ACPI-described
+
+     CPU with an unsupported enable-method (or a failing cpu_init) is
+
+     skipped while the next logical id still succeeds, leaving e.g. 
+
+{0,2,3}
+.
+
+3. What defect 3's unwind does to a zeroed struct cl_env (cl_env_percpu[] is
+
+   static, so an unvisited slot is all zeroes):
+
+	lu_context_exit() (lu_object.c:1816) is harmless on it.  LINVRNT() is
+
+     compiled out unless --enable-invariants, and the lct_exit walk is
+
+     guarded by "ctx->lc_tags & LCT_HAS_EXIT && ctx->lc_value", both zero.
+
+	lu_context_fini() (lu_object.c:1790) is NOT harmless:
+
+         if ((ctx->lc_tags & LCT_REMEMBER) == 0)
+                 LASSERT(list_empty(&ctx->lc_remember));
+
+     lc_tags is 0 so the LASSERT is evaluated, and list_empty() on a zeroed
+
+     list_head is false (head->next == NULL != head).  LASSERT is on by
+
+     default (config/lustre-libcfs.m4 defines LIBCFS_DEBUG unless
+
+     --disable-libcfs-assert), so this LBUGs.
+
+	lu_env_fini() (lu_object.c:1923) reaches the same lu_context_fini().
+
+   So it is an LBUG, not a silent leak.  LBUG() does not return, so real
+
+   entries after the first hole are never finalised either, but with
+
+   panic_on_lbug that is moot.
+
+4. Reachability.  Defect 1 runs on every obdclass module load.  Defect 2 runs
+
+   on the lprocfs stats path, i.e. continuously on a live system.  Defect 3
+
+   runs only if lu_env_init() or lu_context_init() fails, i.e. under memory
+
+   allocation failure, and only from cl_global_init() during module init.
+
+   Defect 4 runs on every CDEBUG/CERROR from an affected CPU, i.e. from the
+
+   moment libcfs.ko is loaded, before any Lustre target or client exists.
+
+5. Not a defect, checked and cleared: tracefile.c:386 and :409
+
+   (debug_format_buffer_alloc_buffers/free_buffers) also walk
+
+   for_each_possible_cpu(), but they iterate a genuine alloc_percpu()
+
+   object via per_cpu_ptr(), which is id-safe by construction.
+
+   cfs_trace_set_debug_mb()'s division by num_possible_cpus() (:1098) is a
+
+   count, not an index, and stays correct once the walk is in id space
+
+   because exactly num_possible_cpus() tcds are then initialised.
+
+Steps to reproduce:
+
+  Not reproducible on x86 - the possible mask is dense there by
+
+  construction.  On arm64 it needs a platform where one CPU's cpu_ops init
+
+  fails while a higher-numbered one succeeds; defect 3 additionally needs an
+
+  allocation failure during "modprobe obdclass".  Defects 1 and 3 can be
+
+  demonstrated synthetically by making cl_env_percpu_init()/
+
+  cl_env_percpu_fini() iterate a hardcoded sparse id list and forcing
+
+  lu_env_init() to fail on the third iteration.  Defect 4 can be
+
+  demonstrated synthetically by clearing a low bit of cpu_possible_mask
+
+  before libcfs.ko is loaded (or by hardcoding a sparse id list in
+
+  cfs_tcd_for_each) and issuing a CDEBUG from the highest CPU under KASAN.
+
+Actual result (on a sparse mask):
+
+	cl_global_init() writes past the end of the cl_envs allocation, and the
+
+    lprocfs stats path writes and reads past the end of ls_percpu[] (slab
+
+    corruption; KASAN slab-out-of-bounds).
+
+	any CDEBUG/CERROR on a CPU whose id is >= the weight of
+
+    cpu_possible_mask locks and appends pages to a tcd past the end of the
+
+    cfs_trace_data allocation (KASAN slab-out-of-bounds in
+
+    cfs_trace_get_tcd / cfs_trace_lock_tcd), and "lctl dk" and libcfs
+
+    unload touch the same out-of-bounds slot.
+
+	and, under an allocation failure,
+
+    LustreError: ... (lu_object.c:1794:lu_context_fini())
+
+    ASSERTION( list_empty(&ctx->lc_remember) ) failed -> LBUG.
+
+Expected result:
+
+  Module load, debug logging and stats accounting behave correctly
+
+  regardless of the shape of cpu_possible_mask.

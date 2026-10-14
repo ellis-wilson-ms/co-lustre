@@ -1,0 +1,114 @@
+Key:        LU-20896
+Summary:    O_DIRECT write >1MiB of encrypted file with key loaded corrupts data
+Link:       https://jira.whamcloud.com/browse/LU-20896
+Type:       Bug
+Priority:   Critical
+Status:     Open
+Resolution: Unresolved
+Assignee:   Andreas Dilger
+Reporter:   Andreas Dilger
+Created:    Wed, 7 Oct 2026 21:31:34 +0000
+Updated:    Tue, 13 Oct 2026 16:47:48 +0000
+Links:      Duplicate: is duplicated by LU-19853; Related: is related to  LU-16374; Related: is related to  LU-19249; Related: is related to  LU-14677
+
+--- Description ---
+"lfs migrate" of an encrypted file by a process that has the encryption key loaded corrupts file data beyond about the first 1MiB.  Files up to 1MiB migrate intact, which is why sanity-sec test_52 (9000-byte file) passes.
+
+Reproducer on master (2.17.59-1-g4a7bdda, single-node VM with client crypto enabled, mounted with test_dummy_encryption):
+
+mkdir /mnt/lustre/dm
+for sz in 9000 65536 1048576 3145728; do
+	f=/mnt/lustre/dm/m$sz
+	head -c $sz /dev/urandom > /tmp/src; cp /tmp/src $f; sync
+	lfs migrate -c 2 $f
+	lctl set_param -n ldlm.namespaces.*osc*.lru_size=clear
+	cmp -s /tmp/src $f && echo "$sz ok" || echo "$sz CORRUPT"
+done
+9000 ok
+65536 ok
+1048576 ok
+3145728 CORRUPT
+
+In the 3MiB file, pages 276-767 (offset 1104KiB to EOF) differ from the source; pages 0-275 are intact.  The source and the volatile file are both opened with O_CIPHERTEXT|O_DIRECT, but with the key loaded the direct read returns plaintext and the direct write encrypts it with the volatile file's own encryption context, before the layout swap gives the data to the original inode.  "lfs mirror extend" of a 3MiB file with the key loaded likewise gave a new mirror whose content (read via "lfs mirror read -N 2") differs from the file.
+
+The root cause is not yet known; the boundary not being a multiple of the RPC size suggests something like the encryption page pool when a direct write spans several RPCs.  A related change is planned to make O_CIPHERTEXT direct IO always transfer the raw ciphertext, even when the key is loaded, which is also what encrypted file backup/restore (LU-16374) and EC parity resync need; with that, migrate/mirror would copy ciphertext and no longer re-encrypt.  sanity-sec test_52 should also be extended to use a multi-MiB file.
+
+--- Comment (adilger, Wed, 7 Oct 2026 23:40:41 +0000) ---
+[Claude] The corruption is not specific to migrate: any O_DIRECT write larger than 1MiB to an encrypted file with the key loaded corrupts data, on unpatched master (2.17.59-1-g4a7bdda, test_dummy_encryption mount):
+
+mkdir /mnt/lustre/dio
+for sz in 1048576 2097152 3145728; do
+	head -c $sz /dev/urandom > /tmp/src
+	dd if=/tmp/src of=/mnt/lustre/dio/f$sz bs=4M oflag=direct
+	lctl set_param -n ldlm.namespaces.*osc*.lru_size=clear
+	cmp /tmp/src /mnt/lustre/dio/f$sz
+done
+1048576: identical
+2097152: differ: byte 1273857
+3145728: differ: byte 1974273
+
+The first differing offset varies between runs.  A buffered read shows the same corruption as a direct read, so the data stored on the OST is wrong, i.e. the encrypted direct write path.  "lfs migrate" and "lfs mirror extend" hit it because their O_CIPHERTEXT direct IO decrypts and re-encrypts the data when the key is loaded.
+
+--- Comment (gerrit, Thu, 8 Oct 2026 01:54:33 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69505
+
+Subject: 1MiB of encrypted file with key loaded corrupts data" class="issue-link" data-issue-key="LU-20896">LU-20896 osc: encrypt direct IO pages at their own file index
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 547779100345a82240e115837b7feac8816c7300
+
+--- Comment (gerrit, Thu, 8 Oct 2026 01:57:07 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69506
+
+Subject: 1MiB of encrypted file with key loaded corrupts data" class="issue-link" data-issue-key="LU-20896">LU-20896 llite: transfer ciphertext for O_CIPHERTEXT DIO
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: c0cca9da8d01686c39a56cd9c52b7f4e78adc071
+
+--- Comment (adilger, Thu, 8 Oct 2026 01:57:19 +0000) ---
+[Claude] Summary of the root cause and fixes:
+
+Root cause: OSC encrypted a direct IO page by pointing the user buffer's folio at the file mapping and setting the folio index to the page's file index, then computing the encryption block number as the folio index plus the page's offset within the folio.  When the user buffer is backed by a transparent huge page, that offset is not zero, so the page was encrypted with the IV of another page of the file, while a direct read decrypts it at its own index.  Pages of one large folio can also be in different RPCs prepared concurrently, all changing the same folio index.  This came in with 59d84ec3ffb8 ("LU-19249 build: Compatibility updates for kernel v6.16").  The corruption starts where the direct IO buffer first crosses a 2MiB huge page boundary, which is why the offset varied and files up to about 1MiB were usually intact.
+
+8MiB direct write with the key loaded, 4MiB buffer, 15 runs:
+
+transparent huge pages
+always
+never
+
+without the fix
+15/15 corrupt
+0/15 corrupt
+
+with the fix
+0/15 corrupt
+0/15 corrupt
+
+Fixes:
+
+	patch https://review.whamcloud.com/69505 ("1MiB of encrypted file with key loaded corrupts data" class="issue-link" data-issue-key="LU-20896">LU-20896 osc: encrypt direct IO pages at their own file index") passes the page's file index to the encryption instead of modifying the user folio.  This alone fixes the plain O_DIRECT, "lfs migrate" and "lfs mirror extend" corruption.  Adds sanity-sec test_67.
+
+	patch https://review.whamcloud.com/69506 ("1MiB of encrypted file with key loaded corrupts data" class="issue-link" data-issue-key="LU-20896">LU-20896 llite: transfer ciphertext for O_CIPHERTEXT DIO") makes O_CIPHERTEXT direct IO transfer the ciphertext as stored on the OSTs even when the key is loaded, as it already did without the key, so migrate, mirror resync and EC parity resync copy the stored data rather than decrypting and re-encrypting it.  EC parity is then always computed from the stored ciphertext, as encrypted EC recovery (patch https://review.whamcloud.com/66481) and encrypted backup/restore (LU-16374) need.  Adds sanity-sec test_66.
+
+--- Comment (gerrit, Fri, 9 Oct 2026 21:38:34 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69556
+
+Subject: 1MiB of encrypted file with key loaded corrupts data" class="issue-link" data-issue-key="LU-20896">LU-20896 osd-zfs: serialize LMA flag update in osd_attr_set
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 52d6b8e837056e0e3f2e58314d4628ae606c3a17

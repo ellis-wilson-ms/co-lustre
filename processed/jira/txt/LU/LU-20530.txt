@@ -1,0 +1,228 @@
+Key:        LU-20530
+Summary:    Server crash for "BUG: unable to handle kernel paging request at ffffffffa8ff2600" in __pv_queued_spin_lock_slowpath()
+Link:       https://jira.whamcloud.com/browse/LU-20530
+Type:       Bug
+Priority:   Medium
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Bruno Faccini
+Reporter:   Bruno Faccini
+Created:    Tue, 28 Jul 2026 12:32:10 +0000
+Updated:    Mon, 7 Sep 2026 15:49:41 +0000
+Resolved:   Wed, 19 Aug 2026 12:58:47 +0000
+
+--- Description ---
+Our servers/VMs are running with Lustre version 2.14.0_ddn240 .
+
+Here is the panic stack :
+
+ 
+
+PID: 624550   TASK: ff4843e77e358000  CPU: 22   COMMAND: "mdt18_006"
+#0 [ff57b48a9d9477e0] machine_kexec at ffffffffa6c6de53
+#1 [ff57b48a9d947838] __crash_kexec at ffffffffa6db9e0a
+#2 [ff57b48a9d9478f8] crash_kexec at ffffffffa6dbad41
+#3 [ff57b48a9d947910] oops_end at ffffffffa6c2c131
+#4 [ff57b48a9d947930] no_context at ffffffffa6c80da3
+#5 [ff57b48a9d947988] __bad_area_nosemaphore at ffffffffa6c81107
+#6 [ff57b48a9d9479d0] do_page_fault at ffffffffa6c81dc7
+#7 [ff57b48a9d947a00] page_fault at ffffffffa78011fe
+    [exception RIP: __pv_queued_spin_lock_slowpath+414] 
+
+Hopefully there was a crash-dump saved, and its analysis has permitted to find that the cause of the crash is because an upcall_cache_entry has been freed, after exiting from schedule_timeout() for timeout/-ETIMEDOUT , and thus when trying to wake-up all of its possible waiters in upcall_cache_get_entry() :
+
+ 
+
+struct upcall_cache_entry *upcall_cache_get_entry(struct upcall_cache *cache,
+                                                  __u64 key, void *args)
+{                       
+        struct upcall_cache_entry *entry = NULL, *new = NULL, *next;
+        struct upcall_cache_entry *best_exp;
+        gid_t fsgid = (__u32)__kgid_val(INVALID_GID);
+        struct group_info *ginfo = NULL;
+        bool failedacquiring = false;
+        struct list_head *head;
+        wait_queue_entry_t wait;
+        bool writelock;
+        int rc = 0, rc2, found;
+ 
+        ENTRY;
+ 
+        LASSERT(cache);
+ 
+        head = &cache->uc_hashtable[UC_CACHE_HASH_INDEX(key,
+                                                        cache->uc_hashsize)];
+find_again:
+..................................
+        /* someone (and only one) is doing upcall upon this item,
+         * wait it to complete */
+        if (UC_CACHE_IS_ACQUIRING(entry)) {
+                long expiry = (entry == new) ?
+                              cfs_time_seconds(cache->uc_acquire_expire) :
+                              MAX_SCHEDULE_TIMEOUT;
+                long left;
+ 
+                init_wait(&wait);
+                add_wait_queue(&entry->ue_waitq, &wait);
+                set_current_state(TASK_INTERRUPTIBLE);
+                write_unlock(&cache->uc_lock);
+ 
+                left = schedule_timeout(expiry);
+ 
+                write_lock(&cache->uc_lock);
+                remove_wait_queue(&entry->ue_waitq, &wait);
+                if (UC_CACHE_IS_ACQUIRING(entry)) {
+                        /* we're interrupted or upcall failed in the middle */
+                        rc = left > 0 ? -EINTR : -ETIMEDOUT;
+                        /* if we waited uc_acquire_expire, we can try again
+                         * with same data, but only if acquire is replayable
+                         */
+                        if (left uc_acquire_replay)
+                                failedacquiring = true;
+                        put_entry(cache, entry); if (!failedacquiring) {
+                                write_unlock(&cache->uc_lock);
+                                failedacquiring = true;
+                                new = NULL;
+                                CDEBUG(D_OTHER,
+                                       "retry acquire for key %llu (got %d)\n",
+                                       entry->ue_key, rc);
+                                goto find_again;
+                        }
+                        wake_up_all(&entry->ue_waitq); "%s: acquire for key %lld after %llu: rc = %d\n",
+                               cache->uc_name, entry->ue_key,
+                               cache->uc_acquire_expire, rc);
+                        GOTO(out, entry = ERR_PTR(rc));
+                }
+        }
+...........................
+
+more digging into crash-dump and associated source code there is a strong feeling that the upcall_cache_entry has been freed by the current task itself during the just preeceding put_entry() !!...
+
+May be this condition has been more likely to occur due to the fact the server/VM was under high memory pressure and cpu load ... :
+
+ 
+
+..............................
+[11276666.845718] Lustre: ll_ost_io14_004: service thread pid 1120549 completed after 550.086s. This likely indicates the system was overloaded (too many service threads, or not enough hardware resources).
+[11276666.965735] Lustre: ll_ost_io05_009: service thread pid 1120636 completed after 558.609s. This likely indicates the system was overloaded (too many service threads, or not enough hardware resources).
+[11276667.015445] Lustre: ll_ost_io10_003: service thread pid 1120538 completed after 652.246s. This likely indicates the system was overloaded (too many service threads, or not enough hardware resources).
+[11276667.046052] Lustre: ll_ost_io03_034: service thread pid 1181717 completed after 588.418s. This likely indicates the system was overloaded (too many service threads, or not enough hardware resources).
+[11276667.063153] Lustre: ll_ost_io07_048: service thread pid 1181692 completed after 676.858s. This likely indicates the system was overloaded (too many service threads, or not enough hardware resources).
+[11276667.345307] Lustre: ll_ost_io05_042: service thread pid 1181579 completed after 542.165s. This likely indicates the system was overloaded (too many service threads, or not enough hardware resources).
+[11276667.386380] Lustre: ll_ost_io02_030: service thread pid 1129848 completed after 525.688s. This likely indicates the system was overloaded (too many service threads, or not enough hardware resources).
+[11276667.456035] LustreError: 553290:0:(service.c:2323:ptlrpc_server_handle_request()) @@@ Dropping timed-out request from 12345-172.16.0.229@o2ib: deadline 23/9s ago  req@0000000020b44464 x1870277730165312/t0(0) o400->dde80656-4875-4f6f-a2d1-17064b92d25c@172.16.0.229@o2ib:250/0 lens 224/0 e 0 to 0 dl 1784606585 ref 1 fl Interpret:H/0/ffffffff rc 0/-1 job:''
+[11276667.463009] LustreError: 553290:0:(service.c:2323:ptlrpc_server_handle_request()) Skipped 8 previous similar messages
+[11276667.465919] BUG: unable to handle kernel paging request at ffffffffa8ff2600
+[11276667.467574] PGD 5c3c12067 P4D 5c3c13067 PUD 5c3c14063 PMD 5c55ff063 PTE 80000005c45f2161
+[11276667.469464] Oops: 0003 [#1] SMP NOPTI
+[11276667.470534] CPU: 22 PID: 624550 Comm: mdt18_006 Kdump: loaded Tainted: G           OE     -------- -  - 4.18.0-553.76.1.el8_lustre.ddn17.x86_64 #1
+[11276667.473247] Hardware name: DDN SFA400NVX2E, BIOS 1.16.3-20250916_202628-co-sf-pe-221 04/01/2014
+[11276667.475175] RIP: 0010:__pv_queued_spin_lock_slowpath+0x19e/0x2a0
+[11276667.476646] Code: c4 c1 ea 12 41 be 01 00 00 00 4c 8d 6d 14 41 83 e4 03 8d 42 ff 49 c1 e4 05 48 98 49 81 c4 c0 45 03 00 4c 03 24 c5 80 68 fc a7  89 2c 24 b8 00 80 00 00 eb 15 84 c0 75 0a 41 0f b6 54 24 14 84
+[11276667.480768] RSP: 0000:ff57b48a9d947ab0 EFLAGS: 00010086
+[11276667.482078] RAX: 0000000000001695 RBX: ff4843f39e5d4620 RCX: 0000000000000001
+[11276667.483615] RDX: 0000000000001696 RSI: 0000000000000000 RDI: 0000000000000000
+[11276667.485237] RBP: ff484409b1bb45c0 R08: 0000000000000000 R09: 0000000000000001
+[11276667.486810] R10: ff4843f39e5d4600 R11: 0000000000000000 R12: ffffffffa8ff2600
+[11276667.488425] R13: ff484409b1bb45d4 R14: 0000000000000001 R15: 00000000005c0000
+[11276667.490203] FS:  0000000000000000(0000) GS:ff484409b1b80000(0000) knlGS:0000000000000000
+[11276667.491985] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[11276667.493347] CR2: ffffffffa8ff2600 CR3: 00000005c3c10005 CR4: 0000000000771ee0
+[11276667.494941] DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+[11276667.496565] DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+[11276667.498098] PKRU: 55555554
+[11276667.498965] Call Trace:
+[11276667.499761]  ? __die_body+0x1a/0x60
+[11276667.500710]  ? no_context+0x1ba/0x3f0
+[11276667.501883]  ? __bad_area_nosemaphore+0x157/0x180
+[11276667.503243]  ? spurious_kernel_fault+0x1ed/0x250
+[11276667.504409]  ? do_page_fault+0x37/0x12d
+[11276667.505416]  ? page_fault+0x1e/0x30
+[11276667.506356]  ? __pv_queued_spin_lock_slowpath+0x19e/0x2a0
+[11276667.507637]  _raw_spin_lock_irqsave+0x34/0x40
+[11276667.508760]  __wake_up_common_lock+0x66/0xd0
+[11276667.509813]  upcall_cache_get_entry+0xab9/0xbe0 [obdclass]
+[11276667.511160]  ? finish_wait+0x80/0x80
+[11276667.512083]  rsi_entry_get+0x117/0x1f0 [ptlrpc_gss]
+[11276667.513246]  gss_svc_upcall_handle_init+0xd7/0xb10 [ptlrpc_gss]
+[11276667.514635]  gss_svc_handle_init+0x987/0xd90 [ptlrpc_gss]
+[11276667.515898]  gss_svc_accept+0x6ba/0xaf0 [ptlrpc_gss]
+[11276667.517054]  ? sptlrpc_wireflavor2policy+0xc4/0x170 [ptlrpc]
+[11276667.518415]  sptlrpc_svc_unwrap_request+0x19c/0x650 [ptlrpc]
+[11276667.519759]  ptlrpc_server_handle_req_in+0xf8/0x8f0 [ptlrpc]
+[11276667.521125]  ptlrpc_main+0xaef/0x13a0 [ptlrpc]
+[11276667.522247]  ? ptlrpc_register_service+0xf30/0xf30 [ptlrpc]
+[11276667.523584]  kthread+0x134/0x150
+[11276667.524436]  ? set_kthread_struct+0x50/0x50
+[11276667.525528]  ret_from_fork+0x1f/0x40
+[11276667.526386] Modules linked in: ofd(OE) ost(OE) osp(OE) mdd(OE) lod(OE) mdt(OE) lfsck(OE) ptlrpc_gss(OE) mgc(OE) osd_ldiskfs(OE) ldiskfs(OE) lquota(OE) lustre(OE) mdc(OE) lov(OE) osc(OE) lmv(OE) fid(OE) fld(OE) ptlrpc(OE) ko2iblnd(OE) obdclass(OE) lnet(OE) libcfs(OE) binfmt_misc sctp ip6_udp_tunnel udp_tunnel libcrc32c rdma_ucm(OE) rdma_cm(OE) iw_cm(OE) ib_ipoib(OE) ib_cm(OE) ib_umad(OE) intel_rapl_msr intel_rapl_common intel_uncore_frequency_common nfit libnvdimm kvm_intel bochs kvm drm_vram_helper drm_ttm_helper ttm drm_kms_helper irqbypass syscopyarea iTCO_wdt sysfillrect crc32_pclmul sysimgblt iTCO_vendor_support rapl drm joydev lpc_ich i2c_i801 pcspkr i6300esb auth_rpcgss sunrpc ext4 mbcache jbd2 sr_mod mlx5_ib(OE) sd_mod cdrom ib_uverbs(OE) t10_pi sg ib_core(OE) mlx5_core(OE) ahci pci_hyperv_intf libahci mlxdevm(OE) psample mlxfw(OE) crct10dif_pclmul crc32c_intel bnxt_en libata mlx_compat(OE) virtio_net ghash_clmulni_intel tls serio_raw net_failover virtio_blk virtio_scsi failover
+[11276667.526462]  dm_mirror dm_region_hash dm_log dm_mod [last unloaded: libcfs]
+[11276667.544227] Red Hat flags: eBPF/cgroup
+[11276667.545143] CR2: ffffffffa8ff2600
+
+ 
+
+and this since quite a long according to full system log !!
+
+I will cook a patch proposal to at least fix this path/possibility in the current code that is still present in latest master.
+
+--- Comment (gerrit, Tue, 28 Jul 2026 12:44:12 +0000) ---
+"Bruno Faccini " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/67591
+
+Subject: LU-20530 obdclass: do not release ref before using
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 6b377510580adc85ced874cbf2791b7c0d5c4357
+
+--- Comment (gerrit, Wed, 29 Jul 2026 14:56:45 +0000) ---
+"Bruno Faccini " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/67617
+
+Subject: LU-20530 obdclass: release ref upon error exit
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: be717f2a956f9d3a68e09e187e1fb9a1c14d3de9
+
+--- Comment (JIRAUSER18717, Wed, 29 Jul 2026 15:00:21 +0000) ---
+2nd/#67617 patch is to fix an other potential upcall_cache_entry reference counter overflow case.
+
+--- Comment (JIRAUSER21301, Wed, 29 Jul 2026 20:02:58 +0000) ---
+bfaccini-nvda  since you're working on the fix, you might as well own this ticket
+
+--- Comment (gerrit, Wed, 12 Aug 2026 06:00:48 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/67591/
+
+Subject: LU-20530 obdclass: do not release ref before using
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: a6334ff4bfbe7bce730b4cc5e65ba6c2889357f7
+
+--- Comment (gerrit, Wed, 19 Aug 2026 01:02:37 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/67617/
+
+Subject: LU-20530 obdclass: release ref upon error exit
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 9bef1f3a5cc4d76ab8db06c8486fc190e1b4e471
+
+--- Comment (pjo, Wed, 19 Aug 2026 12:58:47 +0000) ---
+Merged for 2.18

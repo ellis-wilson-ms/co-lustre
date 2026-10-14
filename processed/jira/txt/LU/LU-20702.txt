@@ -1,0 +1,125 @@
+Key:        LU-20702
+Summary:    recovery-small test_111: MDS oops in osp_check_and_set_rpc_version()
+Link:       https://jira.whamcloud.com/browse/LU-20702
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Oleg Drokin
+Created:    Mon, 7 Sep 2026 00:27:15 +0000
+Updated:    Mon, 7 Sep 2026 00:28:27 +0000
+
+--- Description ---
+An MDS oopses during recovery-small test_111 when the MDT stack is torn
+
+down after a failed mount while the LOD update recovery threads are still
+
+running:
+
+LustreError: 2042628:0:(mdd_device.c:675:mdd_changelog_init()) lustre-MDD0000: changelog setup during init failed: rc = -5
+LustreError: 2042628:0:(tgt_mount.c:2566:server_fill_super()) Unable to start targets: -5
+Lustre: Failing over lustre-MDT0000
+BUG: unable to handle kernel NULL pointer dereference at 0000000000000008
+CPU: 0 PID: 2042677 Comm: lod0000_rec0002
+RIP: 0010:osp_check_and_set_rpc_version+0x138 [osp]
+Call Trace:
+ osp_md_write+0x4fd/0x8b0 [osp]
+ dt_record_write+0x3f/0x190 [obdclass]
+ llog_osd_write_rec+0x830/0x2420 [obdclass]
+ llog_write_rec+0x4fe/0x6e0 [obdclass]
+ llog_cancel_arr_rec+0x52f/0x1650 [obdclass]
+ llog_cancel_rec+0x26/0x30 [obdclass]
+ llog_cat_cleanup+0xea/0x2d0 [obdclass]
+ llog_cat_process_cb+0x3bb/0x3e0 [obdclass]
+ llog_process_thread+0x1454/0x2440 [obdclass]
+ llog_cat_process+0x2a/0x40 [obdclass]
+ lod_sub_recovery_thread+0x19d/0xf20 [lod]
+
+Where it was seen
+
+14 occurrences in the janitor crash archive between 2025-10-28 and
+
+2026-09-06, every one of them recovery-small test 111 on boilpot, e.g.
+
+build v2_17_58-56-gfbf723023e (master-next), 2026-09-06 –
+
+https://testing.whamcloud.com/gerrit-janitor/external/crashes/boilpot-bigmem2-107-2026-09-06-18:47:50
+
+The defect itself is much older than that window (see the Fixes: tag
+
+below); it is simply rare.
+
+Root cause
+
+test_111 makes mdd_changelog_init() fail with fail_loc=0x151, so
+
+server_fill_super() unwinds the MDT stack while the update recovery
+
+threads that lod_prepare() started are still walking the remote update
+
+llogs.
+
+lod_process_config() (lustre/lod/lod_dev.c) forwards LCFG_PRE_CLEANUP
+
+to its OSP targets before it stops those threads:
+
+1111        lod_sub_process_config(env, lod, &lod->lod_mdt_descs, lcfg);  
+
+That order is deliberate: the OSP disconnect is what aborts the threads'
+
+in-flight RPCs so they can exit (8299bdd484 "LU-6705 lod: re-order lodsub
+
+recovery cleanup"). But osp_process_config() also called
+
+osp_update_fini() in that phase, and that frees opd_update.
+
+osp_check_and_set_rpc_version() (lustre/osp/osp_trans.c) reads
+
+opd_update once for its NULL check and then reads it again for the
+
+list_add_tail():
+
+1277        struct osp_updates *ou = osp->opd_update;
+1279        if (ou == NULL)
+1280                return -EIO;
+...
+1297        list_add_tail(&oth->ot_our->our_list,
+1298                      &osp->opd_update->ou_list);          
+
+Disassembly of the crashing osp.ko confirms the fault is the second read:
+
+osp_check_and_set_rpc_version+0x138 is mov 0x8(%r14),%rcx with
+
+%r14 loaded from 0x250(%r12) (== opd_update) at line 1298, while
+
+the value read at line 1277 is still live in %r13:
+
+R12: ffff9239bf6df800   (osp_device)
+R13: ffff923a51c61d40   (ou, read at line 1277 - non-NULL)
+R14: 0000000000000000   (osp->opd_update, re-read at line 1298 - NULL)
+CR2: 0000000000000008
+
+So osp_update_fini() ran between the two reads. The console confirms the
+
+OSP LCFG_PRE_CLEANUP had indeed already happened 6ms before the oops:
+
+[170011.898319] LustreError: ...ptlrpc_import_delay_req()) @@@ IMP_CLOSED ... lustre-MDT0001-osp-MDT0000 ... job:'lod0000_rec0001.0'
+[170011.904433] BUG: unable to handle kernel NULL pointer dereference at 0000000000000008
+
+Note the free precedes the NULL store in osp_update_fini(), so the
+
+ou->ou_version++ at line 1295 is also a use-after-free.
+
+--- Comment (gerrit, Mon, 7 Sep 2026 00:28:27 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68678
+
+Subject: LU-20702 osp: don't free opd_update while LOD threads run
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: b316f55c98fa33fb9d0fdb61171fa367279fcb98

@@ -1,0 +1,91 @@
+Key:        LU-20833
+Summary:    replay_barrier lets the server act on commits it then discards
+Link:       https://jira.whamcloud.com/browse/LU-20833
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Patrick Farrell
+Created:    Fri, 25 Sep 2026 20:14:59 +0000
+Updated:    Sat, 26 Sep 2026 05:35:31 +0000
+Links:      Related: is related to  LU-14470; Related: is related to  LU-3140
+
+--- Description ---
+replay_barrier is meant to simulate a server crash at the barrier.  It does two things:
+
+	notransno stops the target from reporting last_committed to clients;
+
+	the device is switched to dm-flakey drop_writes (lctl readonly on ZFS).
+
+Neither stops the target from seeing its own commits.  dm-flakey completes every dropped write as a success, so jbd2 commits normally and the commit callbacks run with err == 0.  tgt_cb_last_committed() then raises obd_last_committed and exp_last_committed and calls ptlrpc_commit_replies() and tgt_cancel_slc_locks().  It checks neither OBDF_NO_TRANSNO nor anything else the barrier sets.
+
+So every server-side consumer of a commit acts on a transaction that failover then throws away:
+
+	COS/TXN locks saved in difficult replies are released (ptlrpc_commit_replies -> ptlrpc_handle_rs);
+
+	saved cross-MDT locks are cancelled (tgt_cancel_slc_locks);
+
+	sync-on-cancel (tgt_blocking_ast -> tgt_sync) returns success;
+
+	th_sync transactions report success, including FID sequence grants and chmod/chown with sync_permission=1, the default;
+
+	OSP sync (osp_sync_local_commit_cb) sends OST destroys and setattrs for MDT changes that failover then drops.
+
+A real crash cannot produce these histories.  Take DNE commit-on-sharing:
+
+	Op1 on MDT A parks its locks as LCK_TXN.
+
+	Op2 on MDT B conflicts with them, which forces a commit on A.
+
+	The commit "completes" into the dropped device, and op2 is granted.
+
+	After failover, op1 is gone from A's disk, while op2 has run on B on the strength of op1's commit.
+
+A real crash gives one of two histories: op1 is durable before op2 runs, or op2 is never granted.  Under the barrier, recovery replays a pair of operations that commit-on-sharing exists to keep apart, so a test can fail, or pass, on a history no crash produces.
+
+This has been known for single cases, each fixed or worked around on its own:
+
+	the pre-barrier mcreate in replay_barrier (b=24078), so no FID sequence is allocated after it;
+
+	LU-1573 drops the sync BRW reply under OBDF_NO_TRANSNO;
+
+	LU-3536 freezes the update-log batchid under the same flag;
+
+	replay-vbr turns COS and sync_permission off.
+
+LU-3140 recorded the general limitation: "Any sync operation will be a problem, because it will finish like non-sync".  LU-14470 noted that DNE sync-on-cancel "can't be tested with replay_barrier()".  Nothing in test-framework or the tests records either.
+
+Tests exposed today: replay-single 70b-70e and replay-dual 26 run DNE load across repeated barriers, so SLC acts on lost commits there.  Some of their long-standing intermittent failures may be this (for example LU-14878, LU-15892, LU-18001, LU-10559); that is not established.
+
+Proposed fix
+
+	A test-only target flag set by the barrier, e.g. OBDF_REPLAY_BARRIER with its own sysfs attribute.  It must be separate from OBDF_NO_TRANSNO, which production failover umount also sets.
+
+	With the flag set, tgt_cb_last_committed() returns early, as it already does for err != 0: last_committed does not advance, and saved COS/TXN and SLC locks stay held until the target stops.  osp_sync_local_commit_cb() does the same.
+
+	Synchronous waiters that bypass the callbacks (tgt_sync from tgt_blocking_ast, th_sync transactions, OST_SYNC/MDS_SYNC) must not return success under the flag: drop the reply as LU-1573 does, or block until target cleanup with -ESHUTDOWN.
+
+Expected test impact: recovery-small 156 relies on its O_SYNC write completing after the barrier and needs the write backgrounded across the fail; replay-single 115 and 137a/137c need a run; the DNE load tests keep their assertions, with brief stalls at each barrier.
+
+Risks: parked service threads hold ldlm locks, so umount must unwind them; many parked sync operations can use up MDT service threads until the fail.  HARD failover (a real reboot) is unaffected.
+
+--- Comment (paf0186, Fri, 25 Sep 2026 20:18:42 +0000) ---
+A related gap in the same helper: on ldiskfs the barrier can drop nothing at all.
+
+set_dev_readonly() falls back to lctl readonly whenever dm_flakey_supported fails, that is with FLAKEY=false or when the dm-flakey target cannot be loaded.  lctl readonly reaches dt_ro(), and osd-ldiskfs osd_ro() has returned -EOPNOTSUPP since 20553c985a (the removal of the dev_read_only kernel patch).  The only sign is a "CANNOT BE SET READONLY" console error on the server; set_dev_readonly() ignores the failure.  Every write after the barrier is then durable, and a test that expects those writes to be replayed passes without testing replay.
+
+set_dev_readonly() should fail the test when the readonly switch fails, or refuse FLAKEY=false with replay_barrier on ldiskfs.
+
+--- Comment (paf0186, Fri, 25 Sep 2026 20:19:03 +0000) ---
+diwa adilger
+
+--- Comment (paf0186, Fri, 25 Sep 2026 20:21:11 +0000) ---
+Found this issue while stress testing renames - got some failures that should've been impossible.
+
+The good news is this bug is basically worse than reality - we report committed writes which are then lost.  So it's probably been hurting testing w/false failures but not making us miss bugs.
+
+--- Comment (bzzz, Sat, 26 Sep 2026 05:34:39 +0000) ---
+I think the issue is even borader - replay-barrier turns fs into "forget everything" and when read is needed for a reason - whoops, nothing.
+
+sanityn/18 is a good demonstration. this is ldiskfs specific, because ZFS has own approach which does work - write/read everything as usual, except uber-block so the filesystem forgets all changes at remount, not sooner.

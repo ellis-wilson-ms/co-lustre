@@ -8,7 +8,7 @@ Resolution: Fixed
 Assignee:   Alex Zhuravlev
 Reporter:   Quentin Bouget
 Created:    Wed, 5 Aug 2020 09:36:06 +0000
-Updated:    Fri, 23 Jan 2026 08:24:00 +0000
+Updated:    Fri, 26 Jun 2026 10:21:43 +0000
 Resolved:   Wed, 22 Oct 2025 23:04:38 +0000
 Labels:     msft
 
@@ -33,58 +33,78 @@ dmesg provides some interesting information:
 
 Happy hunting
 
---- Comment (scadmin, Fri, 23 Jan 2026 08:24:00 +0000) ---
-Hiya,
+--- Comment (pjones, Wed, 5 Aug 2020 12:57:58 +0000) ---
+Is this something that you are planning to investigate?
 
-we hit this bug on a new filesystem with 2.15.8 servers and 2.15.7 clients.
+--- Comment (bougetq, Wed, 5 Aug 2020 13:04:39 +0000) ---
+No, this was just a test system I setup to review a patch.
 
-it happened as soon as we started making user directories - ie. a loop over 
+This is not something we hit in production (yet).
 
-{ mkdir, chown, chmod }
-.
+--- Comment (JIRAUSER17317, Thu, 14 Jul 2022 15:10:48 +0000) ---
+I believe I ran into this:
 
-any chance this patch can be backported to 2.15?
+root@node:/# chmod -R 777 /lustrefs
 
-for now we're running with our own port of it. seems to work.
+chmod: changing permissions of '/lustrefs': Input/output error
 
-cheers,
+root@node:/# dmesg -T
 
-robin
+...
 
---- Comment (pjones, Wed, 22 Oct 2025 23:04:38 +0000) ---
-Merged for 2.17
+[Mon Jun 27 17:25:18 2022] LustreError: 1259:0:(llite_lib.c:1712:ll_md_setattr()) md_setattr fails: rc = -5 
 
---- Comment (gerrit, Wed, 22 Oct 2025 22:54:03 +0000) ---
-"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/58681/
+Looking at the original error, I see the following at the exact time of chmod failure on the MDT:
 
-Subject: LU-13854 mdd: setattr can use multiple chglog types
+[250875.733525] LustreError: 32002:0:(llog_cat.c:544:llog_cat_current_log()) lustrefs-MDD0000: next log does not exist!
 
-Project: fs/lustre-release
+ 
 
-Branch: master
+There are no surrounding lines that suggest there weren't free slots or something else to indicate why this is happening.
 
-Current Patch Set: 
+ 
 
-Commit: 5ca924c14a02bd86daf9a3bdd5b90671116fcf83
+The description seems to suggest the changelog mask may be involved.  On my clusters I use:
 
---- Comment (bzzz, Fri, 4 Apr 2025 05:56:23 +0000) ---
-hmm, I had to push it tomorrow...
+mdd.lustrefs-MDT0000.changelog_mask=all-ATIME-FLRW-GXATR-MARK-MIGRT-NOPEN-OPEN-RESYNC-XATTR
 
---- Comment (bzzz, Fri, 4 Apr 2025 05:55:08 +0000) ---
-elliswilson thanks for the super detailed and helpful report!
+ 
 
---- Comment (gerrit, Fri, 4 Apr 2025 05:53:24 +0000) ---
-"Alex Zhuravlev " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/58681
+Looking across the many clusters this bug is hit approximately once per day.  Are there any suggestions for ways I could help provide additional debugging information?  Also, is there a reason to not return EAGAIN here rather than EIO (I'm not intimately familiar with this code so I'm sure there is a good reason)?  Looking at this block it feels like just trying again would be reasonable (and certainly these nodes do recover – just that single command gets EIO back).  Failing a whole job for just a one-off retryable concurrency issue is unfortunate.
 
-Subject: LU-13854 mdd: setattr can use multiple chglog recs
+ 
 
-Project: fs/lustre-release
+   536   /* Sigh, the chd_next_log and chd_current_log is initialized   537    * in declare phase, and we do not serialize the catlog
 
-Branch: master
+   538    * accessing, so it might be possible the llog creation
 
-Current Patch Set: 1
+   539    * thread (see llog_cat_declare_add_rec()) did not create
 
-Commit: 6a6b86fd0374235a82628146d6500d27abed74e1
+   540    * llog successfully, then the following thread might
+
+   541    * meet this situation. */
+
+   542   if (IS_ERR_OR_NULL(cathandle->u.chd.chd_next_log)) {
+
+   543     CERROR("%s: next log does not exist!\n",
+
+   544            cathandle->lgh_ctxt->loc_obd->obd_name);
+
+   545     loghandle = ERR_PTR(-EIO);
+
+   546     if (cathandle->u.chd.chd_next_log == NULL) {
+
+   547       /* Store the error in chd_next_log, so
+
+   548        * the following process can get correct
+
+   549        * failure value */
+
+   550       cathandle->u.chd.chd_next_log = loghandle;
+
+{{   551     }}}
+
+   552     GOTO(out_unlock, loghandle);
 
 --- Comment (JIRAUSER17317, Fri, 5 Apr 2024 19:17:49 +0000) ---
 I have continued to see this pop up across all versions of 2.14 and 2.15, and most recently repro'd it against master (bb6a2d2e80f04645b488ecca6ba14cb628e3eeb3).  Here is a quick way to reproduce it:
@@ -155,75 +175,55 @@ This will NOT reproduce if you remove CTIME and SATTR from the changelog mask, b
 
 Our Lustre servers are on Ubuntu 20.04.6, so it's entirely possible that there is something specific about that and the ldiskfs patch series that causes this to materialize for our changelogs but it's not hitting a bunch of others.  Or perhaps nobody else both has sufficiently high attribute changing workloads and changelogs enabled with the necessary masks (I doubt it).  If somebody has a lustre cluster and 20 minutes to see if they can repro this I'd be really appreciative.
 
---- Comment (JIRAUSER17317, Thu, 14 Jul 2022 15:10:48 +0000) ---
-I believe I ran into this:
+--- Comment (gerrit, Fri, 4 Apr 2025 05:53:24 +0000) ---
+"Alex Zhuravlev " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/58681
 
-root@node:/# chmod -R 777 /lustrefs
+Subject: LU-13854 mdd: setattr can use multiple chglog recs
 
-chmod: changing permissions of '/lustrefs': Input/output error
+Project: fs/lustre-release
 
-root@node:/# dmesg -T
+Branch: master
 
-...
+Current Patch Set: 1
 
-[Mon Jun 27 17:25:18 2022] LustreError: 1259:0:(llite_lib.c:1712:ll_md_setattr()) md_setattr fails: rc = -5 
+Commit: 6a6b86fd0374235a82628146d6500d27abed74e1
 
-Looking at the original error, I see the following at the exact time of chmod failure on the MDT:
+--- Comment (bzzz, Fri, 4 Apr 2025 05:55:08 +0000) ---
+elliswilson thanks for the super detailed and helpful report!
 
-[250875.733525] LustreError: 32002:0:(llog_cat.c:544:llog_cat_current_log()) lustrefs-MDD0000: next log does not exist!
+--- Comment (bzzz, Fri, 4 Apr 2025 05:56:23 +0000) ---
+hmm, I had to push it tomorrow...
 
- 
+--- Comment (gerrit, Wed, 22 Oct 2025 22:54:03 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/58681/
 
-There are no surrounding lines that suggest there weren't free slots or something else to indicate why this is happening.
+Subject: LU-13854 mdd: setattr can use multiple chglog types
 
- 
+Project: fs/lustre-release
 
-The description seems to suggest the changelog mask may be involved.  On my clusters I use:
+Branch: master
 
-mdd.lustrefs-MDT0000.changelog_mask=all-ATIME-FLRW-GXATR-MARK-MIGRT-NOPEN-OPEN-RESYNC-XATTR
+Current Patch Set: 
 
- 
+Commit: 5ca924c14a02bd86daf9a3bdd5b90671116fcf83
 
-Looking across the many clusters this bug is hit approximately once per day.  Are there any suggestions for ways I could help provide additional debugging information?  Also, is there a reason to not return EAGAIN here rather than EIO (I'm not intimately familiar with this code so I'm sure there is a good reason)?  Looking at this block it feels like just trying again would be reasonable (and certainly these nodes do recover – just that single command gets EIO back).  Failing a whole job for just a one-off retryable concurrency issue is unfortunate.
+--- Comment (pjones, Wed, 22 Oct 2025 23:04:38 +0000) ---
+Merged for 2.17
 
- 
+--- Comment (scadmin, Fri, 23 Jan 2026 08:24:00 +0000) ---
+Hiya,
 
-   536   /* Sigh, the chd_next_log and chd_current_log is initialized   537    * in declare phase, and we do not serialize the catlog
+we hit this bug on a new filesystem with 2.15.8 servers and 2.15.7 clients.
 
-   538    * accessing, so it might be possible the llog creation
+it happened as soon as we started making user directories - ie. a loop over 
 
-   539    * thread (see llog_cat_declare_add_rec()) did not create
+{ mkdir, chown, chmod }
+.
 
-   540    * llog successfully, then the following thread might
+any chance this patch can be backported to 2.15?
 
-   541    * meet this situation. */
+for now we're running with our own port of it. seems to work.
 
-   542   if (IS_ERR_OR_NULL(cathandle->u.chd.chd_next_log)) {
+cheers,
 
-   543     CERROR("%s: next log does not exist!\n",
-
-   544            cathandle->lgh_ctxt->loc_obd->obd_name);
-
-   545     loghandle = ERR_PTR(-EIO);
-
-   546     if (cathandle->u.chd.chd_next_log == NULL) {
-
-   547       /* Store the error in chd_next_log, so
-
-   548        * the following process can get correct
-
-   549        * failure value */
-
-   550       cathandle->u.chd.chd_next_log = loghandle;
-
-{{   551     }}}
-
-   552     GOTO(out_unlock, loghandle);
-
---- Comment (bougetq, Wed, 5 Aug 2020 13:04:39 +0000) ---
-No, this was just a test system I setup to review a patch.
-
-This is not something we hit in production (yet).
-
---- Comment (pjones, Wed, 5 Aug 2020 12:57:58 +0000) ---
-Is this something that you are planning to investigate?
+robin

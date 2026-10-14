@@ -1,0 +1,66 @@
+Key:        LU-20738
+Summary:    Transient empty GSS credentials cache fails requests with -EPERM
+Link:       https://jira.whamcloud.com/browse/LU-20738
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Sebastien Buisson
+Reporter:   Sebastien Buisson
+Created:    Fri, 11 Sep 2026 13:21:54 +0000
+Updated:    Fri, 11 Sep 2026 13:25:21 +0000
+Labels:     gss, krb5, patch
+
+--- Description ---
+When a root GSS context has to be negotiated, lgss_keyring prepares the credential first, in lkrb5_prepare_root_cred(), which checks the credentials cache and, if needed, obtains a new TGT from the keytab. That work is serialised with other lgss_keyring processes by a SysV semaphore.
+
+But the tickets are only read from the cache later on, when gss_init_sec_context() is called, and that happens after the semaphore has been released. This is a check-then-use race: anything emptying the cache in between makes gss_init_sec_context() return GSS_S_NO_CRED.
+
+Note that holding a gss credential across that window does not help, so setting lnd_cred instead of leaving it to GSS_C_NO_CREDENTIAL is not a fix. An INITIATE credential acquired from the default cache only keeps a krb5_ccache handle:
+
+code = krb5int_cc_default(context, &cred->ccache);
+
+and krb5_gss_init_sec_context() reads the tickets from that cache when it is called:
+
+code = krb5_get_credentials(context, flags, cred->ccache, &in_creds, &result_creds);
+
+The only case where MIT krb5 copies the credentials to a private in memory cache at acquire time is when a password is supplied.
+
+There are two ways for the cache to be emptied in that window:
+
+	Anything running kdestroy, or kinit, or removing the ccache file. 'lfs flushctx -k' is such a case, and it makes it worse by running kdestroy only after the ioctl that flushes the contexts, that is to say while the gss upcalls that this very flush just triggered are still running.
+
+	lgss_keyring itself. lkrb5_get_root_tgt_keytab() stores the new TGT with krb5_cc_initialize() followed by krb5_cc_store_cred(), and krb5_cc_initialize() empties the cache, so it has no credential between those two calls. The semaphore serialises TGT renewals against each other, but not against another lgss_keyring that already released it and is in gss_init_sec_context(). So the window opens on every root TGT renewal, which is precisely when many upcalls may be in flight.
+
+Such a failure is transient, and always recoverable for root, whose credential can be obtained from the keytab again. But it is reported as a fatal error instead:
+
+	lgssc_kr_negotiate_krb() only carries out the negotiation again for -EAGAIN and -ETIMEDOUT, so it reports GSS_S_NO_CRED to the kernel as is;
+
+	gss_kt_update() turns it into -EACCES and sets PTLRPC_CTX_ERROR_BIT on the context;
+
+	sptlrpc_req_refresh_ctx() only tries to replace such a context with an already existing one for root, and there is none just after a flush. Its other way out is reserved to callers passing MAX_SCHEDULE_TIMEOUT, and ptlrpcd passes 0, so it ends up setting rq_err and returning -EPERM.
+
+The application gets -EPERM on an operation that should just have waited for a new context, as shown on a client by:
+
+LustreError: (gss_keyring.c:1805:gss_kt_update()) lustre-MDT0001_UUID at 10.240.43.248@tcp: negotiation: rpc err 0, gss err 70000
+LustreError: (file.c:250:ll_close_inode_openhandle()) mdc close failed: rc = -1
+
+gss err 70000 is GSS_S_NO_CRED, and rpc err 0 means the negotiation never reached the server. This matches what krb5_gss_init_sec_context() reports when the cache has nothing to offer:
+
+    if ((code == KRB5_FCC_NOFILE) || (code == KRB5_CC_NOTFOUND) || (code == KG_EMPTY_CCACHE))
+        major_status = GSS_S_NO_CRED;
+
+This was found while investigating LU-18511, where sanity-krb5 test_90 was calling 'lfs flushctx -k' in a loop under dbench load, and dbench was failing on the resulting -EPERM.
+
+--- Comment (gerrit, Fri, 11 Sep 2026 13:25:21 +0000) ---
+"Sebastien Buisson " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68840
+
+Subject: LU-20738 gss: carry out negotiation again on empty ccache
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 3a48d320b7fb252162ebeb89220ff1f24b3fa420

@@ -1,0 +1,257 @@
+Key:        LU-20542
+Summary:    ptlrpc/gss: server evicts client when its reverse GSS context goes stale, instead of re-establishing it
+Link:       https://jira.whamcloud.com/browse/LU-20542
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Hiroshi Nishida
+Reporter:   Hiroshi Nishida
+Created:    Thu, 30 Jul 2026 13:38:36 +0000
+Updated:    Sun, 11 Oct 2026 15:59:58 +0000
+Links:      Related: is related to LU-20296; Related: is related to LU-20883
+
+--- Description ---
+This issue was created by maloo for Hiroshi Nishida 
+
+This issue relates to the following test suite run: https://testing.whamcloud.com/test_sets/0c617e6f-2c6d-41c6-a029-4a9e74844b07
+
+Test session details:
+
+clients: https://build.whamcloud.com/job/lustre-reviews/128306 - 6.12.0-124.56.1.el10_1.x86_64
+
+servers: https://build.whamcloud.com/job/lustre-reviews/128306 - 4.18.0-553.137.1.el8_10_lustre.x86_64
+
+	
+	
+		Description
+
+	
+	
+
+When a server needs to send a callback RPC (blocking or completion AST) to a client under SSK or Kerberos, it uses the reverse GSS context cached on the export. If the client has meanwhile discarded its side of that context, the server has no way to re-establish one: it expires its only reverse context, immediately fails to find a replacement, and evicts the client. Any in-flight client operation returns EIO.
+
+The server never attempts a re-negotiation and never retries. A single stale reverse context is sufficient to evict.
+
+This is the same failure mode described in LU-14534 ("servers are not able to refresh their reverse contexts by themselves"), which was resolved for 2.15.0. The specific path below is still present on master.
+
+	
+	
+		Symptom
+
+	
+	
+
+Reproduced by sanity-sec test_27d and test_27e on review-dne-selinux-ssk-part-2
+
+(el10.0 clients, el8.10 servers, 4 MDTs / 8 OSTs, SSK ski flavour):
+
+    sanity-sec test_27d: @@@@@@ FAIL: unable to create file in
+
+        /mnt/lustre/d27d.sanity-sec/prim
+
+    bash: line 1: echo: write error: Input/output error
+
+test_27d fails on a completion AST, test_27e on a blocking AST; both are the same defect. The failing write is the first one needing a fresh OST extent lock after the test reloads nodemap-scoped SSK keys and runs "lfs flushctx".
+
+mkdir of the same tree succeeds, because it is MDS-only metadata and needs no OST callback.
+
+	
+	
+		Server-side sequence
+
+	
+	
+
+All four lines occur within 4 ms on the OSS:
+
+    sec_gss.c:698:gss_cli_ctx_handle_err_notify()) lustre-OST0004:
+
+        unknown context (hdl 0x24e2577a1e38bb88:0x8180168a0adf9718)
+
+        from client @tcp (uid 0), retrying
+
+    sec.c:465:sptlrpc_req_get_ctx()) lustre-OST0004:
+
+        fail to get context for req ...: rc = -111
+
+    ldlm_lockd.c:727:ldlm_handle_ast_error()) ### client (nid @tcp)
+
+        returned error from completion AST (... rc -111), evict it
+
+    ldlm_lockd.c:665:ldlm_failed_ast()) lustre-OST0004: A client on nid
+
+        @tcp was evicted due to a lock completion callback time out: rc -111
+
+and on the client:
+
+    LustreError: lustre-OST0004-osc-...: This client was evicted by
+
+        lustre-OST0004; in progress operations using this service will fail.
+
+	
+	
+		Analysis
+
+	
+	
+
+1. The OSS sends the AST on its cached reverse context. The client replies
+
+   GSS_S_NO_CONTEXT, having dropped that context at flushctx.
+
+2. gss_cli_ctx_handle_err_notify() (lustre/ptlrpc/gss/sec_gss.c) takes the
+
+   NO_CONTEXT branch and calls sptlrpc_cli_ctx_expire(ctx). That unlinks the
+
+   context from gsec_kr->gsk_clist. It was the export's only reverse context,
+
+   so the list is now empty.
+
+3. It then calls sptlrpc_req_replace_dead_ctx(req, NULL), which with a NULL
+
+   sec goes to sptlrpc_req_get_ctx() -> get_my_ctx(sec, false).
+
+4. In lustre/ptlrpc/sec.c, get_my_ctx() forces create = 0 and remove_dead = 0
+
+   for any sec carrying PTLRPC_SEC_FL_REVERSE:
+
+        } else if (sec->ps_flvr.sf_flags & (PTLRPC_SEC_FL_REVERSE |
+
+                                            PTLRPC_SEC_FL_ROOTONLY)) {
+
+                vcred.vc_uid = 0;
+
+                vcred.vc_gid = 0;
+
+                if (sec->ps_flvr.sf_flags & PTLRPC_SEC_FL_REVERSE) 
+
+{
+                        create = 0;
+                        remove_dead = 0;
+                }
+
+5. gss_sec_lookup_ctx_kr() short-circuits for a reverse sec and returns
+
+   sec_lookup_root_ctx_kr() directly, under an assumption that no longer
+
+   holds once the context has been unlinked:
+
+        if (is_root) 
+
+{
+                ctx = sec_lookup_root_ctx_kr(sec);
+                /*
+                 * Only lookup directly for REVERSE sec, which should
+                 * always succeed.
+                 */
+                if (ctx || sec_is_reverse(sec))
+                        RETURN(ctx);
+        }
+
+   With an empty gsk_clist this returns NULL.
+
+6. NULL becomes -ECONNREFUSED in sptlrpc_req_get_ctx(), the AST fails, and
+
+   ldlm_handle_ast_error() evicts the client.
+
+A reverse context is only ever installed from an inbound request that already carries a valid forward service context, via
+
+ptlrpc/service.c -> sptlrpc_target_export_check() ->
+
+sptlrpc_svc_install_rvs_ctx(exp->exp_imp_reverse, req->rq_svc_ctx).
+
+The server cannot initiate that exchange. So between the moment the client flushes and the moment it happens to re-init a forward context, every callback the server needs to send is fatal to that client.
+
+gss_cli_ctx_handle_err_notify() already acknowledges the gap in a comment:
+
+        /* reverse sec, just return error, don't expire this ctx because it's
+
+         * crucial to callback rpcs. note if the callback rpc failed because
+
+         * of bit flip during network transfer, the client will be evicted
+
+         * directly. so more gracefully we probably want let it retry for
+
+         * number of times.
+
+         */
+
+but no retry is implemented, and the NO_CONTEXT case falls through that guard and does expire the context.
+
+	
+	
+		Suggested fix
+
+	
+	
+
+Give the server a way to survive a stale reverse context rather than evicting on first failure. Options, roughly in increasing order of effort:
+
+1. Do not expire the reverse context on the first NO_CONTEXT. Retry the
+
+   callback a bounded number of times with backoff, and only evict if the
+
+   client still cannot be reached. This matches the intent already stated in
+
+   the comment above and is the smallest change.
+
+2. Have ldlm_handle_ast_error() distinguish "no security context" from a real
+
+   client timeout, and let the AST be retried once the client re-establishes a
+
+   forward context, rather than treating it as a callback timeout.
+
+3. Allow the reverse sec to trigger a re-negotiation, so the server is not
+
+   dependent on the client happening to re-init.
+
+Option 1 alone would have avoided both failures here: the clients did re-establish forward contexts within a few seconds, so a short bounded retry would have found a fresh reverse context.
+
+	
+	
+		Reproducer
+
+	
+	
+
+sanity-sec test_27d / test_27e with SSK enabled reproduce this on the review-dne-selinux-ssk-part-2 matrix. Note that CI reproduces it reliably only because of a second, separate issue: sanity-sec never sets the gss_identify nodemap property on the c0/c1 nodemaps it creates, so lsvcgssd's fallbacklookup of the client's cluster hash (nodemap_lookup_by_sha() ->
+
+nodemap_lookup_sha()) fails with -EPERM, and the client's forward context re-inits are rejected with -EIDRM for several seconds. That widens the window in which the server has no usable reverse context. That part is arguably a test gap and is worth tracking separately; the eviction defect above is independent of it.
+
+	
+	
+		Related
+
+	
+	
+
+	LU-14534 - Client eviction on blocking AST with Kerberos or SSK enabled
+
+  (resolved 2.15.0; this is the same mechanism, still reachable on master)
+
+--- Comment (gerrit, Wed, 5 Aug 2026 23:04:32 +0000) ---
+"Hiroshi Nishida " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/67783
+
+Subject: LU-20542 gss: retry callback RPC when reverse ctx is stale
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 955182490b592f9d65c12d3d26a95d4ab9baf89c
+
+--- Comment (gerrit, Sun, 11 Oct 2026 15:59:58 +0000) ---
+"Patrick Farrell " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69581
+
+Subject: LU-20542 sec: install reverse ctx when export reconnects
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 9dfeb31b18670de83dd2087831e3557238771698

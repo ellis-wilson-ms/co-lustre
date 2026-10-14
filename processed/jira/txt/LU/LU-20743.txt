@@ -1,0 +1,157 @@
+Key:        LU-20743
+Summary:    tests: skip rather than fail when dbench is not installed
+Link:       https://jira.whamcloud.com/browse/LU-20743
+Type:       Improvement
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Minh Diep - TLC
+Reporter:   Minh Diep - TLC
+Created:    Fri, 11 Sep 2026 23:48:48 +0000
+Updated:    Fri, 11 Sep 2026 23:49:01 +0000
+
+--- Description ---
+Description
+
+Tests that drive dbench report FAIL rather than SKIP on a node where
+
+the dbench binary is not installed. A missing optional benchmark tool
+
+is an environment gap, not a Lustre defect, and the tree already has a
+
+convention for that: skip_env.
+
+rundbench distinguishes the two outcomes, but only when the caller
+
+opts in:
+
+echo "looking for dbench program"
+if ! type -P dbench; then
+        if [[ -z "$MISSING_DBENCH_OK" ]]; then
+                error "dbench is not installed"
+        fi
+
+        skip_env "dbench is not installed"
+
+        exit 0
+fi
+
+Almost nothing sets MISSING_DBENCH_OK. The only two references in
+
+the tree are replay-single.sh test_70b and
+
+parallel-scale-cifs.sh, and both merely propagate
+
+MISSING_DBENCH_OK=$MISSING_DBENCH_OK across the do_nodesv ssh
+
+boundary rather than setting it, so they inherit the error path
+
+whenever it is unset in the environment. The variable predates
+
+Whamcloud Jira – it arrives in b=17839 for the remote
+
+recovery-mds-scale load path, with one later use in LU-6119 – and
+
+was never adopted as a general "skip if absent" mechanism.
+
+Observed as sanity test_71 ("Running dbench on lustre (don't
+
+segment fault)") failing with "dbench is not installed" on a cluster
+
+whose client image lacks the package.
+
+Why setting MISSING_DBENCH_OK everywhere is not the fix
+
+The variable only helps where the call is synchronous and nothing
+
+afterwards depends on a live dbench process. Roughly half the callers
+
+launch rundbench in the background and then poll for a running
+
+dbench, so a skipping rundbench exits 0 and the poll can never
+
+succeed:
+
+	lustre-rsync-test test_2b: wait_for_function 'child_pid=$(pgrep dbench)' 360 polls a condition that can never become true, stalling the full 360s before the test ends SKIP. test_2c is the milder version.
+
+	replay-dual test_26: the while true load loop spins for the whole 200-900s duration doing striped-dir create/unlink while the outer loop fails over MDTs, which also makes an unrelated error "set default dirstripe failed" more likely mid-failover.
+
+	sanity-krb5 start_dbench: checks ps -p $DBENCH_PID two seconds after launching and calls error. run_one_logged tests $LOGDIR/err before $LOGDIR/skip, so the subtest stays FAIL, just with a less informative message.
+
+Proposed fix
+
+Guard the tests instead. This works regardless of call shape, skips
+
+before the test does any setup, and keeps the reason at the test level
+
+rather than relying on a child process to signal its parent through
+
+$LOGDIR/skip – which additionally requires FAIL_ON_SKIP_ENV
+
+and LOGDIR to be exported and the log directory to be writable by
+
+the $RUNAS user.
+
+Add a helper to test-framework.sh that probes the same way
+
+rundbench does:
+
+# rundbench prepends $DBENCH_LIB to PATH before probing, so a guard that
+# only searches the caller PATH would skip a setup that would have worked.
+have_dbench() {
+        PATH="${DBENCH_LIB:+$DBENCH_LIB:}$PATH" type -P dbench > /dev/null
+}
+
+The $DBENCH_LIB prepend matters: rundbench does it before its
+
+own type -P dbench, and DBENCH_LIB is plumbed through
+
+test-framework.sh start_client_load(), replay-single.sh and
+
+parallel-scale-cifs.sh. A plain which dbench guard would be
+
+narrower than the thing it guards and would skip an install living only
+
+under $DBENCH_LIB. type -P is also a builtin and silent on a
+
+miss, unlike GNU which.
+
+Then guard each test with
+
+have_dbench || skip_env "no dbench installed"
+
+at sanity test_71, sanity-pfl test_8, sanity-quota test_8,
+
+replay-dual test_26 and lustre-rsync-test test_2a / test_2b /
+
+test_2c, and at the definition of start_dbench in
+
+sanity-krb5.sh so that every caller benefits.
+
+This is the idiom already used in these suites for iozone, fio, aiocp,
+
+setfattr and prove, and sanity-benchmark test_dbench has opened
+
+with its own which dbench guard since the file was added.
+
+The change is purely additive: guard lines plus the helper, with no
+
+rewritten rundbench invocations and no behaviour change when dbench
+
+is present.
+
+Deliberately not covered
+
+	run_dbench.sh – a client-load driver whose while [ ! -e "$END_RUN_FILE" ] loop treats a zero exit as success. A skip would spin the loop hot and report a healthy client load that is not running, so failing is the correct signal there. Setting MISSING_DBENCH_OK on it is also a no-op today: start_client_load() passes an explicit do_node env whitelist containing neither FAIL_ON_SKIP_ENV nor LOGDIR, and an empty $FAIL_ON_SKIP_ENV expansion is a simple command with no words whose exit status is 0, so error false runs regardless.
+
+	sanity-benchmark test_dbench – already guarded.
+
+	replay-single test_70b and parallel-scale-cifs – the two remote callers. Same background-launch-and-poll shape; a guard on the client alone does not help, because the load is started with do_nodesv and the start-detection loop would need reworking to recognise a skip. Worth a separate ticket. Note that LU-1897 ("dbench not found on some of the clients", test_70b, closed Cannot Reproduce in 2012) is this case.
+
+Related, but different root causes
+
+	LU-15495 – sanity test_71 on ppc64le, dbench present but failing on a missing linux-vdso64.so.1.
+
+	LU-10437 – sanity-pfl test_8, cp: error writing copying client.txt, i.e. a full filesystem.
+
+	LU-1255 – recovery-mds-scale, no client file found for dbench. Note that rundbench's client-file skip path calls skip_env unconditionally, ungated by MISSING_DBENCH_OK, so it is unaffected by this change either way.

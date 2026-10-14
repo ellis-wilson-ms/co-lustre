@@ -3,12 +3,12 @@ Summary:    lfs mirror: Invalid layout: Incomplete mirror - must go to EOF
 Link:       https://jira.whamcloud.com/browse/LU-20011
 Type:       Bug
 Priority:   Medium
-Status:     Open
+Status:     In Progress
 Resolution: Unresolved
-Assignee:   WC Triage
+Assignee:   Nikos Papakonstantinou
 Reporter:   Andreas Dilger
 Created:    Wed, 18 Mar 2026 03:49:58 +0000
-Updated:    Wed, 18 Mar 2026 03:50:12 +0000
+Updated:    Thu, 25 Jun 2026 13:19:41 +0000
 Labels:     flr-improvement, pfl
 Links:      Related: is related to  LU-20005
 
@@ -16,3 +16,96 @@ Links:      Related: is related to  LU-20005
 If a file with a partial PFL layout (i.e. no EOF component) has a mirror added with "lfs mirror extend" it is then impossible to remove the mirror, add a new EOF component, or "lfs mirror split" to return to the original state, receiving the error "lfs mirror: Invalid layout: Incomplete mirror - must go to EOF".
 
 Whatever generates this error should be ignored, and the split or "setstripe --comp-add" command should be allowed to bring the file back into a consistent state.
+
+--- Comment (JIRAUSER20216, Thu, 30 Apr 2026 15:00:14 +0000) ---
+If I am not wrong, this error comes from this block:
+
+if (comp->llc_extent.e_start == 0) {
+    first_comp = true;
+    args->lsa_mirror_count++;
+    /* Most checks apply only within one mirror, this is an
+     * exception. */
+    if (prev && prev->llc_extent.e_end != LUSTRE_EOF) {
+        args->lsa_rc = LSE_INCOMPLETE_MIRROR;
+        goto out_err;
+    } 
+
+in llapi_layout_sanity_cb() function.
+
+I think we can add a new argument (e.g lsa_allow_incomplete_mirrors) and bypass this check, thus the split operation will be able to recover the file into a consistent state.
+
+Does this make any sense?
+
+--- Comment (adilger, Fri, 1 May 2026 07:12:34 +0000) ---
+npapakonstantinou, I was going to write that it isn't permitted to change the function signature for llapi_*() functions, but I now see that the lsa_allow_incomplete_mirrors is in struct llapi_layout_sanity_args which appears local to that function.
+
+It is a bit sad that struct llapi_layout_sanity_args is so poorly laid out, with bool intermixed with pointers and ints of various sizes.  According to pahole:
+
+struct llapi_layout_sanity_args {
+        _Bool                      lsa_incomplete;       /*     0     1 */
+        _Bool                      lsa_flr;              /*     1     1 */
+        _Bool                      lsa_ondisk;           /*     2     1 */
+
+        /* XXX 1 byte hole, try to pack */
+
+        int                        lsa_rc;               /*     4     4 */
+        char *                     fsname;               /*     8     8 */
+        uint16_t                   lsa_mirror_count;     /*    16     2 */
+        _Bool                      lsa_in_parity;        /*    18     1 */
+
+        /* XXX 5 bytes hole, try to pack */
+
+        uint64_t                   lsa_last_parity_end;  /*    24     8 */
+
+        /* size: 32, cachelines: 1, members: 8 */
+        /* sum members: 26, holes: 2, sum holes: 6 */
+        /* last cacheline: 32 bytes */
+};
+
+If there was any danger that this struct was exposed to userspace, the safest course of action would be to add the new bool in the 1-byte hole.
+
+--- Comment (JIRAUSER20216, Sat, 2 May 2026 13:56:08 +0000) ---
+So you think that we have to set the lsa_allow_incomplete_mirrors flag always to true?
+
+I noticed that about the signatures and I was thinking to do the same trick with 
+
+llapi_layout_v2_sanity() function and have something like that for backward compatibility:
+
+int llapi_layout_v3_sanity(struct llapi_layout *layout, bool incomplete, bool flr, bool allow_incomplete_mirrors, char *fsname);
+
+int llapi_layout_sanity(struct llapi_layout *layout, bool incomplete, bool flr)
+{
+	return llapi_layout_v3_sanity(layout, incomplete, flr, false, NULL);
+}
+
+int llapi_layout_v2_sanity(struct llapi_layout *layout,
+			bool incomplete, bool flr, char *fsname)
+{
+	return llapi_layout_v3_sanity(layout, incomplete, flr, false, fsname);
+}
+
+and in mirror_split() in lfs.c we can directly call the llapi_layout_v3_sanity() with allow_incomplete_mirrors true.
+
+--- Comment (adilger, Sat, 2 May 2026 22:08:19 +0000) ---
+It isn't clear for mirror split/delete if the "sanity" of the layout should be checked at all?  The file layout already exists and splitting off/deleting the partial mirror isn't making it any worse than exists today. Maybe only the remaining mirror should be checked for sanity?
+
+--- Comment (JIRAUSER20216, Mon, 4 May 2026 14:17:46 +0000) ---
+Since the goal is to remove the problematic mirror and return to the original state, I think that allowing mirror split command to handle those incomplete mirrors, the goal will be achieved.
+
+What do you mean with the remaining mirror should be checked for sanity ? During split operation or other operation?
+
+--- Comment (adilger, Tue, 5 May 2026 05:48:49 +0000) ---
+I mean that it should be OK to split/delete the partial mirror, but if there is data that is not in the partial mirror then it shouldn't be allowed to split/delete the full mirror and leave the partial mirror behind.
+
+--- Comment (gerrit, Tue, 5 May 2026 09:10:23 +0000) ---
+"Nikos Papakonstantinou " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/65672
+
+Subject: LU-20011 layout: Add function to allow incomplete mirrors
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 568c9b7c73010cc5d1a75b5c231b35f6c6a8dc74

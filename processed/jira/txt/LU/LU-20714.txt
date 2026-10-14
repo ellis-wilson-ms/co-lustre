@@ -1,0 +1,405 @@
+Key:        LU-20714
+Summary:    llite: memory safety bugs in the foreign symlink upcall path
+Link:       https://jira.whamcloud.com/browse/LU-20714
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Oleg Drokin
+Reporter:   Oleg Drokin
+Created:    Wed, 9 Sep 2026 02:30:02 +0000
+Updated:    Tue, 13 Oct 2026 14:13:50 +0000
+Resolved:   Tue, 13 Oct 2026 14:13:50 +0000
+Links:      Related: is related to  LU-17000
+
+--- Description ---
+Summary
+
+The foreign symlink feature (LU-12682) lets a client turn a foreign LOV/LMV EA into a symlink,
+
+using a binary format description that root installs through
+
+/sys/fs/lustre/llite/-/foreign_symlink_upcall_info
+
+Neither end of that pipeline validates its input. The store side parses the format without
+
+checking that an item fits in the buffer; the parse side trusts the values the items carry,
+
+mis-sizes the destination path, and samples a shared array outside its lock. Six defects in
+
+total, in one small file, all present since the feature landed.
+
+Root installs the format, so the first step needs privilege — but root is the intended user of
+
+this interface, and the consequences land on unprivileged readlink(): a kernel oops, a heap
+
+buffer overflow write, and a path built from a truncated or wrong destination.
+
+The defects
+
+A. Store side: no "item fits in the buffer" check
+
+foreign_symlink_upcall_info_store() walks the buffer with while (remaining > 0), only
+
+checking that count is a multiple of sizeof(__u32). It never checks that the item it is
+
+about to read fits.
+
+A1. POSLEN_TYPE has no bounds check at all
+
+Where STRING_TYPE and EOB_TYPE have one. It reads pos (offset 8) and len
+
+(offset 12), then remaining -= POSLEN_ITEM_SZ. A 4-byte buffer holding only the type word is
+
+enough: sysfs hands the store method a kmalloc(count + 1) buffer — 5 bytes, a kmalloc-8
+
+object — so the read is out of bounds and the subtraction underflows remaining to 2^64^ - 12:
+
+# printf '\3\0\0\0' > .../foreign_symlink_upcall_info
+LustreError: foreign_symlink_upcall_info_store()) lustre: wrong type
+  '4294967222' encountered at pos 16 , with 18446744073709551604 remaining
+  bytes, in infos buffer returned by foreign symlink upcall
+
+pos 16 is past the end of a 5-byte allocation and the printed remaining is the underflowed
+
+value. The walk then continues, bounded only by MAX_NB_UPCALL_ITEMS, over an on-stack array.
+
+A2. The STRING_TYPE guard underflows the same way
+
+It computes remaining - offsetof(bytestring) - sizeof(type) in size_t — 20 on LP64. Every
+
+decrement in the loop is a multiple of 4, so remaining can legitimately be 4, 8, 12 or 16
+
+there, all below 20. The subtraction wraps and the guard passes; item->size was itself read
+
+out of bounds and is then used for both OBD_ALLOC() and a memcpy() from past the end:
+
+# printf '\2\0\0\0' > .../foreign_symlink_upcall_info
+LustreError: constant string allocation has failed for constant string of
+  size 18316391873768374784
+------------[ cut here ]------------
+WARNING: CPU: 0 PID: 9329 at mm/page_alloc.c:4566 __alloc_pages+0x1cf/0x250
+  __kmalloc_large_node+0x79/0x110 / __kmalloc+0x322/0x440
+  foreign_symlink_upcall_info_store+...
+
+Those bytes do not escape to userspace: installing a format requires the loop to reach
+
+remaining == 0, and a STRING_TYPE item read with remaining  always underflows
+
+afterwards, so the copy is freed on the error path. This one is an out-of-bounds read and a wild
+
+walk, not a disclosure channel.
+
+A3. A format with no EOB_TYPE item is accepted
+
+A buffer ending exactly on a complete POSLEN_TYPE item leaves remaining == 0 and is
+
+installed:
+
+# printf '\3\0\0\0\0\0\0\0\0\0\0\0\4\0\0\0' > .../foreign_symlink_upcall_info
+# echo $?
+0
+
+ll_foreign_symlink_upcall_parse() has two loops that then disagree about where the array ends:
+
+the first sums items_size over exactly ll_foreign_symlink_upcall_nb_items entries and that
+
+sum sizes the destination allocation, while the second runs until it sees EOB_TYPE. Every item
+
+the second consumes past nb_items is memcpy()}}ed into {{*destname past its end — a *heap
+
+buffer overflow write* reached by an ordinary readlink(). Observed as far as
+
+ll_foreign_symlink_upcall_parse()) unexpected type '0' found in items, because the memory past
+
+the array happened to be zero.
+
+B. Parse side: the item values are never validated
+
+B4. pos + len wraps in 32 bits
+
+lfm_length, pos and len are all __u32 (lustre_user.h:965, :3147-3148), so
+
+the lfm_length  test is evaluated in 32 bits. pos = 0xfffffff0, len = 0x10 sums
+
+to 0 and passes for any EA. pos is unsigned, so lfm_value + pos zero-extends and the
+
+memcpy() reads 4 GiB above the EA. This oopses the client from an unprivileged
+
+readlink(2):
+
+BUG: unable to handle page fault for address: ffff94f90a5bf120
+RIP: 0010:memcpy_erms+0x6/0x10   RSI: ffff94f90a5bf120  RCX/RDX: 0x10
+ ll_foreign_symlink_upcall_parse+0x1de/0x5c0 [lustre]
+ ll_foreign_readlink_internal+0x7c5/0xb10 [lustre]
+ ll_foreign_get_link+0x10a/0x200 [lustre]
+ vfs_readlink+0xb2/0x120  /  __x64_sys_readlink+0x1a/0x30
+
+The faulting address minus 0xfffffff0 is exactly lfm_value. A crash is the reliable
+
+outcome rather than a disclosure: to wrap, len must be at least 2^32^ - pos -
+
+lfm_length, so a short non-faulting copy forces pos up near 2^32^, while a lower pos
+
+forces an enormous len that faults.
+
+B5. items_size overflows int
+
+It is an int, but foreign_symlink_alloc_and_copy_prefix() takes a size_t. A
+
+STRING_TYPE item of size 3000 plus a POSLEN_TYPE with len = 0xFFFFF447 sums to exactly
+
+0xFFFFFFFF, i.e. -1, which becomes SIZE_MAX; {{full_size = suffix_size + prefix_size +
+
+3}} wraps to 7, sails past the full_size > PATH_MAX test, and OBD_ALLOC() returns 7
+
+bytes. Measured on an unpatched build: it gets past the allocation and only fails later, in the
+
+lfm_length check.
+
+The error path also frees one byte less than was allocated, so each failed parse drifts
+
+obd_memory up by one and the leak check reports a phantom leak. Measured on the pre-fix build:
+
+obd_memory ... leaked: 37, "Memory leaks detected".
+
+B6. A NUL byte in the EA silently truncates the path
+
+The suffix is memcpy()}}ed verbatim from user-settable foreign EA content. {{readlink() and
+
+path lookup both stop at the first NUL, so the link resolves to the wrong path while
+
+lfs getstripe -v prints the whole value.
+
+C. Use-after-free on the items array
+
+C7. The items array is sampled outside the read lock
+
+ll_foreign_symlink_upcall_parse() samples sbi->ll_foreign_symlink_upcall_items in its
+
+declaration, before taking ll_foreign_symlink_sem for read, then walks that array while
+
+reading ll_foreign_symlink_upcall_nb_items under the lock. A concurrent write to the parameter
+
+swaps the array and frees the old one, so the reader can walk freed memory — or run the new count
+
+over the old, shorter array.
+
+(Freeing the old array after up_write() is not a bug: down_write() waits for readers
+
+already inside, so once the pointer is sampled under the read lock no reader can still hold the
+
+old one. The early sample is the whole bug.)
+
+Reproducer
+
+As root on a client, in the mount's namespace (has_same_mount_namespace() gates the store).
+
+Non-destructive.
+
+INFO=$(ls -d /sys/fs/lustre/llite/*/foreign_symlink_upcall_info | head -n1)
+
+printf '\3\0\0\0'                          > $INFO   # A1: truncated POSLEN
+printf '\2\0\0\0'                          > $INFO   # A2: truncated STRING
+printf '\2\0\0\0\0\0\0\0\377\377\0\0\0\0\0\0' > $INFO  # A2: memcpy 65535 OOB
+printf '\3\0\0\0\0\0\0\0\0\0\0\0\4\0\0\0'  > $INFO   # A3: accepted, rc=0
+
+# controls that must keep working, before and after the fix:
+# the format l_foreign_symlink installs - POSLEN(0,36) STRING("/") POSLEN(37,36) EOB
+printf '\3\0\0\0\0\0\0\0\0\0\0\0\44\0\0\0\2\0\0\0\0\0\0\0\1\0\0\0\0\0\0\0\57\0\0\0\3\0\0\0\0\0\0\0\45\0\0\0\44\0\0\0\1\0\0\0' > $INFO
+# a STRING item whose payload exactly fills the buffer before the terminator
+printf '\2\0\0\0\0\0\0\0\4\0\0\0\0\0\0\0abcd\1\0\0\0' > $INFO
+
+# then, for the parse-side defects, make the parse side run:
+lctl set_param llite/*/foreign_symlink_enable=1
+lfs mkdir --foreign=symlink --xattr="a/b" --flags=0xda05 --mode 0750 /mnt/lustre/d1
+readlink /mnt/lustre/d1
+
+For B4, install POSLEN(0xfffffff0,16) EOB and readlink() a foreign file — that faults the
+
+node.
+
+--- Comment (gerrit, Wed, 9 Sep 2026 02:31:42 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68719
+
+Subject: LU-20714 llite: bound-check foreign symlink upcall buffer
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: cec8c6806577cf5189eebbec58083a7ac5bc34a8
+
+--- Comment (gerrit, Wed, 9 Sep 2026 02:31:43 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68720
+
+Subject: LU-20714 llite: fix foreign symlink destination path sizing
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 13e635635fca37a3d4a791d6c8fd4fc80de1f78c
+
+--- Comment (gerrit, Wed, 9 Sep 2026 02:31:43 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68721
+
+Subject: LU-20714 llite: reject NUL byte in foreign symlink path
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: c8d10142fe1633f2205d1724cff1fe3909b98b13
+
+--- Comment (gerrit, Wed, 9 Sep 2026 02:31:44 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68722
+
+Subject: LU-20714 llite: fix use-after-free of foreign symlink items
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 009e9c2a2e1d1db7211f0683dc52d137925a1400
+
+--- Comment (gerrit, Thu, 10 Sep 2026 04:51:45 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68770
+
+Subject: LU-20714 lov: bound foreign LOV EA reads by buffer size
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 4078ae9cc96094a1aa88cc4cf2fde58c54c27801
+
+--- Comment (gerrit, Thu, 10 Sep 2026 04:51:46 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68771
+
+Subject: LU-20714 llite: read foreign symlink prefix under lock
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: d04e4a7932514331a835a4f933a0415530850d14
+
+--- Comment (gerrit, Thu, 10 Sep 2026 04:51:47 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68772
+
+Subject: LU-20714 lov: do not read uninitialized lum in getstripe
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 621cb50a82ef20666966440d817365ec8e7c7ec1
+
+--- Comment (gerrit, Mon, 28 Sep 2026 21:28:27 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/68770/
+
+Subject: LU-20714 lov: bound foreign LOV EA reads by buffer size
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 11b59d18169521339bb41363a428b7def2aa2954
+
+--- Comment (gerrit, Mon, 28 Sep 2026 21:28:37 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/68771/
+
+Subject: LU-20714 llite: read foreign symlink prefix under lock
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: fc655e5cbf1c909e513ce35aa8ef8159272d380f
+
+--- Comment (gerrit, Tue, 13 Oct 2026 04:19:14 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/68719/
+
+Subject: LU-20714 llite: bound-check foreign symlink upcall buffer
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 38c15d56d253ed53694ebbbabd254b6183290624
+
+--- Comment (gerrit, Tue, 13 Oct 2026 04:19:22 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/68720/
+
+Subject: LU-20714 llite: fix foreign symlink destination path sizing
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 670d946253f67eafa4025f61b32cb86967bea743
+
+--- Comment (gerrit, Tue, 13 Oct 2026 04:19:29 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/68721/
+
+Subject: LU-20714 llite: reject NUL byte in foreign symlink path
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 001189cd2883f2807d56a30c81a01f068f65044d
+
+--- Comment (gerrit, Tue, 13 Oct 2026 04:19:37 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/68722/
+
+Subject: LU-20714 llite: fix use-after-free of foreign symlink items
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: ddb7d6780da3d30466635f1e50bfebe0f9b759a2
+
+--- Comment (gerrit, Tue, 13 Oct 2026 04:19:51 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/68772/
+
+Subject: LU-20714 lov: do not read uninitialized lum in getstripe
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 33617e90e9ca37b4c02c8b556f8844039e6b9dfc
+
+--- Comment (pjo, Tue, 13 Oct 2026 14:13:50 +0000) ---
+Merged for 2.18

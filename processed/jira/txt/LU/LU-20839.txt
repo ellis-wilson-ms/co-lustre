@@ -1,0 +1,149 @@
+Key:        LU-20839
+Summary:    RFC for new buffered data path and extent lock protocol
+Link:       https://jira.whamcloud.com/browse/LU-20839
+Type:       New Feature
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Sohei Koyama
+Reporter:   Sohei Koyama
+Created:    Mon, 28 Sep 2026 10:34:40 +0000
+Updated:    Fri, 2 Oct 2026 06:44:34 +0000
+Attachments: image-2026-09-28-19-20-24-487.png
+
+--- Description ---
+Concept
+
+	Improve write performance for single shared file. It anticipates patterns such as unaligned or strided access, but it is not limited to those. Instead of increasing bandwidth through higher parallelism, high bandwidth is achieved through consistently low latency. In other words, high bandwidth can be attained even with 1 client process per node.
+
+	Reducing the cost of canceling extent locks. Unaligned DIO achieves high bandwidth with large writes or many client processes by avoiding lock cancellation through server-side extent locks. However, unlike Buffered I/O (BIO), write() latency cannot be hidden. To escape this trade-off, a buffering mechanism separate from the client's page cache is required. (Sorry, I'm reconsidering it now....)
+
+	This design aims to remove the write-back process from the critical path of ownership transfer when an extent lock is cancelled.
+
+Anticipated Q&A
+
+Q. Why not use LDLM lock ahead?
+
+A. Lock ahead is a valuable approach and works well when the access pattern is known in advance. However, it does not preserve the speculative extension of extent locks. For strided writes to a shared file, acquiring a range that covers hundreds of write() calls in a single request is a substantial benefit, and I would like to retain it.
+
+Q. Why not build on folio support?
+
+A. Folio support is an important improvement and should benefit many workloads. For shared-file writes specifically, though, my understanding is that the main bottleneck is the cost of handing over extent locks between clients, which folios are not designed to address. I see this proposal as complementary to the folio work rather than an alternative to it.
+
+Q. Why not rely on unaligned DIO?
+
+A. Unaligned DIO performs very well with large transfer sizes or many client processes, and it is a good fit for those cases. This proposal targets a different scenario: the hypothesis is that consistently low write() latency leads to shorter end-to-end runtimes for real applications. The goal is therefore to deliver good performance even when parallelism is modest and transfer sizes are small.
+
+ 
+
+Evaluated prototype using ior hard, excluding write latency to ldiskfs (via FEMU's NoSSD mode).
+
+I'm preparing a paper on this work. Any feedback is welcome.
+
+--- Comment (paf0186, Tue, 29 Sep 2026 21:44:18 +0000) ---
+It's not clear to me what the proposal is here - the statement stops in the middle and does not describe an actual proposed solution, so I can't evaluate it.
+
+The current answer to this problem is to switch buffered IO to use the hybrid path when lock contention is detected; kxu is working on this and can give status.
+
+Note it's not possible to remove writeback from lock cancellation - locks exist specifically to protect the cache.  That is their only purpose.  The only way to do that is to not cache things, which is what hybrid/UDIO does.
+
+--- Comment (JIRAUSER19217, Wed, 30 Sep 2026 03:11:58 +0000) ---
+Thanks, Patrick. You're right that this can't be evaluated as written. I posted it before the design section was ready, so it only states goals. Apologies for that.
+
+I have also evaluated hybrid IO, and I appreciate that it delivers good bandwidth and is a practical architecture for this problem. What I'd like to explore is the write() latency side, as shown in the attached evaluation.
+
+> it's not possible to remove writeback from lock cancellation
+
+Agreed, under the current protocol. Today the ordering between the old and new lock holders is enforced by flushing dirty data before the lock is released, so writeback is inherent to cancellation.
+
+> locks exist specifically to protect the cache.
+
+This is the assumption I'd like to revisit. I want to separate the responsibilities of the extent lock. Right now it does two things at once: it decides the order of ownership, and it guarantees that the previous holder's data is complete to flush before ownership moves. My question is whether the lock could decide only the order, while completion (visibility) is deferred. Deferring completion also means the new holder must not read-modify-write against stale data, which is why I think a buffering mechanism separate from the page cache may be needed. 
+
+To be clear, this is strictly a research design, and I don't expect it to be realized easily or soon. I'm mainly looking for feedback on whether the direction is sound or not.
+
+ kxu,  I'd appreciate hearing the current status of the hybrid IO work.
+
+--- Comment (JIRAUSER22400, Wed, 30 Sep 2026 03:13:53 +0000) ---
+Thanks paf0186. Hi skoyama in the case of switching buffered IO to use hybrid path when lock contention is detected, there're 2 patches in the series currently,
+
+1. LU-12550 ldlm: contention detection #35287  [landed]
+
+2. LU-16964 llite: auto switch from BIO to DIO #51679 [under development]
+
+The 1st landed recently, which proposes a new indicator to replace the old contention detector - based on a histogram recording the recently conflicted locks; and the follow-up one is from qian_wc, it based on the new indicator (contended or not), performing the switching to DIO which offloads extent lock acquisition from client to server side when certain criteria are met. 
+
+It seems the proposal here is not settled yet... Hopefully we're not duplicating work here. Or it maybe a complementary strategy? Like to check it out once the strategy is settled.
+
+ 
+
+Update:
+
+My question is whether the lock could decide only the order, while completion (visibility) is deferred. Deferring completion also means the new holder must not read-modify-write against stale data, which is why I think a buffering mechanism separate from the page cache may be needed. 
+
+Defer dirty data flush while maintain consistency... sounds interesting.
+
+--- Comment (JIRAUSER19217, Wed, 30 Sep 2026 04:23:51 +0000) ---
+Thanks Keguang, I think it is more likely complementary.
+
+I would like to understand the overlap better once the protocol is more concrete.
+
+--- Comment (paf0186, Wed, 30 Sep 2026 18:01:37 +0000) ---
+Sohei,
+
+For data, visibility and ordering are the same thing - it’s basically visibility that we order.
+
+If you’re ordering reads and writes, then obviously you must have rigid ordering AND visibility or the reads will get incorrect data.
+
+For writes vs writes, there’s no visibility per-se, but you still have to ensure ordering - last write wins.  In theory you could discard earlier writes on overlap, but that’s a small optimization with lots of complexity and it still requires locking to notice it.
+
+It’s just not possible to have distributed asynchronicity or caching without locking to ensure consistency.  This is a general theorem, not a contingent fact about Lustre; it applies to CPU caches just as much.  If you create another buffer on the client, it doesn’t change this - UDIO does this, but it must use that buffer synchronously.
+
+--- Comment (JIRAUSER19217, Wed, 30 Sep 2026 21:42:55 +0000) ---
+Patrick, you're entirely right from a consistency standpoint; my explanation was poor. I'm not sure this will come across well, but let me try to explain it again. (That said, I may still be missing something fundamental, but let me state the distinction more precisely...)
+
+First, I'd like to focus on the ranges of the extents and the locks. Consider a write by client A to [0, 47008), write(A), followed by a write by client B to [47008, 94016), write(B). These two writes have no real dependency on each other. However, if A holds a lock covering [0, EOF), current Lustre creates a dependency between them. (The reason is speculative lock extension, which lets buffered I/O complete write() without any communication as long as the write falls within the lock's range.) In principle, the metadata describing the extents, [0, 47008) and [47008, 94016), which is only a few bytes, should be sufficient to determine the dependency relationship between the two writes, and the dirty data transfer latency (from receiving the blocking AST until the cancel) should not need to sit between write(A) and write(B).
+
+(Note: this isn't a precise example, since lock ranges are actually rounded to page boundaries. Also, in actual ior-hard writeback, far more than 47008 bytes of dirty data ends up in that latency, because before write(B), A has also written [94016, 141024) and so on.)
+
+And my question goes a step further... Consider a write by client A' to [0, 47008), write(A'), followed by a write by client B' to [0, 47008), write(B'). While there is a genuine dependency here, surely there is no need for the dirty data transfer latency to sit between write(A') and write(B')?
+
+--- Comment (paf0186, Wed, 30 Sep 2026 22:25:18 +0000) ---
+Ah, now I see what you mean - yes, this makes sense.  This is like what I said with write-write dependencies not requiring visibility.
+
+So it’s true there’s no dependency, the question is how can you efficiently exploit this fact?  Lock expansion allows lock reuse, which is very valuable since it allows writes to cache rather than disk.  The idea of Lockahead was to request locks in advance of need, but then you have to know the IO pattern and you end up with many locks.  And of course it is a bit of a benchmarking trick, as real applications may not be so nice.
+
+I am curious where you go with this; I am not aware of anything that allows consistency without overhead.
+
+One possibility I considered is having clients inform the server of their writes but not wait for the sync operation.  Copy to a buffer, inform the server of write intent, then the write call returns to userspace and the data is written as convenient.  The server handles the locking.
+
+The problem is this is quite close to just locking without lock expansion, since it requires server round trip on every write.
+
+Anyway, I see the general direction now and it makes sense - thank you.
+
+--- Comment (JIRAUSER19217, Thu, 1 Oct 2026 00:20:15 +0000) ---
+The current prototype works roughly as follows. When a client receives a blocking AST, it stops accepting new writes under that extent lock and sends the server metadata describing its buffered writes, such as their byte ranges. Once the server has recorded those writes and established any necessary ordering between overlapping writes, the client releases the lock without waiting for the data itself to be transferred. The old client keeps the buffered data and continues sending it asynchronously after losing the lock.
+
+I need to verify whether this will work without any issues...
+
+--- Comment (paf0186, Thu, 1 Oct 2026 00:39:04 +0000) ---
+What happens if a read occurs after the first lock has been released?
+
+--- Comment (JIRAUSER19217, Thu, 1 Oct 2026 06:08:19 +0000) ---
+That's a good question. I don't think reads benefit from this in the same way. In the current prototype, a read does not simply proceed after the old lock is released. If there are unapplied writes overlapping the read range, the server delays the read until those writes have been applied. Writers can receive ownership early; readers cannot observe stale data.
+
+--- Comment (paf0186, Thu, 1 Oct 2026 15:50:46 +0000) ---
+Then I don't really understand how this is different from using DLM locking; the server has to provide the same sort of guard.
+
+--- Comment (JIRAUSER19217, Thu, 1 Oct 2026 16:42:20 +0000) ---
+Setting aside the question of whether it takes the specific form of a "DLM lock", there are two mechanisms for synchronization: 1) a client-side mechanism (=DLM lock) that determines a ordering and supports lock expansion, and 2) a server-side mechanism (maybe not DLM lock) that resolves dependencies regarding actual byte-range reads and writes. Mechanism 2) constructs a graph (DAG) based on byte-range dependencies and the epochs assigned by mechanism 1) (where the epoch value is simply incremented each time ownership is transferred).
+
+--- Comment (paf0186, Thu, 1 Oct 2026 17:06:45 +0000) ---
+Yes, but if the DAG requires clients to communicate with the server and wait, which it will, it begins looking a lot like DLM locks.  Remember we'll still need to track exactly which clients do what, and in case of a true data dependency (any reads or a partial write), we'll have to wait for sync from the earlier writer.
+
+I'm not saying the idea is impossible but it starts I think to have very diminishing returns in practice.
+
+--- Comment (JIRAUSER19217, Fri, 2 Oct 2026 06:44:34 +0000) ---
+If true dependencies were dominant (for example, if B attempted to read [0, 47008) immediately after A wrote to [0, 47008)), the value of this idea would be significantly lower; UDIO would likely provide lower latency in such a case. However, I am not sure how often such dependencies would actually result in stalls in practice. More precisely, B only needs to wait if it begins reading before A's write to [0, 47008) has been transferred to and applied on the server.
+
+One thing I would particularly like to quantify is how many write() operations can typically be covered by an expanded lock, and how much this allows communication to be aggregated and server round-trip costs to be amortized.

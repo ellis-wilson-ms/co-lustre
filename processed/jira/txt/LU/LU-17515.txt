@@ -8,7 +8,7 @@ Resolution: Unresolved
 Assignee:   Chakshu Kansal
 Reporter:   Andreas Dilger
 Created:    Wed, 7 Feb 2024 22:25:01 +0000
-Updated:    Mon, 5 Jan 2026 05:44:46 +0000
+Updated:    Mon, 29 Jun 2026 22:56:30 +0000
 Labels:     lnet, medium, multi-rail, usability
 Links:      Related: is related to LU-17513; Related: is related to LU-17258; Related: is related to LU-17514
 
@@ -31,6 +31,15 @@ It would never increase conns_per_peer until the system is restarted, or maybe i
 
 I've also filed LU-17514 for tracking an "expected_clients" tunable that can be used to set a ballpark figure for the number of clients, so that various runtime parameters like conns_per_peer could be set appropriately early in the cluster mount process.
 
+--- Comment (adilger, Fri, 9 Feb 2024 21:45:14 +0000) ---
+I was thinking about this further, and I'm wondering if the number of connections per peer should be more dynamic at runtime rather than "establish N connections immediately at mount time"?
+
+Essentially, conns_per_peer would be considered as "maximum number of peer connections" and ksocklnd would start with only 1 connection per peer (maybe not even per peer NID) until there was a substantial amount of traffic flowing to the peer. The the node would dynamically add new connections as long as this increased the real message transfer rate, and the server did not reject the connection with -EALREADY, and did not exceed conns_per_peer.  Once the client is finished its IO burst it would dynamically drop idle connections again in the background.
+
+That would allow the "single busy client" case to get peak bandwidth, while the "many clients" case would immediately be handled by 1 initial connection and the server would just not allow it to escalate if it was busy or had too many connections. Depending on how long it takes to establish a new connection, we might even consider to drop idle bulk read/write connections to 0 and only keep the control connection for pings and small messages, but I'm not sure that this is necessary. 
+
+I think that behavior gives us the best of both worlds - peak bandwidth when a single client can drive it, without overloading the server when its network/storage is the limit.
+
 --- Comment (gerrit, Mon, 5 Jan 2026 05:39:52 +0000) ---
 "Chakshu Kansal " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/63230
 
@@ -44,11 +53,29 @@ Current Patch Set: 1
 
 Commit: 545bdc2187c852d090f2a1bb0bf8e000349b4b56
 
---- Comment (adilger, Fri, 9 Feb 2024 21:45:14 +0000) ---
-I was thinking about this further, and I'm wondering if the number of connections per peer should be more dynamic at runtime rather than "establish N connections immediately at mount time"?
+--- Comment (hornc, Mon, 29 Jun 2026 22:43:29 +0000) ---
+I've been working on a patch series that I think better addresses the spirit of this ticket and largely satisfies the behavior outlined by Andreas on 09/February/24 . The goal of the series is to make socket use track actual concurrent I/O rather than client count, and to give a server a way to bound and fairly ration its own socket pool instead of letting the client population dictate it. All of it is opt-in and inert unless enabled.
 
-Essentially, conns_per_peer would be considered as "maximum number of peer connections" and ksocklnd would start with only 1 connection per peer (maybe not even per peer NID) until there was a substantial amount of traffic flowing to the peer. The the node would dynamically add new connections as long as this increased the real message transfer rate, and the server did not reject the connection with -EALREADY, and did not exceed conns_per_peer.  Once the client is finished its IO burst it would dynamically drop idle connections again in the background.
+Four commits (so far), bottom to top:
 
-That would allow the "single busy client" case to get peak bandwidth, while the "many clients" case would immediately be handled by 1 initial connection and the server would just not allow it to escalate if it was busy or had too many connections. Depending on how long it takes to establish a new connection, we might even consider to drop idle bulk read/write connections to 0 and only keep the control connection for pings and small messages, but I'm not sure that this is necessary. 
+1. grow connections per peer on demand. Adds dynamic_conns mode, which treats conns_per_peer as a ceiling rather than a fixed count. Each peer starts at one bulk conn per direction and opens more toward the ceiling only while that direction is backed up. This is the growth half only: idle connections aren't reaped, so the count floats up to the ceiling and stays there until the peer is torn down. Shrinking needs a wire primitive socklnd doesn't have yet, so it's left to the next patch.
 
-I think that behavior gives us the best of both worlds - peak bandwidth when a single client can drive it, without overloading the server when its network/storage is the limit.
+2. cap and scale-down via connection budget. Supplies that missing primitive. A partial close is read by the remote as link failure and cascades into a whole-peer teardown (ksocknal_close_conn_and_siblings() on any EOF), so there's no way today to retire one connection or to tell a peer how many should exist. Adds KSOCK_PROTO_V5: a trailing HELLO budget word and a KSOCK_MSG_DECONN control message that retires a single connection gracefully, both negotiated by version so mixed V4/V5 clusters interoperate. That one primitive serves three opt-in uses: reaper scale-down of idle drained conns, a server-side cap (conns_limit), and cooperative scale-up clamped to the peer's advertised budget.
+
+3. dynamic fair-share connection budget. The cap from the prior patch is binary (no limit below conns_limit, the floor at or over it) and can only shed conns this node dialed, so a pure server can't reclaim what its clients opened against it. Replaces it with a fair share rationed per CPT, fair = clamp((X - Y) / 2Y, 1, N) per direction (where X is the CPT's conns_limit slice, Y its active peer_ni count and N the NI's speed-derived conns_per_peer ceiling), and adds ksocknal_server_trim() to DECONN (decrement the agreed conn count by one) the excess on accepted (pure-server) peers. Admission gates accepts against the CPT slice, and the dialer self-clamps its own growth to its fair share.
+
+4. demand-aware fair-share budget. Flat fair hands an idle peer the same share as a saturated one, so the idle peer's slack sits stranded while a busy peer is capped below the link ceiling N. Demand-aware makes the budget water-fill: pour the idle peers' slack into the demanders, sized over the server population's own pool. A demander is a peer that recently tried to open an extra bulk conn (whether admitted or refused) or still holds grown conns and isn't idle. Adds a pure-accept idle-drain trigger so a demander that simply stops its load declassifies and converges back to fair.
+
+Together these meet the core goal: steady-state socket use tracks I/O, a server can cap and fairly ration its pool, and an active peer on an otherwise idle server can use the slack the idle peers leave.
+
+Outstanding:
+
+1. The pool isn't fully work-conserving: the integer-division remainder and any slack left when demanders pin at N aren't redistributed.
+
+2. A peer already above a since-lowered fair is reclaimed only by the hard cap, not trimmed down to fair, and fair is monotone-down per peer-lifetime, so a trimmed client regains capacity only on reconnect.
+
+3. In eager mode (dynamic_conns off) the dial-side clamp is open-time only, so the dialer still opens to its conns_per_peer ceiling bounded only by the remote budget and the hard per-CPT cap.
+
+4. The EALREADY refuse path is coarse, and the advertise path reads the demander share with one unlocked load, so a peer connecting between trim passes can see a one-pass-stale ceiling (self-corrects next pass, floor always honored).
+
+I am finishing some testing and will push the series soon.

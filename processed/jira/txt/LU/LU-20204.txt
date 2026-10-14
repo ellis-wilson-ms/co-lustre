@@ -1,0 +1,89 @@
+Key:        LU-20204
+Summary:    Growing lock counts need some solutions
+Link:       https://jira.whamcloud.com/browse/LU-20204
+Type:       Improvement
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Oleg Drokin
+Created:    Wed, 29 Apr 2026 22:28:10 +0000
+Updated:    Wed, 7 Oct 2026 05:37:55 +0000
+Links:      Related: is related to LU-20205
+
+--- Description ---
+System sizes keep growing including RAM and client counts.
+
+This leads to greatly increasing lock counts in the wild, the other day I saw a system that had nearly 100 million locks on one of the servers. That does not sound much, but for example with our object hash size of 1 object lookup, and we do a lot of those!
+
+Certain workloads (e.g. cancel RPC with ELC where every request could carry hundreds of lock handles that are then rapidly iterated over, but there could be more) get disproportionally affected (LU-20205 for this particular case).
+
+For the handle->object hash table possible soutions include:
+
+increasing the hash even more (but then that's temporary again and uses lot's of RAM even on smaller systems where it's not really needed)
+
+replacing the hashtable entirely with something else (possible options: xarray and rbtrees)
+
+ 
+
+For other hash tables (like resource hashes per namespace) - making them resizable might make sense. I guess I'll make a separate ticket for this case so we can concentrate on the one type of the hash table here.
+
+--- Comment (vitaly_fertman, Wed, 29 Apr 2026 23:58:43 +0000) ---
+as a possible quick solution - lru_resize has a limit for the amount of locks the server is going to have and we start asking clients to cancel quickly only when reaching this limit  -  LDLM_POOL_HOST_L, 50 ldlm locks for 1MB of RAM. however the handle hash table which is supposed to keep the same amount of locks has fixed size, we can chose its size on setup according to that lru_resize limit.
+
+--- Comment (JIRAUSER19323, Thu, 7 May 2026 17:27:25 +0000) ---
+Just also want to mention that the cancel is heavily cpu-bound and lead to high cpu for a long period of time. If the server is part of HA (for example pacemaker), it will get fenced due to high cpu situation, and the problem repeats causing very unstable MDS. The memory usage also results in OOM getting invoked with the following message appearing in the log:
+
+Mar 24 14:06:38 mds0 kernel: obd_memory max: 754195227390, obd_memory current: 748883621152
+
+...
+
+Mar 24 14:06:38 mds0 kernel: oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),cpuset=/,mems_allowed=0,global_oom,task_memcg=/system.slice/host-agent.service,task=java,pid=18936,uid=1000
+
+--- Comment (gerrit, Mon, 18 May 2026 22:15:27 +0000) ---
+"Vitaly Fertman " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/65985
+
+Subject: LU-20204 obdclass: adjust object hash size
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 473a19f9023868fdb4a954c4bb758cc01429903b
+
+--- Comment (vitaly_fertman, Mon, 18 May 2026 22:32:03 +0000) ---
+some comments regaridng different possible solutions:
+
+rbtree - this was my first proposal when Oleg originally came to discuss the issue. for 100M locks it is just the depth 16.5, at avg just 8 comparisons! but it is to be under rwlock...
+
+hashtable - later I realise that the hash size on the server could be immediately setup of an appropriate size - as I wrote below. The submitted patch considers the hash queue length at ~50 locks, for 1.5Tb the hashtable is 24Mb size. it is 25 comparisons at avg, x3 vs the rbtree, but it has RCU enhancement - what would be faster?))
+
+rhashtable - as we have an ldlm pool limit, it does not looks beneficial for the server side, but could be for the client side - whatever table size is chosen, we will have to change it again in future when servers will keep 1G-10G-100G locks. at the same time, if client wants to keep too many locks, it is probably not normal, it should be limited.... having sad that, if someone decides to move to rhashtable, and decides to use it on server as well to have a common solution, I would like to see the perf results with a rehashing process running in parallel in background. 100M of locks to be rehashed is a big job, what if later the situation will change and we will need to shrink the table? does it mean we will be permanently rehash it? I think rhashtable would be OK if a) it will be of only increasing size, and b) we can store the current size in parameters and setup it with the previous size after failover.
+
+xarray - it works great with well packed indexes, but we allocate lock handles with HANDLE_INCR 7 - not so well packed… however, locks are allocated in just one place (where handle_base is) and dies with time, it is a very race case for a lock to live for ages… still not sure it will work great here…
+
+--- Comment (gerrit, Sat, 20 Jun 2026 15:42:50 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/65985/
+
+Subject: LU-20204 obdclass: adjust object hash size
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: b7d6750398325a604e34e981e369fa5ea8b3d78a
+
+--- Comment (adilger, Wed, 7 Oct 2026 05:37:55 +0000) ---
+I just found this ticket.  Some other work is already being done in this area. 
+
+I think rhashtable would be OK if a) it will be of only increasing size, and b) we can store the current size in parameters and setup it with the previous size after failover.
+
+James already has a patch https://review.whamcloud.com/45882 ("LU-8130 ldlm: convert ldlm_resource hash to rhashtable") to move the code over to rhashtable, which I think is more scalable than the static LDLM hashtable.  It would be reasonable to avoid shrinking it, and it isn't clear if rehashing on growth is worse than having 1500 entries in each bucket.
+
+There was also work by Keguang to implement the client LFRU and improved client pressure in patch https://review.whamcloud.com/62497 ("LU-7266 ldlm: introduce pressure-based SLV") so that they are cancelling locks more aggressively instead of allowing 100M locks accumulate on the server.  It would be good to get some reviews on those patches so they can move forward instead of sitting in Gerrit forever.
+
+In recent development there is now an expected_clients tunable parameter that can be set by the admin, or is auto-tuned based on the maximum number of client mountpoints ever seen.  That could be used to pre-estimate the expected hashtable size instead of just making it a function of RAM size.

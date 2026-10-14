@@ -1,0 +1,216 @@
+Key:        LU-20544
+Summary:    selinux: confine lgss_keyring in its own domain instead of sharing keyutils_request_t on  RHEL 10
+Link:       https://jira.whamcloud.com/browse/LU-20544
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Hiroshi Nishida
+Created:    Thu, 30 Jul 2026 17:32:13 +0000
+Updated:    Thu, 30 Jul 2026 17:32:13 +0000
+
+--- Environment ---
+RHEL10.X
+
+--- Description ---
+Description
+
+	
+	
+
+LU-20119 adds a `lustre_helpers` SELinux policy module with a dedicated
+
+`lustre_helper_t` domain for the helpers the kernel launches via
+
+call_usermodehelper() - l_getsepol, lctl, l_getidentity, l_getauth. The point
+
+of that domain is that those grants do not have to sit on a shared domain.
+
+lgss_keyring does not get the same treatment, because it is not launched the
+
+same way. It is started by the kernel keyring request-key upcall via
+
+/etc/request-key.d/lgssc.conf, so it runs in the base policy's
+
+`keyutils_request_t`. The rules it needs are therefore written against
+
+`keyutils_request_t` directly, and `keyutils_request_t` is the domain for
+
+every request-key upcall on the machine - cifs.upcall, dns_resolver,
+
+nfsidmap and anything else that registers one.
+
+So every permission LU-20119 grants for lgss_keyring is also granted to those
+
+unrelated helpers:
+
+	`self:udp_socket` and `self:tcp_socket`, plus
+
+  `dns_port_t:tcp_socket name_connect`
+
+	`self:netlink_route_socket`
+
+	`net_conf_t:file`, `passwd_file_t:file`, `cert_t:dir` and `cert_t:file`
+
+  reads
+
+	`init_t:dir/file/lnk_file` and `nsfs_t:file getattr` for /proc/1/ns and
+
+  mount-namespace lookups
+
+	`debugfs_t:dir search`, `debugfs_t:filesystem getattr` and
+
+  `sysfs_t:file { getattr open read write }` for the Lustre parameter paths
+
+That is broader than intended. Granting Lustre parameter write access and a
+
+DNS client to nfsidmap and cifs.upcall is not something this patch needs to
+
+do, and it is at odds with the reason lustre_helper_t exists.
+
+	
+	
+		Platform scope: RHEL 10 only
+
+	
+	
+
+`keyutils_request_t` is only defined in the RHEL 10 base policy. Measured
+
+with `seinfo -t keyutils_request_t`:
+
+| distro    | selinux-policy | keyutils_request_t |
+
+|----------|--------------|-------------------|
+
+| RHEL 8.10 | 3.14.3-139     | absent             |
+
+| RHEL 9.7  | 38.1.65        | absent             |
+
+| RHEL 10.2 | 42.1.18        | present            |
+
+(10.0 and 10.1 not measured; 10.0 is on the 40.13.26 line rather than 42.x,
+
+so it is worth confirming rather than assuming.)
+
+Because the type does not exist on el8/el9, the entire lgss_keyring section of
+
+lustre_helpers.te sits inside an `optional { require 
+
+{ type
+keyutils_request_t; }
+ ... }` block and is inert on those releases - so neither
+
+the permission leak described above nor the fix proposed below has any effect
+
+there. lustre.spec.in also defaults the policy bcond off for `%rhel This is therefore a RHEL 10 (and derivative) issue only, which is part of why
+
+it is filed as a cleanup rather than a defect.
+
+	
+	
+		Proposal
+
+	
+	
+
+Give lgss_keyring its own exec label and domain, and transition into it from
+
+the request-key upcall:
+
+    type lustre_keyring_t;
+
+    type lustre_keyring_exec_t;
+
+    ...
+
+    type_transition keyutils_request_t lustre_keyring_exec_t:process
+
+        lustre_keyring_t;
+
+with a matching lustre_helpers.fc entry for the lgss_keyring binary, and the
+
+rules currently written against `keyutils_request_t` moved onto
+
+`lustre_keyring_t`.
+
+Worth evaluating at the same time, but not a precondition: carrying
+
+`nsswitch_domain` on the new domain instead of hand-listing the resolver
+
+permissions. The base policy's `nsswitch_domain` already grants
+
+`port_type:tcp_socket name_connect`, full `self:tcp_socket`, `net_conf_t` and
+
+`passwd_file_t` reads, `cert_t`, the sssd/nscd/systemd-userdb sockets and the
+
+DNS rules, all inside distro-maintained optional_policy blocks, so nothing has
+
+to be re-derived when a backend appears or moves.
+
+Caveat on that second part: attribute-derived grants are not unconditional.
+
+Measuring the `domain` attribute baseline for LU-20119 across selinux-policy
+
+3.14.3 / 38.1.65 / 40.13.26 / 42.1.7 / 42.1.18 found three rules whose only
+
+baseline grant is boolean-gated - `kernel_t:fd use` via `domain_fd_use`, and
+
+`sysctl_kernel_t` dir/file via `fips_mode` - so flipping a boolean silently
+
+removes the permission. The same measurement should be repeated for
+
+`nsswitch_domain` before relying on it, rather than assuming the attribute
+
+covers the set.
+
+	
+	
+		Why this is separate from LU-20119
+
+	
+	
+
+This is a confinement cleanup, not a bug fix. LU-20119 fixes real failures
+
+(SSK mounts and NID resolution under enforcing SELinux); moving lgss_keyring
+
+into its own domain does not change whether anything works, only which other
+
+domains inherit the grants.
+
+It also carries real test cost. A new exec type and type_transition means new
+
+.fc entries, a new relabel path to verify in %post, and a fresh validation
+
+pass across el8.10 / el9.7 / el10.0 / el10.1 / el10.2. LU-20119 already has to
+
+account for an el10.0 policy difference (10.0 keeps kernel_generic_helper_t at
+
+policy 40.13.26; 10.1+ dropped it) and for el8, where `keyutils_request_t`
+
+does not exist at all and the whole lgss_keyring section is inside an
+
+`optional { }` block. Folding this into LU-20119 would invalidate the testing
+
+that patch series has had.
+
+	
+	
+		Not deferred to this ticket
+
+	
+	
+
+The missing `tcp_socket` permission for the resolver is fixed in LU-20119
+
+itself, not here. Without it glibc's TCP fallback - taken when the UDP answer
+
+is truncated, and taken unconditionally under `options use-vc` - is denied at
+
+socket(), so NID-to-hostname resolution fails at exactly the sites LU-20119
+
+is meant to fix. That is a functional bug and is independent of which domain
+
+the rule ends up on.

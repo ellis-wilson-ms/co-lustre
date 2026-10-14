@@ -1,0 +1,240 @@
+Key:        LU-20903
+Summary:    BUG: unable to handle page fault for address: 0000000000080003. Non-root lctl get_param triggers out-of-bounds write in lustre_stats_dump() and MDS crash (2.17.0)
+Link:       https://jira.whamcloud.com/browse/LU-20903
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Nguyen Hoang Minh
+Created:    Thu, 8 Oct 2026 09:14:35 +0000
+Updated:    Thu, 8 Oct 2026 09:14:35 +0000
+
+--- Environment ---
+5.14.0-611.13.1_lustre.el9
+
+--- Description ---
+Dear Whamcloud team,
+
+We would like to report a bug in Lustre 2.17.0. It appears that collecting Lustre stats as a non-root user using lctl get_param might trigger an out-of-bounds (OOB) memory write, which can lead to a kernel crash. Example affected commands are as follows:
+
+lctl get_param "mdt.*MDT*.exports.*@*.stats"
+lctl get_param obdfilter.*OST*.exports.*@*.stats 
+
+While crashes are frequently observed on MDS VMs, we have not yet observed any OSS VMs crash with this OOB. To reproduce the crash:
+
+	Create a clean VM running the Lustre server kernel 5.14.0-611.13.1_lustre.el9.x86_64. (single Lustre server deployment)
+
+	Download and install Lustre 2.17.0 （https://downloads.whamcloud.com/public/lustre/lustre-2.17.0/el9.7/server/）
+
+	Format the MDT with the following flags:
+
+Filesystem features:      has_journal ext_attr resize_inode dir_index filetype needs_recovery extent mmp flex_bg ea_inode dirdata large_dir sparse_super large_file huge_file uninit_bg dir_nlink quota project
+Filesystem flags:         signed_directory_hash track_trim
+
+       4. Format the OST with the following flags:
+
+Filesystem features:      has_journal ext_attr dir_index filetype needs_recovery meta_bg extent 64bit mmp flex_bg large_dir sparse_super large_file huge_file uninit_bg dir_nlink quota project
+Filesystem flags:         signed_directory_hash track_trim
+
+       5. Mount the MGT/MDT/OST
+
+       6. Use a non-root user to execute the vulnerable command as follows:
+
+[root@lustre-mdsvm1 ~]# sudo -u testuser bash -c '  
+     for i in $(seq 1 200); do    
+            lctl get_param "mdt.*MDT*.exports.*@*.stats" >/dev/null 2>&1    
+            echo "$(date +%T) loop $i/200"  
+     done
+'
+12:45:30 loop 1/200
+12:45:30 loop 2/200
+...for readability>...
+12:45:30 loop 10/200
+12:45:30 loop 11/200
+client_loop: send disconnect: Broken pipe
+(the SSH session dropped because the node crashed)
+
+The crash typically occurs within 10-20 loops. The following memory access error appears in the vmcore:
+
+[root@lustre-mdsvm1 ~]# grep -E "BUG:|Oops:|Comm:|RIP:|R13:|CR2:|refill_obj_stock|memcg_slab_free|kmem_cache_free"  /var/crash/127.0.0.1-2026-10-07-12:45:33/vmcore-dmesg.txt
+[ 2271.041217] BUG: unable to handle page fault for address: 0000000000080003
+[ 2271.041248] Oops: 0000 [#1] PREEMPT SMP NOPTI
+[ 2271.041257] CPU: 10 PID: 45876 Comm: lctl Kdump: loaded Tainted: G           OE      ------  ---  5.14.0-611.13.1_lustre.el9.x86_64 #1
+[ 2271.041263] RIP: 0010:refill_obj_stock+0x3e/0x160
+[ 2271.041311] R13: 0000000000080003 R14: ff3b4df686a7bdc0 R15: 0000000000080003
+[ 2271.041316] CR2: 0000000000080003 CR3: 000000010957a003 CR4: 0000000000773ef0 
+
+To the best of our knowledge, the issue is limited to Lustre stats collection. Any application that collects Lustre stats with the affected commands as a non-root user may be affected. In contrast, running the above affected commands as root does not cause any crashes.
+
+ 
+
+Kernel Crash and Out-of-Bounds Memory Access.  The page fault at 0x80003 appears to be a downstream effect of this issue. Using KASAN, we identified its source as an out-of-bounds write to a buffer in lustre_stats_dump() (lustre/obdclass/kernelcomm.c, v2_17_0), allocated at line 891 and freed at line 923.
+
+The error was captured on the same Lustre version with a debug build of the same kernel (5.14.0-611.13.1_lustre.el9.x86_64), rebuilt with the RHEL debug configuration and KASAN enabled (CONFIG_KASAN=y, CONFIG_KASAN_GENERIC=y, CONFIG_KASAN_INLINE=y, CONFIG_KASAN_VMALLOC=y). The resulting kernel reports itself as 5.14.0-611.13.1.kasan.el9.x86_64+debug. It was booted with kasan.fault=panic so that the first KASAN report triggers a panic and is preserved in the vmcore by kdump. The KASAN report extracted from the vmcore is as follows:
+
+[root@lustre-mdsvm1 ~]# grep -E "BUG: KASAN|Write of size|Read of size|Allocated by|located .* to the right|region \ [|kmalloc-512|lustre_stats_dump \+0xc75|Comm: lctl" /var/crash/127.0.0.1-2026-10-07-13:39:46/vmcore-dmesg.txt
+[  132.839772] BUG: KASAN: slab-out-of-bounds in lustre_stats_dump+0x1bee/0x2570 [obdclass][  132.839921] Write of size 16 at addr ff110006918d09f8 by task lctl/3087
+[  132.839926] CPU: 4 PID: 3087 Comm: lctl Kdump: loaded Tainted: G        W  OE      ------  ---  5.14.0-611.13.1.kasan.el9.x86_64+debug #1
+[  132.841596] Allocated by task 3087:
+[  132.841615]  lustre_stats_dump+0xc75/0x2570 [obdclass] which belongs to the cache kmalloc-512 of size 512
+[  132.841762] The buggy address is located 0 bytes to the right of allocated 504-byte region [ff110006918d0800, ff110006918d09f8) 
+
+Key findings:
+
+	lustre_stats_dump() allocated a 504-byte buffer at lustre_stats_dump+0xc75 (see "Allocated by task 3087").
+
+	The same task (3087) then wrote 16 bytes just after the end of this buffer. The buffer is [ff110006918d0800 , ff110006918d09f8), and the write starts at ff110006918d09f8, causing OOB memory access.
+
+Source-Level Analysis. Analyzing the crash at the source-code level yields the same conclusion. Because lustre_stats_dump() is part of the obdclass.ko module, the faulting address lies in module space, so we loaded the module's debug symbols in crash to resolve it. The backtrace shows the faulting instruction at address 0xffffffffc30a548e.
+
+crash> bt                                                                
+PID: 3087     TASK: ff11000773860000  CPU: 4    COMMAND: "lctl"          
+... for readability>...
+#5 [ffa000000da6f038] lustre_stats_dump at ffffffffc30a548e [obdclass]  
+
+Disassembling this instruction maps it to the following source line:
+
+crash> dis -s ffffffffc30a548e | head -7
+FILE: /var/lib/dkms/lustre-all/2.17.0/build/lustre/obdclass/kernelcomm.c
+LINE: 901
+  896                           }
+  897                           *start = stats_list; /* Set initial values */
+  898                           start->lkl_maxattr += stats->ls_num;
+  899                           for (i = LUSTRE_STATS_ATTR_MAX + 1;
+  900                                i lkl_maxattr; i++)
+* 901                                   start->lkl_list[i] =
+  902                                           stats_list.lkl_list[LUSTRE_STATS_ATTR_DATASET]; 
+
+To understand how and why OOB occurs, we explain our understanding regarding how Lustre 2.17.0 prepares the vulnerable start buffer. The following code prepares the start pointer in Lustre 2.17.0:
+
+/* In lustre-release/lnet/include/uapi/linux/lnet/lnet-nl.h at b2_17 */
+...
+struct ln_key_props {              
+  char                                   *lkp_value;              __u16                                lkp_key_format;              __u16                                lkp_data_type;
+};
+struct ln_key_list {              
+__u16                                lkl_maxattr;              
+struct ln_key_props            lkl_list[];
+}; 
+
+/* In lustre-release/lustre/obdclass/kernelcomm.c at b2_17 */
+size_t len = sizeof(struct ln_key_list);
+...
+struct ln_key_list *start;
+...
+count = LUSTRE_STATS_ATTR_MAX + stats->ls_num - 1;
+len += sizeof(struct ln_key_props) * count;
+OBD_ALLOC(start, len);
+
+The size of the region allocated for start is len, computed as:
+
+len = sizeof(struct ln_key_list) + sizeof(struct ln_key_props) * count 
+
+Without memory padding, the struct sizes would be:
+
+	struct ln_key_props: 12 bytes (8 bytes for the char *lkp_value pointer, 2 bytes for _u16 __ lkp_key_format,{_} and 2 bytes __ for __ _u16 lkp_data_type).
+
+	struct ln_key_list: 2 bytes (the __u16 lkl_maxattr }}field). The flexible array member {{lkl_list[] adds no size, but it does impose the 8-byte alignment of its element type.
+
+This would give len = 2 + 12 * count. However, pahole shows the actual layouts include padding:
+
+[root@lustre-mdsvm1 ~]# pahole -C ln_key_props $(modinfo -n obdclass)
+struct ln_key_props {
+        char *                     lkp_value;            /*     0     8 */
+        __u16                      lkp_key_format;       /*     8     2 */
+        __u16                      lkp_data_type;        /*    10     2 */
+        /* size: 16, cachelines: 1, members: 3 */
+        /* padding: 4 */
+        /* last cacheline: 16 bytes */
+};
+[root@lustre-mdsvm1 ~]# pahole -C ln_key_list $(modinfo -n obdclass)
+struct ln_key_list {
+        __u16                      lkl_maxattr;          /*     0     2 */
+        /* XXX 6 bytes hole, try to pack */
+        struct ln_key_props        lkl_list[];           /*     8     0 */
+        /* size: 8, cachelines: 1, members: 2 */
+        /* sum members: 2, holes: 1, sum holes: 6 */
+        /* last cacheline: 8 bytes */
+}; 
+
+struct ln_key_list is padded from 2 to 8 bytes (6 bytes after lkl_maxattr), and struct ln_key_props is padded from 12 to 16 bytes (4 bytes of tail padding). The effective size is therefore len = 8 + 16 * count. Conversely, count = (len − 8) / 16. For the 504-byte buffer in the KASAN report, this gives count = (504 − 8) / 16 = 31. We then examined the lustre_stats_dump() stack frame in the vmcore at the time of the crash:
+
+[root@lustre-mdsvm1 ~]# drgn -c /var/crash/127.0.0.1-2026-10-07-13\:39\:46/vmcore \
+     -s /usr/lib/debug/lib/modules/5.14.0-611.13.1.kasan.el9.x86_64+debug/vmlinux \
+     -s obdclass.ko...
+>>> trace = prog.crashed_thread().stack_trace()
+>>> f = next(fr for fr in trace if fr.name == "lustre_stats_dump")
+>>> print(f)
+#6 at 0xffffffffc30a548e (lustre_stats_dump+0x1bee/0x2562) in lustre_stats_dump at /var/lib/dkms/lustre-all/2.17.0/build/lustre/obdclass/kernelcomm.c:901:24
+>>> f["i"]
+(int)31
+>>> f["len"]
+(size_t)504
+# recompute count, the size of the start->lkl_list list
+>>> (f["len"] - sizeof(prog.type("struct ln_key_list"))) / sizeof(prog.type("struct ln_key_props"))
+(size_t)31 
+
+Key findings:
+
+	len is 504, so, as derived above, start->lkl_list holds count = 31 elements, with valid indices 0 through 30.
+
+	At the time of the crash, the loop index i is 31, and the code writes to start->lkl_list[31].
+
+	Index 31 is one past the end of the array. This 16-byte write is the out-of-bounds write.
+
+Triggering the Vulnerable Path as a Non-Root User. Analyzing the runtime call graph leading to lustre_stats_dump() reveals the execution path that produces the out-of-bounds write. When a non-root user queries Lustre statistics with the affected command:
+
+sudo -u testuser lctl get_param mdt.*MDT*.exports.*@*.stats 
+
+Lustre chooses how to read the data based on the requesting user's privileges. It first tries to open the file path with the user's privileges. If the user is not root and the parameter files are not found (-ENOENT), Lustre falls back to llapi_param_display_value():
+
+# Code in lustre/utils/lustre_param.c{...
+# Try to open file as current user privilege
+  rc2 = do_param_op(&popt, path, NULL, GET_PARAM, NULL);
+  if (rc2 if (rc == 0)
+    rc = rc2;
+
+   if (rc2 == -ENOENT && getuid() != 0)
+# if user is not root and cannot read the file, use this function
+    rc2 = llapi_param_display_value(path, version, flags, stdout);
+   continue;
+  }
+ } 
+
+Following llapi_param_display_value() in user space leads, via netlink, to the vulnerable kernel function lustre_stats_dump():
+
+# perf record  --call-graph dwarf sudo -u testuser lctl get_param mdt.*MDT*.exports.*@*.stats
+# perf report --stdio -G
+3.67%     0.00%  lctl         libc.so.6               [.] __libc_start_main@@GLIBC_2.34
+            |
+            ---__libc_start_main@@GLIBC_2.34
+               __libc_start_call_main
+               |
+               |--2.44%--0x557fc2ee6a29
+               |          cfs_parser
+               |          0x557fc2eec686
+               |          llapi_param_display_value
+               |          |
+               |          |--1.22%--0x7f5d75ce2f2f
+               |          |          yaml_parser_initialize
+               |          |
+               |           --1.21%--0x7f5d75ce31a1
+               |                     yaml_emitter_emit
+... for readability>
+               |                     netlink_dump
+               |                     genl_dumpit
+               |                     lustre_stats_dump
+... for readability>
+
+Because root can read the file path directly, it never takes this fallback path, which explains why the crash does not occur when the affected commands are run as root.
+
+Our analysis indicates that statistics collection for OSTs and MDTs shares the same execution path. Although we have not observed crashes on OSS VMs running the standard kernel, KASAN reports the same out-of-bounds write on OSS VMs, so we believe OSS nodes are also affected.
+
+We look forward to your reply
+
+Best regards,
+
+Minh
+
+HPC Research Engineer, Core Micro System, JP

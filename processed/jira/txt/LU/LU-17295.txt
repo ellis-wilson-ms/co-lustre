@@ -8,13 +8,62 @@ Resolution: Unresolved
 Assignee:   Qian Yingjin
 Reporter:   Qian Yingjin
 Created:    Fri, 17 Nov 2023 03:20:41 +0000
-Updated:    Sat, 17 May 2025 02:53:54 +0000
+Updated:    Mon, 9 Mar 2026 12:14:08 +0000
 Labels:     IO500, performance
+Attachments: LU-17295-2026-0308.xlsx, deadlock-traces-53169-ps33.txt
 
 --- Description ---
 This is an experimental feature to avoid the VFS exclusive locking on parent directory in ->atomic_open during file creations.
 
 It converted the exclusive semaphore mutex into a shared lock to avoid waiting for the heavy creation RPC to finished
+
+--- Comment (qian_wc, Fri, 17 Nov 2023 04:02:10 +0000) ---
+Found a possible bug in Lustre:
+
+ 
+
+        static int ll_atomic_open()
+        /* VFS has locked the inode before calling this */
+        ll_set_inode_lock_owner(dir); 
+
+As the dir maybe lock in shared mode, we may wrongly thought that the @dir is locked in exclusive mode:
+
+ 
+
+        if (open_flag & O_CREAT)
+		inode_lock(dir->d_inode);
+	else
+		inode_lock_shared(dir->d_inode);
+	error = lookup_open(nd, &path, file, op, got_write);
+	if (open_flag & O_CREAT)
+		inode_unlock(dir->d_inode);
+	else
+		inode_unlock_shared(dir->d_inode);
+
+ 
+
+in vvp_inode_ops(),
+
+we may unlock the inode wrongly...
+
+ 
+
+case COIO_INODE_UNLOCK:
+        if (ll_get_inode_lock_owner(inode) == current)
+               ll_inode_unlock(inode);
+
+--- Comment (gerrit, Fri, 17 Nov 2023 08:35:18 +0000) ---
+"Qian Yingjin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/53169
+
+Subject: atomic_open()" class="issue-link" data-issue-key="LU-17295">LU-17295 llite: avoid VFS exclusive locking in atomic_open
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: a5d02885d5eaacaefc10c7962056587b74199daf
 
 --- Comment (JIRAUSER19217, Thu, 25 Jul 2024 10:07:47 +0000) ---
 Here is the performance evaluation
@@ -88,50 +137,349 @@ a5d02885d5-dirty
 5857.956
 11622.297
 
---- Comment (gerrit, Fri, 17 Nov 2023 08:35:18 +0000) ---
-"Qian Yingjin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/53169
+--- Comment (sihara, Sat, 7 Mar 2026 00:17:47 +0000) ---
+Thanks skoyama for looking into this and for your work. 
 
-Subject: atomic_open()" class="issue-link" data-issue-key="LU-17295">LU-17295 llite: avoid VFS exclusive locking in atomic_open
+The latest patch https://review.whamcloud.com/c/fs/lustre-release/+/53169 (patchset 33) worked well and demonstrated significant performance improvements. It is about 20× faster than the current behavior. 
 
-Project: fs/lustre-release
+With this patch, we now achieve nearly the same performance for a single shared directory as for unique directory operations when using Stripe DIR.
 
-Branch: master
+Here is the performance results without DNE and with DNE for stripe DIR.
 
-Current Patch Set: 1
+Original: commit:8306b4d51d
+patch : https://review.whamcloud.com/c/fs/lustre-release/+/53169 (patchset 33)
+Test case : mpirun -np  mdtest -n 10000 -F -C -r -Y -d /lustre/dir
+Client: 2 x Gold 6438Y+, 480GB RAM, 2 x CX7 HDR200
+Lustre server : 8 x MDT, 8 x OST 
 
-Commit: a5d02885d5eaacaefc10c7962056587b74199daf
-
---- Comment (qian_wc, Fri, 17 Nov 2023 04:02:10 +0000) ---
-Found a possible bug in Lustre:
-
- 
-
-        static int ll_atomic_open()
-        /* VFS has locked the inode before calling this */
-        ll_set_inode_lock_owner(dir); 
-
-As the dir maybe lock in shared mode, we may wrongly thought that the @dir is locked in exclusive mode:
+NoDNE, StripeDIR=1
 
  
-
-        if (open_flag & O_CREAT)
-		inode_lock(dir->d_inode);
-	else
-		inode_lock_shared(dir->d_inode);
-	error = lookup_open(nd, &path, file, op, got_write);
-	if (open_flag & O_CREAT)
-		inode_unlock(dir->d_inode);
-	else
-		inode_unlock_shared(dir->d_inode);
-
+Original
+Original
+Original
+/w Patch
  
 
-in vvp_inode_ops(),
+NP
+Unique DIR
+Shared DIR (Multiple Mountpoints)
+Shared DIR
+Shared DIR
+Patch/Original
 
-we may unlock the inode wrongly...
+1
+3,692
+3,641
+3,649
+3,757
+103%
+
+2
+7,222
+7,361
+5,641
+7,102
+126%
+
+4
+13,202
+14,576
+4,831
+11,208
+232%
+
+8
+22,368
+25,742
+4,898
+19,855
+405%
+
+16
+21,628
+37,941
+4,687
+20,499
+437%
+
+32
+20,677
+43,733
+4,595
+19,340
+421%
+
+64
+20,261
+46,348
+4,728
+19,320
+409%
+
+128
+20,071
+44,361
+3,938
+19,109
+485%
+
+we see ~5x performance boost here.
+
+We might need to look into why a unique directory on a single MDT does not scale compared to multiple mount points. However, this appears to be a separate issue.
+
+DNE, StripeDIR=8
 
  
+Original
+Original
+Original
+/w Patch
+ 
 
-case COIO_INODE_UNLOCK:
-        if (ll_get_inode_lock_owner(inode) == current)
-               ll_inode_unlock(inode);
+NP
+Unique DIR
+Shared DIR (Multiple Mountpoints)
+Shared DIR
+Shared DIR
+Patch/Original
+
+1
+3,077
+3,121
+3,227
+3,091
+96%
+
+2
+5,973
+6,039
+4,734
+5,986
+126%
+
+4
+12,425
+12,698
+4,201
+12,327
+293%
+
+8
+24,163
+24,570
+4,127
+23,818
+577%
+
+16
+42,882
+43,264
+4,159
+42,394
+1019%
+
+32
+66,599
+65,524
+4,173
+65,222
+1563%
+
+64
+79,531
+82,495
+4,115
+78,025
+1896%
+
+128
+81,533
+85,834
+3,996
+79,659
+1993%
+
+With DNE (8 MDTs in this case), we achieved about a 20× performance boost compared to the current behavior, and the performance scales similarly to unique directory operations.
+
+I attached a summarized spreadsheet.
+
+--- Comment (adilger, Sat, 7 Mar 2026 01:32:46 +0000) ---
+sihara, is it possible the single-MDT test case is being limited by mdc.*.max_mod_rpcs_in_flight=8, but with multiple MDTs or multiple mountpoints that limit is no longer hit?  The single-MDT performance increases up to NP=8 and then hits a limit, but the performance continues to increase for other configurations.
+
+--- Comment (sihara, Sat, 7 Mar 2026 02:34:56 +0000) ---
+adilger Yeah, I also realized same one after tested and am collecting new numbers with increased max_mod_rpcs_in_flight. I will update the table later.
+
+--- Comment (sihara, Sat, 7 Mar 2026 23:23:38 +0000) ---
+Here are the results with increased max_rpcs_in_flight and max_mod_rpcs_in_flight.
+
+The numbers for the single MDT case now make more sense, as we were hitting the in-flight RPC limits per MDC.
+
+(The attached spreadsheet has also been updated.)
+
+Original: commit:8306b4d51d
+patch : https://review.whamcloud.com/c/fs/lustre-release/+/53169 (patchset 33)
+Test case : mpirun -np  mdtest -n 10000 -F -C -r -Y -d /lustre/dir
+1 x Client: 2 x Gold 6438Y+, 480GB RAM, 2 x CX7 HDR200
+2 x Lustre server : 8 x MDT, 8 x OST
+
+Lustre Params: lctl set_param mdc.*.max_rpcs_in_flight=128 mdc.*.max_mod_rpcs_in_flight=127
+
+NoDNE, StripeDIR=1
+
+ 
+Original
+Original
+Original
+/w Patch
+ 
+
+NP
+Unique DIR
+Shared DIR (Multiple Mountpoints)
+Shared DIR
+Shared DIR
+Patch/Original
+
+1
+3,729
+3,731
+3,633
+3,674
+101%
+
+2
+7,208
+7,377
+5,593
+6,679
+119%
+
+4
+13,959
+14,497
+4,649
+11,013
+237%
+
+8
+24,466
+25,430
+4,816
+20,464
+425%
+
+16
+38,364
+37,906
+4,752
+32,721
+689%
+
+32
+43,774
+43,323
+4,879
+40,080
+821%
+
+64
+44,687
+46,076
+4,486
+41,281
+920%
+
+128
+41,633
+44,086
+3,897
+40,555
+1041%
+
+From a single MDT perspective, the patch boosts performance by about 10×.
+
+NoDNE, StripeDIR=1
+
+ 
+Original
+Original
+Original
+/w Patch
+ 
+
+NP
+Unique DIR
+Shared DIR (Multiple Mountpoints)
+Shared DIR
+Shared DIR
+Patch/Original
+
+1
+3,214
+3,035
+3,028
+3,106
+103%
+
+2
+6,023
+6,017
+4,620
+5,985
+130%
+
+4
+12,551
+12,774
+4,178
+12,338
+295%
+
+8
+24,416
+24,400
+4,129
+23,669
+573%
+
+16
+43,622
+42,942
+4,149
+42,372
+1021%
+
+32
+66,428
+65,527
+4,130
+65,762
+1592%
+
+64
+81,909
+81,529
+4,030
+79,890
+1982%
+
+128
+76,963
+83,523
+4,010
+82,465
+2056%
+
+I don’t see a significant difference when using max_rpcs_in_flight=8 and max_mod_rpcs_in_flight=8 in the 8 MDT case.
+
+In any case, file creation scaling with the number of processes is now close to that of both unique directory and shared directory operations. (e.g. mdtest-hard)
+
+I think this will help a lot for IO500 on small clusters (e.g., 10 nodes), where we previously needed many mount points (import/export) to saturate metadata performance when the system has many MDTs.
+
+We used to rely on multiple mount points for this, which is allowed and represents a real use case (e.g., Docker containers or sub-directory mounts on a single client). However, above results demonstrated that we can now achieve similar performance even with a single mount point.
+
+--- Comment (JIRAUSER19217, Mon, 9 Mar 2026 12:14:08 +0000) ---
+Patchset 33 causes deadlock. This log contains the details. qian_wc 
+
+deadlock-traces-53169-ps33.txt

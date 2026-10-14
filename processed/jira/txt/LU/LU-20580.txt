@@ -1,0 +1,134 @@
+Key:        LU-20580
+Summary:    o2iblnd: sleeping in atomic in kiblnd_startup() via rtnl_lock()
+Link:       https://jira.whamcloud.com/browse/LU-20580
+Type:       Bug
+Priority:   Medium
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Chris Horn
+Reporter:   Chris Horn
+Created:    Tue, 11 Aug 2026 17:59:22 +0000
+Updated:    Fri, 9 Oct 2026 14:39:02 +0000
+Resolved:   Thu, 3 Sep 2026 14:05:09 +0000
+Links:      Related: is related to  LU-20102; Related: is related to  LU-19707
+
+--- Description ---
+kiblnd_startup() calls lnet_get_link_status() from inside the
+
+write_lock_irqsave(&kiblnd_data.kib_global_lock) section:
+
+  write_lock_irqsave(&kiblnd_data.kib_global_lock, flags);
+  ibdev->ibd_nnets++;
+  list_add_tail(&net->ibn_list, &ibdev->ibd_nets);
+  if (ibdev->ibd_hdev->ibh_state == IBLND_DEV_PORT_DOWN)
+          kiblnd_set_ni_fatal_on(ibdev->ibd_hdev, 1);
+
+  netdev = dev_get_by_name(ni->ni_net_ns, net->ibn_dev->ibd_ifname);
+
+  if (netdev &&
+      ((netdev->reg_state == NETREG_UNREGISTERING) ||
+       (netdev->operstate != IF_OPER_UP) ||
+      (lnet_get_link_status(netdev) == 0))) {
+          kiblnd_set_ni_fatal_on(ibdev->ibd_hdev, 1);
+  }
+  dev_put(netdev);
+  write_unlock_irqrestore(&kiblnd_data.kib_global_lock, flags);
+
+lnet_get_link_status() takes rtnl_lock() and netdev_lock_ops(). rtnl_lock()
+
+is mutex_lock(), which can sleep. We call it with preemption disabled and
+
+interrupts off.
+
+LU-20102 removed the rcu_read_lock() around this code but left the call
+
+inside the rwlock section, so the sleep in atomic context stays.
+
+The failure is silent while rtnl_mutex is free, because the mutex fast path
+
+does not schedule, and might_sleep() reports nothing unless
+
+CONFIG_DEBUG_ATOMIC_SLEEP is set. When rtnl_mutex is held by another task,
+
+__mutex_lock_slowpath() calls schedule_preempt_disabled() and the kernel
+
+reports:
+
+  BUG: scheduling while atomic: lnetctl/8668/0x00000002
+
+preempt_count 0x2 is 1 from write_lock_irqsave() and 1 from
+
+schedule_preempt_disabled().
+
+This was seen on an aarch64 client (kernel 7.0.0-1013-nvidia-64k, 64K pages,
+
+NVIDIA GB300 NVL) during boot, when systemd-networkd and udev hold
+
+rtnl_mutex while LNet is configured. The node does not boot.
+
+After the report the node panics. schedule_debug() calls __schedule_bug()
+
+and then preempt_count_set(PREEMPT_DISABLED), so the later unlocks no longer
+
+balance. The task returns to user space with a non-zero preempt count, and
+
+the next ordinary user page fault takes the faulthandler_disabled() path:
+
+  Unable to handle kernel paging request at virtual address 0000fffff7cc59f4
+  ESR = 0x0000000082000007
+  EC = 0x20: IABT (lower EL), IL = 32 bits
+  pc : 0000fffff7cc59f4
+  lr : 0000fffff7fb4910
+  ...
+  Kernel panic - not syncing: Aiee, killing interrupt handler!
+
+The address is a user address (x16 is the aarch64 PLT register and holds the
+
+same value), so the Oops carries no kernel call trace.
+
+The fix is to read the net device state before the lock is taken, and to
+
+take kib_global_lock only to publish the result.
+
+--- Comment (hornc, Tue, 11 Aug 2026 18:04:20 +0000) ---
+Two adjacent defects found in the same read. They are not the cause of this panic and are not addressed by the fix for this ticket.
+
+1. kiblnd_dev_failover() (o2iblnd.c, set_fatal branch) calls kiblnd_set_ni_fatal_on() outside kib_global_lock. That function walks hdev->ibh_dev->ibd_nets, which the lock protects.
+
+2. ksocknal_ip2index() (socklnd.c) uses 'dev' after rcu_read_unlock() with no reference held. When for_each_netdev_rcu() finds no match, 'dev' also holds the loop-terminal value, so dev->reg_state and lnet_get_link_status(dev) read an invalid pointer.
+
+Each needs its own ticket.
+
+--- Comment (hornc, Tue, 11 Aug 2026 18:50:33 +0000) ---
+Correction to the analysis above: the sleep in atomic context was introduced by aebedbe75007 ("LU-19707 lnet: fix RTNL assert in LNet on v6.15"), which added rtnl_lock() to lnet_get_link_status(). The query in kiblnd_startup() was already inside the write_lock_irqsave(kib_global_lock) section before that commit, but did not sleep. e3a0dfd046fb (LU-20102) removed the surrounding RCU read section and left the sleep in place; it is not the commit that introduced the defect.
+
+This matters for backports: a tree that carries aebedbe75007 without e3a0dfd046fb has the same defect.
+
+--- Comment (gerrit, Tue, 11 Aug 2026 19:57:18 +0000) ---
+"Chris Horn " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/67927
+
+Subject: LU-20580 o2iblnd: don't sleep in atomic in kiblnd_startup()
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: bb82221cc7a082f30faf075aae249a9ea111050a
+
+--- Comment (gerrit, Thu, 3 Sep 2026 06:43:06 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/67927/
+
+Subject: LU-20580 o2iblnd: don't sleep in atomic in kiblnd_startup()
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: fd76c0fe6c427f0143d412817ce7dde91d96dfe2
+
+--- Comment (pjo, Thu, 3 Sep 2026 14:05:09 +0000) ---
+Merged for 2.18

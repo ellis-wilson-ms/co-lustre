@@ -1,0 +1,162 @@
+Key:        LU-20871
+Summary:    MDS NULL pointer dereference in lod_it_init() when the lower layer's do_index_ops is not yet visible
+Link:       https://jira.whamcloud.com/browse/LU-20871
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Max Wang
+Created:    Sat, 3 Oct 2026 03:11:20 +0000
+Updated:    Sat, 3 Oct 2026 03:19:14 +0000
+
+--- Environment ---
+MDS on aarch64, Lustre 2.15.8
+
+--- Description ---
+An MDS servicing MDS_READPAGE (readdir) takes a NULL pointer dereference at
+
+offset 0x28 and panics:
+
+  Unable to handle kernel NULL pointer dereference at virtual address 0000000000000028
+  Comm: mdt_rdpg03_060
+  pc : lod_it_init+0x4c/0xdc [lod]
+  lr : lod_it_init+0x30/0xdc [lod]
+  Code: aa0003f3 2a1603e2 aa1503e0 aa1403e1 (f9401463)
+  Call trace:
+   lod_it_init+0x4c/0xdc [lod]
+   dt_index_walk+0xb0/0x4e8 [obdclass]
+   mdd_readpage+0xc0/0x5bc [mdd]
+   mdt_readpage+0x788/0xd00 [mdt]
+   tgt_handle_request0+0x2bc/0x660 [ptlrpc]
+   tgt_request_handle+0x268/0xaac [ptlrpc]
+   ptlrpc_server_handle_request+0x460/0xf20 [ptlrpc]
+   ptlrpc_main+0xd18/0x15b8 [ptlrpc]
+  
+
+The faulting instruction is ldr x3, x3, #0x28 with x3 == 0. x3 was
+
+loaded at lod_it_init+52 from dt_object_child(dt)->do_index_ops, and 0x28 is the offset of dio_it.init within
+
+struct dt_index_operations. The NULL is therefore the lower layer's
+
+->do_index_ops.
+
+Root cause: a missing read-side acquire
+
+lod_index_try() sets the lower layer's ->do_index_ops (via
+
+->do_index_try()) and then its own. A second thread never runs that
+
+function: dt_try_as_dir() returns early when the upper layer's
+
+->do_index_ops is already set, so it neither re-runs >do_index_try()
+
+nor establishes any ordering. That thread performs two independent loads:
+
+	the upper layer's ->do_index_ops, in dt_try_as_dir() / dt_index_walk()
+
+	the lower layer's, in lod_it_init()
+
+with nothing ordering them. On a weakly ordered architecture the second load may
+
+be satisfied before the first store is observed, returning NULL. dt_index_walk()
+
+asserts only the upper layer's ops, so it does not catch this.
+
+A vmcore confirms the mechanism: the field holds a valid osd_dir_ops in the
+
+dump while the faulting thread had loaded NULL, so another CPU's store became
+
+visible in the interval. Nothing in the tree ever assigns do_index_ops = NULL,
+
+which rules out a teardown or clear race and leaves ordering as the only
+
+explanation.
+
+This is also why it has not been seen on x86: x86-TSO forbids load-load
+
+reordering, so the window is unreachable there. It is reachable on weakly
+
+ordered architectures.
+
+A second, related exposure on the lookup path
+
+lod_lookup() and lod_striped_lookup() call dt_lookup() (since
+
+eb5e3cc6, LU-13139), and dt_lookup() begins with
+
+LASSERT(dt->do_index_ops); on the object passed in, which is the lower
+
+layer. The same race therefore produces an LBUG rather than a NULL
+
+dereference on that path. Same defect, different symptom.
+
+Reproducer
+
+Deterministic and architecture-independent, via fault injection. Under a new
+
+fail_loc, have lod_index_try() publish its own ->do_index_ops while
+
+leaving the lower layer's unset – the state weak ordering produces – then
+
+return:
+
+  #define OBD_FAIL_LOD_INDEX_OPS_RACE   0x1902
+  
+        if (CFS_FAIL_CHECK(OBD_FAIL_LOD_INDEX_OPS_RACE)) {
+                dt->do_index_ops = &lod_index_ops;
+                RETURN(0);
+        }       
+  
+
+  mkdir $DIR/d && createmany -o $DIR/d/f 20
+  fail mds1                        # cold the MDT's object cache; dt_try_as_dir()
+                                   # fast-paths once ->do_index_ops is set, so the
+                                   # object must be instantiated fresh
+  lctl set_param fail_loc=0x1902   # on the MDS
+  ls -U $DIR/d                     # unpatched: MDS panics as above
+  
+
+A two-thread race on a single directory is not reachable, because concurrent
+
+readdirs serialise on the directory's LDLM lock, so the single-threaded form
+
+above is what reproduces it.
+
+Impact
+
+Any client able to issue readdir can crash an MDS, with no special privileges
+
+and no unusual arguments. The window is narrow, so it presents as a rare
+
+unexplained MDS panic rather than a reproducible failure, and the panic recurs
+
+for as long as the workload keeps instantiating directory objects on a weakly
+
+ordered MDS.
+
+Proposed fix
+
+	Add an acquire-side accessor exported from obdclass/dt_object.c alongside dt_try_as_dir() (per LU-13139's direction): dt_index_ops(dt) returning smp_load_acquire(&dt->do_index_ops).
+
+	Publish with release in lod_index_try(): smp_store_release(&dt->do_index_ops, &lod_index_ops) and the striped variant.
+
+	A repairing accessor for the lower layer, lod_child_index_ops(), used by lod_it_init() and lod_striped_it_init(). On NULL it calls dt_try_as_dir(env, next, true) to establish the ops (idempotent for directories) and returns -ENOTDIR only if the object genuinely cannot be an index. Self-healing is required, not merely defensive: once the upper layer's ops are published, every subsequent caller takes the dt_try_as_dir() fast path, so lod_index_try() never runs again for that object and nothing would otherwise ever set the lower layer's ops. A guard that only returned an error leaves the directory unreadable until it is evicted from the object cache; this was observed during testing.
+
+	Soften dt_lookup()'s LASSERT(dt->do_index_ops) to an error return for the lookup path.
+
+	Add sanity.sh test_132 driving the fail_loc above, asserting that readdir succeeds, that the repair path actually ran (so the test cannot pass vacuously), and that the directory is still readable after the fault is cleared.
+
+--- Comment (gerrit, Sat, 3 Oct 2026 03:19:14 +0000) ---
+"Max Wang " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69393
+
+Subject: LU-20871 lod: fix NULL deref on unordered do_index_ops read
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 76767162a59688a22508f39ef1cdd811d94d77e8

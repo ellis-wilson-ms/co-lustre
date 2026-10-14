@@ -1,0 +1,96 @@
+Key:        LU-20494
+Summary:    NFS re-export getattr corrupts lli_size_mutex by running statahead on a non-directory
+Link:       https://jira.whamcloud.com/browse/LU-20494
+Type:       Bug
+Priority:   Medium
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Oleg Drokin
+Reporter:   Oleg Drokin
+Created:    Sun, 19 Jul 2026 16:12:21 +0000
+Updated:    Thu, 23 Jul 2026 23:29:08 +0000
+Resolved:   Thu, 23 Jul 2026 23:29:08 +0000
+
+--- Description ---
+Under parallel-scale-nfsv3 (test_connectathon, also seen on iorssf), a Lustre client that re-exports its mount over NFS panics inside a glimpse triggered by knfsd:
+
+ 
+
+  kernel BUG at lib/list_debug.c:26!
+  list_add corruption. prev->next should be next (X), but was
+  .
+    __list_add_valid.cold
+    __mutex_add_waiter
+    __mutex_lock
+    ll_merge_attr [lustre]
+    cl_glimpse_lock [lustre]
+    __cl_glimpse_size [lustre]
+    ll_getattr_dentry [lustre]
+    svcxdr_encode_post_op_attr [nfsd]
+    nfs3svc_encode_readres [nfsd]
+    nfsd_dispatch / svc_process / nfsd 
+
+ 
+
+The crash is intermittent and has been observed across many kernels (5.14.0-503 through 5.14.0-611.x). It is on the Lustre client (llite) side; the interop client/server version difference is not involved even though it frequently hits in interop runs
+
+sample crash: https://testing.whamcloud.com/test_sets/a3e81776-2f20-4ec2-bb37-a0d29724c275
+
+Root cause
+
+ll_getattr_dentry() determines the parent directory of the dentry being stat'd:
+
+parent = dget_parent(de);
+dir = d_inode(parent);
+ll_statahead_enter(dir, de); 
+
+knfsd operates on disconnected, self-parented dentries obtained from d_obtain_alias() (d_parent points at the dentry itself). For such a dentry dget_parent() returns the file's own dentry, so dir ends up being the regular file itself, not a directory.
+
+The statahead code (ll_statahead_enter(), sa_pattern_fname_detect() ) then updates directory-only members of struct ll_inode_info: lli_sa_match_count, lli_sa_fname_index, .... These share a union with the regular-file members, and lli_sa_match_count overlaps the upper half of lli_size_mutex.wait_list.next. Writing it zeroes the top 32 bits of that list pointer.
+
+The corruption is silent until a later glimpse takes lli_size_mutex on the contended (slow) path: __mutex_add_waiter() walks the corrupted wait_list and hits the list_debug BUG. This is easy to hit under parallel-scale-nfsv3 because many nfsd threads glimpse re-exported files concurrently.
+
+The offending statahead call was added by LU-14361 (regularized fname
+
+  statahead pattern) and is active by default (llite.*.enable_statahead_fname=1).
+
+Reproducer
+
+Does not require a full NFS setup — the same disconnected-dentry path can be driven directly on a Lustre mount:
+
+name_to_handle_at() a regular file, then
+
+echo 3 >  /proc/sys/vm/drop_caches to evict its dentry;
+
+open_by_handle_at() it (yields the self-parented dentry) and fstat() the fd — this corrupts the file's lli_size_mutex;
+
+with fail_loc=0x1435 (OBD_FAIL_LLITE_STAT_RACE2, holds the size mutex inside ll_merge_attr) set, have several threads fstat() the same fd concurrently — the contending thread reproduces the list_add BUG above.
+
+--- Comment (gerrit, Sun, 19 Jul 2026 16:15:47 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/67372
+
+Subject: LU-20494 llite: don't run statahead on a non-directory parent
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 0f13d73b1d3d1264e33a7e16fc66d779c2c8bbe5
+
+--- Comment (gerrit, Thu, 23 Jul 2026 23:10:48 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/67372/
+
+Subject: LU-20494 llite: don't run statahead on a non-directory parent
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: daa67440ed1853bf7a596d9b1946d0fa9643dae6
+
+--- Comment (pjo, Thu, 23 Jul 2026 23:29:08 +0000) ---
+Merged for 2.18

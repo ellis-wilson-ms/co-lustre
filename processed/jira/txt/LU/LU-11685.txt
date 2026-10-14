@@ -1,5 +1,5 @@
 Key:        LU-11685
-Summary:    removing file names and freeing inodes are not atomic on the OST
+Summary:    removing file names and freeing inodes are not atomic on the OST and MDT
 Link:       https://jira.whamcloud.com/browse/LU-11685
 Type:       Bug
 Priority:   Minor
@@ -8,7 +8,7 @@ Resolution: Unresolved
 Assignee:   WC Triage
 Reporter:   Andrew Perepechko
 Created:    Tue, 20 Nov 2018 17:33:15 +0000
-Updated:    Fri, 15 Mar 2019 11:13:14 +0000
+Updated:    Wed, 15 Apr 2026 18:12:25 +0000
 Links:      Related: is related to  LU-10048
 
 --- Description ---
@@ -70,13 +70,8 @@ lustre-OST0000: 332/100000 files (0.3% non-contiguous), 20021/100000 blocks
 
 Before suggesting a patch, I'd like to discuss possible solutions. Should we try extending the transaction so as to include the final iput? Should we use any other approach?
 
---- Comment (bzzz, Fri, 15 Mar 2019 11:13:14 +0000) ---
-I have a patch calling ext4_orphan_add() as ext4 does, but wasn't sure about performance impact as well.
-
-my thought was that on OST we don't care that much about destroy rate while on MDT most of regular files are empty and we could call ldiskfs_delete_inode() directly.
-
---- Comment (panda, Fri, 15 Mar 2019 10:01:05 +0000) ---
-Thank you!
+--- Comment (panda, Fri, 15 Mar 2019 07:30:22 +0000) ---
+adilger, possibly, a typo? The nodemap issue looks unrelated.
 
 --- Comment (adilger, Fri, 15 Mar 2019 09:48:00 +0000) ---
 I meant to link LU-10048 here.
@@ -87,5 +82,215 @@ An initial patch was proposed to ext4 to multi-thread the orphan list along with
 
 https://patchwork.ozlabs.org/patch/461805
 
---- Comment (panda, Fri, 15 Mar 2019 07:30:22 +0000) ---
-adilger, possibly, a typo? The nodemap issue looks unrelated.
+--- Comment (panda, Fri, 15 Mar 2019 10:01:05 +0000) ---
+Thank you!
+
+--- Comment (bzzz, Fri, 15 Mar 2019 11:13:14 +0000) ---
+I have a patch calling ext4_orphan_add() as ext4 does, but wasn't sure about performance impact as well.
+
+my thought was that on OST we don't care that much about destroy rate while on MDT most of regular files are empty and we could call ldiskfs_delete_inode() directly.
+
+--- Comment (panda, Tue, 14 Apr 2026 18:59:21 +0000) ---
+Still seems to be an issue in 2.16:
+
+[root@test tracing]# cat set_ftrace_filter  
+jbd2_journal_extend [jbd2]
+ldiskfs_evict_inode [ldiskfs]
+ldiskfs_dec_count [ldiskfs]
+ldiskfs_orphan_add [ldiskfs]
+
+[root@test tracing]# cat set_event
+jbd2:jbd2_handle_stats
+
+[root@test tracing]# dd if=/dev/zero of=/mnt/lustre/fff bs=1M count=100
+100+0 records in
+100+0 records out
+104857600 bytes (105 MB, 100 MiB) copied, 0.21032 s, 499 MB/s
+
+[root@test tracing]# sync
+
+[root@test tracing]# > trace
+
+[root@test tracing]# unlink /mnt/lustre/fff
+
+[root@test tracing]# cat trace
+# tracer: function
+#
+# entries-in-buffer/entries-written: 37/37   #P:4
+#
+#                                _-------=> irqs-off/BH-disabled
+#                               / _------=> need-resched
+#                              | / _-----=> need-resched-lazy
+#                              || / _----=> hardirq/softirq
+#                              ||| / _---=> preempt-depth
+#                              |||| / _--=> preempt-lazy-depth
+#                              ||||| / _-=> migrate-disable
+#                              |||||| /     delay
+#           TASK-PID     CPU#  |||||||  TIMESTAMP  FUNCTION
+#              | |         |   |||||||      |         |
+       mdt00_004-11268   [002] ....2.. 149936.969130: ldiskfs_dec_count 
+
+The inode is not orphaned on the MDT, setting nlink to zero and eviction potentially happen in different transactions (jbd2_handle_stats event is effectively jbd2_journal_stop when handle refc drops to 0).
+
+The inode is orphaned on the OST, however it does not happen in the very transaction which sets nlink to zero.
+
+The exact traces when a non-DOM file is deleted:
+
+       mdt00_001-10518   [001] ....1.. 150163.117053: ldiskfs_dec_count 
+ => 0xffffffffc31c8097
+ => ldiskfs_dec_count
+ => osd_ref_del
+ => lod_sub_ref_del
+ => mdd_unlink
+ => mdt_reint_unlink
+ => mdt_reint_rec
+ => mdt_reint_internal
+ => mdt_reint
+ => tgt_handle_request0
+ => tgt_request_handle
+ => ptlrpc_server_handle_request.isra.0
+ => ptlrpc_main
+ => kthread
+ => ret_from_fork
+       mdt00_001-10518   [001] ....... 150163.117273: jbd2_handle_stats: dev 253,0 tid 48 type 0 line_no 2121 interval 1 sync 0 requested_blocks 416 dirtied_blocks 8
+       mdt00_001-10518   [001] ....... 150163.117284: 
+ => trace_event_raw_event_jbd2_handle_stats
+ => jbd2_journal_stop
+ => __ldiskfs_journal_stop
+ => osd_trans_stop
+ => top_trans_stop
+ => mdd_trans_stop
+ => mdt_reint_unlink
+ => mdt_reint_rec
+ => mdt_reint_internal
+ => mdt_reint
+ => tgt_handle_request0
+ => tgt_request_handle
+ => ptlrpc_server_handle_request.isra.0
+ => ptlrpc_main
+ => kthread
+ => ret_from_fork
+       mdt00_001-10518   [001] ....... 150163.117337: ldiskfs_evict_inode 
+ => 0xffffffffc31c8097
+ => ldiskfs_evict_inode
+ => evict
+ => osd_object_delete
+ => lu_object_free.isra.0
+ => mdt_object_put
+ => mdt_reint_unlink
+ => mdt_reint_rec
+ => mdt_reint_internal
+ => mdt_reint
+ => tgt_handle_request0
+ => tgt_request_handle
+ => ptlrpc_server_handle_request.isra.0
+ => ptlrpc_main
+ => kthread
+ => ret_from_fork
+
+--- Comment (bzzz, Tue, 14 Apr 2026 19:16:49 +0000) ---
+there is a comment about this in osd_destroy()
+
+--- Comment (zam, Wed, 15 Apr 2026 12:45:59 +0000) ---
+bzzz
+
+> there is a comment about this in osd_destroy()
+
+that orphan list might not scale well , I think LFSCK can take care about such inodes with nlink=0
+
+while iterating over the inode table.
+
+Thanks,
+
+Zam.
+
+--- Comment (adilger, Wed, 15 Apr 2026 18:12:25 +0000) ---
+I think LFSCK can take care about such inodes with nlink=0 while iterating over the inode table.
+
+We cannot leave the filesystem in an inconsistent state and hope that something else will fix it later.  LFSCK may not be running for many different reasons, and leaking inodes in this case will cause problems.
+
+Since upstream commit v5.14-rc2-23-g4a79a98c7b (el9.x, but not el8.x), ext4 has improved orphan handling performance so that can be updated by multiple threads concurrently without blocking:
+
+commit 4a79a98c7b19dd3d4cfe9200fbc384ba9119e039
+Author:     Jan Kara 
+CommitDate: Mon Aug 30 23:36:51 2021 -0400
+
+    ext4: Improve scalability of ext4 orphan file handling
+    
+    Even though the length of the critical section when adding / removing
+    orphaned inodes was significantly reduced by using orphan file, the
+    contention of lock protecting orphan file still appears high in profiles
+    for truncate / unlink intensive workloads with high number of threads.
+    
+    This patch makes handling of orphan file completely lockless. Also to
+    reduce conflicts between CPUs different CPUs start searching for empty
+    slot in orphan file in different blocks.
+    
+    Performance comparison of locked orphan file handling, lockless orphan
+    file handling, and completely disabled orphan inode handling
+    from 80 CPU Xeon Server with 526 GB of RAM, filesystem located on
+    SAS SSD disk, average of 5 runs:
+    
+    stress-orphan (microbenchmark truncating files byte-by-byte from N
+    processes in parallel)
+    
+    Threads Time            Time            Time
+            Orphan locked   Orphan lockless No orphan
+      1       0.945600       0.939400        0.891200
+     16      14.937600       8.516400        8.138000
+    128     122.941400      70.950400       69.315000
+
+    So we can see that with lockless orphan file handling, addition /
+    deletion of orphaned inodes got almost completely out of picture even
+    for a microbenchmark stressing it.
+    
+    For reaim creat_clo workload on ramdisk there are also noticeable gains
+    (average of 5 runs):
+    
+    Clients         Vanilla (ops/s)        Patched (ops/s)
+    creat_clo-1     14705.88 (   0.00%)    14354.07 *  -2.39%*
+    creat_clo-11    44000.00 (   0.00%)    65088.76 *  47.93%*
+    creat_clo-31    14283.52 (   0.00%)    67982.45 * 375.95%*
+
+and the previous commit that moved the orphan linked list into a separate file instead of hanging it from the superblock as I originally implemented:
+
+commit 02f310fcf47fa9311d6ba2946a8d19e7d7d11f37
+Author:     Jan Kara 
+CommitDate: Mon Aug 30 23:36:51 2021 -0400
+
+    ext4: Speedup ext4 orphan inode handling
+    
+    Ext4 orphan inode handling is a bottleneck for workloads which heavily
+    truncate / unlink small files since it contends on the global
+    s_orphan_mutex lock (and generally it's difficult to improve scalability
+    of the ondisk linked list of orphaned inodes).
+    
+    This patch implements new way of handling orphan inodes. Instead of
+    linking orphaned inode into a linked list, we store it's inode number in
+    a new special file which we call "orphan file". Only if there's no more
+    space in the orphan file (too many inodes are currently orphaned) we
+    fall back to using old style linked list. Currently we protect
+    operations in the orphan file with a spinlock for simplicity but even in
+    this setting we can substantially reduce the length of the critical
+    section and thus speedup some workloads. In the next patch we improve
+    this by making orphan handling lockless.
+    
+    Note that the change is backwards compatible when the filesystem is
+    clean - the existence of the orphan file is a compat feature, we set
+    another ro-compat feature indicating orphan file needs scanning for
+    orphaned inodes when mounting filesystem read-write. This ro-compat
+    feature gets cleared on unmount / remount read-only.
+    
+    Some performance data from 80 CPU Xeon Server with 512 GB of RAM,
+    filesystem located on SSD, average of 5 runs:
+    
+    stress-orphan (microbenchmark truncating files byte-by-byte from N
+    processes in parallel)
+    
+    Threads Time            Time
+            Vanilla         Patched
+      1       1.057200        0.945600
+     16      14.827800       14.937600
+    128     206.504000      122.941400
+    
+    So we can see significant wins all over the board.

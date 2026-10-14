@@ -1,0 +1,189 @@
+Key:        LU-20476
+Summary:    o2iblnd: double destroy of cm_id on netevent UNREACHABLE
+Link:       https://jira.whamcloud.com/browse/LU-20476
+Type:       Bug
+Priority:   Critical
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Chris Horn
+Reporter:   Chris Horn
+Created:    Mon, 13 Jul 2026 14:56:56 +0000
+Updated:    Fri, 2 Oct 2026 16:45:31 +0000
+Resolved:   Sun, 2 Aug 2026 15:22:11 +0000
+Labels:     o2iblnd
+Links:      Related: is related to  LU-18897
+
+--- Description ---
+A server that loses all of its o2ib interfaces at once (switch failure, or
+
+every port unplugged) panics in kiblnd_connd() about 5 minutes later:
+
+general protection fault, probably for non-canonical address 0xdead000000000200
+RIP: 0010:_destroy_id+0x18c/0x300 [rdma_cm]
+RAX: dead000000000100  RDX: dead000000000200
+Call Trace:
+ kiblnd_destroy_conn+0x29f/0x670 [ko2iblnd]
+ kiblnd_connd+0xfa/0x980 [ko2iblnd]
+ kthread+0x134/0x150
+
+RAX and RDX are LIST_POISON1 and LIST_POISON2, so the hlist node in the
+
+cm_id has already been unlinked once. The cm_id was destroyed before
+
+kiblnd_destroy_conn() called rdma_destroy_id() on it, i.e. this is a
+
+double destroy.
+
+The first destroy comes from the CMA netevent notifier added in
+
+925d046e7e52 "RDMA/core: Add a netevent notifier to cma" (v6.0).
+
+cma_netevent_work_handler() delivers RDMA_CM_EVENT_UNREACHABLE to the ULP
+
+and, if the ULP handler returns non-zero, destroys the cm_id itself:
+
+	if (cma_cm_event_handler(id_priv, &event)) {
+		__acquire(&id_priv->handler_mutex);
+		id_priv->cm_id.ib = NULL;
+		cma_id_put(id_priv);
+		destroy_id_handler_unlock(id_priv);
+		return;
+	}
+
+o2iblnd returns non-zero from UNREACHABLE when the cm_id context is NULL:
+
+	case RDMA_CM_EVENT_UNREACHABLE:
+		conn = cmid->context;
+
+		/* In case we have a flapping network, we can get this event
+		 * before conn is created */
+		if (conn == NULL)
+			return -ENETDOWN;
+
+That comment, and the commit that added the check (47b4886e12dc "LU-18897
+
+o2iblnd: NULL pointer dereference"), assume a NULL context means no conn
+
+has been created yet. It doesn't. The only assignment of NULL to a cm_id
+
+context anywhere in o2iblnd is in the DISCONNECTED handler:
+
+	case RDMA_CM_EVENT_DISCONNECTED:
+		...
+		kiblnd_conn_decref(conn);
+		cmid->context = NULL;
+		return 0;
+
+Before a conn exists the context is not NULL, it is the kib_peer_ni that
+
+kiblnd_connect_peer() passed to rdma_create_id() (or, on the passive side,
+
+the kib_dev inherited from the listener). So a NULL context at UNREACHABLE
+
+can only mean that DISCONNECTED has already run and the conn is a zombie
+
+waiting for connd, which is exactly the case where o2iblnd still owns the
+
+cm_id. The -ENETDOWN hands that cm_id to rdma_cm to destroy, and
+
+kiblnd_destroy_conn() then calls rdma_destroy_id() on it a second time.
+
+Returning 0 instead is correct and does not leak: the conn still holds
+
+ibc_cmid, and connd destroys the cm_id in kiblnd_destroy_conn() before
+
+freeing the conn, so the cm_id never outlives the conn.
+
+Note that we return before the CNETERR, so there is nothing in the logs to
+
+show that the UNREACHABLE arrived.
+
+There is a second problem in the same handler. An id becomes eligible for
+
+netevent UNREACHABLE once cma_add_id_to_tree() puts it in the id table,
+
+which happens in rdma_resolve_route() on the RoCE path only. o2iblnd calls
+
+rdma_resolve_route() from the ADDR_RESOLVED handler, but does not create
+
+the conn until ROUTE_RESOLVED. For the duration of the route resolve the id
+
+is in the table with its context still pointing at a kib_peer_ni, and an
+
+UNREACHABLE delivered in that window is read as a kib_conn:
+
+conn->ibc_peer->ibp_nid in the CNETERR dereferences a kib_peer_ni as a
+
+kib_conn. Narrow, but a link loss is precisely when neighbour
+
+invalidations are flying.
+
+Both problems are only reachable via the netevent notifier, so they need an
+
+IP based fabric (RoCE) and an OFED new enough to carry 925d046e7e52. Prior
+
+to that, UNREACHABLE could only arrive from cma_ib_handler() while a
+
+connect was in flight, where the context is always a live conn. Dropping
+
+every port on a server at once and waiting ~5 minutes reproduced the panic
+
+on 3 of 4 servers, so it is straightforward to verify a fix against.
+
+Proposed fix:
+
+1. UNREACHABLE must never return non-zero for a cm_id that o2iblnd owns.
+
+   Return 0 on the NULL context.
+
+2. Distinguish the pre-conn (kib_peer_ni) context from a conn context so
+
+   UNREACHABLE cannot type-confuse the two.
+
+3. Reorder kiblnd_destroy_conn() to call rdma_destroy_id() before
+
+   kiblnd_peer_decref(). Today the peer reference is dropped while the
+
+   cm_id is still live and a netevent handler may still be running on it.
+
+   rdma_destroy_id() blocks until in-flight handlers complete, so doing it
+
+   first closes that window.
+
+1) is the panic and is a one line change. 2) and 3) are latent.
+
+I'm opening this as critical because it panics the node and reproduces
+
+reliably on a total link loss.
+
+--- Comment (gerrit, Mon, 13 Jul 2026 15:55:49 +0000) ---
+
+
+--- Comment (gerrit, Mon, 13 Jul 2026 15:59:33 +0000) ---
+"Chris Horn " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/67210
+
+Subject: LU-20476 o2iblnd: don't destroy a cm_id we still own
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 6b4abd7201ac8582e506493ff292342b3095eafc
+
+--- Comment (gerrit, Sun, 2 Aug 2026 04:33:49 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/67210/
+
+Subject: LU-20476 o2iblnd: don't destroy a cm_id we still own
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: ad026af8a3305b68ea8e8a478cc3f2a78d9b87d0
+
+--- Comment (pjo, Sun, 2 Aug 2026 15:22:11 +0000) ---
+Merged for 2.18

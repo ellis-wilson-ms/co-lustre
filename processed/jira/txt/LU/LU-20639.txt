@@ -1,0 +1,311 @@
+Key:        LU-20639
+Summary:    Pingless clients might lose server / client side memory of it on reconnect
+Link:       https://jira.whamcloud.com/browse/LU-20639
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Oleg Drokin
+Created:    Tue, 25 Aug 2026 01:16:13 +0000
+Updated:    Tue, 25 Aug 2026 01:23:12 +0000
+
+--- Description ---
+AI content below, but in general while somewhat fringe, this might come handy eventually so it's worth getting this code right so when we need it - it actually works.
+
+Summary
+
+An export is watched by the ping evictor only while it is linked into the
+
+target's obd_exports_timed tree.  A reconnect never re-evaluates that
+
+membership, so after a runtime change of the suppress_pings module parameter
+
+the tree disagrees with what the target actually expects of the client, in both
+
+directions:
+
+	suppress_pings turned off, client reconnects: the target now expects
+
+  pings but the export is never linked, so a dead client is never evicted and
+
+  holds its export, locks and grant until umount.
+
+	suppress_pings turned on, client reconnects: the target grants
+
+  OBD_CONNECT_PINGLESS and the client stops pinging, but the export stays
+
+  linked with a deadline nobody renews, so the evictor throws out a healthy
+
+  client.
+
+Two patches, one per direction; both are needed for the export to be linked
+
+exactly when the target expects the client to ping.
+
+Environment
+
+	Any Lustre server (MDT or OST), master at 2.17.57.  The first direction is
+
+  present since 2.4, the second since 2.16.54 (see "Regressions").
+
+	Requires the ptlrpc module parameter suppress_pings to be changed on a
+
+  running target.  It is module_param(..., 0644)
+
+  (lustre/ptlrpc/pinger.c:26), so it is writable at runtime through
+
+  /sys/module/ptlrpc/parameters/suppress_pings with no remount involved.
+
+	Reproduced on rocky8 (4.18.0-553.89.1.el8_10_lustre) and on a four node
+
+  rocky9 cluster (5.14.0-611.13.1.el9_7_lustre, 1 MDS + 1 OSS + 2 clients),
+
+  ldiskfs.
+
+Description
+
+What the target decides, and where it is recorded
+
+On every connect and reconnect the target decides whether the client must
+
+ping, and records the answer in exp_timed:
+
+/* lustre/ofd/ofd_obd.c:235, and the same shape at lustre/mdt/mdt_handler.c:7245 */
+if (OCD_HAS_FLAG(data, PINGLESS) && !ptlrpc_pinger_suppress_pings())
+        data->ocd_connect_flags &= ~OBD_CONNECT_PINGLESS;
+
+if (!OCD_HAS_FLAG(data, PINGLESS)) {
+        spin_lock(&exp->exp_lock);
+        exp->exp_timed = 1;
+        spin_unlock(&exp->exp_lock);
+}
+
+ofd_parse_connect_data() is reached from both ofd_obd_connect() and
+
+ofd_obd_reconnect(); mdt_connect_internal() likewise.
+
+Every consumer, however, keys off actual tree membership rather than the flag:
+
+	ptlrpc_update_export_timer() (lustre/ptlrpc/service.c:1286) returns
+
+  early on list_empty(&exp->exp_timed_chain) with the comment "this one is
+
+  not timed", so it neither renews nor adds.
+
+	ping_evictor_main() (lustre/ptlrpc/pinger.c:509) walks only
+
+  obd_exports_timed, so an unlinked export is invisible to it.
+
+Membership is therefore the only thing that matters, and a reconnect never
+
+updates it.
+
+Direction 1 – the reconnect that should start watching does not link
+
+The only insertion is in rev_import_init() (lustre/ldlm/ldlm_lib.c:1078):
+
+if (export->exp_timed) {
+        rc = obd_export_timed_init(export, &data);
+        ...
+        obd_export_timed_add(export, &data);
+}
+
+and target_handle_connect() calls rev_import_init() only where the export
+
+has no reverse import yet: the new-export path under dont_check_exports:
+
+(lustre/ldlm/ldlm_lib.c:1518) and the recovery case where
+
+tgt_clients_data_init() created the export
+
+(lustre/ldlm/ldlm_lib.c:1539):
+
+rc = obd_reconnect(req->rq_svc_thread->t_env, export, target, &cluuid, data, req);
+if (rc == 0) {
+        reconnected = true;
+        /*
+         * In case of recovery, tgt_clients_data_init() created the export,
+         * exp_imp_reverse is still needed.
+         */
+        if (export->exp_imp_reverse == NULL)
+                rc = rev_import_init(export);
+}
+
+An ordinary reconnect of a live export has exp_imp_reverse != NULL, so
+
+nothing inserts it.  exp_timed is set and has no effect.
+
+Direction 2 – the reconnect that should stop watching does not unlink
+
+exp_timed is write-once.  The two assignments above are the only ones in the
+
+tree and both store 1; nothing ever clears it:
+
+$ git grep -n 'exp_timed[^_]' -- '*.c' '*.h'
+lustre/include/lustre_export.h:266:                              exp_timed:1,
+lustre/ldlm/ldlm_lib.c:1069:    if (export->exp_timed) {
+lustre/mdt/mdt_handler.c:7253:          exp->exp_timed = 1;
+lustre/ofd/ofd_obd.c:240:               exp->exp_timed = 1;
+
+So a reconnect granted OBD_CONNECT_PINGLESS keeps the stale 1, and
+
+nothing takes the export out of the tree.  The client meanwhile acts on the
+
+reply and stops pinging:
+
+/* lustre/ptlrpc/pinger.c:212 */
+suppress = ir_up && OCD_HAS_FLAG(&imp->imp_connect_data, PINGLESS);
+
+ptlrpc_update_export_timer() only renews a deadline when a request arrives,
+
+so an idle pingless client sends nothing, its deadline expires, and the evictor
+
+removes it.
+
+Steps to reproduce
+
+Direction 1 – dead client never evicted
+
+	Load the server modules with suppress_pings=1 and mount MDT/OST/client.
+
+	echo 0 > /sys/module/ptlrpc/parameters/suppress_pings on the server.
+
+	Force a reconnect without dropping the export:
+
+  lctl --device  recover on the client.
+
+	Do any file system operation and inspect the server's export.
+
+With a temporary diagnostic printing exp_timed and
+
+list_empty(&exp->exp_timed_chain) at the end of target_handle_connect(),
+
+and warning in ptlrpc_update_export_timer() when an exp_timed export
+
+takes the "not timed" early return:
+
+# suppress_pings=1, first connect -- correct
+(ldlm_lib.c:1653:target_handle_connect()) DIAG lustre-MDT0000: connect from
+  d8f3ed2b-...: exp ffff92abf13a5800 exp_timed=0 timed_empty=1
+
+# suppress_pings=0, same export reconnects -- flag set, tree entry missing
+(ldlm_lib.c:1653:target_handle_connect()) DIAG lustre-MDT0000: connect from
+  d8f3ed2b-...: exp ffff92abf13a5800 exp_timed=1 timed_empty=1
+(service.c:1291:ptlrpc_update_export_timer()) DIAG lustre-MDT0000:
+  exp ffff92abf13a5800 exp_timed but NOT in obd_exports_timed
+
+The last line repeats for every RPC that export ever sends.
+
+Direction 2 – healthy client evicted
+
+	Mount MDT/OST and a client with suppress_pings=0 everywhere.
+
+	On the client, lctl set_param osc.*.idle_timeout=0 so the idle logic does
+
+  not disconnect and hide the effect.
+
+	echo 1 > /sys/module/ptlrpc/parameters/suppress_pings on every server node.
+
+	Force a reconnect: lctl --device  recover for each osc and
+
+  mdc.
+
+	Confirm pingless was granted:
+
+  lctl get_param -n osc..import mdc..import | grep -c pingless reports one
+
+  per import.
+
+	Leave the client completely idle and watch the server console.
+
+About 150s (the export deadline) after the reconnect, with the client still
+
+mounted, connected and healthy:
+
+Lustre: lustre-OST0000: Client 68de790d-... (at 192.168.100.106@tcp) reconnecting
+Lustre: lustre-OST0000: haven't heard from client 68de790d-... (at 192.168.100.106@tcp)
+  in 149 seconds. I think it's dead, and I am evicting it.
+  exp ffff8a17cacb3400, cur 1787605113 deadline 1787605110 last 1787604964
+Lustre: lustre-OST0001: haven't heard from client 68de790d-... (at 192.168.100.106@tcp)
+  in 150 seconds. I think it's dead, and I am evicting it.
+
+last is the time of the reconnect itself: it is the last thing the server
+
+ever heard, because the client honoured the pingless reply it was just given.
+
+The client does not notice until its next RPC, so osc.*.state still reads
+
+FULL throughout – the eviction has to be observed on the server.
+
+Actual result
+
+Scenario
+exp_timed
+In obd_exports_timed
+Client pings
+Outcome
+
+connect, suppress_pings=0
+1
+yes
+yes
+correct
+
+connect, suppress_pings=1
+0
+no
+no
+correct
+
+reconnect after suppress_pings 1 -> 0
+1
+no
+yes
+dead client never evicted
+
+reconnect after suppress_pings 0 -> 1
+1
+yes
+no
+healthy client evicted
+
+In row 3 the export, its DLM locks and its grant are held until the target is
+
+unmounted; other clients block on those locks and recovery after a later
+
+failover waits for a client that will never return.
+
+Expected result
+
+Rows 3 and 4 should match rows 1 and 2 respectively: after any connect or
+
+reconnect, the export is linked into obd_exports_timed exactly when the
+
+target expects that client to ping.
+
+--- Comment (gerrit, Tue, 25 Aug 2026 01:23:11 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68294
+
+Subject: LU-20639 ldlm: link reconnecting exports to the timed tree
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: b1c25ac0830e7faef1c106914e03e929273ae67f
+
+--- Comment (gerrit, Tue, 25 Aug 2026 01:23:12 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68295
+
+Subject: LU-20639 ldlm: unlink pingless exports from the timed tree
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 782011e194205a6090aa89f62519a5d02ecc752c

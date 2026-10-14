@@ -1,0 +1,152 @@
+Key:        LU-20635
+Summary:    LNet recreates an unlocked peer on NID add, primary NID oscillates
+Link:       https://jira.whamcloud.com/browse/LU-20635
+Type:       Bug
+Priority:   Medium
+Status:     In Progress
+Resolution: Unresolved
+Assignee:   Chris Horn
+Reporter:   Chris Horn
+Created:    Mon, 24 Aug 2026 17:38:46 +0000
+Updated:    Wed, 7 Oct 2026 16:51:55 +0000
+
+--- Description ---
+With lock_prim_nid=0, a client can fail to mount. The mount fails with -EIO,
+
+and the console shows the MGS config log RPC time out. The cause is that LNet
+
+deletes and recreates the peer on every NID registration, so the primary NID
+
+of the peer oscillates.
+
+Cause
+
+LNetAddPeer() registers the NIDs that Lustre knows for a peer, such as the
+
+NIDs on a mount line. It calls lnet_peer_add(). When the peer already exists
+
+and its primary NID is not locked, lnet_peer_add() takes this arm at
+
+lnet/lnet/peer.c:1863:
+
+} else if (!(flags & (LNET_PEER_LOCK_PRIMARY | LNET_PEER_CONFIGURED))) {
+        /* if not recreating peer as configured and
+         * not locking primary nid, no need to
+         * do anything if primary nid is not being changed
+         */
+        if (nid_same(&lp->lp_primary_nid, nid)) {
+                spin_unlock(&lp->lp_lock);
+                rc = -EEXIST;
+                goto out;
+        }
+}
+spin_unlock(&lp->lp_lock);
+...
+rc = lnet_peer_del(lp);
+
+The function short circuits only when the primary NID is equal to the NID
+
+being added. In every other case it falls through to lnet_peer_del() and
+
+builds the peer again, with the added NID as the primary.
+
+Discovery owns the primary NID of an unlocked peer. Discovery sets it to the
+
+first NID that the remote advertises. That NID does not have to be the one on
+
+the mount line. So each registration flips the primary NID. The add
+
+recreates the peer with the mount line NID as primary. Discovery then moves the
+
+primary to the advertised NID. The next add recreates the peer again.
+
+Symptom
+
+A client mount registers the MGS NIDs. The client then reads the configuration
+
+log. The log names the same servers, so the client registers the same NIDs a
+
+second time. That second registration recreates the peer and moves the primary
+
+NID again.
+
+ptlrpc posts the reply buffer with a match ID that it takes from the
+
+connection, at lustre/ptlrpc/niobuf.c:1031:
+
+peer = connection->c_peer;
+...
+reply_me = LNetMEAttach(request->rq_reply_portal, &peer, ...);
+
+ptlrpc_connection_get() resolves that address once, with LNetPrimaryNID(), and
+
+caches it in c_peer. See lustre/ptlrpc/connection.c:106. The value never
+
+changes for the life of the connection.
+
+LNet matches an arrival against the primary NID at the instant it arrives.
+
+lnet_parse() sets msg_initiator from lnet_peer_primary_nid_locked() at
+
+lnet/lnet/lib-move.c:4875. The portal then matches the ME on msg_initiator at
+
+lnet/lnet/lib-ptl.c:697.
+
+The two values are read at different times. When the peer is recreated between
+
+the post and the arrival, the primary NID moves and the two do not agree. The
+
+reply finds no ME. The client drops it, the config log RPC times out, and the
+
+mount fails with -EIO.
+
+The cached address does not recover on its own. The primary NID can settle on
+
+a value other than the one in c_peer. Every reply on that connection then
+
+fails to match, until the connection is built again.
+
+Affected configurations
+
+Only lock_prim_nid=0 is affected. The default is lock_prim_nid=1, and it takes
+
+the LNET_PEER_LOCK_PRIMARY arm above, which returns -EALREADY and keeps the
+
+peer.
+
+The peer must advertise a NID other than the NID used to mount. A single rail
+
+server that advertises the mount NID first does not show the defect.
+
+Proposed fix
+
+Do not tear down a peer that already exists. Adopt it, add the NID as a
+
+secondary NID, and return -EALREADY. The callers of LNetAddPeer() already
+
+handle -EALREADY, because the LNET_PEER_LOCK_PRIMARY arm returns it today.
+
+Test coverage
+
+sanity-lnet has no test that runs with lock_prim_nid=0.
+
+	test_26 and test_304 use "lnetctl peer add --lock_prim". That is the
+
+  per-peer lock, not the module parameter.
+
+	test_40 covers the LNetAddPeer path, but it skips unless lock_prim_nid=1.
+
+A regression test must go with the fix.
+
+--- Comment (gerrit, Mon, 5 Oct 2026 18:07:07 +0000) ---
+"Chris Horn " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69431
+
+Subject: LU-20635 lnet: adopt an existing unlocked peer
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 88d7d1932ca5d279d558641c1fcce966eeb7afc4

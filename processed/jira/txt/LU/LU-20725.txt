@@ -1,0 +1,282 @@
+Key:        LU-20725
+Summary:    performance-sanity test_2: MDS soft lockup in ptlrpc_commit_replies() in new kernels
+Link:       https://jira.whamcloud.com/browse/LU-20725
+Type:       Bug
+Priority:   Medium
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Oleg Drokin
+Reporter:   Oleg Drokin
+Created:    Thu, 10 Sep 2026 03:29:42 +0000
+Updated:    Tue, 29 Sep 2026 00:40:55 +0000
+Resolved:   Tue, 29 Sep 2026 00:40:55 +0000
+Links:      Related: is related to  LU-19142; Related: is related to  LU-20070; Related: is related to  LU-6527
+
+--- Description ---
+Symptom
+
+An MDS panics with a soft lockup in the jbd2 commit thread under a
+
+metadata create load:
+
+[ 6503.321311] watchdog: BUG: soft lockup - CPU#1 stuck for 21s! [jbd2/dm-4-8:10615]
+[ 6503.321453] RIP: 0010:ptlrpc_commit_replies+0xc6/0x3d0 [ptlrpc]
+[ 6503.322709] Kernel panic - not syncing: softlockup: hung tasks
+...
+ ? ptlrpc_commit_replies+0xc6/0x3d0 [ptlrpc]
+ tgt_cb_last_committed+0x379/0x4f0 [ptlrpc]
+ osd_trans_commit_complete+0x126/0x2f0 [osd_ldiskfs]
+ osd_trans_txn_cb+0xd8/0x130 [osd_ldiskfs]
+ jbd2_journal_commit_transaction+0x159d/0x1840 [jbd2]
+ kjournald2+0xaa/0x250 [jbd2]
+
+Seen on lustre-master-next build 1014, full-dne-part-3,
+
+el10.2 x86_64, lustre 2.17.58_66_g39332ca, kernel
+
+6.12.0-211.47.1.el10_2_lustre.x86_64, on MDS trevis-152vm262 running
+
+MDT0001 and MDT0003.
+
+Maloo: https://testing.whamcloud.com/test_sets/320885ae-0d4c-40ee-8f74-3658720d8276
+
+The panic is rare (one recorded occurrence), but the underlying
+
+quadratic is deterministic – whether it crosses the 21s watchdog
+
+threshold just depends on how many transactions land in one journal
+
+commit. Below the threshold it shows up as a 2.2x metadata slowdown
+
+rather than a crash (see Measurements).
+
+Root cause
+
+osd_trans_txn_cb() runs one commit callback per transaction of the
+
+journal commit, draining top->ot_cblist from the head. Handles are
+
+queued onto that list with list_add_tail() in
+
+osd_trans_register_callback(), so the callbacks run in
+
+registration order, i.e. ascending transno.
+
+Each one calls tgt_cb_last_committed(), which raises
+
+exp_last_committed by a single transno and then calls
+
+ptlrpc_commit_replies(). That function scans the entire
+
+exp_uncommitted_replies list to find the (at most one) reply it
+
+just committed. Its fast path –
+
+	/* Fast path w/o spinlock, if exp_last_committed was updated
+	 * with higher transno, no need to take spinlock and check ... */
+	if (ccb->llcc_transno llcc_exp->exp_last_committed)
+		goto out;
+
+– can never fire when the callbacks arrive in ascending order, so the
+
+whole list is rescanned once per transaction: O(N^2) under
+
+exp_uncommitted_replies_lock, in the jbd2 commit thread, with
+
+preemption off.
+
+The list only grows large with sync lock cancel enabled
+
+(mdt.*.sync_lock_cancel=blocking), which mdt_enable_slc() turns
+
+on when an MDS-MDS connection exists. That makes this DNE-specific in
+
+practice: with SLC, mdt_save_lock() sets no_ack, so
+
+target_send_reply() leaves the reply on
+
+exp_uncommitted_replies until the transaction commits instead of
+
+dispatching it on the LNet ACK.
+
+tgt_cancel_slc_locks() is walked per callback for the same reason
+
+and collapses the same way.
+
+Evidence from the crash dump
+
+Read out of the vmcore with drgn:
+
+ item 
+ value 
+
+ crashing export 
+ lustre-MDT0003, exp_last_committed = 4295045010 
+
+ exp_uncommitted_replies length 
+ 8069 (second client export: 8203) 
+
+ lowest transno on the list 
+ 4295045012 – above last_committed, so the in-flight scan removed nothing 
+
+ callbacks still queued on top->ot_cblist 
+ 6930 
+
+ their transnos 
+ strictly ascending, 4295045011 ... 4295051887 
+
+So at the moment of the panic the CPU had already burned 21s and had
+
+roughly 6930 x 8000 more list steps to go.
+
+When it was introduced
+
+5744762a5a38 ("LU-19142 osd-ldiskfs: journal commit callback",
+
+v2.16.57-138) replaced the t_private_list scheme – removed
+
+upstream – with the s_txn_cb_map rbtree plus ot_cblist.
+
+The old scheme got the reverse order from
+
+ubuntu18/ext4-jcb-optimization.patch, which is LU-6527 and exists
+
+precisely for this:
+
+Also change list_add_tail to list_add. It gives advantages to ldiskfs
+
+in tgt_cb_last_committed. In the beginning of list will be placed
+
+thandles with the highest transaction numbers. So at the first
+
+iterations we will have the highest transno. It will save from extra
+
+call of ptlrpc_commit_replies.
+
+That patch is still in 51 ldiskfs series, including
+
+ldiskfs-6.12-rhel10.0 and -rhel10.1. The new scheme does not
+
+use it, so the optimization was silently lost for every series that
+
+adopts linux-6.15/ext4-journal-commit-transaction-callback.patch:
+
+	ldiskfs-6.12-rhel10.2 (added by 83ce9acb8e, "LU-20070 kernel: add rhel10.2 server support", v2.17.57-51 – this is what put it in CI)
+
+	ldiskfs-6.18-ml
+
+	ldiskfs-7.0-ml
+
+	ldiskfs-7.0.0-14-ubuntu26
+
+The crash path is byte-identical between master and the tested
+
+master-next build, so this is a master bug, not -next-specific.
+
+Proposed fix
+
+Queue the extra handles at the head so osd_trans_txn_cb() runs
+
+the callbacks newest-registration first (the rbtree holder already runs
+
+last), restoring the ordering every other distro has had since LU-6527:
+
+ 	if (node) {
+-		/* found existing: add additional osd to be notified */
++		/* found existing: add this handle to be notified too.
++		 * newest registration first, so osd_trans_txn_cb() (which
++		 * runs the list from the head, holder last) sees the highest
++		 * transno first -- only the common case, as the transno is
++		 * assigned later, in dt_txn_hook_stop()
++		 */
+ 		top = container_of(node, struct osd_thandle, ot_node);
+-		list_add_tail(&oh->ot_cblist, &top->ot_cblist);
++		list_add(&oh->ot_cblist, &top->ot_cblist);
+ 	}
+
+Registration order is only approximately transno order –
+
+osd_trans_stop() calls osd_trans_register_callback() before
+
+dt_txn_hook_stop(), where tgt_txn_stop_cb() assigns the transno
+
+– so this is a heuristic, exactly as the old ldiskfs patch was. The
+
+worst case degrades to today's behaviour; every commit callback reached
+
+from osd_trans_commit_complete() is max- or threshold-based and so
+
+order-independent.
+
+Measurements
+
+100k createmany -m, rocky10 / 6.12.0-211.47.1.el10_2 (the kernel
+
+from the failing run), 2 MDTs, sync_lock_cancel=blocking, with
+
+ptlrpc_commit_replies() instrumented identically in both arms:
+
+ build 
+ commit_replies calls 
+ list steps scanned 
+ creates/s 
+
+ master 
+ 100,007 / 99,999 
+ 2.21e9 / 2.23e9 
+ 3818 / 3275 
+
+ with fix 
+ 3 / 5 
+ 100,982 / 101,076 
+ 8372 / 8149 
+
+Two runs per arm. ~22,000x fewer list steps, and metadata create
+
+throughput a little over 2x.
+
+sanity on the fixed build: 1041 PASS / 37 SKIP / 7 FAIL. All seven
+
+failures (39r, 123k, 255b, 256, 300k, 300l,
+
+901) reproduce 3/3 on unmodified master on the same el10.2
+
+configuration, i.e. they are pre-existing on this platform and not
+
+caused by the change.
+
+--- Comment (green, Thu, 10 Sep 2026 03:31:22 +0000) ---
+LU-19142 – introduced the s_txn_cb_map callback scheme
+
+	LU-6527 – the ldiskfs patch whose effect was lost
+
+	LU-20070 – added the RHEL 10.2 server series that exposed it
+
+--- Comment (gerrit, Thu, 10 Sep 2026 03:32:25 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68766
+
+Subject: LU-20725 osd-ldiskfs: run commit callbacks newest first
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 0a332fdcedd443324928e6b409b1e57b4b664e3d
+
+--- Comment (gerrit, Mon, 28 Sep 2026 21:30:59 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/68766/
+
+Subject: LU-20725 osd-ldiskfs: run commit callbacks newest first
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 9c35143b500ee916d0687db884c1f1ff9ff8ab2a
+
+--- Comment (pjo, Tue, 29 Sep 2026 00:40:55 +0000) ---
+Merged for 2.18

@@ -1,0 +1,217 @@
+Key:        LU-20695
+Summary:    Handling of upcoming time bombs in Lustre code
+Link:       https://jira.whamcloud.com/browse/LU-20695
+Type:       Bug
+Priority:   Blocker
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Oleg Drokin
+Created:    Fri, 4 Sep 2026 22:53:43 +0000
+Updated:    Tue, 6 Oct 2026 16:38:00 +0000
+Links:      Related: is related to  LU-12514; Related: is related to  LU-12064; Related: is related to  LU-16738; Related: is related to LU-20779; Related: is related to LU-12514
+
+--- Description ---
+I am setting this to blocker for now as next timebomb is 2.18.0 and we must not forget about it. Will drop down to critical once that one is handled.
+
+Backstory:
+
+We often phase out of old features/code with a timed ifdefs that checl current version via LUSTRE_VERSION_CODE define and once pas a particular threshold, things get disabled.
+
+The problem here is this new code shape is never tested nor is even easily testable, a tag is created and boom, exactly same code breaks.
+
+This happened numerous time, last time as of the time of this writing was 2.17.58.
+
+I dispatched Claude to catalogue remaining time bombs and when they will hit and what hte falout would be, here are the 8 that would break the build:
+
+ h2. Verified build breaks — what happens on each future tag day
+
+Fires at
+Site
+Failure
+
+2.18.0
+lustre/utils/lfs.c:5600
+#error "Remove LFS_EC_OK check for 2.18 release" — deliberate, guarded > 2.17.90. Build stops in lustre/utils.
+
+2.18.53
+lustre/ptlrpc/wiretest.c:4194 and lustre/utils/wiretest.c:4213
+struct mgs_send_param / MGS_PARAM_MAXLEN disappear from lustre_idl.h, but the two generated wiretest.c files reference them unconditionally: invalid application of 'sizeof' to incomplete type 'struct mgs_send_param', 'MGS_PARAM_MAXLEN' undeclared. Breaks the ptlrpc module and the userspace wiretest. wirecheck.c (the generator) is guarded — its output is not.
+
+3.0.0
+lustre/include/lustre_ioctl_old.h:60,65 via lustre/obdclass/class_obd.c:338
+#define OBD_IOC_CMD_GONE(cmd, name) takes two arguments but the #else branches call OBD_IOC_CMD_GONE(cmd): macro "OBD_IOC_CMD_GONE" requires 2 arguments, but only 1 given. This fallback branch has never been compiled since it was written.
+
+3.0.0
+lustre/llite/llite_lib.c:4258
+if (cmd == OBD_IOC_GETNAME_OLD || ...) is not #ifdef-guarded although the definition (and the case at line 3660) are: 'OBD_IOC_GETNAME_OLD' undeclared.
+
+3.0.53
+lustre/utils/obd.c:827
+struct obd_ioctl_data data; in jt_obd_no_transno() is declared outside the guard, used only inside it: unused variable 'data' [-Werror=unused-variable]. Exactly the again: label failure again.
+
+3.0.53
+lustre/mdt/mdt_internal.h:1560
+static unsigned int max_mod_rpcs_per_client lives in a header; once mdt_max_mod_rpcs_changed() becomes a #define ... false and the module_param_cb in mdt_handler.c:50 goes away, every TU gets defined but not used [-Werror=unused-variable].
+
+3.1.53
+lustre/obdclass/llog_ioctl.c:23-26
+id, seq, end, ogen, rc in str2logid() are declared outside the guard: five -Werror=unused-variable.
+
+> 3.2.53
+lustre/utils/mount_lustre.c:377
+#warn "remove MS_STRICTATIME override..." — #warn is not a directive: error: invalid preprocessing directive #warn; did you mean #warning?. And after correcting it to #warning, it is still fatal: error: #warning ... [-Werror=cpp]. The "just remind me later" idiom does not work at all in this build.
+
+3. Verified runtime / behaviour breaks
+
+3.1 tgt_lastrcvd.c:2198 (3.5.53) — every server target becomes unmountable
+
+include/uapi/linux/lustre/lustre_disk.h:220 still says:
+
+#define LRH_MAGIC		LRH_MAGIC_V1
+
+so tgt_reply_data_init() writes a V1 header into a brand-new reply_data file (tgt_lastrcvd.c:2174, unguarded). But the case LRH_MAGIC_V1: that reads it back is inside #if LUSTRE_VERSION_CODE . At 3.5.53 the read falls to default: and returns -EINVAL.
+
+Reproduced (3.5.53 build, existing ldiskfs MDT):
+
+mount.lustre: mount /dev/vdb at /mnt/mdt0 failed: Invalid argument
+LustreError: (tgt_lastrcvd.c:2228:tgt_reply_data_init()) lustre-MDT0000:
+             invalid reply_data magic: bdabda01 != bdabda01/bdabda02
+LustreError: (tgt_mount.c:1887:server_start_targets()) failed to start server lustre-MDT0000: -22
+
+Note the error message prints the magic as equal to LRH_MAGIC_V1 while declaring it invalid. This is not only an upgrade problem: a filesystem formatted and mounted by the 3.5.53 build itself fails on its second mount, because the first mount wrote a V1 header the same build then refuses:
+
+# fresh mkfs + mount by the 3.5.53 build: OK
+# umount, mount again:
+mount.lustre_tgt: mount /dev/vdb at /mnt/mdt0 failed: Invalid argument
+LustreError: ... invalid reply_data magic: bdabda01 != bdabda01/bdabda02
+
+This is the single most dangerous item in the tree. It is a total, fleet-wide server outage on the release that crosses 3.5.53, and nothing in the tree forces LRH_MAGIC to be bumped to LRH_MAGIC_V2 first.
+
+3.2 lustre/utils/mount_lustre.c:1163 (2.18.53) — inverted comparison
+
+#if LUSTRE_VERSION_CODE > OBD_OCD_VERSION(2, 18, 53, 0)
+		/* Pre-2.13 Lustre without 'lustre_tgt' type?
+		 * Try with 'lustre' instead.  Eventually this
+		 * can be removed (e.g. 2.18 or whenever).
+		 */
+
+The comment describes backward compatibility that should last until 2.18; the test is >, so the code is compiled out now and switches on at 2.18.53 — precisely backwards. Reproduced by invoking the helper with the module autoloader disabled so the mount() returns ENODEV:
+
+=== 2.18.53 (fallback compiled OUT — today's behaviour) ===
+mount.lustre_tgt: mount -t lustre_tgt /dev/vdb at /mnt/mdt0 failed: No such device retries left: 0
+mount.lustre_tgt: mount /dev/vdb at /mnt/mdt0 failed: No such device
+
+=== 2.19.53 (fallback compiled IN) ===
+mount.lustre_tgt: mount -t lustre_tgt /dev/vdb at /mnt/mdt0 failed: No such device retries left: 0
+mount.lustre_tgt: mount -t lustre /dev/vdb at /mnt/mdt0 failed: No such device retries left: 0
+mount.lustre_tgt: mount /dev/vdb at /mnt/mdt0 failed: No such device
+
+The "mount an old target with a new mount.lustre" fallback is dead today and will resurrect itself later — the exact opposite of what was intended, and consistent with the LU-12514 "Can't find device name" reports.
+
+3.3 lustre/utils/lfs.c:7920 (2.18.53) — a case label that wakes up and crashes
+
+#if LUSTRE_VERSION_CODE >= OBD_OCD_VERSION(2, 18, 53, 0)
+		case 'p':
+#endif
+		case LFS_POOL_OPT:
+			if (strlen(optarg) > LOV_MAXPOOLNAME) {
+
+lfs find's option string is "-0A:b:B:...Pp..." — p is declared as taking no argument, so optarg is NULL. Reproduced:
+
+=== 2.17.58 (today) ===
+$ lfs find -p mypool /mnt/lustre/tdir
+lfs: unrecognized option '-p'          (rc=4, prints usage)
+
+=== 2.18.53 ===
+$ lfs find -p mypool /mnt/lustre/tdir
+Segmentation fault (core dumped)       (rc=139)
+
+A clean error today becomes a NULL dereference in strlen() on the tag that crosses 2.18.53. --pool (the long option, with a required argument) works in both. This is "sleeping code that has never executed" in its purest form.
+
+3.4 lustre/ofd/lproc_ofd.c:532,1302 (2.20.53) — sanity 56c breaks
+
+The compatibility sysfs alias obdfilter.*.no_precreate (for no_create) is removed at 2.20.53. lustre/tests/sanity.sh:7386-7390 uses it gated only on OST1_VERSION >= 2.12.55 — a lower bound with no upper bound, the same mistake as 300l. Reproduced:
+
+=== 2.17.58 ===            === 2.20.53 ===
+obdfilter.*.no_create      obdfilter.*.no_create
+obdfilter.*.no_precreate   (gone)
+
+$ ONLY=56c bash sanity.sh          # 2.20.53
+error: set_param: setting : Invalid argument
+sanity test_56c: @@@@@@ FAIL: lustre-OST0000 status is 'Df', missing 'N'
+
+conf-sanity.sh:10011 (test_112a) handles the same parameter correctly (>= 2.15.56.125 → no_create, else no_precreate), which shows the fix is known — it just was not applied everywhere.
+
+And even more stuff:
+
+E. Mis-scoped guard swallowing live code.
+
+lustre/osd-ldiskfs/osd_handler.c:8556: the #if  was clearly meant to cover the Lustre-1.x dirdata warning, but the #endif sits 18 lines further down and also swallows
+
+	/* enable large_dir on MDTs to avoid REMOTE_PARENT_DIR overflow,
+	 * and on very large OSTs to avoid object directory overflow */
+	if (unlikely(!ldiskfs_has_feature_largedir(...)))
+		ldiskfs_set_feature_largedir(...);
+
+which is not compat code at all. At 3.2.53 the runtime auto-enable of large_dir disappears. mkfs.lustre sets large_dir at format time (libmount_utils_ldiskfs.c:676), so freshly formatted targets are unaffected — but any target formatted by an older mkfs.lustre, or with an e2fsprogs that lacked the feature, silently stops being upgraded, and eventually overflows REMOTE_PARENT_DIR. A guard whose #endif is in the wrong place is the easiest kind of bug to write and the hardest to see in review.
+
+F. Silent removal of a runtime interface with a test that cannot skip.
+
+sanity 300l (already broken) and sanity 56c (breaks at 2.20.53) are the same bug: the test has a lower version bound and no upper bound, so when the feature is deleted on schedule the test converts to a permanent failure. Grep-able signature: a test that uses a parameter/ioctl/option that appears inside any #if LUSTRE_VERSION_CODE  block. Present candidates: obdfilter.*.no_precreate (sanity 56c, 2.20.53), lctl conf_param (test-framework.sh:568 sets PERM_CMD to it by default, 13 more uses in conf-sanity.sh — 3.0.53), lfs find -i (sanity.sh:29014, 3.0.53), lfs setquota -d (sanity-quota.sh:5255,5363, 2.22.53), and lfs find --ost-list (conf-sanity.sh:7648, 3.0.53).
+
+G. On-disk / on-wire format guards that outlive their own default.
+
+§3.1 is the extreme case: the reader of a format is deleted on a timer while the writer still emits it. The same shape exists (benignly, today) in ptlrpc/layout.c:1334 + pack_generic.c:3111 + lustre_idl.h:3812 (mdc_swap_layouts_217, 3.4.53) — those three are consistently guarded, but the pattern deserves a rule, not luck.
+
+--- Comment (adilger, Sat, 5 Sep 2026 02:43:02 +0000) ---
+Definitely some time bombs lurking there, but "fleet-wide server outage on the release that crosses 3.5.53" is a bit melodramatic unless we build and push out a 3.6.0 release without any testing at all...  While I agree that these one-time issues after updating the build version can be annoying, the alternative of keeping dead code in the tree forever (I still see unguarded "for compat with 1.6 or 1.8" comments in the code that haven't been removed yet), or hoping that someone will review Jira tickets requesting that some code should be deleted in 5 years is also unrealistic.  Having some way to build the future code easily without creating a fake git tag (which is also dangerous) would help, but I suspect that even if that was done at the time the patch landed that other changes to the code will still mean there will be errors hit in the future.  Using a 2.17.58 version check is unexpected, since most of the checks are using .53 so they are predictable.
+
+I think the best approach for many of them would be to create the code removal patches at 2.x.50+ so that they delete the obsolete code before the version is changed.  
+
+The LRH_MAGIC_V1 vs. LRH_MAGIC_V2 issue is of course significant, and the intent was that this file would change over automatically to LRH_MAGIC_V2 in the 2.17 or 2.18 release when WBC was landed (which makes the V2 format mandatory).  However, the WBC feature code is still not landed, and patch https://review.whamcloud.com/50636 ("LU-16096 target: use lsd_reply_data_v1 format by default") changed the default to LRH_MAGIC_V1 in commit v2_15_61-2-g5321d51087 before the 2.16.0 release to maintain compatibility with older servers as much as possible.  The default can be changed when WBC is landed, maybe 2.19?
+
+For several of the others, using C99 inline variable declarations would avoid the "unused variable" warnings at the cutover date and could be landed today.
+
+I think the MS_STRICTATIME override is still not fixed.  At the time it was added the expectation was that we could get a fix into the kernel in a timely manner (LU-1783 from 2012-08-23, belated happy 14th birthday).
+
+The backward 2.18.53 lustre_tgt check is most immediately significant issue, since lustre_tgt mounting was broken after v2_16_53-7-g6493d8997e and was just fixed in commit v2_17_57-80-g58adf0b4aa, so that check needs to be fixed and bumped out a couple releases so that 2.17 servers could mount with common userspace tools (if that ever happens).
+
+--- Comment (gerrit, Sat, 5 Sep 2026 04:26:58 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68655
+
+Subject: LU-20695 utils: fix mount.lustre_tgt fallback
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 557ce73c97eacc76e5394f8bd29131b6b9376113
+
+--- Comment (gerrit, Wed, 9 Sep 2026 08:05:56 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68732
+
+Subject: LU-20695 llite: Revert "llite: Remove the 2.17.58 timebomb"
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 31d7955b145a0b40c5f4cbb73a2d95ba54e52f00
+
+--- Comment (gerrit, Mon, 28 Sep 2026 21:27:44 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/68655/
+
+Subject: LU-20695 utils: fix mount.lustre_tgt fallback
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 746136a356c5706bef6bccece2cbecd66699be68

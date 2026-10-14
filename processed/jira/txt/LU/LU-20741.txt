@@ -1,0 +1,138 @@
+Key:        LU-20741
+Summary:    remote inode should inherit agents inode UID and GID
+Link:       https://jira.whamcloud.com/browse/LU-20741
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Sergey Cheremencev
+Created:    Fri, 11 Sep 2026 17:01:09 +0000
+Updated:    Wed, 30 Sep 2026 10:13:16 +0000
+
+--- Description ---
+If move a file from one MDT to another, it causes to create a remote inode. This inode inherits project id, but UID and GID are to 0. Agent inode UID, GID and PROJID remain unchanged. That said each file moved between MDTs causes creating a new inode that increments project ID usage(if agent ahs project ID set on it).
+
+I think agents inode UID and GID should be also set to the remote inode as well as PROJID to be considered by account by quota accounting subsystem. I don't have a good example, but probably it also makes sense from the security point of view(inode has ROOT UID and GID).
+
+Below is a simple example with the details:
+
+[root@vm3 ~]# cat repro3.sh 
+#!/bin/bash
+
+cd /mnt/lustre
+mkdir my_project
+chattr +P -p 32 my_project
+lsattr -dp my_project/
+#   32 -------------------P-- my_project/
+cd my_project/
+#mkdir p{1..3}
+lfs mkdir -i 1 p1
+lfs mkdir -i 2 p2
+lfs mkdir -i 3 p3
+touch p1/truc
+chown 64030:112 p1/truc
+mv p1/truc p2/truc
+lsattr -dp *
+[root@vm3 ~]# bash repro3.sh 
+   32 -------------------P-- my_project/
+   32 -------------------P-- p1
+   32 -------------------P-- p2
+   32 -------------------P-- p3
+[root@vm3 ~]# debugfs -c -R "stat REMOTE_PARENT_DIR/0x280000404:0x5:0x0/truc" /tmp/lustre-mdt3 
+debugfs 1.47.3-wc2 (11-Nov-2025)
+Inode: 162   Type: regular    Mode:  0000   Flags: 0x20080000
+Generation: 766296278    Version: 0x00000000:00000000
+User:     0   Group:     0   Project:    32   Size: 0
+File ACL: 0
+Links: 1   Blockcount: 0
+Fragment:  Address: 0    Number: 0    Size: 0
+ ctime: 0x6aa43332:0b32b67c -- Fri Sep 11 19:58:26 2026
+ atime: 0x00000000:fffffff8 -- Thu Jan  1 03:00:00 1970
+ mtime: 0x00000000:fffffff8 -- Thu Jan  1 03:00:00 1970
+crtime: 0x6aa43332:0b32b67c -- Fri Sep 11 19:58:26 2026
+Size of extra inode fields: 32
+Extended attributes:
+  lma: fid=[0x240000404:0x9:0x0] compat=0 incompat=2
+EXTENTS:
+
+[root@vm3 ~]# debugfs -c -R "stat REMOTE_PARENT_DIR/0x240000404:0x9:0x0" /tmp/lustre-mdt2
+debugfs 1.47.3-wc2 (11-Nov-2025)
+Inode: 156   Type: regular    Mode:  0644   Flags: 0x20080000
+Generation: 1320037609    Version: 0x00000001:00000054
+User: 64030   Group:   112   Project:    32   Size: 0
+File ACL: 0
+Links: 1   Blockcount: 0
+Fragment:  Address: 0    Number: 0    Size: 0
+ ctime: 0x6aa43332:00000000 -- Fri Sep 11 19:58:26 2026
+ atime: 0x6aa43332:00000000 -- Fri Sep 11 19:58:26 2026
+ mtime: 0x6aa43332:00000000 -- Fri Sep 11 19:58:26 2026
+crtime: 0x6aa43332:00ebdbec -- Fri Sep 11 19:58:26 2026
+Size of extra inode fields: 32
+Extended attributes:
+  lma: fid=[0x240000404:0x9:0x0] compat=0 incompat=4
+  trusted.lov (56) = d0 0b d1 0b 01 00 00 00 09 00 00 00 00 00 00 00 04 04 00 40 02 00 00 00 00 00 40 00 01 00 00 00 02 04 00 40 03 00 00 00 03 00 00 00 00 00 00 00 00 00 00 00 01 00 00 00 
+  security.selinux (37) = "unconfined_u:object_r:unlabeled_t:s0\000"
+  user.job (7) = "touch.0"
+  linkea: idx=0 parent=[0x280000404:0x5:0x0] name='truc'
+  trusted.som (24) = 04 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+EXTENTS:
+
+--- Comment (JIRAUSER19803, Thu, 17 Sep 2026 14:13:18 +0000) ---
+I would like to add that fixing this will need to add a way for users to easily identify those agent files. They are invisible with lfs find and in lfs quota, so it leads to have an inodes count that will be bigger than the actual file/directory count.
+
+One idea is to add an option to lfs quota to show files/directories count without agent files, this way users will see the gap between their inode quota and files/directories count.
+
+Another one that would probably be handy is to add an lfs find option to list files having an agent file, this will help to identify files that are not one the same directory than their parent.
+
+--- Comment (JIRAUSER19803, Thu, 24 Sep 2026 09:52:41 +0000) ---
+I checked the code and it seems that projectid should not be set on agent file :
+
+/**
+ * Create an local agent inode for remote entry
+ */
+static struct inode *osd_create_local_agent_inode(const struct lu_env *env,
+                                                  struct osd_device *osd,
+                                                  struct osd_object *pobj,
+                                                  const struct lu_fid *fid,
+                                                  __u32 type,
+                                                  struct thandle *th)
+{
+....
+        /* Agent inode should not have project ID */
+        if (LDISKFS_I(pobj->oo_inode)->i_flags & LUSTRE_PROJINHERIT_FL &&
+            i_projid_read(pobj->oo_inode) != 0) {
+                rc = osd_transfer_project(local, 0, th);
+                if (rc) {
+                        CERROR("%s: quota transfer failed:. Is project quota enforcement enabled on the ldiskfs filesystem? rc = %d\n",
+                               osd_ino2name(local), rc);
+                        RETURN(ERR_PTR(rc));
+                }
+        }
+
+So as agent files are not real files for the user, the comment is totally valid, but it seems the code doesn't reflect this comment.
+
+--- Comment (sergey, Mon, 28 Sep 2026 17:49:29 +0000) ---
+Another one that would probably be handy is to add an lfs find option to list files having an agent file, this will help to identify files that are not one the same directory than their parent.
+
+Agree that such option for lfs find also makes sense. I’m not 100% sure, but at first look if files mdt index != file_parent mdt_index, it means such file is a result of cross mdt operation and should have 2 inodes(original + agent). Probably, there could be another cases that I’m not taking into account, but we could at least find such inodes and put a note to the manual that new option (--agent-inode) is to find files which indexes are different from the parents:
+
+--agent-inode Find namespace objects whose MDT differs from the MDT of their parent directory. Generally, such files occupy 2 inodes affecting project quota usage.
+
+--- Comment (gerrit, Wed, 30 Sep 2026 10:08:48 +0000) ---
+"Aurélien Cedeyn " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69328
+
+Subject: LU-20741: lfs: find remote file and directory
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 5938074c496d2c3a59b82bbcbb674ba1e93b4c6f
+
+--- Comment (JIRAUSER19803, Wed, 30 Sep 2026 10:13:16 +0000) ---
+scherementsev I went for the option name '--remote' since the resulting found files are not guaranteed to have an agent. It is the case with the current implementation but I'm not sure that it will be still the case in the future.
+
+Let's discuss on this on gerrit .

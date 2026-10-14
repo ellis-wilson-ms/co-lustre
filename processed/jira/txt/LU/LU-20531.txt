@@ -1,0 +1,451 @@
+Key:        LU-20531
+Summary:    cross-MDT close from ldlm_bl deadlocks the blocking-AST thread pool when the MDC import is not FULL
+Link:       https://jira.whamcloud.com/browse/LU-20531
+Type:       Bug
+Priority:   Critical
+Status:     Open
+Resolution: Unresolved
+Assignee:   Vandana Rungta
+Reporter:   Vandana Rungta
+Created:    Tue, 28 Jul 2026 15:26:36 +0000
+Updated:    Fri, 14 Aug 2026 16:03:00 +0000
+
+--- Environment ---
+16-MDT DNE filesystem, ~535 TiB, Lustre 2.15, EL9 kernel (5.14.x). Triggered during failover/recovery of a single MDT.
+
+--- Description ---
+On a DNE filesystem, an MDS can permanently deadlock its entire LDLM
+
+blocking-AST (ldlm_bl) thread pool when a cross-MDT close is issued from lock
+
+cancellation while the MDC import to the target MDT is not LUSTRE_IMP_FULL. All
+
+lock cancellation on the affected MDS stops, the MDS begins evicting its own
+
+internal client and then its regular clients, peer MDTs evict the affected MDS,
+
+and the condition does not self-heal – only a reboot clears it.
+
+ 
+
+Observed impact: on a 16-MDT production filesystem, two peer MDS entered this
+
+state during failover of a third MDT. The filesystem was unusable for
+
+approximately two hours and was recovered only by rebooting all MDS.
+
+--- Comment (JIRAUSER19474, Tue, 28 Jul 2026 15:29:58 +0000) ---
+1. SUMMARY
+
+--------------------------------------------------------------------------------
+
+ 
+
+An ldlm_bl thread, while performing a routine LRU lock cancellation, cancelled
+
+a cross-MDT lock holding the MDS_INODELOCK_OPEN bit for a cached, deferred open
+
+handle on an otherwise idle inode. Cancelling that lock pruned the last cached
+
+dentry, dropped the final inode reference, and flushing the deferred open handle
+
+to the MDT that owns the inode required a synchronous MDS_CLOSE RPC.
+
+ 
+
+MDT-A's MDC import to MDT-B was not LUSTRE_IMP_FULL (MDT-B was in recovery), so
+
+the close was delayed indefinitely by ptlrpc_import_delay_req() – while holding
+
+the single close modify-RPC slot. Every subsequent ldlm_bl thread that reached a
+
+close then blocked in obd_get_mod_rpc_slot() waiting for that one slot. Once the
+
+pool was drained, MDT-A could no longer process any lock cancellation, including
+
+the blocking ASTs its own server needed answered in order to grant conflicting
+
+locks, so it began evicting its own internal client and then its regular
+
+clients.
+
+ 
+
+The state is unbreakable: the slot wait is TASK_UNINTERRUPTIBLE with
+
+MAX_SCHEDULE_TIMEOUT and is woken only on modify-RPC completion – there is no
+
+wakeup on import state change. When MDT-B's recovery subsequently aborted the
+
+peer's lock replays and evicted it (setting the import invalid), the waiters
+
+could never wake, because the RPC they were waiting behind could never complete.
+
+ 
+
+ 
+
+2. CALL STACK EVIDENCE
+
+--------------------------------------------------------------------------------
+
+ 
+
+Ten ldlm_bl threads, all in state D, all with the identical stack:
+
+ 
+
+    INFO: task ldlm_bl_01:24821 blocked for more than 122 seconds.
+
+          (also ldlm_bl_02, _03, _05, _06, _10, _13, _14, _17, _20)
+
+ 
+
+    obd_get_mod_rpc_slot+0x120/0x564 [obdclass]                                                         close slot
+
+    ptlrpc_get_mod_rpc_slot+0x38/0x60 [ptlrpc]
+
+    mdc_close+0x21c/0xe64 [mdc]                       lmv_close+0x1a8/0x480 [lmv]
+
+    ll_close_inode_openhandle+0x404/0xcc8 [lustre]
+
+    ll_md_real_close+0xa4/0x280 [lustre]
+
+    ll_clear_inode+0x1a0/0x7d8 [lustre]
+
+    ll_delete_inode+0x70/0x260 [lustre]
+
+    evict+0xdc/0x240                                                                                    the inode active
+
+    iput_final / iput / dentry_unlink_inode / __dentry_kill / dentry_kill / dput
+
+    d_prune_aliases+0x164/0x1c8
+
+    ll_prune_aliases+0x224/0x540 [lustre]
+
+    ll_lock_cancel_bits+0x250/0xcc8 [lustre]
+
+    ll_md_blocking_ast+0x1c0/0x3f4 [lustre]           ldlm_cancel_callback+0x6c/0x334 [ptlrpc]
+
+    ldlm_cli_cancel_local+0xf8/0x76c [ptlrpc]
+
+    ldlm_cli_cancel_list_local+0x10c/0x43c [ptlrpc]                                                         branch
+
+    ldlm_bl_thread_blwi.constprop.0+0x244/0x490 [ptlrpc]
+
+    ldlm_bl_thread_main+0x4e4/0x6c0 [ptlrpc]
+
+ 
+
+Two facts from this stack are worth calling out:
+
+ 
+
+1. The trigger is a local LRU cancel, not a received AST.
+
+   ldlm_cli_cancel_list_local() under ldlm_bl_thread_blwi() is only reachable on
+
+   the batch branch (blwi->blwi_count != 0), which is produced solely by
+
+   ldlm_bl_to_thread_list(), whose only caller is ldlm_cancel_lru() – driven by
+
+   the periodic SLV/pool recalc and namespace resize. A received
+
+   LDLM_BL_CALLBACK would take the other branch (ldlm_handle_bl_callback()),
+
+   which appears in ZERO traces across the entire event. LDLM_CB_CANCELING in
+
+   the stack is not evidence of a received AST: every final cancel funnels
+
+   through ldlm_cancel_callback() -> l_blocking_ast(..., LDLM_CB_CANCELING)
+
+   regardless of what triggered it.
+
+ 
+
+2. The inode was idle, not in use. ldlm_cancel_lru() only walks ns_unused_list,
+
+   so the lock had zero l_readers/l_writers. Reaching d_prune_aliases ->
+
+   iput_final -> evict proves nothing held the inode active. The
+
+   MDS_INODELOCK_OPEN bit was held for a CACHED open handle – Lustre keeps open
+
+   state cached under the inode lock to avoid a re-open round-trip, and that
+
+   cached och does not take an active DLM reference. So the lock was
+
+   LRU-eligible precisely BECAUSE it was idle, and cancelling it is the client
+
+   voluntarily returning cached open state.
+
+ 
+
+The contended resource
+
+~~~~~~~~~~~~~~~~~~~~~~
+
+ 
+
+A hung service thread dumped the resource, confirming the OPEN bit and the
+
+resulting pile-up:
+
+ 
+
+    Resource: [0x240000578:0x55a:0x0].0x0  ns: mdt--MDT-A_UUID
+
+              refcount = 5
+
+    Granted locks (in reverse order):
+
+      lock: ...157d7741  mode: CR/CR  res:[0x240000578:0x55a:0x0]
+
+            bits 0x5/0x0  nid: 0@lo  expref: 17273
+
+    Waiting locks:
+
+      lock: ...159cee6c  mode: --/CW  res:[0x240000578:0x55a:0x0]
+
+            bits 0x2/0x0  nid: local
+
+ 
+
+bits 0x5 = MDS_INODELOCK_LOOKUP | MDS_INODELOCK_OPEN; the granted lock is held
+
+by MDT-A's own internal client (0@lo), and a waiting UPDATE (bits 0x2) writer is
+
+queued behind it indefinitely.
+
+ 
+
+The pool being dead is what caused the evictions
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+ 
+
+    lock callback timer expired after 102s, ldlm_bl_timeout 100s:
+
+        evicting client at 0@lo
+
+    MDT-A-mdc...: Connection to -MDT-A (at 0@lo) was lost
+
+    lock timed out (enqueued 302s ago); not entering recovery in server code
+
+        [repeats every 2-5 min]
+
+    lock callback timer expired after 153s: evicting client at 
+
+        [regular clients follow]
+
+ 
+
+expired_lock_main() only fires for a lock whose blocking AST was already SENT
+
+(l_blast_sent), so these are ASTs going unanswered as a CONSEQUENCE of the
+
+drained pool – MDT-A's server could not get its own client side to respond.
+
+ 
+
+Why the import never recovered
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+ 
+
+MDT-A's MDC to MDT-B logged no "Connection restored" for the whole window. The
+
+replays were being rejected:
+
+ 
+
+    ptlrpc_replay_interpret() @@@ status 301 ... o101->MDT-B-mdc...
+
+ 
+
+o101 = LDLM_ENQUEUE, status 301 = ELDLM_LOCK_ABORTED. The peer MDTs had
+
+in-flight cross-MDT lock enqueues at failover; during MDT-B's recovery those
+
+enqueues were aborted, which aborted the whole replay set, so the MDC never
+
+reached FULL and was disconnected as a stale client – marking the import
+
+invalid. MDT-B's log confirms this from the other side (the peer joined
+
+recovery, then "disconnect stale client", and recovery ended with 2 of 583
+
+clients evicted). Only the two peer MDTs holding in-flight cross-MDT locks were
+
+affected; the other 581 clients replayed cleanly.
+
+ 
+
+The resulting close failures are visible as:
+
+ 
+
+    ll_close_inode_openhandle() ... inode [0x240000578:0xa8:0x0]
+
+        mdc close failed: rc = -108
+
+ 
+
+-108 is -ESHUTDOWN, exactly what ptlrpc_import_delay_req() returns once the
+
+import is invalid.
+
+ 
+
+Ruled out
+
+~~~~~~~~~
+
+ 
+
+No OOM, page-allocation-failure, shrinker or reclaim activity anywhere in the
+
+window (this is not memory pressure – the LRU cancel is volume-driven cache
+
+trimming). No truncate_inode_pages / folio_wait / wait_on_page in any trace. No
+
+received-blocking-AST frames.
+
+ 
+
+ 
+
+3. ROOT CAUSE
+
+--------------------------------------------------------------------------------
+
+ 
+
+mdc_close() takes a modify-RPC slot and then waits synchronously:
+
+ 
+
+    ptlrpc_get_mod_rpc_slot(req);
+
+    rc = ptlrpc_queue_wait(req);
+
+    ptlrpc_put_mod_rpc_slot(req);
+
+ 
+
+A plain close has rq_send_state = LUSTRE_IMP_FULL and no rq_allow_replay, so on
+
+a non-FULL import ptlrpc_import_delay_req() sets delay = 1 and the request
+
+sleeps with no timeout – delayed requests carry rq_waiting, are skipped by both
+
+ptlrpc_set_next_timeout() and ptlrpc_expired_set(), and are only ever woken by
+
+ptlrpc_wake_delayed() when the import reaches FULL.
+
+ 
+
+Meanwhile the slot it already holds is the ONLY close slot:
+
+ 
+
+    /* A slot is available if
+
+     * - number of modify RPCs in flight is less than the max
+
+     * - it's a close RPC and no other close request is in flight */
+
+    avail = cli->cl_mod_rpcs_in_flight cl_max_mod_rpcs_in_flight ||
+
+            (close_req && cli->cl_close_rpcs_in_flight == 0);
+
+ 
+
+so every later close finds avail == false and sleeps uninterruptibly in
+
+wait_woken(..., MAX_SCHEDULE_TIMEOUT).
+
+ 
+
+The defect is that obd_get_mod_rpc_slot() has no notion of import state. Threads
+
+asleep on cl_mod_rpcs_waitq are woken only by modify-RPC completion, so when the
+
+import is invalidated – which the status-301 recovery abort guarantees – the
+
+waiters are waiting on an event that can never occur. Running this path from
+
+ldlm_bl context turns that into a pool-wide, cluster-visible deadlock.
+
+--- Comment (gerrit, Tue, 28 Jul 2026 17:49:45 +0000) ---
+"Vandana Rungta " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/67599
+
+Subject: LU-20531 mdc: fix cross-MDT close blocking-AST thread deadlock
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 4386bfa994a87b7047c81ef5a17df7a81f58dd9f
+
+--- Comment (gerrit, Fri, 14 Aug 2026 15:50:59 +0000) ---
+"Vandana Rungta " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68014
+
+Subject: LU-20531 tests: add reproducer for cross-MDT close deadlock
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: de501680a4ae77d8b101e863f339c3a7172d602d
+
+--- Comment (JIRAUSER19474, Fri, 14 Aug 2026 16:03:00 +0000) ---
+Here's how I reproduced and validated the fix using fail injection parameters
+
+Parameter Value Effect
+
+fail_loc 0x32e OBD_FAIL_LDLM_REPLAY_PAUSE — pauses inside ldlm_cancel_unused_locks_for_replay during reconnect
+
+fail_val 2 2-second pause duration
+
+The 2s pause widens the window where lock cancel callbacks (bl_ast) fire while the import is still in REPLAY_LOCKS state. This ensures enough bl threads enter mdc_close() simultaneously to drain the pool.
+
+Prerequisites: 3-MDT filesystem, client at $DIR
+1. Generate OPEN-bit locks
+
+lctl set_param llite.*.opencache_threshold_count=1
+
+lfs mkdir -c 3 $DIR/testdir
+
+for i in $(seq 0 99); do echo data > $DIR/testdir/f$i; done
+
+for i in $(seq 0 99); do cat $DIR/testdir/f$i > /dev/null; done
+
+2. Verify locks on MDT0001
+
+lctl get_param -n ldlm.namespaces.MDT0001mdc*.lock_count
+
+Should show > 50
+3. Arm fail_loc on client
+
+lctl set_param fail_val=2 fail_loc=0x32e
+
+4. Crash MDT0001 (force stop + restart the MDS instance)
+5. Wait 90s, then check:
+
+lctl get_param mdc.MDT0001.import | grep state:
+
+With fix: FULL
+Without fix: REPLAY_LOCKS (permanent deadlock)
+6. Try new activity:
+
+mkdir $DIR/newdir
+
+With fix: succeeds instantly
+Without fix: hangs forever (only reboot clears)

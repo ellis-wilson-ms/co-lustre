@@ -8,8 +8,9 @@ Resolution: Unresolved
 Assignee:   Qian Yingjin
 Reporter:   Etienne Aujames
 Created:    Fri, 29 Sep 2023 15:28:35 +0000
-Updated:    Sat, 22 Feb 2025 09:39:09 +0000
-Labels:     lad24dd, tbf
+Updated:    Sat, 12 Sep 2026 22:54:36 +0000
+Labels:     TC-triage-followup, easy, lad24dd, tbf
+Links:      Related: is related to  LU-20089; Related: is related to LU-20116
 
 --- Description ---
 The TBF rate is related to Lustre CPU partition, that mean that the same TBF class can exist on several CPTs. So the maximum rate with several clients is: rate * nbr_cpt
@@ -26,12 +27,16 @@ The job rate with 1 node will be limited 3000 RPC/s. But if the OSS is configure
 
 I think this was originally design to keep the CPT independents and avoid lock contentions. But this can be mitigated by using rhashtable with rcu_lock to share tokens between CPT.
 
---- Comment (adilger, Sat, 22 Feb 2025 09:39:09 +0000) ---
-qian_wc the current problem with NRS + CPT is that the rates that are specified for e.g. TBF rules are per-CPT which is not what users expect, and can be unevenly applied if the clients are not using each CPT uniformly.  While I don't think we have to remove CPT from NRS completely, there are two changes that should be done to make this behavior more what users expect:
+--- Comment (adilger, Fri, 29 Sep 2023 15:38:18 +0000) ---
+As a starting point it would make sense to divide the rate by the CPT count so that the total rate remains the same regardless of how many CPTs are configured. Being able to share tokens between CPTs is an improvement beyond that.
 
-	the specified rate/tokens for a rule should be the global rate across all CPTs, and divided by the number of CPTs when assigned to a bucket.  This ensures that the total rate in one interval is the rate that was specified, and does not depend on the NUMA/CPT configuration on a server node.
+--- Comment (adilger, Fri, 20 Sep 2024 05:52:42 +0000) ---
+eaujames, I see that this is assigned to you, is it something you plan to start working on, or should it go into the LAD Developer Day candidate list?
 
-	there should be balancing between the TBF buckets in different CPTs within an interval, so that all tokens can be used if needed.  This balancing doesn't have to be perfect, but could definitely be improved significantly over not balancing at all.  For example, if a CPT bucket runs out of tokens, it could check the buckets in other CPTs until it finds one with tokens, and take 1/2 of the remaining tokens.
+--- Comment (eaujames, Mon, 23 Sep 2024 09:30:50 +0000) ---
+adilger, I am not planing to work on this now, it can go on the Developer ticket list.
+
+But note, that this issue does not apply for "tbf nid" policy because NID are assigned to a CPT.
 
 --- Comment (qian_wc, Tue, 24 Dec 2024 02:09:03 +0000) ---
 I do not think we can get rid of CPT, as the NRS schedule framework is based on CPT.
@@ -40,13 +45,129 @@ If we want to make TBF rate not based on CPT, this means lots of NRS framework r
 
 Or Etenne, could you please present your design idea in more details?
 
---- Comment (eaujames, Mon, 23 Sep 2024 09:30:50 +0000) ---
-adilger, I am not planing to work on this now, it can go on the Developer ticket list.
+--- Comment (adilger, Sat, 22 Feb 2025 09:39:09 +0000) ---
+qian_wc the current problem with NRS + CPT is that the rates that are specified for e.g. TBF rules are per-CPT which is not what users expect, and can be unevenly applied if the clients are not using each CPT uniformly.  While I don't think we have to remove CPT from NRS completely, there are two changes that should be done to make this behavior more what users expect:
 
-But note, that this issue does not apply for "tbf nid" policy because NID are assigned to a CPT.
+	the specified rate/tokens for a rule should be the global rate across all CPTs, and divided by the number of CPTs when assigned to a bucket.  This ensures that the total rate in one interval is the rate that was specified, and does not depend on the NUMA/CPT configuration on a server node.
 
---- Comment (adilger, Fri, 20 Sep 2024 05:52:42 +0000) ---
-eaujames, I see that this is assigned to you, is it something you plan to start working on, or should it go into the LAD Developer Day candidate list?
+	there should be balancing between the TBF buckets in different CPTs within an interval, so that all tokens can be used if needed.  This balancing doesn't have to be perfect, but could definitely be improved significantly over not balancing at all.  For example, if a CPT bucket runs out of tokens, it could check the buckets in other CPTs until it finds one with tokens, and take 1/2 of the remaining tokens.
 
---- Comment (adilger, Fri, 29 Sep 2023 15:38:18 +0000) ---
-As a starting point it would make sense to divide the rate by the CPT count so that the total rate remains the same regardless of how many CPTs are configured. Being able to share tokens between CPTs is an improvement beyond that.
+--- Comment (qian_wc, Tue, 7 Apr 2026 07:30:59 +0000) ---
+CPT Mapping of Client RPCs and NID-Based TBF Configuration
+Mapping between client RPCs (src NID) and server‑side CPT
+
+When LNet distributes incoming RPCs to CPTs / `ptlrpc_service_part` instances, it does not simply round‑robin them evenly. Instead, it follows rules that usually ensure that all requests from the same client (NID) are mapped to the same CPT, in order to reduce lock contention and cache thrashing.
+
+The mapping from source NID to CPT is done entirely in the LNet layer. 
+
+The PtlRPC layer simply uses this CPT to select the corresponding `ptlrpc_service_part` and its thread pool.
+
+On the server, after CPT is introduced, the high‑level flow is:
+
+1. LNet uses the local CPT topology and NI (network interface) configuration to create CPT‑specific portal/service resources for each CPT (buffer pools, wait queues, etc.).
+
+2. Each PtlRPC service (for example the `ost` and `ost_io` services on an OST) is split into multiple `ptlrpc_service_part` instances, each bound to one CPT (its `srv_cptid`).
+
+3. When LNet receives an RPC:
+
+	It selects a CPT id for this packet based on NIC/CPT mappings, a hash of the source NID, and/or local CPU affinity rules.
+
+	It then enqueues the request into the queue of the `ptlrpc_service_part` for that CPT, to be processed by that CPT’s service threads.
+
+It is not simply plain round‑robin across CPTs when assign a RPC to a CPT, for two main reasons:
+
+1. Locality / lock contention
+
+	If requests from the same client were randomly scattered across CPTs, this would cause:
+
+	Frequent lock contention for shared state (exports, objects, etc.) across multiple CPTs;
+
+	Cache lines constantly bouncing between NUMA nodes, which is expensive.
+
+	Therefore, the common design is to maintain a stable CPT mapping for each peer (NID/export) so that its requests consistently land on the same CPT.
+
+2. Overall load balancing
+
+	With many clients, their NIDs are hashed across multiple CPTs, so the load is approximately balanced across CPTs at the node level.
+
+	However, a single client is not evenly spread; it is typically bound to one (or a small number of) CPTs.
+
+Setting NRS TBF for NID‑based rules
+
+The current problem with NRS + CPT is that the rates specified for, e.g., TBF rules are per‑CPT, which is not what users typically expect and can lead to uneven behavior if clients are not using each CPT uniformly. There are two possible changes that should be made to make this behavior closer to user expectations:
+
+	The rate/tokens specified for a rule should represent the global rate across all CPTs on a server node, and should be divided by the number of CPTs when assigned to a per‑CPT class bucket. This ensures that the total rate in one interval matches the configured value and does not depend on the server’s NUMA/CPT configuration.
+
+	There should be balancing among TBF buckets across CPTs within an interval so that all tokens can be consumed if needed. This balancing does not have to be perfect, but it can and should be much better than having no balancing at all. For example, if the TBF bucket on one CPT runs out of tokens, it could look at buckets on other CPTs and, upon finding one with remaining tokens, steal half of the remaining tokens.
+
+However, for NID‑based TBF rules (such as rules keyed by NID or Nodemap), because all requests from a given source NID are consistently mapped to a single same CPT, it is sufficient to configure the TBF rule only on the TBF scheduler of that CPT. There is no need to configure the same rule on every CPT.
+
+Under Nodemap configuration, a nodemap typically contains a set of client NIDs. If the NIDs in that nodemap are configured at the LNet layer so that they all map to the {}same CPT{}, then all requests belonging to that nodemap will fall into that single CPT. In that case, an administrator only needs to configure the TBF scheduler on the PtlRPC service for that CPT to achieve the desired rate limiting for the entire nodemap, no need to configure the related class buckets on all CPT services.
+
+--- Comment (adilger, Tue, 14 Apr 2026 10:23:16 +0000) ---
+The rate/tokens specified for a rule should represent the global rate across all CPTs on a server node, and should be divided by the number of CPTs when assigned to a per‑CPT class bucket. This ensures that the total rate in one interval matches the configured value and does not depend on the server’s NUMA/CPT configuration.
+
+Yes, this is the first-order concern.  If an admin sets a TBF (or any NRS) rule with rate "1000", they don't expect this rate might become 4000 or 8000 on some server, and possibly be different between servers (if the CPU architecture is different between servers, or a software upgrade changes the CPT calculation mechanism for some reason).  Whatever rate is specified by the user should apply to the whole node, and it is an internal implementation detail how the rate is divided across CPTs.
+
+There should be balancing among TBF buckets across CPTs within an interval so that all tokens can be consumed if needed. This balancing does not have to be perfect, but it can and should be much better than having no balancing at all. For example, if the TBF bucket on one CPT runs out of tokens, it could look at buckets on other CPTs and, upon finding one with remaining tokens, steal half of the remaining tokens.
+
+Yes, exactly.  A mechanism for stealing tokens from another CPT, regardless of how it is implemented, is better than not implementing this.  Whether stealing 1/2 of the remaining or 1/4 or some other fraction is optimal should be a tunable parameter (or auto-tuned based on whether the "stolen" tokens are themselves "stolen again").  I suspect that either would be a good starting point that converges toward being able to use all of the tokens per time slice, even if a client NID is mapped only to a single CPT, as long as the "empty" CPT can always steal at least one token from another CPT.  The "empty CPT" should initially pick a random CPT number to steal from, which should still balance when many CPTs are active, without centralized control.
+
+It would be interesting to consider that "stolen tokens" are "sticky" on a CPT for the next time slice.  That allows them to automatically "migrate" to CPTs where they are being used (e.g. in the single-client NID-CPT affinity case), but if that was a short-term imbalance then the "greedy" CPT will have its tokens stolen on the next timeslice (or even in the current time slice if it took too many to process quickly).
+
+an administrator only needs to configure the TBF scheduler on the PtlRPC service for that CPT to achieve the desired rate limiting for the entire nodemap, no need to configure the related class buckets on all CPT services.
+
+I doubt administrators will even know about CPTs or how to configure TBF rate limits for a single CPT.  All of this needs to be "self balancing" so that administrators don't need to do this at all.
+
+Also interesting would be if OSTs and MDTs could steal (at least some) tokens from other nodes that are not busy.  That way, if one server is active for a bucket, but other servers are idle, then the active server could perform more work for that bucket.
+
+However, it isn't clear that being able to steal all of the tokens to one server is good or bad.  It would be good to use up idle resources on the active server, and to allow a class to consume all of its tokens across all servers (in which case we might consider to make the "rates" be filesystem-wide instead of per-server.  It would be bad if a large number of stolen tokens allowed that class's IO to overwhelm the active server resources.
+
+--- Comment (hornc, Wed, 15 Apr 2026 20:04:26 +0000) ---
+Changing the semantics of rate= could break existing rules that were formed with the current per-CPT semantics. Is that acceptable as a flag-day type transition, or should we introduced new parameters to set server rates which are then sub-divided amongst the CPTs?
+
+Or another option, add a module parameter like tbf_global_rate that defaults to 0/false to preserve legacy behavior. Allow admins to migrate with intention (set to 1, test their rules with the new semantics), and we can flip it to 1/true in a future release before removing it completely.
+
+--- Comment (gerrit, Fri, 17 Apr 2026 19:50:29 +0000) ---
+"Chris Horn " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/65399
+
+Subject: LU-17158 ptlrpc: Per-rule per-CPT TBF statistics
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 040318e3af6616778f267a342fb3c06284e553ec
+
+--- Comment (gerrit, Fri, 17 Apr 2026 19:50:30 +0000) ---
+"Chris Horn " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/65400
+
+Subject: LU-17158 ptlrpc: add CPT-aware global rate for TBF NRS
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: f3aa941324e666078e50d3028f9a6cc948dcde69
+
+--- Comment (adilger, Sat, 18 Apr 2026 06:40:03 +0000) ---
+My preference would be that the "global cpt rate" default to "on", and there is a one-time step needed to disable this if needed. AFAIK the NRS TBF functionality is not widely used today, because the complexity of configuring rules makes it hard for most users to use (including the very fact that the "rate" being configured depends on internal implementation details that can change for reasons totally unrelated to TBF).
+
+Going forward, as TBF improves functionality and ease of use improves (including this global rate patch) I think adoption will increase, so I think it makes sense to fix the future behavior (with an escape hatch) rarther than perpetuate the old one. I wish we'd done that many times in the past for other changes that didn't enable "better" behavior by default, and left features disable that most users never knew existed.
+
+--- Comment (gerrit, Sat, 12 Sep 2026 22:54:36 +0000) ---
+"Chris Horn " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68853
+
+Subject: LU-17158 nrs: per-rule statistics for the class scheduler
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 08dea53f72f4e689fd477a646fa9b16af0455836

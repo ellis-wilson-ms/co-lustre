@@ -1,0 +1,456 @@
+Key:        LU-20559
+Summary:    obd2obt() obt_magic assertion failure destroying exports of a failed server mount
+Link:       https://jira.whamcloud.com/browse/LU-20559
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Oleg Drokin
+Created:    Thu, 6 Aug 2026 19:45:30 +0000
+Updated:    Tue, 13 Oct 2026 04:20:55 +0000
+
+--- Description ---
+AI generated summary report:
+
+A server mount that fails inside tgt_init(), after tgt_server_data_init() has
+
+already run, panics the node from the zombie export workqueue:
+
+LustreError: 16232:0:(osd_handler.c:215:osd_trans_start()) lustre-MDT0000: can't assign tx: rc = -122
+LustreError: 16232:0:(tgt_lastrcvd.c:1238:tgt_client_del()) lustre-MDT0000: failed to update server data, skip client eccb9bda-5939-46e6-a0f6-3f152cfdf2eb zeroing, rc -122
+LustreError: 1594:0:(obd_target.h:61:obd2obt()) ASSERTION( obt->obt_magic == 0xBDDECEAE ) failed:
+LustreError: 1594:0:(obd_target.h:61:obd2obt()) LBUG
+CPU: 1 PID: 1594 Comm: kworker/u9:0
+Workqueue: obd_zombid obd_zombie_exp_cull [obdclass]
+Call Trace:
+ dump_stack_lvl+0x34/0x48
+ lbug_with_loc.cold+0x5/0x50 [libcfs]
+ tgt_grant_sanity_check+0x58e/0x5f0 [ptlrpc]
+ mdt_destroy_export+0x245/0x340 [mdt]
+ class_export_destroy+0x114/0x580 [obdclass]
+ obd_zombie_exp_cull+0xe/0x70 [obdclass]
+ process_one_work+0x196/0x380
+Kernel panic - not syncing: LBUG
+
+Root cause
+
+tgt_init() -> tgt_server_data_init() -> tgt_clients_data_init()
+
+(lustre/target/tgt_lastrcvd.c) creates one obd_export per non-zero last_rcvd
+
+client slot. The tgt_server_data_update() immediately after it then fails, and
+
+err_client: calls class_disconnect_exports(), which only queues those exports
+
+on the obd_zombid workqueue – teardown is asynchronous and nothing waits for it.
+
+tgt_server_data_init() returns the error to tgt_init(), which takes its out_put:
+
+label and zeroes obt_magic (lustre/target/tgt_main.c:615 – the only place in the
+
+tree that ever writes zero there). The zombie worker then runs
+
+class_export_destroy() -> mdt_destroy_export() -> tgt_grant_sanity_check(), whose
+
+first statement is obd2obt(obd)->obt_lut, and the assertion inside obd2obt()
+
+fires.
+
+A zeroed obt_magic is the intended signal that the target is gone: the
+
+lu_target lives inside the mdt_device that mdt_init0() frees on failure.
+
+class_exp2tgt(), tgt_client_free() and tgt_grant_discard() all honour that
+
+signal already. tgt_grant_sanity_check(), and the tgd_tot_granted_clients
+
+decrements next to it in mdt_destroy_export() and ofd_destroy_export(), never
+
+did.
+
+The console ordering pins the race: tgt_client_del() at 2081.675 got past
+
+class_exp2tgt()'s magic guard, so obt_magic was still valid then; the LBUG
+
+followed 4.4 ms later. (Only one "can't assign tx" line appears for two failures
+
+because CERROR is CDEBUG_LIMIT with a per-call-site rate limiter – a sibling
+
+crash on the same cluster shows the matching "Skipped 3 previous similar
+
+messages".)
+
+History
+
+	0d3a07a8aa46 "LU-7430 mdt: better handle MDT recovery error path" (2015-12,
+
+2.7.65) created the contract – it added the obt_magic zeroing to tgt_init()'s
+
+error path and guarded exactly one consumer, tgt_client_free().
+
+	0697cf73c74d "LU-3285 mdt: use generic grant code at MDT" (2016-12, 2.10.56)
+
+added three new unguarded consumers on the same export-destroy path, including
+
+the tgt_grant_sanity_check() call that panics here.
+
+	5ed65fd05947 "LU-10806 target: skip discard for a missing obt_lut" (2018-09,
+
+2.11.56) diagnosed this exact scenario – its commit message reads "If error
+
+happens at tgt_init, obt_lut is zeroed. The error handle path destroys export
+
+and calls tgt_grant_discard which access to non allocated memory" – but
+
+guarded only tgt_grant_discard(), one line short of the two derefs that crash.
+
+	888962496078 "LU-8837 lustre: remove target declarations from obd.h"
+
+(2022-11, 2.15.53) hoisted an unconditional LASSERT() into obd2obt(). Before
+
+it, the NULL obt_lut was used only for pointer arithmetic and
+
+tgt_grant_sanity_check() returned harmlessly at the following
+
+list_empty(&obd->obd_exports) test – obd_exports is empty here, having just
+
+been spliced away by class_disconnect_exports(). That commit turned a benign
+
+path into a panic, which is why this signature only exists on 2.15.53+.
+
+Occurrence
+
+Seen on lustre-master-next build 1001,
+
+lustre-master-next-el9.7-x86_64_lustre-b2_15-el8.10-x86_64-rolling-downgrade-client1-zfs
+
+(https://testing.whamcloud.com/test_sets/7234a5bd-e764-4e38-9b37-08a3024d775d).
+
+The crash-database signature records 56 occurrences, but 55 of them come from a
+
+single unlanded Gerrit change (58592, "LU-8130 obd: replace gen hash with
+
+Xarray") in two autotest runs, where that patch's own
+
+"tgt_clients_data_init() duplicate export for client generation" error reaches
+
+the same path. This is the only sighting on landed code.
+
+The bug is not interop-, ZFS- or arch-specific: the 58592 cluster fired on
+
+plain review-ldiskfs across el8/el9/el10/sles/ubuntu and aarch64, and the failure
+
+reproduces on ldiskfs (see below). Only the trigger in this instance was ZFS.
+
+Trigger in this instance
+
+The MDT dataset was at its ZFS quota, so the first transaction of the mount
+
+returned -EDQUOT. The immediately preceding session on the same node
+
+(rolling-upgrade-client2-zfs) had CRASHed in sanity test_805, which does
+
+"zfs set quota=..." on the MDT dataset and only restores it if it survives; the
+
+rolling upgrade/downgrade groups never reformat, so the reduced quota carried
+
+into the next session. That preceding crash is a separate, already-diagnosed
+
+grant-accounting LBUG whose fix was not in the tested build.
+
+Any error out of tgt_server_data_init() reaches the same race, so the -EDQUOT is
+
+incidental.
+
+Reproducer
+
+conf-sanity test_138 (added with the fix). It keeps a client's last_rcvd slot
+
+across an MDT umount with OBD_FAIL_TGT_CLIENT_DEL, then injects -EDQUOT into the
+
+tgt_server_data_update() that follows tgt_clients_data_init() so the genuine
+
+err_client path runs. On an unfixed build the node panics with the stack above;
+
+with the fix the mount fails cleanly with -EDQUOT and the server stays up.
+
+Fix
+
+Guard the consumers, as LU-7430 and LU-10806 already did for their siblings: add
+
+a non-asserting obd2obt_safe() accessor and use it in tgt_grant_sanity_check()
+
+and in the tgd_tot_granted_clients decrements in mdt_destroy_export() and
+
+ofd_destroy_export().
+
+Draining the zombie queue before obt_magic is cleared is not a workable
+
+alternative: the tgt_init() error paths that do not go through
+
+tgt_server_data_init()'s err_client label leave the exports still linked on
+
+obd_exports with nothing to disconnect them, so obd_exports_barrier() there would
+
+never return.
+
+--- Comment (gerrit, Fri, 7 Aug 2026 16:51:07 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/67818
+
+Subject: LU-20559 target: don't LBUG on exports of a failed mount
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 31da8d066ed1840a551b81b15dc2ae1d0223b271
+
+--- Comment (gerrit, Fri, 7 Aug 2026 16:51:08 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/67819
+
+Subject: LU-20559 target: keep client records when a mount fails
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: bcfd720f99f06910eab9c592cd22198e7154e388
+
+--- Comment (gerrit, Fri, 7 Aug 2026 16:51:08 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/67820
+
+Subject: LU-20559 target: drop an export reference on reply_data error
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 993898d7b74475070029780d0e523d1fbd9f56ae
+
+--- Comment (gerrit, Fri, 7 Aug 2026 16:51:09 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/67821
+
+Subject: LU-20559 target: drain zombie exports before invalidating obt
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: a69a19d5913b2fa8bf99fa0d2dbf178761801a78
+
+--- Comment (gerrit, Fri, 7 Aug 2026 16:51:10 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/67822
+
+Subject: LU-20559 tests: cover the tgt_init() reply_data failure path
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 32ef3c8af50f279457e5ade49196bbede2273973
+
+--- Comment (gerrit, Fri, 7 Aug 2026 16:51:10 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/67823
+
+Subject: LU-20559 target: keep client bitmap updates out of assertions
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: d57bb222671ded827cb68f6f8c36a48230355cd5
+
+--- Comment (gerrit, Sun, 9 Aug 2026 19:01:18 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/67870
+
+Subject: LU-20559 misc: keep updates out of assertion conditions
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: b73afdc6e290653472513fcaba962af6fcaaab06
+
+--- Comment (gerrit, Sun, 9 Aug 2026 19:01:19 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/67871
+
+Subject: LU-20559 obdclass: keep the modify RPC tag search in bounds
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: aee4e7ef1bf850462ca2807f292a90f6b24375c3
+
+--- Comment (gerrit, Sun, 9 Aug 2026 19:01:20 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/67872
+
+Subject: LU-20559 ofd: release the mount on the setup error path
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: d02ea2a9588ad92178a1c18a8052124bf1e9a53d
+
+--- Comment (gerrit, Sun, 9 Aug 2026 19:01:20 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/67873
+
+Subject: LU-20559 misc: fix the --disable-libcfs-assert build
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 4c906c268a8b8000451c34e5d04de8189a40e8f3
+
+--- Comment (gerrit, Sun, 9 Aug 2026 19:01:21 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/67874
+
+Subject: LU-20559 ofd: drain the exports of a failed mount
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: ca9da92af435c506ec0b4ce5e84eebf0d23a3908
+
+--- Comment (gerrit, Sun, 9 Aug 2026 19:01:22 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/67875
+
+Subject: LU-20559 tests: cover the OST mount error path
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 05d181dc912745691659cfd5b73e2dc8e6e23f0e
+
+--- Comment (gerrit, Sun, 23 Aug 2026 03:37:20 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/67820/
+
+Subject: LU-20559 target: drop an export reference on reply_data error
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 99831c2d31820580283e8f67a1ea54b570b5d4a1
+
+--- Comment (gerrit, Sun, 23 Aug 2026 03:37:46 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/67870/
+
+Subject: LU-20559 misc: keep updates out of assertion conditions
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: ffe1627adca33262bc7ece28887642d6c209b639
+
+--- Comment (gerrit, Mon, 24 Aug 2026 05:37:04 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68259
+
+Subject: LU-20559 lod: bound the lod_get_ea() retry for real
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 893928998d0c44b8e66852ae055971629e184d49
+
+--- Comment (gerrit, Mon, 24 Aug 2026 05:38:33 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68260
+
+Subject: LU-20559 lnet: keep nidstrings counters out of assertions
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 920183f6ff9fcff741f4e84c6aa931863162a743
+
+--- Comment (gerrit, Sun, 30 Aug 2026 16:56:57 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/68260/
+
+Subject: LU-20559 lnet: keep nidstrings counters out of assertions
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 98e93da7973d7bfc23fb1e0b350c32bb4479e933
+
+--- Comment (gerrit, Sun, 6 Sep 2026 22:05:36 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/68259/
+
+Subject: LU-20559 lod: bound the lod_get_ea() retry for real
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: ad63c5a9afe04c1369dff68525de420118053220
+
+--- Comment (gerrit, Fri, 18 Sep 2026 17:00:21 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/67818/
+
+Subject: LU-20559 target: don't LBUG on exports of a failed mount
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 2fd8273337b8da5dedf1f09c3b56c59db03f2868
+
+--- Comment (gerrit, Tue, 13 Oct 2026 04:20:55 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/67819/
+
+Subject: LU-20559 target: keep client records when a mount fails
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 1d28182983bd23a68bc91e84d999e584846c2852

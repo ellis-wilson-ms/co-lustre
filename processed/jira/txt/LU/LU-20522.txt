@@ -1,0 +1,169 @@
+Key:        LU-20522
+Summary:    recovery-small test_154a intermittently crashes
+Link:       https://jira.whamcloud.com/browse/LU-20522
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Oleg Drokin
+Created:    Sat, 25 Jul 2026 18:32:30 +0000
+Updated:    Thu, 13 Aug 2026 05:55:42 +0000
+Links:      Related: is related to  LU-16182; Related: is related to  LU-6602; Related: is related to  LU-15934
+
+--- Description ---
+recovery-small test_154a intermittently crashes the MDS with an out-of-bounds
+
+access in print_llog_hdr(), reached from lustre_swab_llog_hdr():\
+
+   BUG: unable to handle kernel paging request at ffff9857f0a959ca
+  RIP: 0010:print_llog_hdr+0x568/0x6b0 [obdclass]
+  RAX: 00000000dc75d9ce RBX: ffff985714338000
+  CR2: ffff9857f0a959ca
+  Comm: lod0000_rec0001
+  Call Trace:
+   lustre_swab_llog_hdr+0x37/0x140 [obdclass]
+   llog_osd_read_header+0x4b1/0xb60 [obdclass]
+   llog_read_header+0x6a/0x390 [obdclass]
+   llog_init_handle+0xf2/0xad0 [obdclass]
+   lod_sub_prep_llog+0x581/0xcd9 [lod]
+   lod_sub_recovery_thread+0xd6/0xef0 [lod]
+
+Observed in both boilpot and maloo
+
+https://testing.whamcloud.com/test_sets/45052dfe-8146-44f2-9908-c27f75d07a16
+
+https://testing.whamcloud.com/gerrit-janitor/external/crashes/boilpot-bigmem2-112-2026-07-25-04:00:02
+
+AI root cause:
+
+LLOG_HDR_TAIL() locates the header tail at llh_hdr.lrh_len - 8 bytes from the
+
+start of the header buffer. lustre_swab_llog_hdr() dereferences it twice
+
+without ever bounding lrh_len, which at that point is raw data from disk or
+
+from the wire:
+
+  print_llog_hdr()       CDEBUG(D_OTHER) of LLOG_HDR_TAIL(h)->lrt_index and
+
+                         ->lrt_len - an out-of-bounds read
+
+  lustre_swab_llog_rec() __swab32s() of those same two fields via
+
+                         tail = LLOG_HDR_TAIL(llh) - an out-of-bounds WRITE
+
+The first print_llog_hdr() call happens before the header is swabbed, so
+
+lrh_len is still in the peer's byte order. Even a perfectly valid
+
+foreign-endian header therefore reads ~2MB past an 8KB buffer:
+
+__swab32(8192) == 0x00200000.
+
+test_154a overwrites an update log catalog with /dev/urandom and expects the
+
+corrupt log to be rejected. About 1 random lrh_type in 4096 satisfies
+
+LLOG_REC_HDR_NEEDS_SWABBING() - the condition is
+
+(lrh_type & 0x0000f0ff) == 0x00006010 - which sends the random header into
+
+lustre_swab_llog_hdr() and dereferences the tail at a random multi-gigabyte
+
+offset. That is the intermittency.
+
+The registers confirm this exactly rather than by inference: the faulting
+
+instruction is "mov edx,[rbx+rax-4]", RAX holds the on-disk lrh_len
+
+0xdc75d9ce, RBX the header buffer at ffff985714338000, and
+
+RBX + RAX - 4 == CR2, i.e. LLOG_HDR_TAIL(h)->lrt_index precisely.
+
+WHY IT ONLY APPEARS RECENTLY
+
+The unbounded dereference dates to dc689955366c ("lrh_len LU-6602 obdclass: variable
+
+llog chunk size", 2015, first in 2.7.56), which replaced the fixed
+
+&llh->llh_tail member with the lrh_len-derived LLOG_HDR_TAIL() macro. Nothing
+
+about the call path changed since - the lustre_swab_llog_hdr() call in
+
+llog_osd_read_header() is unchanged since 0d43b8d1b0 (LU-1302) and
+
+LLOG_REC_HDR_NEEDS_SWABBING() since the b1_5 landing.
+
+What is new is the exposure: nothing fed a corrupt header into that path
+
+until test_154a landed in 54301fe4f5 ("LU-15934 tests: add a test case for
+
+update llog", first in 2.15.57), and its MDS1_VERSION >= 2.15.60.2 guard
+
+means it only actually runs on builds from about 2.15.61 on. At 1 in 4096 per
+
+run, a first sighting in Sept 2024 is consistent.
+
+It is not test-only. lod_update_log_stale() (added in b054fcd785, "LU-16159
+
+lod: cancel update llogs upon recovery abort") swabs an on-disk header during
+
+ordinary stale update log cleanup with no length check at all, so any DNE
+
+filesystem that hits a damaged or truncated update log can take the same
+
+path. The RMF_LLOG_LOG_HDR reply swabber registered in ptlrpc/layout.c is a
+
+third caller, where a foreign-endian peer could reach the out-of-bounds
+
+write over the network; that one is hardening and has not been demonstrated.
+
+Note the out-of-bounds WRITE in lustre_swab_llog_rec() is the more dangerous
+
+half: when the computed address happens to be mapped it silently corrupts 8
+
+bytes of kernel memory instead of panicking, and it does not depend on
+
+D_OTHER being enabled.
+
+AI-suggested fix:
+
+Bound lrh_len to the range llog_init_handle() can actually allocate, and
+
+require a power of two, before dereferencing the tail in either place.
+
+Callers detect the still-unswabbed header through their existing lrh_type and
+
+lrh_len checks and return -EINVAL, which lod_sub_prep_llog() already handles
+
+by renewing the log. Fixing it in the swabber covers all three callers.
+
+--- Comment (green, Sat, 25 Jul 2026 18:36:08 +0000) ---
+Related: lrh_len LU-6602 introduced the dereference, LU-15934 added the test that exposes it, lrh_index == tail->lrt_index ) failed" class="issue-link" data-issue-key="LU-16182">LU-16182 is adjacent llog corruption hardening.
+
+--- Comment (gerrit, Sat, 25 Jul 2026 18:39:10 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/67532
+
+Subject: LU-20522 obdclass: bound llog header length before using the tail
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 663cd57746d9d301a4582dd8cbd9dbe297716e6b
+
+--- Comment (gerrit, Thu, 13 Aug 2026 05:55:42 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/67956
+
+Subject: LU-20522 obdclass: bound llog record length before using the tail
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 57d18cee3b4383da4e86647f61dfbd57d4f0ee25

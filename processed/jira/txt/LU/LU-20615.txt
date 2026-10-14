@@ -1,0 +1,121 @@
+Key:        LU-20615
+Summary:    obdclass: jobid_name width wrap causes a one-byte out-of-bounds write
+Link:       https://jira.whamcloud.com/browse/LU-20615
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Oleg Drokin
+Created:    Thu, 20 Aug 2026 16:37:38 +0000
+Updated:    Sun, 23 Aug 2026 01:50:18 +0000
+
+--- Description ---
+Found by AI review while working on LU-20614.  Pre-existing, not
+
+introduced by that ticket's patches, and not triggered by them.
+
+lustre/obdclass/jobid.c, jobid_interpret_string(), parses an optional
+
+"%.N" field width out of obd_jobid_name:
+
+    static int jobid_interpret_string(const char *jobfmt, char *jobid,
+                                      ssize_t joblen)
+    {
+            ...
+            long width = joblen;
+            int l;
+            ...
+            if (*jobfmt == '.') {
+                    long w = 0;
+                    int size = 0;
+
+                    jobfmt++;
+                    if (sscanf(jobfmt, "%ld%n", &w, &size) == 1)
+                            jobfmt += size;
+                    if (w > 0)
+                            width = min(w+1, joblen);
+            }
+            ...
+            if (l >= width)
+                    l = width-1;
+            jobid += l;
+            joblen -= l;
+
+@w is a long read straight from the format string with no upper bound.
+
+With w = LONG_MAX:
+
+	w > 0 passes, and w + 1 overflows to LONG_MIN (signed overflow is
+
+    undefined behaviour in C; in practice it wraps), so
+
+    width = min(LONG_MIN, joblen) = LONG_MIN.
+
+	l >= width is then true, so l = width - 1, which wraps back to
+
+    LONG_MAX.
+
+	l is an int, so assigning LONG_MAX truncates to -1.
+
+	jobid += -1 moves the cursor one byte before the caller's buffer,
+
+    and joblen -= -1 grows the remaining count.
+
+The next literal character in the format then executes *jobid = c one
+
+byte before the buffer.  For the lustre_msg_set_jobinfo() caller that is
+
+pb_jobid[-1], i.e. the adjacent field of the on-wire ptlrpc_body.
+
+Reproducer (untested, but the arithmetic is confirmed by inspection):
+
+    lctl set_param jobid_var=nodelocal
+    lctl set_param jobid_name='%.9223372036854775807hX'
+    # 23 characters, so it fits in obd_jobid_name[LUSTRE_JOBID_SIZE]
+    # then drive any I/O so lustre_get_jobid() runs
+
+Note the trailing literal ("X" above) is what performs the write; a
+
+format ending at the escape only moves the cursor.
+
+Severity: setting jobid_name requires root on the client (lctl
+
+set_param), so this is not a privilege boundary crossing on its own.  It
+
+is still a memory-safety defect reachable from a supported tunable, the
+
+overflow of w + 1 is undefined behaviour that a compiler is free to
+
+optimise unpredictably, and the write lands in a network message buffer.
+
+Suggested fix: bound w before use – reject or clamp anything larger
+
+than joblen (or LUSTRE_JOBID_SIZE) rather than relying on min() after
+
+the increment – and make the types consistent so the width arithmetic
+
+cannot wrap into l.  Worth auditing the other %-escape cases in the same
+
+switch for the same int/long mismatch while there.
+
+Note this does NOT invalidate the reasoning in the LU-20614 series:
+
+jobid + joblen is invariant across the loop, so joblen still cannot go
+
+negative and jobid_interpret_string() still always returns 0.  Only the
+
+cursor moves out of bounds.
+
+--- Comment (gerrit, Sun, 23 Aug 2026 01:50:18 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68227
+
+Subject: LU-20615 obdclass: bound the jobid_name field width
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 48456be3cee2c92eb2c674c98cdffe4774bc425f

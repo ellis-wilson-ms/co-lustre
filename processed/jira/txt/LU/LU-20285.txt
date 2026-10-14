@@ -1,0 +1,182 @@
+Key:        LU-20285
+Summary:    replaces an indirect heuristic (vui_ra_valid flag) with a direct check of the I/O type (CIT_FAULT)
+Link:       https://jira.whamcloud.com/browse/LU-20285
+Type:       Bug
+Priority:   Medium
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Xiyang Wang
+Reporter:   Xiyang Wang
+Created:    Wed, 20 May 2026 12:05:21 +0000
+Updated:    Tue, 16 Jun 2026 09:20:20 +0000
+Resolved:   Mon, 8 Jun 2026 01:15:33 +0000
+Labels:     patch
+
+--- Description ---
+The patch replaces an indirect heuristic (vui_ra_valid flag)
+
+with a direct check of the I/O type (CIT_FAULT),
+
+which represents a page fault handling operation
+
+(typically triggered by mmap'd page access).
+
+CIT_FAULT explicitly indicates the I/O is happening
+
+due to a page fault from a memory-mapped region,
+
+rather than inferring from readahead validity.
+
+--- Comment (JIRAUSER22000, Wed, 20 May 2026 12:06:48 +0000) ---
+Comes from https://jira.whamcloud.com/browse/GCP-250.
+
+Author: Jinshan Xiong 
+Date:   Thu May 14 20:04:12 2026 +0000
+
+    Identify the mmap use case properly
+
+    Change-Id: Iffd069b67a4b28e630b834886ff1679c501c2b74
+
+diff --git a/lustre/llite/rw.c b/lustre/llite/rw.c
+index f6836627fe..753c9613e9 100644
+--- a/lustre/llite/rw.c
++++ b/lustre/llite/rw.c
+@@ -1742,8 +1742,7 @@ int ll_io_read_page(const struct lu_env *env, struct cl_io *io,
+        struct cl_sync_io         *anchor = NULL;
+        int                        rc = 0, rc2 = 0;
+        bool                       uptodate;
+-       struct vvp_io *vio = vvp_env_io(env);
+-       bool mmap = !vio->vui_ra_valid;
++       bool mmap = !!(io->ci_type == CIT_FAULT);
+        pgoff_t ra_start_index = 0;
+        pgoff_t io_start_index;
+        pgoff_t io_end_index;
+
+--- Comment (gerrit, Wed, 20 May 2026 13:39:57 +0000) ---
+"Xiyang Wang " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/66029
+
+Subject: LU-20285 llite: GCP-250: a fix of mmap read ahead logic
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 633c846134683413038aa8a6d33c9ba3baf60e16
+
+--- Comment (JIRAUSER22000, Wed, 20 May 2026 13:44:04 +0000) ---
+Change-Id:  I9cfd098c6d3e84a438eb8f30d74a66c47ee46208
+
+b_es6_0 --> https://review.whamcloud.com/c/ex/lustre-release/+/66016
+
+b_es7_0 --> https://review.whamcloud.com/c/ex/lustre-release/+/66028
+
+master   --> https://review.whamcloud.com/c/ex/lustre-release/+/66029
+
+--- Comment (JIRAUSER22000, Sat, 23 May 2026 09:13:59 +0000) ---
+Since somebody have some questions on this change, i studied the code a little.
+
+The old sign was initialized in cl_io_init as false 
+
+ 
+
+  cl_io_init(env, io, io_type, obj)
+      └─ coo_io_init()  // cl_object_operations
+          └─ vvp_io_init(env, obj, io)  
+
+ 
+
+and set true only in read process, the code like this.
+
+ 
+
+static int vvp_io_read_start(const struct lu_env *env,
+                               const struct cl_io_slice *ios){
+      struct vvp_io *vio = cl2vvp_io(env, ios);
+      struct cl_io *io = ios->cis_io;
+      struct cl_object *obj = io->ci_obj;
+      struct inode *inode = vvp_object_inode(obj);
+      struct ll_inode_info *lli = ll_i2info(inode);
+      struct file *file = vio->vui_fd->fd_file;
+      loff_t pos = io->u.ci_rd.rd.crw_pos;
+      size_t crw_bytes = io->u.ci_rd.rd.crw_bytes;
+      size_t tot_bytes = vio->vui_tot_bytes;
+      int result;
+      ENTRY;
+      trunc_sem_down_read(&lli->lli_trunc_sem);
+      // ━━━ return 1: async read ━━━
+      if (io->ci_async_readahead) {
+          file_accessed(file);
+          RETURN(0);  // ← vui_ra_valid remains false
+      }
+      // ━━━ return 2: Layout change  ━━━
+      if (!can_populate_pages(env, io, inode))
+          RETURN(0);  // ← vui_ra_valid remains false
+      // ━━━ return 3: LRU preserve failed  ━━━
+      flags = iocb_ki_flags_get(file, vio->vui_iocb);
+      if (!iocb_ki_flags_check(flags, DIRECT)) {
+          result = cl_io_lru_reserve(env, io, pos, crw_bytes);
+          if (result)
+              RETURN(result);  // ← vui_ra_valid remains false
+      }
+      // ━━━ erturn 4: filesize check  ━━━
+      result = vvp_prep_size(env, obj, io, pos, crw_bytes, &exceed);
+      if (result != 0)
+          RETURN(result);  // ← vui_ra_valid remains false
+      else if (exceed != 0)
+          GOTO(out, result);  // ← vui_ra_valid remains false
+      // ━━━ set true  ━━━
+      /* initialize read-ahead window once per syscall */
+      if (!vio->vui_ra_valid) {
+          vio->vui_ra_valid = true;  // vui_ra_valid set true
+          vio->vui_ra_start_idx = pos >> PAGE_SHIFT;
+          vio->vui_ra_pages = 0;
+          page_offset = pos & ~PAGE_MASK;
+          if (page_offset) {
+              vio->vui_ra_pages++;
+              if (tot_bytes > PAGE_SIZE - page_offset)
+                  tot_bytes -= (PAGE_SIZE - page_offset);
+              else
+                  tot_bytes = 0;
+          }
+          vio->vui_ra_pages += (tot_bytes + PAGE_SIZE - 1) >> PAGE_SHIFT;
+          CDEBUG(D_READA, "tot %zu, ra_start %lu, ra_count %lu\n",
+                 vio->vui_tot_bytes, vio->vui_ra_start_idx,
+                 vio->vui_ra_pages);
+      }
+      // ━━━ actually  I/O (第 892 行) ━━━
+      result = generic_file_read_iter(vio->vui_iocb, &iter);
+      // this will cause page_fault → ll_readpage() → ll_io_read_page()
+      ......
+}
+
+ 
+
+as we can see, if vio->vui_ra_valid remains false, it won't trigger ll_io_read_page(). 
+
+This means when in ll_io_read_page(), if the sign is true, it will no doubtly comes from a REAL read.
+
+But if the sign is false, it will comes from Not only mmap, but also a normal write with page fault.
+
+Regarding a write as a mmap won't affect this function's correctness, because ll_io_read_page() still will grab the page, 
+
+but it may cause more RPCs as a mmap, miscalculate the statistic info and affect the RAS policy. 
+
+So the change is more precise.
+
+--- Comment (gerrit, Mon, 8 Jun 2026 00:22:55 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/66029/
+
+Subject: LU-20285 llite: identify mmap use case by checking CIT_FAULT
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: a9efacc73011dac216712a978f333109664ebea1
+
+--- Comment (pjo, Mon, 8 Jun 2026 01:15:34 +0000) ---
+Merged for 2.18

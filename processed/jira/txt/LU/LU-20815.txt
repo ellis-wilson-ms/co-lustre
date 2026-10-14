@@ -1,0 +1,93 @@
+Key:        LU-20815
+Summary:    Repeated symlink opens cause MDT OI/IAM lock contention causing high latency and MDS cpu usage
+Link:       https://jira.whamcloud.com/browse/LU-20815
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Vadakkumuri Valappil Abooback
+Created:    Wed, 23 Sep 2026 16:24:19 +0000
+Updated:    Fri, 2 Oct 2026 05:02:04 +0000
+
+--- Environment ---
+2.15.5
+
+--- Description ---
+Problem
+
+A workload repeatedly opens a small, fixed set of symlinks. With hundreds of clients accessing the same subset of symlinks in a directory, the Lustre client sends each symlink open to the MDT rather than reusing a cached completed open. The resulting aggregate request rate concentrates on the same directory, FIDs and a few OI/IAM leaves, causing severe MDT lookup contention.
+
+The affected symlink objects map to OI container oi.16.57, concentrated in IAM leaves 3-5. The observed MDT path is:
+
+ 
+
+mdt_reint_open
+
+  → mdd_lookup
+
+  → __osd_oi_lookup
+
+  → iam_it_get / __iam_it_get
+
+  → dynlock_lock
+
+Perf attributed approximately 99% of sampled call chains to the OI/IAM path, with about 53% in queued-spinlock slow paths. During the unthrottled workload, the MDT showed hundreds of blocked/runnable workers, approximately 90% system CPU, negligible I/O wait, poor open throughput, and extreme open tail latency.
+
+The behavior is consistent with inline OI consistency validation. After directory lookup, osd_ldiskfs_consistency_check() performs another osd_oi_lookup() to compare the directory-entry inode mapping against the OI mapping. This additional lookup increases pressure on hot IAM leaves.
+
+Observed mitigations
+
+	auto_scrub=0 diagnostic comparison
+
+Disabling automatic scrub eligibility bypasses the inline OI consistency check and caused a large improvement in open rate and latency. This is not a preferred permanent workaround because it sacrifices automatic OI inconsistency detection. It also shifts the bottleneck toward LDLM AST/lock-cancellation processing.
+
+	NRS TBF on ldlm_enqueue
+
+A TBF rule limiting ldlm_enqueue to 1600 with a 32-partition table limits aggregate opens to approximately 100k opens/s. This maintains microsecond-scale latency and substantially reduces CPU utilization.
+
+This is currently the better operational workaround, but it enforces a throughput cap which may be ok. It protects MDT responsiveness by restricting the workload rather than resolving the underlying OI/IAM contention.
+
+ 
+
+Enhancement requests
+
+	Server side: investigate reducing contention in the OI consistency-check and IAM lookup path, especially for objects concentrated in hot IAM leaves. Potential areas include reducing redundant OI lookups where correctness permits, shortening lock hold/concurrency amplification, or introducing more targeted fairness/backpressure than a global ldlm_enqueue rate cap.
+
+	Client side: investigate caching or suppressing redundant repeated symlink opens, with correct invalidation and close-to-open semantics. This is particularly important when thousands of clients operate on the same small symlink subset.
+
+Collected evidence
+
+	perf report --stdio for the unthrottled contention interval.
+
+	MDT md_stats and CPU data for baseline and throttled cases.
+
+	Lustre debugs with inode and LDLM enabled
+
+	Open rate, latency percentiles, and CPU for:
+	
+		unthrottled baseline,
+
+		TBF-limited workload,
+
+		auto_scrub=0 diagnostic comparison.
+
+	
+	
+
+	OI/IAM mapping the symlinks  to oi.16.57, leaves 3-5.
+
+	Workload details: 100s of client hitting a small subset of symlinks. In problem reproduction scenario, 200 symlinks on the same MDT was used.
+
+--- Comment (gerrit, Fri, 2 Oct 2026 05:02:04 +0000) ---
+"wangdi " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69373
+
+Subject: LU-20815 mdt: return lookup lock on symlink open
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 9fbc38b04f25eb6142cc351295392fab4b28521d

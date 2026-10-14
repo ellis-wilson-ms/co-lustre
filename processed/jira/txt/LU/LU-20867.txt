@@ -1,0 +1,122 @@
+Key:        LU-20867
+Summary:    sanity-sec test_79: Timeout occurred after 313 minutes
+Link:       https://jira.whamcloud.com/browse/LU-20867
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Maloo
+Created:    Fri, 2 Oct 2026 13:23:11 +0000
+Updated:    Thu, 8 Oct 2026 22:19:41 +0000
+
+--- Description ---
+sanity-sec test_79 TIMEOUTs in the review-dne-selinux-ssk-part-2 test group (lustre-reviews, el8.10 and el9.8 x86_64 servers/clients):
+
+Timeout occurred after 313 minutes, last suite running was sanity-sec
+
+The test hangs right after the first client remount with the c0 key (gssonly_identification), at "[[ -f $DIR/this_is_c0 ]]".  It is failing across unrelated patches (several of which only touch lustre/tests).
+
+Frequency: 4 TIMEOUT out of 33 non-skipped test_79 runs in lustre-reviews on 2026-10-01..02 (all in review-dne-selinux-ssk-part-2, on both el8.10 and el9.8; test_79 is skipped without shared keys).  lustre-master has no sanity-sec runs in the scanned sessions.  The code involved (lsvcgssd nodemap lookup, test_79, the full OST remounts in test_70/test_75b) all landed between 2024 and June 2026, so there is no obvious recent landing that started it; a possible but unconfirmed contributor is 14cf8275e232 ("LU-20087 tests: fix sanity-sec/27ad hang with shared key", landed 2026-08-22), which adds another per-nodemap SSK mount before test_70.
+
+Example sessions:
+
+	https://testing.whamcloud.com/test_sessions/8082e408-13ae-49b3-8f3b-fe8a5f00f225 (review 69363, el8.10)
+
+	https://testing.whamcloud.com/test_sessions/f8abc11a-12d3-4990-af7c-9564eaaa76ab (review 63189, el8.10)
+
+	https://testing.whamcloud.com/test_sessions/83e643f3-fb77-4fdc-9b99-6eb02f43770c (review 63188, el8.10)
+
+	https://testing.whamcloud.com/test_sessions/44aa4198-e816-4e66-ac5e-9ac4c8e93742 (el9.8)
+
+	https://testing.whamcloud.com/test_sessions/384b320f-f919-4696-8bb0-9af18f980b0c (el9.8)
+
+Client stat is stuck in a glimpse because GSS context negotiation to the OSTs never succeeds:
+
+LustreError: gss_keyring.c:1858:gss_kt_update()) lustre-OST0000_UUID at 10.240.38.135@tcp: negotiation: rpc err 0, gss err d0000
+LustreError: gss_keyring.c:1858:gss_kt_update()) Skipped 3813 previous similar messages
+
+task:bash state:I pid:850930
+ cl_sync_io_wait+0xda/0x350 [obdclass]
+ cl_lock_request+0x1b5/0x1e0 [obdclass]
+ cl_glimpse_lock+0x1ef/0x2a0 [lustre]
+ __cl_glimpse_size+0x168/0x2a0 [lustre]
+ ll_getattr_dentry+0xbec/0x1140 [lustre]
+ vfs_statx+0x8a/0xe0
+
+On the OSS, lsvcgssd sends the gss identification nodemap lookup ioctl to the wrong obd device, so the rsi upcall fails:
+
+LustreError: 9815:0:(ofd_obd.c:1327:ofd_iocontrol()) lustre-OST0000: iocontrol from 'lsvcgssd' cmd=c00866c5 _IOWR('f', 197, 8) unrecognized: rc = -25
+LustreError: 597333:0:(gss_svc_upcall.c:904:gss_svc_upcall_handle_init()) lustre-OST0000: failed to get entry from rsi cache (nid 10.240.38.133@tcp): rc = -43
+
+In session 83e643f3 the same ioctl lands on lustre-OST0006-osd on the OSS and on lustre-MDT0003-osd on MDS2:
+
+LustreError: 13487:0:(obd_class.h:1208:obd_iocontrol()) lustre-OST0006-osd: no obd_iocontrol operation
+LustreError: 5864:0:(obd_class.h:1208:obd_iocontrol()) lustre-MDT0003-osd: no obd_iocontrol operation
+LustreError: 349718:0:(gss_svc_upcall.c:904:gss_svc_upcall_handle_init()) lustre-MDT0001: failed to get entry from rsi cache (nid 10.240.46.101@tcp): rc = -43
+
+--- Comment (adilger, Fri, 2 Oct 2026 13:34:03 +0000) ---
+Analysis of the hang (sessions 8082e408 and 83e643f3):
+
+The client is not hung in the test itself but in the stat from "[[ -f $DIR/this_is_c0 ]]" after remounting with the c0 key: ll_getattr_dentry() -> cl_glimpse_lock() waits forever because the OSC import can never establish a GSS context.  lgss_keyring retries ctx init every few seconds and gets GSS_S_FAILURE (gss err d0000) from the OSS (and in 83e643f3 also from MDT0001/MDT0003 on MDS2).
+
+On those servers lsvcgssd handles the SK ctx init, sees that the nodemap hash sent by the client (c0, gssonly_identification) differs from the nodemap inferred from the client NID, and calls nodemap_lookup_by_sha() (lustre/utils/gss/svcgssd_proc.c).  That sends OBD_IOC_NODEMAP/LCFG_NODEMAP_LOOKUP_SHA to data.ioc_dev = srv_ioc_dev, but the ioctl reaches the wrong obd device:
+
+OSS:  ofd_iocontrol()) lustre-OST0000: iocontrol from 'lsvcgssd' cmd=c00866c5 _IOWR('f', 197, 8) unrecognized: rc = -25
+OSS:  obd_iocontrol()) lustre-OST0006-osd: no obd_iocontrol operation
+MDS2: obd_iocontrol()) lustre-MDT0003-osd: no obd_iocontrol operation
+
+so the lookup fails, lsvcgssd rejects the context, and gss_svc_upcall_handle_init() reports "failed to get entry from rsi cache: rc = -43" for every attempt.
+
+Cause: srv_ioc_dev is the obd index of the "OSS"/"MDS" device, resolved once by set_srv_ioc_dev() (at daemon start, or on the first lookup) and then cached for the lifetime of lsvcgssd.  But server_stop_servers() (lustre/target/tgt_mount.c) cleans up the OSS/MDS obd when the last OST/MDT on the node is unmounted, and the next mount creates it again, possibly at a different index that is then reused by an OST/OSD device.  lsvcgssd is not restarted across server remounts (pid 9815 on the OSS in 8082e408 is the instance started at boot; later "lsvcgssd" starts in test-framework exit via gssd_init_unique()), and sanity-sec test_70 and test_75b unmount and remount all OSTs before test_79.  Once any earlier test has made lsvcgssd resolve srv_ioc_dev, test_79's lookups go to a stale index.  The MGS node is not affected because it looks up the "MGS" device, which stays put.
+
+The failure is intermittent because it needs both an earlier lookup that caches srv_ioc_dev on that server and the OSS/MDS obd coming back at a different index after the remount.
+
+Possible fixes:
+
+	in lsvcgssd, resolve the device by name (OBD_IOC_NAME2DEV) for each nodemap_lookup_by_sha() call instead of caching srv_ioc_dev, or re-resolve and retry once when the ioctl fails with ENOTTY/EINVAL; and/or
+
+	make the OBD_IOC_NODEMAP lookup independent of a specific device index (e.g. accept it on any server target device, or address it by name).
+
+The test itself should also not wait forever on a failed context negotiation; a bounded wait on the stat would turn this into a quick FAIL instead of a 90-minute session TIMEOUT.
+
+--- Comment (gerrit, Fri, 2 Oct 2026 16:50:04 +0000) ---
+"Sebastien Buisson " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69382
+
+Subject: LU-20867 gss: re-resolve lsvcgssd ioctl device on failure
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 75a744890e06a25b859f5e88316f146b5358f8c8
+
+--- Comment (sebastien, Fri, 2 Oct 2026 16:55:05 +0000) ---
+Thanks Andreas for the detailed analysis. I have pushed patch "LU-20867 gss: re-resolve lsvcgssd ioctl device on failure" to fix this problem. I chose to retry in case of ioctl failure, because the ioctl is not cheap so resolving the device for every call to nodemap_lookup_by_sha might be too expensive.
+
+--- Comment (adilger, Fri, 2 Oct 2026 17:59:35 +0000) ---
+sebastien, could you please confirm the analysis above and comment on the proposed fixes?
+
+Summary: this looks like a code defect in lsvcgssd rather than a test defect.  test_79 only exposes it:
+
+	lsvcgssd caches the "OSS"/"MDS" obd index in srv_ioc_dev for the life of the daemon, but server_stop_servers() destroys that obd when the last target on the node is unmounted, and the next mount can recreate it at a different index.  lsvcgssd normally keeps running across target unmount/remount (failover, maintenance), so in production too, after such a remount every client needing nodemap_lookup_by_sha() (gssonly_identification, or an SSK key whose nodemap differs from the NID nodemap) would be refused on that server until lsvcgssd is restarted.
+
+	The client cannot recover by itself: it already retries ctx negotiation every few seconds, but the server fails the same way each time because of the stale index.
+
+Proposed fixes:
+
+	lsvcgssd: resolve the device by name (OBD_IOC_NAME2DEV) for each nodemap_lookup_by_sha() call instead of caching srv_ioc_dev, or re-resolve and retry once if the ioctl fails.  The lookup only happens at context setup, so the extra ioctl is negligible.
+
+	sanity-sec test_79: bound the wait after the remounts, so a failed context negotiation gives a quick FAIL instead of a 90-minute session TIMEOUT.
+
+Does that match your understanding, and is there a reason srv_ioc_dev needs to be cached?
+
+--- Comment (sebastien, Mon, 5 Oct 2026 06:29:21 +0000) ---
+Yes, this analysis makes sense. But I still think it is better to cache srv_ioc_dev. Updating it in case of ioctl failure is not very expensive, but fetching it for every nodemap_lookup_by_sha() call is not exactly cheap. In some environments with lots of clients in constantly changing nodemaps, context setup can happen very frequently.
+
+--- Comment (adilger, Thu, 8 Oct 2026 22:19:41 +0000) ---
+I agree that a short-term cache is useful, and refreshing only on error is much less expensive.  I might have accidentally asked the agent to post to this ticket twice.
+
+The sanity-sec test_79 failure is fairly common so important to get this patch landed.

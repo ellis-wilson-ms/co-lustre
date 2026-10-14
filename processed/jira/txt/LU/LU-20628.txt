@@ -1,0 +1,377 @@
+Key:        LU-20628
+Summary:    lst add_test brw crashes the test node for unvalidated size= and off= parameters
+Link:       https://jira.whamcloud.com/browse/LU-20628
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Oleg Drokin
+Created:    Mon, 24 Aug 2026 04:47:25 +0000
+Updated:    Mon, 24 Aug 2026 06:08:53 +0000
+
+--- Description ---
+ai generated content:
+
+Two related defects in the same code path, both reached from an
+
+ordinary `lst add_test brw` command line with no debug options, both
+
+filed here because they share the same cause (brw bulk parameters are
+
+never bounded before they reach the page-vector arithmetic), the same
+
+files, and one fix series.
+
+Justified by what was DEMONSTRATED, not asserted:
+
+	Defect A reproduced twice, on two kernels:
+
+	rocky8 4.18.0-553.89.1.el8_10_lustre, Lustre 2.17.57: kernel
+
+        panic (LBUG) within a second of `lst add_test`.
+
+	rocky9 5.14.0-611.55.1.el9_7_lustre + KASAN, master 9db228beb2:
+
+        "BUG: KASAN: slab-out-of-bounds in srpc_init_bulk()", read of
+
+        size 8, "0 bytes to the right of allocated 48-byte region".
+
+	Defect A is WIRE-REACHABLE.  The out-of-bounds access happens on
+
+    the ADD_TEST RPC service thread, i.e. the offending parameter
+
+    arrived from the console node (stack: srpc_handle_rpc ->
+
+    sfw_bulk_ready -> sfw_add_test -> sfw_add_test_instance ->
+
+    brw_client_init -> srpc_init_bulk).  Any node that has joined an
+
+    LST session can be crashed, or its heap corrupted, by the session
+
+    console.  It is not limited to local argv.
+
+	Defect A is a heap WRITE, not only a read: srpc_init_bulk() reads
+
+    bk_iovs[i].bv_page out of bounds and, whenever that stale slab word
+
+    is non-NULL, srpc_init_bulk_page() then stores bv_offset and bv_len
+
+    at the same out-of-bounds index before the trailing LASSERTF
+
+    notices anything.  In both runs the stale word happened to be NULL
+
+    and the node took the LBUG instead; the write is one branch away
+
+    and depends only on what the slab allocator last left there.
+
+	Defect B reproduced on rocky8 2.17.57: `lst add_test ... brw read
+
+    size=4095` is accepted, and the node panics on `lst run`, before
+
+    any bulk RPC is sent.  It needs no unusual option - `size=` is a
+
+    documented parameter and check=none is the DEFAULT.
+
+Environment:
+
+master (9db228beb2, 2.17.57).  Any node running lnet_selftest.
+
+================================================================
+
+DEFECT A - off= with a page-multiple size= overruns the bulk allocation
+
+================================================================
+
+Introduced by:
+
+  e502638050a6 ("LU-16011 lnet: use preallocate bulk for server"),
+
+  2024-02-06.  It split srpc_alloc_bulk() from srpc_init_bulk() and
+
+  dropped the offset from the allocation size.  Before it,
+
+  brw_client_init() computed
+
+        npg = (off + len + PAGE_SIZE - 1) >> PAGE_SHIFT;
+
+  and both rejected npg out of range and passed npg to
+
+  srpc_alloc_bulk().  Both were lost.  Verified with `git show` and
+
+  `git blame -w -M -C`.
+
+lnet/selftest/rpc.c:121 srpc_alloc_bulk(cpt, bulk_len)
+        int bulk_npg = (bulk_len + PAGE_SIZE - 1) >> PAGE_SHIFT;
+        LIBCFS_CPT_ALLOC(bk, ..., offsetof(struct srpc_bulk,
+                                           bk_iovs[bulk_npg]));
+
+The offset is not part of the sizing.
+
+lnet/selftest/rpc.c:156 srpc_init_bulk(bk, bulk_off, bulk_len, sink)
+        for (i = 0; bulk_len > 0; i++) {
+                LASSERT(bk->bk_iovs[i].bv_page != NULL);      /* rpc.c:175 */
+                nob = min_t(unsigned int, bulk_off + bulk_len,
+                            PAGE_SIZE) - bulk_off;
+                srpc_init_bulk_page(bk, i, bulk_off, nob); /* WRITES bk_iovs[i] */
+                bulk_len -= nob; bulk_off = 0;
+        }
+        bk->bk_niov = i;
+        LASSERTF(bk->bk_niov >= 0 && bk->bk_niov bk_alloc, ...);
+
+The walk needs ceil((off + len) / PAGE_SIZE) entries; only
+
+ceil(len / PAGE_SIZE) were allocated.  The trailing LASSERTF is a
+
+post-hoc detector, not a guard - it runs after the out-of-bounds write
+
+has already happened.
+
+Nothing upstream bounds off + len:
+
+	brw_test.c:85 brw_client_init() checks off % BRW_MSIZE,
+
+    len > LNET_MTU, opc and flags - never the resulting page count.
+
+	lst.c:3543 lst_get_bulk_param() bounds only blk_size  LNET_MTU, off 
+
+Two further crashes in the same function from the same missing check:
+
+	A zero length (blk_len = 0 over the wire, or a blk_npg product that
+
+    overflows unsigned int on the pre-LST_FEAT_BULK_LEN path) gives
+
+    bulk_npg == 0 and trips
+
+    LASSERT(bulk_npg > 0 && bulk_npg brw_test.c:293 brw_client_prep_rpc() recomputes
+
+        npg = (off + len + PAGE_SIZE - 1) >> PAGE_SHIFT;
+
+    from breq->blk_offset WITHOUT the `& ~PAGE_MASK` that
+
+    brw_client_init() applies, so `off=4096` makes the two disagree.
+
+    The resulting unsafe_memcpy() reads past the source bulk, and the
+
+    rpc-reuse path then trips
+
+    LASSERT(nblk == rpc->crpc_bulk.bk_niov) in sfw_create_test_rpc().
+
+Server side: NOT exposed for defect A.  brw_server_handle()
+
+(brw_test.c:474) and sfw_alloc_pages() (framework.c:1169) both call
+
+srpc_init_bulk() with off == 0 against a descriptor preallocated for
+
+LNET_MTU, and brw_len is bounded to (0, LNET_MTU].  The exposure is
+
+entirely on the --from node, which is still a remote node from the
+
+console's point of view.
+
+Steps to reproduce (single node is enough; it is both console and test
+
+node):
+
+  NID=$(lctl list_nids | head -1)
+  modprobe lnet_selftest
+  export LST_SESSION=$$
+  lst new_session --force repro
+  lst add_group self $NID
+  lst add_batch bulk
+  lst add_test --batch bulk --from self --to self brw read size=4096 off=8
+  # node panics here, before `lst run`
+
+Any off= that is not 0 together with a size= that is a multiple of
+
+PAGE_SIZE does it, e.g. `off=8 size=8k`, `off=1024 size=32k`.
+
+Actual:
+
+  LNetError: (rpc.c:175:srpc_init_bulk()) ASSERTION( bk->bk_iovs[i].bv_page
+              != ((void *)0) ) failed:
+  LNetError: (rpc.c:175:srpc_init_bulk()) LBUG
+  Kernel panic - not syncing: LBUG
+  Workqueue: lst_s swi_wi_action [lnet_selftest]
+  Call Trace:
+   lbug_with_loc.cold.7+0x5/0x43 [libcfs]
+   srpc_init_bulk+0x102/0x2d0 [lnet_selftest]
+   brw_client_init+0xbc/0x1e0 [lnet_selftest]
+   sfw_add_test_instance.isra.21+0xc02/0xc60 [lnet_selftest]
+   sfw_add_test+0x1a6/0x510 [lnet_selftest]
+   sfw_bulk_ready+0xa1/0x2b0 [lnet_selftest]
+   srpc_handle_rpc+0x390/0x4b0 [lnet_selftest]
+
+and on the KASAN kernel, before the LBUG:
+
+  BUG: KASAN: slab-out-of-bounds in srpc_init_bulk+0xb0/0x390 [lnet_selftest]
+  Read of size 8 at addr ffff8881059164b0 by task kworker/u8:5/843
+  Allocated by task 843:
+   srpc_alloc_bulk+0x25f/0x400 [lnet_selftest]
+   brw_client_init+0x1d3/0x2b0 [lnet_selftest]
+  The buggy address belongs to the object at ffff888105916480
+   which belongs to the cache kmalloc-64 of size 64
+  The buggy address is located 0 bytes to the right of
+   allocated 48-byte region [ffff888105916480, ffff8881059164b0)
+
+Expected:
+
+The test is either set up correctly, or refused with EINVAL.  No
+
+out-of-bounds access and no LBUG for any combination of off= and size=.
+
+================================================================
+
+DEFECT B - a size= that is not a multiple of 8 asserts in every mode
+
+================================================================
+
+Introduced by:
+
+  efcef00cb304 ("LU-5718 lnet: add offset for selftest brw"),
+
+  2016-09-20.  It gave brw_fill_page()/brw_check_page() their off and
+
+  len arguments and added
+
+        LASSERT(off % BRW_MSIZE == 0 && len % BRW_MSIZE == 0);
+
+  ABOVE the early return for the patterns that touch no data.  An
+
+  arbitrary blk_len had been possible since fe651f6b21 ("LU-521 lnet:
+
+  make LST support variable page size", 2011), so the assertion was
+
+  reachable from the day it was written.  Verified with `git log -L` on
+
+  the assertion line and `git merge-base --is-ancestor`.
+
+lnet/selftest/brw_test.c:136 brw_fill_page()
+
+        LASSERT(addr != NULL);
+        LASSERT(off % BRW_MSIZE == 0 && len % BRW_MSIZE == 0);  /* :144 */
+
+        if (pattern == LST_BRW_CHECK_NONE ||
+            pattern == LST_BRW_CHECK_DISCARD)
+                return;
+
+The assertion is above the early return, and brw_fill_bulk() is called
+
+unconditionally from brw_client_prep_rpc() (brw_test.c:308) for every
+
+RPC of the test, whatever the check mode.  A size= that is not a
+
+multiple of sizeof(__u64) therefore LBUGs the --from node even for
+
+check=none and check=discard, which write and verify nothing.
+
+brw_check_page() (brw_test.c:180) has the identical mis-ordering.
+
+Nothing rejects the length: brw_client_init() checks off % BRW_MSIZE
+
+but never len % BRW_MSIZE, and lst_get_bulk_param() bounds only
+
+blk_size  LNET_MTU.
+
+Server side: SAME defect, from a wire parameter.
+
+brw_server_handle() (brw_test.c:474) validates the incoming brw_len
+
+only against 0 and LNET_MTU, then calls
+
+        srpc_init_bulk(rpc->srpc_bulk, 0, reqst->brw_len, ...);
+
+        brw_fill_bulk(rpc->srpc_bulk, reqst->brw_flags, ...);
+
+so a peer that sends brw_len = 4095 with brw_flags =
+
+LST_BRW_CHECK_FULL LBUGs the --to node the same way.  This was NOT
+
+reproduced, because an unmodified console sends the same brw_flags to
+
+both ends and the --from node asserts first; it takes a modified or
+
+buggy peer to reach it.  It is still a kernel assertion driven by an
+
+unvalidated wire field and the fix must cover it.
+
+Why an odd length must be REFUSED when the data is checked, not merely
+
+tolerated: brw_fill_page() lays the pattern down in __u64 units, and
+
+the two ends split the same byte stream into different iovs (the
+
+client honours off=, the server always starts at 0).  Filling or
+
+checking a partial trailing __u64 would compare bytes that were never
+
+transferred and report spurious "Bulk data is corrupted!".  An odd
+
+length is meaningful only for the modes that do not inspect content.
+
+Steps to reproduce:
+
+  NID=$(lctl list_nids | head -1)
+  modprobe lnet_selftest
+  export LST_SESSION=$$
+  lst new_session --force repro
+  lst add_group self $NID
+  lst add_batch bulk
+  lst add_test --batch bulk --from self --to self brw read size=4095
+  lst run bulk
+  # node panics here
+
+`brw write size=4095`, `brw read size=4095 check=full` and
+
+`brw read size=4095 check=discard` all panic the same way.
+
+Actual:
+
+  LustreError: (brw_test.c:144:brw_fill_page()) ASSERTION( off %
+               sizeof(__u64) == 0 && len % sizeof(__u64) == 0 ) failed:
+  LustreError: (brw_test.c:144:brw_fill_page()) LBUG
+  Kernel panic - not syncing: LBUG
+  Workqueue: lst_t swi_wi_action [lnet_selftest]
+  Call Trace:
+   lbug_with_loc.cold.7+0x5/0x43 [libcfs]
+   brw_fill_page+0xd8/0x1a0 [lnet_selftest]
+   brw_client_prep_rpc+0x10e/0x270 [lnet_selftest]
+   sfw_run_test+0x4a/0x1f0 [lnet_selftest]
+
+Expected:
+
+	check=none and check=discard: the test runs, transferring an odd
+
+    number of bytes.  LNet has no alignment requirement of its own.
+
+	check=full and check=simple: the test is refused with a clear
+
+    message, because the pattern cannot be laid down in whole __u64.
+
+	No LBUG in any case.
+
+--- Comment (gerrit, Mon, 24 Aug 2026 06:08:52 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68263
+
+Subject: LU-20628 lnet: size selftest bulk to cover the offset
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: ed04d8400aee03b9ceffbf77171a33081e3fddf0
+
+--- Comment (gerrit, Mon, 24 Aug 2026 06:08:53 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68265
+
+Subject: LU-20628 lnet: do not assert on an odd selftest bulk size
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: fc0532e25c36b9eb1dc7e45dcab33c33d5b2be75

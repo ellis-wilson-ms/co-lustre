@@ -1,0 +1,117 @@
+Key:        LU-20505
+Summary:    sanity-lfsck test_5 ldiskfs: Fail to generate linkEA
+Link:       https://jira.whamcloud.com/browse/LU-20505
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Maloo
+Created:    Tue, 21 Jul 2026 13:44:36 +0000
+Updated:    Thu, 1 Oct 2026 13:10:51 +0000
+Links:      Related: is related to  LU-20308
+
+--- Description ---
+This issue was created by maloo for Andreas Dilger 
+
+This issue relates to the following test suite run: https://testing.whamcloud.com/test_sets/807c55f0-d570-446e-81a1-88ab752cee6d
+
+test_5 failed with the following error:
+
+lfs fid2path: cannot find /mnt/lustre [0x200005221:0x53:0x0]: No data available
+(13) Fail to generate linkEA: [0x200005221:0x53:0x0] 
+
+Test session details:
+
+clients: https://build.whamcloud.com/job/lustre-reviews/127607 - 5.14.0-687.17.1.el9_8.x86_64
+
+servers: https://build.whamcloud.com/job/lustre-reviews/127607 - 5.14.0-687.17.1.el9_8_lustre.x86_64
+
+The mds1 console log reports an -ENOENT error just before the test fails:
+
+https://testing.whamcloud.com/test_logs/bf470efe-9413-4a7f-b3f5-4dfc6a812649/show_text
+
+mdd_dir_page_build()) lustre-MDT0000-mdtlov: build page failed for [0x200005221:0x1:0x0]: rc = -2
+
+This is failing only on ldiskfs, because this subtest is always skipped on ZFS "OI Scrub not implemented for ZFS"
+
+VVVVVVV DO NOT REMOVE LINES BELOW, Added by Maloo for auto-association VVVVVVV
+
+sanity-lfsck test_5 - (13) Fail to generate linkEA: [0x200005221:0x53:0x0]
+
+--- Comment (adilger, Tue, 21 Jul 2026 21:24:56 +0000) ---
+This may be a duplicate of LU-20308 and LU-20424 with a different symptom.  It is only failing this way on newer kernels (optional test sessions), and most of the time sanity-lfsck test_0 is failing with "Error:  '(10) Expect nothing to be repaired, but got: 97'" and then all of the subtests fail until test_5 fails with "Fail to cleanup the env!".
+
+About 7% of the 30% of test_5 failures are caused by this issue, but the lack of linkEA is similar to the missing dirdata in LU-20424.
+
+--- Comment (gerrit, Thu, 23 Jul 2026 03:57:12 +0000) ---
+"wangdi " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/67474
+
+Subject: LU-20505 osd-ldiskfs: suppress LMA for OBD_FAIL_FID_IGIF
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 418c401fd8cfe9da0df249e2b5ee0960afdb0988
+
+--- Comment (JIRAUSER19464, Fri, 14 Aug 2026 00:07:58 +0000) ---
+adilger  the real reason for this failure is that
+
+"The real reason for the failure is that in test-5, OBD_FAIL_FID_IGIF only suppressed LinkEA and FID-in-dirent, but still wrote the Normal FID into trusted.lma. Consequently, when LFSCK ran after the backup/restore reformat, it detected the existing trusted.lma and reconstructed the LinkEA and dirent using the Normal FID instead of upgrading the file to an IGIF FID. Because the file remained a Normal FID object and the MDT was started without OI scrub, the OI table lacked an entry for this Normal FID, causing subsequent FID-to-path lookups (lfs fid2path) to fail."
+
+ 
+
+(The test occasionally passed previously because if the inode mapping happened to remain in OSD's in-memory OI cache (oti_cache), it bypassed the on-disk OI table check; once evicted from cache, subsequent lfs fid2path lookups failed with error 13).
+
+So the patch suppress writing the FID to trusted.lma as well.  But after this fix, it failed with 
+
+== sanity-lfsck test 5: LFSCK can handle IGIF object upgrading ========================================================== 12:09:54 (1786118994)
+preparing... 1 * 1 files will be created Fri Aug  7 12:09:57 EDT 2026.
+fail_loc=0x1504
+total: 1 mkdir in 0.01 seconds: 182.78 ops/second
+total: 1 create in 0.01 seconds: 137.88 ops/second
+ sanity-lfsck test_5: @@@@@@ FAIL: createmany 1
+  Trace dump:
+  = /home/green/git/lustre-release/lustre/tests/test-framework.sh:7496:error()
+  = /home/green/git/lustre-release/lustre/tests/sanity-lfsck.sh:94:lfsck_prep()
+  = /home/green/git/lustre-release/lustre/tests/sanity-lfsck.sh:656:test_5()
+  = /home/green/git/lustre-release/lustre/tests/test-framework.sh:7873:run_one()
+  = /home/green/git/lustre-release/lustre/tests/test-framework.sh:7936:run_one_logged()
+  = /home/green/git/lustre-release/lustre/tests/test-framework.sh:7750:run_test()
+  = /home/green/git/lustre-release/lustre/tests/sanity-lfsck.sh:715:main()
+
+The root cause in lfsck_prep 1 1 1 (analyze by gemini, and looks correct to me)
+
+	When createmany -d $DIR/$tdir/d 1 creates directory d0, osd_create() creates the backend inode on disk without trusted.lma. However, the MDT still replies to the client with the Normal FID allocated for the mkdir RPC. The client VFS instantiates and caches the dentry "d0" bound to this Normal FID.
+
+	Immediately on the next step, createmany -m $DIR/$tdir/d0/f 1 tries to create file f0 inside d0.
+
+	The client VFS path walk traverses into d0 and issues an IT_LOOKUP "d0" RPC to the MDT.
+
+	When the MDT looks up d0 on disk, it finds no trusted.lma, so osd_iget_fid() dynamically constructs an IGIF FID [0x0:ino_d0:gen_d0] and returns it in the lookup reply.
+
+	The client receives the IGIF FID from the MDT, which collides with the cached dentry in client dcache (already bound to the Normal FID inode). This dentry alias mismatch causes the lookup to fail with -ENOENT (rc = -2).
+
+To make MDT reply igif FID with this fail_loc will need some efforts.  So I wonder do we still support IGIF now? otherwise can we skip this test? It seems not worth the efforts.
+
+--- Comment (gerrit, Sat, 5 Sep 2026 18:47:46 +0000) ---
+"Alex Zhuravlev " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68662
+
+Subject: LU-20505 lfsck: fix osd-scrub vs lfsck race
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: c1f5f5b95446a16e941dcb1d07b7c55d5f56b235
+
+--- Comment (adilger, Wed, 9 Sep 2026 00:15:40 +0000) ---
+ddiwang the IGIF FIDs are still potentially used if the LMA FIDs are lost, though not normally.  However, in this case I'd expect that the dirent found during the lookup contains the original FID, so it should be possible to rebuild the LMA FID from that?
+
+--- Comment (emoly.liu, Tue, 15 Sep 2026 01:43:18 +0000) ---
++1 on master: https://testing.whamcloud.com/test_sets/def5af5f-500e-4e2a-a105-983729584583

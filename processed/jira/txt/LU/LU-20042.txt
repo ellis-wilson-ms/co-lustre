@@ -3,12 +3,13 @@ Summary:    sanity test_160s crash in llog_cat_add_rec()
 Link:       https://jira.whamcloud.com/browse/LU-20042
 Type:       Bug
 Priority:   Medium
-Status:     Open
-Resolution: Unresolved
+Status:     Resolved
+Resolution: Fixed
 Assignee:   Mikhail Pershin
 Reporter:   Andreas Dilger
 Created:    Wed, 25 Mar 2026 20:08:31 +0000
-Updated:    Fri, 10 Apr 2026 10:38:38 +0000
+Updated:    Fri, 10 Jul 2026 12:34:56 +0000
+Resolved:   Thu, 28 May 2026 15:36:42 +0000
 Labels:     Janitor, crash, llog
 
 --- Description ---
@@ -43,18 +44,54 @@ Call Trace:
   ptlrpc_server_handle_request+0x443/0x13b0 [ptlrpc]
   ptlrpc_main+0xce8/0x1400 [ptlrpc]
 
---- Comment (gerrit, Thu, 9 Apr 2026 08:08:54 +0000) ---
-"Mikhail Pershin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/65191
+--- Comment (tappro, Wed, 1 Apr 2026 17:21:26 +0000) ---
+there is long standing flaw in llog_cat_add_rec() leading to error like below:
 
-Subject: LU-20042 llog: don't use stale current llog
+llog_write_rec()) lustre-MDD0000: loghandle ffff8fd249e47000 with no header
 
-Project: fs/lustre-release
+and shortly after to various kind of bad outcomes
 
-Branch: master
+Here we go:
 
-Current Patch Set: 1
+llog_cat_add_rec():
+    if (!llog_exist(loghandle)) {
+        rc = llog_cat_new_log(env, cathandle, loghandle, th);
+        if (rc lgh_hdr != NULL) {
+        /* If llog object is remote and creation is failed, lgh_hdr
+         * might be left over here, free it first */
+        LASSERT(!llog_exist(loghandle));
+        OBD_FREE_LARGE(loghandle->lgh_hdr, loghandle->lgh_hdr_size);
+        loghandle->lgh_hdr = NULL;
+    }
+    ...
+    rc = llog_create(env, loghandle, th);
+    /* if llog is already created, no need to initialize it */
+    if (rc == -EEXIST) {
+        GOTO(out, rc = 0)
+    ...
 
-Commit: ea41370a630026f65131260e00431ec67be557d3
+so if llog_create() returns -EEXIST then loghandle is left without lgh_hdr initialized and caller will hit this discrepancy sooner or later
+
+I think llog_cat_new_log() should return -EEXIST to caller so it would close loghandle and get the real current one or probably that can be done inside llog_cat_new_log() function somehow
+
+--- Comment (tappro, Thu, 2 Apr 2026 15:46:45 +0000) ---
+there are also evidences that loghandle was used after being destroyed:
+
+  lgh_hdr = 0xdead000000000387,
+  lgh_hdr_size = 8192,
+  lgh_obj = 0xffff8fe866a83800,
+  lgh_last_idx = 5,
+...
+  lgh_refcount = {
+    refs = {
+      counter = 0
+    }
+  },
+  lgh_max_index = 64767,
+  lgh_max_size = 2097152,
+  lgh_destroyed = true,
+
+so refcount is zero and lgh_destroyed is set, lgh_hdr is POISON pointer after OBD_FREE(), all that means refcounter leakage somewhere in code or taking log_handle without referencing so it is decremented in parallel while being used by another process.
 
 --- Comment (tappro, Sat, 4 Apr 2026 15:50:06 +0000) ---
 well, on further investigation, thanks to Alex, I was able to get full debug llog:
@@ -91,51 +128,31 @@ which, I believe, is also not safe here.
 
 Meanwhile, the only way for loghandle to be freed is last refcount put, so that is natural to get reference each time we get pointer for llog and it costs us nothing
 
---- Comment (tappro, Thu, 2 Apr 2026 15:46:45 +0000) ---
-there are also evidences that loghandle was used after being destroyed:
+--- Comment (gerrit, Thu, 9 Apr 2026 08:08:54 +0000) ---
+"Mikhail Pershin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/65191
 
-  lgh_hdr = 0xdead000000000387,
-  lgh_hdr_size = 8192,
-  lgh_obj = 0xffff8fe866a83800,
-  lgh_last_idx = 5,
-...
-  lgh_refcount = {
-    refs = {
-      counter = 0
-    }
-  },
-  lgh_max_index = 64767,
-  lgh_max_size = 2097152,
-  lgh_destroyed = true,
+Subject: LU-20042 llog: don't use stale current llog
 
-so refcount is zero and lgh_destroyed is set, lgh_hdr is POISON pointer after OBD_FREE(), all that means refcounter leakage somewhere in code or taking log_handle without referencing so it is decremented in parallel while being used by another process.
+Project: fs/lustre-release
 
---- Comment (tappro, Wed, 1 Apr 2026 17:21:26 +0000) ---
-there is long standing flaw in llog_cat_add_rec() leading to error like below:
+Branch: master
 
-llog_write_rec()) lustre-MDD0000: loghandle ffff8fd249e47000 with no header
+Current Patch Set: 1
 
-and shortly after to various kind of bad outcomes
+Commit: ea41370a630026f65131260e00431ec67be557d3
 
-Here we go:
+--- Comment (gerrit, Thu, 28 May 2026 04:58:44 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/65191/
 
-llog_cat_add_rec():
-    if (!llog_exist(loghandle)) {
-        rc = llog_cat_new_log(env, cathandle, loghandle, th);
-        if (rc lgh_hdr != NULL) {
-        /* If llog object is remote and creation is failed, lgh_hdr
-         * might be left over here, free it first */
-        LASSERT(!llog_exist(loghandle));
-        OBD_FREE_LARGE(loghandle->lgh_hdr, loghandle->lgh_hdr_size);
-        loghandle->lgh_hdr = NULL;
-    }
-    ...
-    rc = llog_create(env, loghandle, th);
-    /* if llog is already created, no need to initialize it */
-    if (rc == -EEXIST) {
-        GOTO(out, rc = 0)
-    ...
+Subject: LU-20042 llog: don't use stale current llog
 
-so if llog_create() returns -EEXIST then loghandle is left without lgh_hdr initialized and caller will hit this discrepancy sooner or later
+Project: fs/lustre-release
 
-I think llog_cat_new_log() should return -EEXIST to caller so it would close loghandle and get the real current one or probably that can be done inside llog_cat_new_log() function somehow
+Branch: master
+
+Current Patch Set: 
+
+Commit: b9ad49a78f01ae8d33a458aa08d94cc5067efdb9
+
+--- Comment (pjo, Thu, 28 May 2026 15:36:43 +0000) ---
+Merged for 2.18

@@ -1,0 +1,128 @@
+Key:        LU-20840
+Summary:    DNE auto-split: stripe cap uses inflated mdt_mds_mds_conns (-E2BIG), failed splits EX-lock dir repeatedly, migration blocks clients
+Link:       https://jira.whamcloud.com/browse/LU-20840
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Lai Siyao
+Reporter:   Lai Siyao
+Created:    Mon, 28 Sep 2026 15:23:09 +0000
+Updated:    Thu, 8 Oct 2026 14:23:40 +0000
+
+--- Description ---
+enable_dir_auto_split does not work properly with a 64-process create load into one directory (128 k entries; dir_split_count 50 000, two MDTs). Two findings:
+
+1. As shipped it does nothing on our filesystem. The default dir_split_delta=4 asks for four stripes on a two-MDT system, so every split attempt fails ( mdt_auto_split() … split […] to count 4 failed: rc = -7 , 17 attempts, three directories) and the directory stays as it was. The failing attempts are not free: stat throughput dropped from 342 k to 18 k/s while they ran. Please default or clamp dir_split_delta to the MDT count.
+
+2. When it does trigger, the directory goes offline for the tenant. With dir_split_delta=2 the split fired about 60 s after the directory passed the threshold ( lmv_stripe_count 2, fnv_1a_64, migrating ); from that moment creates, ls and lfs getdirstripe on the directory hang, client processes sit in D state, and the migration had made no progress after 20 minutes (it is still migrating now; part of the stall is a server-to-server path problem in our lab, but the hang itself is the migration phase, not the network). An automatic feature that takes a tenant's directory out of service at a moment the tenant does not choose, for a duration you do not document, is not something we can enable for tenants. What is the expected duration and client-visible behaviour of the migration, and can it be made non-blocking or scheduled?
+
+We reverted both parameters to 0 / 4.
+
+AI-assited analysis (by Ravindra?)
+
+Component: MDT / DNE (lustre/mdt/mdt_restripe.c, mdt_handler.c) 
+
+Customer repro: 2 MDTs, enable_dir_auto_split=1, dir_split_count=50000, 64-proc create into one dir (128k entries). Customer has reverted to enable_dir_auto_split=0, dir_split_delta=4.
+
+A. Stripe count exceeds MDT count -> split fails -E2BIG
+
+	mdt_auto_split() clamps target to min(cur + dir_split_delta, mdt_mds_mds_conns + 1) (mdt_restripe.c:340).
+
+	Customer log: mdt_auto_split() ... split [...] to count 4 failed: rc = -7 on a 2-MDT fs (17 attempts, 3 dirs) => mdt_mds_mds_conns >= 3.
+
+	Suspected: mdt_connect_internal() increments mdt_mds_mds_conns on connect and reconnect (mdt_handler.c:7300, from LU-13522), mdt_obd_disconnect() decrements once (:7456). Reconnect on a live export leaks +1. Customer lab had MDS-MDS path problems (reconnects likely).
+
+	LOD rejects vs. real MDT count -> -E2BIG (lod_object.c:9311).
+
+	getattr trigger (mdt_handler.c:1581) uses the same counter, so dir keeps being queued.
+
+	[verify] repro with forced MDT-MDT reconnects; check split ... (MDT count N) at debug=+info.
+
+B. Each failed attempt revokes the whole directory
+
+	PW parent lock + EX stripes lock (mdt_restripe.c:367-374) are taken before mo_layout_change() fails in LOD.
+
+	mot_restriping then cleared -> next getattr above threshold re-queues -> repeat.
+
+	Observed: stat throughput 342k/s -> 18k/s while attempts ran.
+
+C. Migration phase blocks clients, can stall indefinitely
+
+	Single mdt_restriper_main kthread per MDT migrates entries serially via mdt_reint_migrate() (cross-MDT distributed txn per entry; ns-only by default, dir_restripe_nsonly=1).
+
+	Holds PW on stripe (name hash) + LOOKUP|XATTR|OPEN on source per entry; if OUT RPC to peer MDT stalls, conflicting client ops block. Customer (with dir_split_delta=2): split fired ~60s after threshold (lmv_stripe_count 2, fnv_1a_64, migrating), then create / ls / lfs getdirstripe hung in D state, no progress after 20 min.
+
+	On any non-EBUSY error the stripe is dropped from mdr_migrating (mdt_restripe.c:626); only re-queued when a getattr sees restriping LMV (mdt_handler.c:1550) -> progress depends on client traffic.
+
+	No progress stat, no throttle/schedule/pause control, no documented duration or client-visible behaviour.
+
+	[verify] behaviour on a healthy MDS-MDS fabric (degraded vs. blocked).
+
+Proposed fixes
+
+	Clamp stripe count to LOD MDT count (lod_remote_mdt_count + 1); separately fix reconnect accounting so an already-counted export isn't re-incremented.
+
+	Validate target stripe count before taking locks; treat -E2BIG as terminal for that dir (negative-cache until layout/MDT count changes).
+
+	Default dir_split_delta to "up to MDT count" (or clamp on store).
+
+	Migration: progress stat (remaining entries per stripe), pause/throttle or time-window gate, keep stalled stripe queued instead of dropping on error.
+
+	Docs: client-visible behaviour during split/migrate; recommend lfs setdirstripe -D -c N over auto-split for hot dirs.
+
+Workaround
+
+enable_dir_auto_split=0; pre-stripe tenant dirs with lfs setdirstripe -D -c  / lfs mkdir -c ; manual restripe (lfs migrate -m -c N) only in a maintenance window on a healthy MDS-MDS fabric.
+
+--- Comment (gerrit, Mon, 28 Sep 2026 15:37:15 +0000) ---
+"Lai Siyao " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69288
+
+Subject: LU-20840 mdt: don't re-count MDS-MDS conns on reconnect
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 20c0d1124a5a86f534b6b1a092fdecfb815ba0d1
+
+--- Comment (gerrit, Mon, 28 Sep 2026 15:37:16 +0000) ---
+"Lai Siyao " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69289
+
+Subject: LU-20840 mdt: don't retry terminal auto-split failures
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: b313baf677889bf48c9f44335ff2140d6971e2cc
+
+--- Comment (gerrit, Mon, 28 Sep 2026 15:37:16 +0000) ---
+"Lai Siyao " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69290
+
+Subject: LU-20840 mdt: don't drop stalled dir migration
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: fdc0010953204136bf880523067b805013aac6ef
+
+--- Comment (gerrit, Thu, 8 Oct 2026 14:23:40 +0000) ---
+"Lai Siyao " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69518
+
+Subject: LU-20840 test: keep full debug during creates in test_230q
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: c97c69c759a319b89cec9fefdd57e10563369468

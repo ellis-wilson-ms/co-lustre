@@ -1,0 +1,104 @@
+Key:        LU-20516
+Summary:    flock deadlock-detection state is updated under the resource lock but reference-counted under the flock-hash bucket lock
+Link:       https://jira.whamcloud.com/browse/LU-20516
+Type:       Bug
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   Sohei Koyama
+Reporter:   Sohei Koyama
+Created:    Thu, 23 Jul 2026 07:39:28 +0000
+Updated:    Tue, 28 Jul 2026 06:42:57 +0000
+Attachments: image-2026-07-23-16-36-32-060.png, image-2026-07-28-15-37-36-496.png, image-2026-07-28-15-39-06-596.png, image-2026-07-28-15-39-26-995.png, image-2026-07-28-15-40-13-204.png
+
+--- Description ---
+The per-lock flock blocking state — blocking_owner, blocking_export, blocking_refs, and the lock's membership in its owning export's exp_flock_hash — is mutated by ldlm_flock_blocking_link() / ldlm_flock_blocking_unlink() while the request lock's resource lock (lr_lock) is held. The very same state is concurrently read and reference-counted by the deadlock-detection walk:
+
+ldlm_flock_deadlock() -> obd_nid_export_for_each()
+    -> ldlm_flock_lookup_cb() -> cfs_hash_lookup() / cfs_hash_put() 
+
+which only holds the flock-hash bucket lock (hsb_lock) of the export being searched. The two paths share no common lock, so a relink performed while a walk holds an in-flight reference on the same lock corrupts both the reference count and the blocking_export pointer. Two distinct failure modes follow from this single root cause.
+
+ 
+
+#1  MDS LBUG (observed in production)
+
+[3230397.998116] LustreError: 14261:0:(ldlm_flock.c:921:ldlm_export_flock_get()) ASSERTION( flock->blocking_export != ((void *)0) ) failed: 
+[3230398.001104] LustreError: 14261:0:(ldlm_flock.c:921:ldlm_export_flock_get()) LBUG
+[3230398.002890] CPU: 5 PID: 14261 Comm: mdt02_006 Kdump: loaded Tainted: G           OE     -------- -  - 4.18.0-553.40.1.el8_lustre.ddn17.x86_64 #1
+[3230398.005375] Hardware name: DDN SFA400NVX2E, BIOS 1.16.3-20250613_205747-8ebaeaa02506 04/01/2014
+[3230398.007142] Call Trace:
+[3230398.007957]  dump_stack+0x41/0x60
+[3230398.008879]  lbug_with_loc.cold.8+0x5/0x43 [libcfs]
+[3230398.010144]  ldlm_export_flock_get+0x60/0x60 [ptlrpc]
+[3230398.011480]  cfs_hash_bd_lookup_intent+0x72/0xc0 [libcfs]
+[3230398.012640]  cfs_hash_multi_bd_lookup_locked.constprop.34+0x25/0x60 [libcfs]
+[3230398.014116]  cfs_hash_lookup+0x66/0xf0 [libcfs]
+[3230398.015150]  ? cfs_hash_bd_lookup_intent+0x72/0xc0 [libcfs]
+[3230398.016430]  ldlm_flock_lookup_cb+0x2c/0x60 [ptlrpc]
+[3230398.017691]  ? ldlm_export_flock_put+0x80/0x80 [ptlrpc]
+[3230398.018934]  obd_nid_export_for_each+0x122/0x1a0 [obdclass]
+[3230398.020225]  ldlm_flock_deadlock.isra.18+0x9e/0x1c0 [ptlrpc]
+[3230398.021651]  ldlm_process_flock_lock+0x3d9/0x31c0 [ptlrpc]
+[3230398.022881]  ? ldlm_flock_add_lock+0x130/0x130 [ptlrpc]
+[3230398.024027]  ldlm_reprocess_queue+0x1b9/0x3e0 [ptlrpc]
+[3230398.025245]  ldlm_process_flock_lock+0x18c7/0x31c0 [ptlrpc]
+[3230398.026629]  ldlm_lock_enqueue+0x24e/0x800 [ptlrpc]
+[3230398.027784]  ldlm_handle_enqueue0+0x79d/0x16c0 [ptlrpc]
+[3230398.028954]  tgt_enqueue+0xa4/0x200 [ptlrpc]
+[3230398.029945]  tgt_request_handle+0xc0a/0x1b50 [ptlrpc]
+[3230398.031232]  ? ptlrpc_nrs_req_get_nolock0+0xff/0x1f0 [ptlrpc]
+[3230398.032458]  ? ptlrpc_update_export_timer+0x3d/0x520 [ptlrpc]
+[3230398.033712]  ptlrpc_server_handle_request+0x25a/0xca0 [ptlrpc]
+[3230398.034956]  ? lprocfs_counter_add+0x10e/0x180 [obdclass]
+[3230398.036062]  ptlrpc_main+0xb45/0x13a0 [ptlrpc]
+[3230398.037201]  ? ptlrpc_register_service+0xf30/0xf30 [ptlrpc]
+[3230398.038393]  kthread+0x134/0x150
+[3230398.039131]  ? set_kthread_struct+0x50/0x50
+[3230398.040023]  ret_from_fork+0x1f/0x40 
+
+crash> struct ldlm_lock.l_policy_data.l_flock 0xff23dd50325e1200 -x
+  l_policy_data.l_flock = {
+    start = 0x0,
+    end = 0x7fffffffffffffff,
+    owner = 0xff4533377afb3000,
+    blocking_owner = 0x0,
+    blocking_export = 0x0,
+    blocking_refs = {
+      counter = 0x0
+    },
+    pid = 0xfe572
+  },
+crash> struct ldlm_lock.l_exp_flock_hash 0xff23dd50325e1200 -x
+      l_exp_flock_hash = {
+        next = 0xff23dd4a4465fae8,
+        pprev = 0xff23dd4dca75f238
+      },
+crash> struct ldlm_lock.l_granted_mode 0xff23dd50325e1200 -x
+  l_granted_mode = LCK_MINMODE,
+crash> struct ldlm_lock.l_req_mode 0xff23dd50325e1200 -x
+  l_req_mode = LCK_PW, 
+
+the victim ldlm_lock is still hashed (l_exp_flock_hash.pprev != NULL) with blocking_refs=0, blocking_export=NULL, blocking_owner=0 — the exact post-put-to-zero state — and its owner matches the key the crashing walk was looking up. l_granted_mode=LCK_MINMODE, l_req_mode=LCK_PW (a still-waiting flock). ~15 MDT service threads were in the flock path concurrently; the crash followed a large-scale MDT recovery (2646 clients) under very high load.
+
+ 
+
+#2  export refcount mismatch
+
+ldlm_export_flock_get() does class_export_get(flock->blocking_export) and ldlm_export_flock_put() does class_export_put(flock->blocking_export), bothreading the live field. If blocking_link() overwrites blocking_export (req->...blocking_export = lock->l_export) between a walk's hs_get and its matching hs_put, the walk gets export A but puts export B: export A leaks a reference, export B is over-put.
+
+--- Comment (gerrit, Thu, 23 Jul 2026 11:13:10 +0000) ---
+"Sohei Koyama " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/67492
+
+Subject: LU-20516 ldlm: fix flock deadlock-detection state races
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 8f70177afaca1575f30728ea519451956cb82414
+
+--- Comment (JIRAUSER19217, Tue, 28 Jul 2026 06:42:57 +0000) ---
+ys Please take a look at these figures.

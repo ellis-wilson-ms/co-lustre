@@ -8,7 +8,7 @@ Resolution: Unresolved
 Assignee:   Sergey Cheremencev
 Reporter:   Hongchao Zhang
 Created:    Fri, 16 Jan 2026 03:16:07 +0000
-Updated:    Fri, 13 Feb 2026 09:12:39 +0000
+Updated:    Wed, 1 Apr 2026 14:08:29 +0000
 
 --- Description ---
 The cached writes on clients will fail with -EDQUOT and dropped silently
@@ -63,47 +63,35 @@ void osc_page_submit(const struct lu_env *env, struct osc_page *opg,
         ...
 }
 
---- Comment (gerrit, Fri, 13 Feb 2026 01:22:04 +0000) ---
-"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/63541/
+--- Comment (paf0186, Fri, 16 Jan 2026 19:56:09 +0000) ---
+I don't understand - SYNC should specifically be set to make sure errors are returned.  Why does setting sync cause dropped writes?
 
-Subject: LU-19791 quota: fix silent data loss for root project
+--- Comment (sergey, Tue, 20 Jan 2026 15:28:47 +0000) ---
+Normally when we add a page to the cache(osc_page_cache_add->osc_queue_async_io) we check that current UID/GID/PRJ is not OVER QUOTA(osc_quota_chkdq). If the client hasn't got -EDQUOT yet for this ID, it doesn't know that this page can't be added to the cache. This will be known after sending BRW with this page to the OSD. Anyway we are not going to drop this page because "everything that came to the cache must be written". At some point pages added to the cache will be written and the OSD will return -EDQUOT telling our client that some ID is over quota(osc_brw_fini_request). Trying to add a new async page to the cache OSC checks the quotas(osc_quota_chkdq) and if there is no quotas, it switches to SYNC write:
 
-Project: fs/lustre-release
+        /* out of quota, try sync write */
 
-Branch: master
+        if ((rc == -EDQUOT && !cl_io_is_mkwrite(io)) || prio > IO_PRIO_NORMAL) {
 
-Current Patch Set: 
+                rc = vvp_io_commit_sync(env, io, queue,
 
-Commit: e1af85a420b9ec65df58a52a5763b25d7a2aeb9b
+                                        vio->u.readwrite.vui_from,
 
---- Comment (adilger, Fri, 23 Jan 2026 19:38:03 +0000) ---
-Sergey has pushed a patch.
+                                        vio->u.readwrite.vui_to);
 
---- Comment (gerrit, Fri, 23 Jan 2026 18:43:09 +0000) ---
-"Sergey Cheremencev " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/63541
+                ....
 
-Subject: LU-19791 quota: fix silent data loss for root project
+That's why we don't set OSD_QID_FORCE for OBD_BRW_SYNC. It is a way to check that we still have some quotas and able to write. If there is still no quotas(QSD will even ask QMT), QSD returns -EDQUOT or proceeds handling BRW_SYNC pages in opposite case.
 
-Project: fs/lustre-release
+Speaking about the problem, I would suppose the problem is caused by drop_caches. Does it mean it causes to write the page from the cache with OBD_BRW_SYNC flag?
 
-Branch: master
+--- Comment (paf0186, Tue, 20 Jan 2026 18:28:58 +0000) ---
+I did some investigation in the code on this; I can't find anywhere in the code where a write() call which is completed would have its pages converted to OBD_BRW_SYNC/have OBD_BRW_ASYNC removed.
 
-Current Patch Set: 1
+So I tried to reproduce the problem where writes which have completed fail silently, but I couldn't.  HongChao, you mentioned in chat you reproduced a problem - can you describe exactly what you did and what happened?
 
-Commit: 1751c36424dbaa378bae1081e40d905fc9087650
-
---- Comment (gerrit, Tue, 20 Jan 2026 20:50:42 +0000) ---
-"Patrick Farrell " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/63487
-
-Subject: LU-19791 quota: preserve OSD_QID_FORCE for async writes
-
-Project: fs/lustre-release
-
-Branch: master
-
-Current Patch Set: 1
-
-Commit: d8cbb787e7da4e26f0aab92b2ab40df380f71852
+--- Comment (paf0186, Tue, 20 Jan 2026 18:40:57 +0000) ---
+Nvm, I had missed the reproducer here - my bad.  It uses two clients and THAT fails.
 
 --- Comment (paf0186, Tue, 20 Jan 2026 20:19:28 +0000) ---
 With the reproducer, Augment/Opus 4.5 was able to figure out the bug and fix.  It looks good to me.  I have it working on a sanity-quota test and then it will push against this ticket.
@@ -185,32 +173,44 @@ The design intent is:
 
 The bug was that QUOTA_FL_ROOT_PRJQUOTA handling incorrectly overrode the async write protection.
 
---- Comment (paf0186, Tue, 20 Jan 2026 18:40:57 +0000) ---
-Nvm, I had missed the reproducer here - my bad.  It uses two clients and THAT fails.
+--- Comment (gerrit, Tue, 20 Jan 2026 20:50:42 +0000) ---
+"Patrick Farrell " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/63487
 
---- Comment (paf0186, Tue, 20 Jan 2026 18:28:58 +0000) ---
-I did some investigation in the code on this; I can't find anywhere in the code where a write() call which is completed would have its pages converted to OBD_BRW_SYNC/have OBD_BRW_ASYNC removed.
+Subject: LU-19791 quota: preserve OSD_QID_FORCE for async writes
 
-So I tried to reproduce the problem where writes which have completed fail silently, but I couldn't.  HongChao, you mentioned in chat you reproduced a problem - can you describe exactly what you did and what happened?
+Project: fs/lustre-release
 
---- Comment (sergey, Tue, 20 Jan 2026 15:28:47 +0000) ---
-Normally when we add a page to the cache(osc_page_cache_add->osc_queue_async_io) we check that current UID/GID/PRJ is not OVER QUOTA(osc_quota_chkdq). If the client hasn't got -EDQUOT yet for this ID, it doesn't know that this page can't be added to the cache. This will be known after sending BRW with this page to the OSD. Anyway we are not going to drop this page because "everything that came to the cache must be written". At some point pages added to the cache will be written and the OSD will return -EDQUOT telling our client that some ID is over quota(osc_brw_fini_request). Trying to add a new async page to the cache OSC checks the quotas(osc_quota_chkdq) and if there is no quotas, it switches to SYNC write:
+Branch: master
 
-        /* out of quota, try sync write */
+Current Patch Set: 1
 
-        if ((rc == -EDQUOT && !cl_io_is_mkwrite(io)) || prio > IO_PRIO_NORMAL) {
+Commit: d8cbb787e7da4e26f0aab92b2ab40df380f71852
 
-                rc = vvp_io_commit_sync(env, io, queue,
+--- Comment (gerrit, Fri, 23 Jan 2026 18:43:09 +0000) ---
+"Sergey Cheremencev " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/63541
 
-                                        vio->u.readwrite.vui_from,
+Subject: LU-19791 quota: fix silent data loss for root project
 
-                                        vio->u.readwrite.vui_to);
+Project: fs/lustre-release
 
-                ....
+Branch: master
 
-That's why we don't set OSD_QID_FORCE for OBD_BRW_SYNC. It is a way to check that we still have some quotas and able to write. If there is still no quotas(QSD will even ask QMT), QSD returns -EDQUOT or proceeds handling BRW_SYNC pages in opposite case.
+Current Patch Set: 1
 
-Speaking about the problem, I would suppose the problem is caused by drop_caches. Does it mean it causes to write the page from the cache with OBD_BRW_SYNC flag?
+Commit: 1751c36424dbaa378bae1081e40d905fc9087650
 
---- Comment (paf0186, Fri, 16 Jan 2026 19:56:09 +0000) ---
-I don't understand - SYNC should specifically be set to make sure errors are returned.  Why does setting sync cause dropped writes?
+--- Comment (adilger, Fri, 23 Jan 2026 19:38:03 +0000) ---
+Sergey has pushed a patch.
+
+--- Comment (gerrit, Fri, 13 Feb 2026 01:22:04 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/63541/
+
+Subject: LU-19791 quota: fix silent data loss for root project
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: e1af85a420b9ec65df58a52a5763b25d7a2aeb9b

@@ -1,0 +1,126 @@
+Key:        LU-20423
+Summary:    TBF: fix the wrong TBF class bucket when check its state bit in LRU
+Link:       https://jira.whamcloud.com/browse/LU-20423
+Type:       Bug
+Priority:   Medium
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Qian Yingjin
+Reporter:   Qian Yingjin
+Created:    Wed, 24 Jun 2026 01:33:35 +0000
+Updated:    Fri, 10 Jul 2026 19:51:46 +0000
+Resolved:   Fri, 10 Jul 2026 19:51:46 +0000
+
+--- Description ---
+In nrs_tbf_cli_findadd(), when found a class bucket form rhashtable but with refcount of 0, it should continue to check whether it is in LRU. But the implementation uses the wrong class bucket for the check.
+
+static struct nrs_tbf_client *                                                  
+nrs_tbf_cli_findadd(struct nrs_tbf_head *head,                                  
+                    struct nrs_tbf_client *cli)                                 
+{                                                                               
+        struct nrs_tbf_client *cli2 = NULL;                                     
+                                                                                
+try_again:                                                                      
+        rcu_read_lock();                                                        
+        cli2 = rhashtable_lookup_get_insert_fast(&head->th_cli_rhash,           
+                                                 &cli->tc_rhash,                
+                                                 head->th_rhash_params);        
+        if (IS_ERR(cli2))                                                       
+                goto out;                                                       
+                                                                                
+        if (cli2 && !refcount_inc_not_zero(&cli2->tc_ref)) {                    
+                cli2 = nrs_tbf_lru_tryhit(head, cli); ==> "cli" -> "cli2"                          
+                if (!cli2) {                                                    
+                        /* lost race -> retry */                                
+                        rcu_read_unlock();                                      
+                        schedule();                                             
+                        goto try_again;                                         
+                }                                                               
+        }
+
+--- Comment (qian_wc, Wed, 24 Jun 2026 01:36:27 +0000) ---
+Moreover, I doubt there should be some racing bug in nrs_tbf_lru_shrink():
+
+rcu_read_lock();                                                        
+        list_for_each_entry_rcu(cli, &head->th_lru_list, tc_lru) {              
+                if (atomic_read(&head->th_lru_cnt) break;                                                  
+                                                                                
+                /* race with nrs_tbf_lru_tryhit()/nrs_tbf_lru_add ? */          
+                if (!test_and_clear_bit(NRS_TBF_CLI_LRU_BIT, &cli->tc_state))   
+                        continue;                                               
+                                                                                
+                LASSERTF(!refcount_read(&cli->tc_ref), "class@%p ref != 0: %d", 
+                         cli, refcount_read(&cli->tc_ref));                     
+                                                                                
+                rhashtable_remove_fast(&head->th_cli_rhash, &cli->tc_rhash,     
+                                       head->th_rhash_params);                  
+                                                                                
+                spin_lock(&head->th_lru_lock);                                  
+                atomic_dec(&head->th_lru_cnt);                                  
+                list_del_rcu(&cli->tc_lru);                                     
+                spin_unlock(&head->th_lru_lock);                                
+                                                                                
+                nrs_tbf_cli_fini(cli);                                          
+                freed++;                                                        
+        }                                                                       
+        rcu_read_unlock();
+
+we remove the class bucket in the read RCU lock, it may race with nrs_tbf_lru_add()?
+
+--- Comment (gerrit, Wed, 24 Jun 2026 01:47:31 +0000) ---
+"Qian Yingjin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/66827
+
+Subject: LU-20423 nrs: check LRU hit using the wrong TBF class bucket
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 8c7e257cb2e31d0977a03f8b4befcedb9939f39e
+
+--- Comment (eaujames, Wed, 24 Jun 2026 09:14:40 +0000) ---
+we remove the class bucket in the read RCU lock, it may race with nrs_tbf_lru_add()?
+
+Could you elaborate on your thoughts? What race are you referring to?
+
+This comment explains how handle the race to add/delete/shrink the TBF LRU:
+
+/* The following nrs_tbf_lru_* function manipulate class object with a 0
+ * refcount. These need to be accessed with a rcu lock to prevent deletions.
+ * A TBF class with a 0 refcount means the following things:
+ *  - class is in LRU list (NRS_TBF_CLI_LRU_BIT is set)
+ *  - class is being added in LRU (refs 1->0 then NRS_TBF_CLI_LRU_BIT 0->1)
+ *  - class is being deleted (NRS_TBF_CLI_LRU_BIT 1->0)
+ *  - class is being removed from LRU (NRS_TBF_CLI_LRU_BIT 1->0 then refs 0->1)
+ */
+
+So to add a class in LRU the ref was > 0 and the flag NRS_TBF_CLI_LRU_BIT not set, this should not race with the shrink process ref = 0 and NRS_TBF_CLI_LRU_BIT set. The race window between test_and_clear_bit(NRS_TBF_CLI_LRU_BIT,..) and rhashtable_remove_fast() should not exist.
+
+static void
+nrs_tbf_cli_put(struct nrs_tbf_head *head, struct nrs_tbf_client *cli)
+{
+
+	if (!refcount_dec_and_test(&cli->tc_ref))
+		return;
+
+	nrs_tbf_lru_add(head, cli);
+	nrs_tbf_lru_shrink(head);
+}
+
+--- Comment (gerrit, Fri, 10 Jul 2026 17:47:10 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/66827/
+
+Subject: LU-20423 nrs: check LRU hit using the wrong TBF class bucket
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: a87f0d7ab72fa84d52458e495955a8155df00153
+
+--- Comment (pjo, Fri, 10 Jul 2026 19:51:46 +0000) ---
+Merged for 2.18

@@ -1,0 +1,155 @@
+Key:        LU-20909
+Summary:    16KiB PAGE_SIZE aarch64 client issues (macOS Apple Silicon VMs)
+Link:       https://jira.whamcloud.com/browse/LU-20909
+Type:       Improvement
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Andreas Dilger
+Reporter:   Andreas Dilger
+Created:    Thu, 8 Oct 2026 20:55:30 +0000
+Updated:    Tue, 13 Oct 2026 04:47:35 +0000
+Links:      Related: is related to  LU-18877; Related: is related to  LU-20910
+
+--- Description ---
+Track client-side issues with a 16KiB PAGE_SIZE aarch64 client (CONFIG_ARM64_16K_PAGES), usually against 4KiB PAGE_SIZE servers.
+
+Apple Silicon (M-series) CPUs implement only the 4KiB and 16KiB translation granules, so a 64KiB-page kernel (RHEL kernel-64k) cannot boot under the macOS Hypervisor.framework (HVF) and needs slow TCG emulation.  A 16KiB-page Rocky 10.2 (6.12.0-211.47.1.el10_2) kernel runs at full speed there, and gives cheap local coverage of most PAGE_SIZE > 4KiB issues that otherwise only show up on aarch64+64k or ppc64le.  The ltvm test VM tool has a rocky10-16k target for this.
+
+Individual fixes may get their own ticket, link to an existing one, or use this ticket for small fixes.
+
+Issues found so far (code review, not all verified by test yet):
+
+	llite: ll_dir_finish_open() copies PAGE_SIZE bytes per folio from a dir read-on-open reply of only rep_size bytes (often one 4KiB lu_dirpage), reading past the reply buffer.  A folio allocation failure partway also leaves lu_pgs unconsumed and trips the LASSERT in mdc_adjust_dirpages().
+
+	ptlrpc (latent): IOP_LEN(len) in __ptlrpc_prep_bulk_page() ignores the in-page offset, so bd_iop_len differs between peers for a fragment that both starts and ends inside a 4KiB unit and crosses a 4KiB boundary (e.g. [2KiB, 6KiB)).  Current IO paths only produce such fragments in single-page RPCs, far below LNET_MTU, so the MD boundaries still agree; IOP_LEN((pageoffset & 4095) + len) would make this robust.
+
+	osc/llite/pcc: the encrypted-file decrypt loops stop at the first all-zero 4KiB unit in a page, so a page with a hole before written data returns ciphertext (e.g. write 4KiB at offset 8KiB of a new encrypted file, then re-read).
+
+	osc: the partial-last-page lost-grant correction runs only without OBD_CONNECT_GRANT_PARAM, so a 16KiB client and a 4KiB OST may disagree on grant for partial pages.
+
+	gss: krb5p/skpi privacy pads each fragment to the cipher block size, so the ciphertext layout depends on where pages split; also the "bv_offset & blocksize" alignment checks should use (blocksize - 1).
+
+	rw26: 4KiB-aligned O_DIRECT is treated as unaligned on a 16KiB client; STATX_DIOALIGN is not reported.
+
+	tests: several tests hard-code 4096 for O_DIRECT sizes or page-based counters (sanity 64j, 77n, 119n, 119r, 224c; sanityn 16b, 20, 95a and the 0x1e1 OST thread test; recovery-small 148; sanity-ec 12c-12f via test_parity_read.c).
+
+--- Comment (gerrit, Fri, 9 Oct 2026 07:54:20 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69543
+
+Subject: LU-20909 llite: copy only reply bytes for dir read-on-open
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: e93007ed5accc20f252bb06e049e8720cbad8fd8
+
+--- Comment (gerrit, Fri, 9 Oct 2026 07:54:32 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69544
+
+Subject: LU-20909 sec: decrypt units after a hole in a large page
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: a8050c65a2d9d47b12563df3d8c1825ef8905231
+
+--- Comment (adilger, Fri, 9 Oct 2026 23:44:12 +0000) ---
+[Claude] Test results with a 16KiB PAGE_SIZE client (Rocky 10.2, 6.12.0-211.47.1.el10_2 with CONFIG_ARM64_16K_PAGES, aarch64 VM under macOS HVF) against a 4KiB PAGE_SIZE server (Rocky 9.7, ldiskfs, 4 MDTs + 4 OSTs of 400MB), master 4a7bddaf15ce.  Each failure was rerun on a 4KiB client with the same build to separate page-size failures from environment ones.
+
+Suite
+Pass
+Fail
+Skip
+16K-only failures
+
+sanity
+1052
+2
+47
+test_42e
+
+sanity-flr
+91
+0
+4
+ 
+
+sanity-ec (8 OSTs)
+212
+0
+8
+ 
+
+sanityn
+238
+9
+4
+test_81d (unconfirmed)
+
+sanity-dom
+120
+0
+0
+ 
+
+sanity-pcc
+85
+0
+6
+ 
+
+recovery-small
+127
+0
+9
+ 
+
+replay-single
+193
+0
+4
+ 
+
+conf-sanity
+225
+2
+26
+ 
+
+Failure triage:
+
+	sanity test_42e "less than 16-pages write RPCs 34% > 15%": passes on a 4KiB client.  The test writes 16 pages per file, so 4x the data with 16KiB pages; on small OSTs already holding data the client runs out of grant and falls back to sync writes.  Reproduced 2/2 with OST0000 pre-filled by 40MB, passes 2/2 with the number of files scaled by 4096/PAGE_SIZE (test fix to follow).
+
+	sanityn test_81d killed by the OOM killer on the 3GB 16KiB client (mrename); passes standalone on both page sizes.  Not yet rerun with more client memory.
+
+	sanityn test_71a, 77b-77j, conf-sanity test_81: ENOSPC on the small OSTs during the full suite; all pass standalone on the 16KiB client, and 77x fail the same way in a full sanityn run on the 4KiB client.  Environment, not page size.
+
+	sanity test_123k, sanityn test_121, conf-sanity test_123ah: also fail on the 4KiB client in this environment; not page size.
+
+	sanity-ec with only 4 OSTs: 12 setstripe ENOSPC failures; all pass with 8 OSTs.
+
+Fixes found by code review:
+
+	patch https://review.whamcloud.com/69543 ("LU-20909 llite: copy only reply bytes for dir read-on-open"), an out-of-bounds read with no test-visible symptom; sanity test_855 passes with it on the 16KiB client
+
+	patch https://review.whamcloud.com/69544 ("LU-20909 sec: decrypt units after a hole in a large page"), sanity-sec test_38 fails without it (data after a punched 4KiB unit read back as ciphertext) and passes with it.
+
+--- Comment (gerrit, Tue, 13 Oct 2026 04:47:35 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69629
+
+Subject: LU-20909 tests: fit sanity/42e to small OSTs and large pages
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: d3f81b8f53a11297f14eaac786074798c54df93e

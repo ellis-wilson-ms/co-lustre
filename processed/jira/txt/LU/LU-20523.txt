@@ -1,0 +1,207 @@
+Key:        LU-20523
+Summary:    sanity test_805/807a: MDS LBUG in tgt_grant_sanity_check()  when the ZFS MDT dataset quota is lowered below the outstanding client grant
+Link:       https://jira.whamcloud.com/browse/LU-20523
+Type:       Bug
+Priority:   Major
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Oleg Drokin
+Reporter:   Oleg Drokin
+Created:    Sat, 25 Jul 2026 21:24:06 +0000
+Updated:    Tue, 13 Oct 2026 14:12:41 +0000
+Resolved:   Tue, 13 Oct 2026 14:12:41 +0000
+Links:      Related: is related to  LU-19418
+
+--- Description ---
+(ai generated triage result follows)
+
+The MDS panics inside the grant sanity check while serving MDS_STATFS:
+
+ LustreError: 1216447:0:(tgt_grant.c:129:tgt_check_export_grants())
+  lustre-MDT0000: cli 2665b580-11c7-4de3-9a75-db056c3a0623/ff4495a2313c3800
+  ted_grant(29622272) + ted_pending(0) > maxsize(6946816)
+LustreError: 1216447:0:(tgt_grant.c:209:tgt_grant_sanity_check()) LBUG
+Kernel panic - not syncing: LBUG
+CPU: 0 UID: 0 PID: 1216447 Comm: mdt00_003
+Call Trace:
+ lbug_with_loc.cold+0x5/0x50 [libcfs]
+ tgt_grant_sanity_check+0x1aa/0x650 [ptlrpc]
+ mdt_statfs+0x546/0x8c0 [mdt]
+ tgt_handle_request0.isra.0+0x124/0x810 [ptlrpc]
+ tgt_request_handle+0x232/0xd50 [ptlrpc]
+ ptlrpc_server_handle_request.isra.0+0x293/0xda0 [ptlrpc]
+ ptlrpc_main+0xaeb/0xed0 [ptlrpc]
+
+Reported instances (all ZFS):
+
+	https://testing.whamcloud.com/test_sets/f6b84f37-439b-425c-a1a8-d3ae9ec259b4
+
+  - lustre-master build 4743, el10.1, full-zfs-part-2, sanity test_807a
+
+	https://testing.whamcloud.com/test_sets/3031e8bd-acdb-4ea9-944d-9508bea4d810
+
+  - lustre-reviews 127989, el9.7, review-dne-zfs-part-1, sanity test_805
+
+	https://testing.whamcloud.com/test_sets/98b0ce47-c9e9-4294-9cfa-29ef6d361ab9
+
+  - lustre-master-next 997, el10.1, rolling-upgrade-client2-zfs, test_807a
+
+	https://testing.whamcloud.com/test_sets/f87f05e6-45d4-4b70-a222-3022c4aa0120
+
+  - lustre-reviews 127733, el8.10, sanity test_805
+Root Cause
+
+tgt_grant_sanity_check() treats the size of the backing device as an
+
+upper bound on the space that can be granted to a client, and LBUGs when
+
+it is exceeded, on the assumption that only counter corruption can produce
+
+such a value (lustre/target/tgt_grant.c):
+
+ maxsize = tgd->tgd_osfs.os_blocks tgd_blockbits;
+...
+if (ted->ted_grant + ted->ted_pending > maxsize) {
+        CERROR(...);
+        return -EFAULT;                 /* -> LBUG() in the caller */
+}
+
+That assumption does not hold on ZFS. osd_objset_statfs() reports
+
+os_blocks = (usedbytes + availbytes) >> bshift - reserved   /* >= 16MB */ 
+
+so the total size of a target shrinks at runtime whenever the dataset
+
+quota is lowered (or the pool's free space is consumed elsewhere). Space
+
+granted to clients while the target was large stays legitimately
+
+outstanding, and the next statfs panics the server.
+
+sanity test_805 ("ZFS can remove from full fs") does exactly this to the
+
+MDT in order to reach ENOSPC quickly:
+
+ do_facet $SINGLEMDS zfs set quota=$(((usedkb+freekb)*1024)) $fsset
+
+with freekb capped at 5000, i.e. quota = used + 5MB. The numbers from the
+
+build-4743 crash line up exactly: quota 23732224 - 16MiB osd-zfs reserve =
+
+maxsize 6946816. Any client holding more than that in DoM grant - here
+
+28.25MB acquired while the MDT was 3G - takes the MDS down, either in
+
+test_805 itself or in a later test whose statfs runs the check (test_806,
+
+test_807a).
+
+The grant counters are not corrupt in this failure; the yardstick is.
+
+ 
+
+Crash-DB aggregation shows 21 occurrences of this signature going back to
+
+2022-01-24 (lustre-master build 4261), across master, b2_15 and review
+
+runs, 18 of them in test_805 and the rest in test_806/807a. Per-export
+
+grants range from 3.4MB to 355MB against a maxsize of 1.3MB to 64MB - i.e.
+
+always a plausible grant against an implausibly small device.
+
+The check was introduced by 71d68757c76c ("LU-1406 ofd: grant support",
+
+2012) and became reachable on MDTs with 0697cf73c7 ("LU-3285 mdt: use
+
+generic grant code at MDT", 2016).
+
+Proposed fix
+
+Keep a high-water mark of the device size seen since mount and compare the
+
+per-export counters against that instead of the current cached statfs:
+
+grants that were legitimate when they were issued are no longer mistaken
+
+for corruption, while corrupt counters (negative, or beyond any size the
+
+device ever had) are still caught. On targets whose size never shrinks -
+
+ldiskfs, and ZFS with a stable quota - the high-water equals the current
+
+size and behaviour is unchanged.
+
+--- Comment (green, Sat, 25 Jul 2026 21:24:45 +0000) ---
+LU-19418 - different mechanism, same LBUG line. There the OST reports
+
+  ted_grant(-22151168) against a healthy maxsize(7739539456): a
+
+  negative grant, i.e. a real counter underflow (the check fires only
+
+  because a negative long converts to a huge u64). The fix proposed here
+
+  neither repairs nor masks that case. Note that the 2026-07-20 comment on
+
+  LU-19418 ("+1 on master in sanity test_805") is an instance of this
+
+  bug, not of the original one.
+
+	LU-14578 (Won't Fix) and LU-11288 - the corrupt-counter flavour, which
+
+  must keep LBUGing.
+
+--- Comment (gerrit, Sat, 25 Jul 2026 21:30:30 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/67533
+
+Subject: LU-20523 target: don't LBUG when the device shrinks
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: c67f1e77deab37af7edb145ac3066593e2c45910
+
+--- Comment (gerrit, Tue, 4 Aug 2026 01:39:21 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/67713
+
+Subject: LU-20523 target: don't scale cached statfs by tgd_blockbits
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 59593474b6c5ab140688b12585f0ebcf3ab2d539
+
+--- Comment (gerrit, Mon, 28 Sep 2026 21:41:25 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/67713/
+
+Subject: LU-20523 target: don't scale cached statfs by tgd_blockbits
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 4d5b5315824e2a2c721e7bd8ecad78a0efe0ab2c
+
+--- Comment (gerrit, Tue, 13 Oct 2026 04:18:53 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/67533/
+
+Subject: LU-20523 target: don't LBUG when the device shrinks
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 3214400edb60b093feeba5270eae5578c8c511d7
+
+--- Comment (pjo, Tue, 13 Oct 2026 14:12:41 +0000) ---
+Merged for 2.18

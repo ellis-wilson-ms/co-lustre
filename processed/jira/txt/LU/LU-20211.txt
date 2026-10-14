@@ -1,0 +1,103 @@
+Key:        LU-20211
+Summary:    FLR-ECRO: allow 'truncate(file, 0)' and 'open(file, O_TRUNC)' on degraded EC file
+Link:       https://jira.whamcloud.com/browse/LU-20211
+Type:       Improvement
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Keguang Xu
+Reporter:   Andreas Dilger
+Created:    Fri, 1 May 2026 04:32:14 +0000
+Updated:    Thu, 8 Oct 2026 20:02:31 +0000
+Labels:     FLR-EC-RO, FLR-EC-backlog, medium
+Links:      Related: is related to  LU-19258; Related: is related to  LU-19259; Related: is related to LU-20212; Related: is related to LU-20849
+
+--- Description ---
+To improve FLR-ECRO usability in production when an OST is inaccessible, it would be desirable to handle operations like open("file", O_TRUNC) and truncate("file", 0) transparently to the application. Since these file operations are data-discarding operations, there is no need to reconstruct any data, and generally open("file", O_TRUNC) is preceding write(file), so it presents an ideal opportunity to "repair" a file with an inaccessible stripe without having full FLR-ECIW. Otherwise, in the FLR-ECRO paradigm that file access would immediately hang the application until the OST is recovered.
+
+The MDS always gets the MDS_REINT_SETATTR RPC first, before the OST objects are truncated, in order to check and block truncate on files opened for execution.
+
+I think there are two possible options for replacing inaccessible objects during truncate:
+
+	the MDS replaces objects individually for OSTs (OSPs) that are inactive and puts them in the delete queue (possibly attached to a temporary inode)
+
+	the MDS swaps the whole file layout in this case and reallocates it from the current set of OSTs
+
+While the replacing individual objects seems appealing at first glance for lower overhead, I think there are several arguments in favor of replacing the whole file layout:
+
+	replacing individual objects is a more complex layout operation (which we don't implement) compared to replacing the whole file layout (which could easily be done with layout swap today)
+
+	in some configurations it may not be possible to allocate replacement object(s) that obey the failure-domain restrictions.  For example, with a 6+2 layout on an 8-OST system, if there are 1 or 2 OSTs offline, there is no other OST that could be used for allocation, while a full layout reallocation could fall back to 4+2 and continue operation uninterrupted.
+
+	"deleting" the whole file layout actually integrates better with Trash Can, because it would allow an older version of a file to be preserved in case of "overwrite in place" workloads, in a similar manner to how rename("file.new", "file") is currently also handled by TCU by moving the over-renamed file into trash.
+
+	depending on your point of view, recreating the file layout in this case also (potentially) allows the MDS to make a better layout decision for the file on the next go-around, assuming that it will be a similar size as before.  For example, if the file has a PFL 1-4-40 stripe layout, and the file size has grown into the 4- or 40-stripe component, then it would probably make sense to skip the 1-stripe component entirely and go straight to the wider-stripe component on the second try.  Not only would wider striping help bandwidth and space balance for early file offsets that were previously on the 1-stripe component, it would allow EC to immediately use parity stripes from offset 0 instead of a mirror for the first component.
+
+--- Comment (adilger, Fri, 1 May 2026 05:51:31 +0000) ---
+The LU-19258 (TCU rename-over) functionality is already implemented, while LU-19259 (TCU truncate-to-zero-equals-unlink) is not yet implemented.  I hope that the mechanism for the two could be the same (namely to create an open-unlinked victim file with the new layout, allocate new objects, swap layouts, drop victim file).
+
+--- Comment (qian_wc, Wed, 3 Jun 2026 07:39:46 +0000) ---
+Should we also consider to improve it by storing HSM info as LOV layout also in LU-10606 ?
+
+--- Comment (gerrit, Fri, 26 Jun 2026 07:43:39 +0000) ---
+"Keguang Xu " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/66882
+
+Subject: LU-20211 mdt: trunc(0) with layout swap on degraded stripes
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: da4eb36fdd548e500a628e074dd181f74eba342c
+
+--- Comment (gerrit, Thu, 20 Aug 2026 12:40:08 +0000) ---
+"Keguang Xu " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68182
+
+Subject: LU-20211 mdd: declare credits for jobid xattr on create
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 7e5e17e0a9fc87217c12221e7e316e22be2708b6
+
+--- Comment (adilger, Fri, 25 Sep 2026 23:46:33 +0000) ---
+Thinking about this some more, it seems possible to relax the `truncate(0)` semantics to allow this to work in more situations (definitely in another patch, though possibly also a different ticket depending on how complex the solution becomes).
+
+The truncate(0) semantic is to handle the case of an OST becoming unavailable and then being dropped from the layout, to allow the application to continue using the file in the face of an OST outage. It is impossible that this situation could apply to a DoM component (which is always first) because the data is resident on the same MDT where the inode lives (they are in fact identical) so it will always be available if the inode can be accessed at all.
+
+It should actually be possible to relax the truncate(0) semantic for DoM files to allow truncate(offset , since the DoM data would always be available in this case. In fact this could be generalized even further to allow truncate(offset .
+
+That would allow small files (especially DoM) to handle non-zero truncates without exposing OST failure to applications, but potentially also much larger files where e.g. the first component(s) have all OST(s) available, but truncate() is deleting all data in a later component that has an unavailable OST, or e.g. the missing OST is in the file at (stripe_offset=48 * stripe_size=4MiB) = 192MiB (from the start of that component) and the truncate is somewhere below this offset.  This should not allow the truncate offset to cross the missing OST object even once.
+
+If only a single OST is unavailable and is being truncated away, it might be better to replace only that one file stripe rather than replacing the whole layout, so that there is no need to move any of the other data in the file, and the replacement OST object would be zero-length ("pre truncated") so the MDS could swap the layout directly in this case.
+
+--- Comment (gerrit, Mon, 28 Sep 2026 21:32:01 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/68182/
+
+Subject: LU-20211 mdd: declare credits for jobid xattr on create
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: c830d5e8dc2ff7f8d91c10fd21e9096b0e113704
+
+--- Comment (gerrit, Thu, 8 Oct 2026 20:02:31 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69531
+
+Subject: LU-20211 idl: reserve OBD_CONNECT2_LAYOUT_REPLACE flag
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 12dc0d6f4dc63078b0b0468874226cc7bace90ee

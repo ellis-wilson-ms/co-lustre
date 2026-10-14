@@ -1,0 +1,195 @@
+Key:        LU-20694
+Summary:    MDS LBUG in lod_obd_get_info(): ASSERTION( ctxt != NULL ) failed
+Link:       https://jira.whamcloud.com/browse/LU-20694
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Oleg Drokin
+Created:    Fri, 4 Sep 2026 20:58:37 +0000
+Updated:    Fri, 4 Sep 2026 21:03:48 +0000
+
+--- Description ---
+An MDS panics while a client connects, if the connect lands in the window
+
+lod_add_device() leaves between publishing a new MDT target and creating
+
+that target's update llog:
+
+LustreError: 2261791:0:(lod_dev.c:2459:lod_obd_get_info()) ASSERTION( ctxt != ((void *)0) ) failed:
+LustreError: 2261791:0:(lod_dev.c:2459:lod_obd_get_info()) LBUG
+CPU: 2 PID: 2261791 Comm: mdt00_002
+Call Trace:
+ lbug_with_loc.cold.4+0xd/0x86 [libcfs]
+ lod_obd_get_info+0x7e8/0x990 [lod]
+ mdd_obd_get_info+0x319/0x5a0 [mdd]
+ mdt_obd_connect+0x4cc/0xa00 [mdt]
+ target_handle_connect+0x831/0x4420 [ptlrpc]
+ tgt_request_handle+0x6cd/0x2010 [ptlrpc]
+ ptlrpc_server_handle_request+0x443/0x13c0 [ptlrpc]
+ ptlrpc_main+0xcfc/0x1410 [ptlrpc]
+Kernel panic - not syncing: LBUG
+
+Where it was seen
+
+	boilpot, conf-sanity test_38, build 2.17.57_149_g9ef9cbb (master-next),
+
+  2026-09-01 –
+
+  https://testing.whamcloud.com/gerrit-janitor/external/crashes/boilpot-bigmem2-54-2026-09-01-11:56:17
+
+	boilpot, conf-sanity test_41b, build v2_15_90-71-g7bc129aaf1,
+
+  2024-09-22 –
+
+  https://testing.whamcloud.com/gerrit-janitor/external/crashes/boilpot-bigmem-24-2024-09-22-22:26:58
+
+Those are the only two hits in the whole janitor crash archive (7060 dumps), so
+
+it is rare. Both are conf-sanity cases that regenerate the config logs and then
+
+mount a client while MDT0000 is still learning about the other MDTs.
+
+Root cause
+
+lod_add_device() (lustre/lod/lod_lov.c) publishes the target with
+
+ltd_active set at ltd_add_tgt(), drops ltd_rw_sem, and only then
+
+calls lod_sub_init_llog() to create the target's
+
+LLOG_UPDATELOG_ORIG_CTXT:
+
+ 227        rc = ltd_add_tgt(ltd, tgt_desc);          ltd_rw_sem);
+ ...
+ 250                rc = lod_sub_init_llog(env, lod, tgt_desc->ltd_tgt);
+
+lod_obd_get_info() walks the same list under lod_getref(), which takes
+
+that same semaphore for read, and asserts every active target has a context
+
+(lustre/lod/lod_dev.c:2459). A client connect arriving in the gap runs
+
+mdt_obd_connect() -> mdd_obd_get_info() -> lod_obd_get_info() – the
+
+one-shot KEY_OSP_CONNECTED probe mdt_obd_connect() does while
+
+MDT_FL_SYNCED is clear – and hits the assertion.
+
+The debug ring buffer from the 2026-09-01 crash shows the two threads about
+
+600us apart:
+
+.878994  2262932  ltd_add_tgt()      publishes lustre-MDT0001-osp-MDT0000
+.880116  2261791  target_handle_connect()  first client connect to MDT0000
+.883507  2262932  up_write(ltd_rw_sem)
+.883527  2261791  LASSERT(ctxt != NULL)  
+
+Regression
+
+This used to be handled. 9882d4e933fd ("LU-15934 lod: clear up the message",
+
+landed in 2.15.57) replaced the existing NULL-context branch with the
+
+assertion:
+
+-                       if (!ctxt) {
+-                               CDEBUG(D_INFO, "%s: %s is not ready.\n", ...);
+-                               rc = -EAGAIN;
+-                               break;
+-                       }
++                       LASSERT(ctxt != NULL);
+
+Before that the race just returned -EAGAIN and the client retried the connect.
+
+Fix
+
+Treat a missing context as the "not ready yet" state the following
+
+!loc_handle test already reports as -EAGAIN, which the client retries via
+
+ptlrpc_busy_reconnect(). Report it at D_HA rather than D_INFO so that a
+
+connect refusal is visible on the default debug mask.
+
+Second defect on the same path
+
+Turning the LBUG into -EAGAIN exposes the other half: an MDT can reach that
+
+state permanently. lod_sub_init_llogs() discards what
+
+lod_sub_init_llog() returns for each remote target, so a target whose
+
+update llog could not be set up stays active without one – it records no
+
+distributed transaction, and lod_obd_get_info() then answers every client
+
+connect with -EAGAIN for as long as the MDT runs. The MDT mounts and nothing
+
+can use it, which is the state LU-15934 was originally filed for.
+
+A return from lod_sub_init_llog() is a local failure, not an unreachable
+
+peer – lod_sub_recovery_thread() already retries -ETIMEDOUT/-EAGAIN/-EIO
+
+itself and falls back to lod_sub_cancel_llog() – so the target will not
+
+recover on its own. Keep initializing the remaining targets, which is what
+
+LU-17365 wanted, but return the first failure so the mount fails instead of
+
+coming up unusable. The same failure on lod_child already fails the mount;
+
+the remote targets only differed because the error was dropped.
+
+lod_sub_init_llog() also left the llog context behind when
+
+lu_env_init() failed, unwinding to free_lrd rather than out_llog.
+
+Deactivating the target (ltd_active = 0) is not a usable alternative:
+
+lod_statfs_and_check() owns that flag for MDT targets as well as OSTs and
+
+sets it back to 1 on the next successful statfs, which the OSP answers
+
+perfectly well – only the llog failed.
+
+--- Comment (gerrit, Fri, 4 Sep 2026 21:03:47 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68638
+
+Subject: LU-20694 lod: don't LBUG when an MDT update llog is not ready
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 30f838280c164efffedb62bbda3f1cb67298ad1d
+
+--- Comment (gerrit, Fri, 4 Sep 2026 21:03:48 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68639
+
+Subject: LU-20694 lod: fail mount when an update llog cannot be set up
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 71c8384bfa67d16df43a67c1b479d1e0ac7dbffb
+
+--- Comment (gerrit, Fri, 4 Sep 2026 21:03:48 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68640
+
+Subject: LU-20694 tests: exercise the LOD update llog failure paths
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 49ccb503e5d30d217e617cc39745b1404f18e94b

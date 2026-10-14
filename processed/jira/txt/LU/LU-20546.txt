@@ -1,0 +1,172 @@
+Key:        LU-20546
+Summary:    ptlrpc: import reference leaked or double-released on setup failure
+Link:       https://jira.whamcloud.com/browse/LU-20546
+Type:       Bug
+Priority:   Minor
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Hiroshi Nishida
+Reporter:   Hiroshi Nishida
+Created:    Fri, 31 Jul 2026 13:57:00 +0000
+Updated:    Tue, 13 Oct 2026 14:28:05 +0000
+Resolved:   Tue, 13 Oct 2026 14:28:05 +0000
+Links:      Related: is related to LU-20811
+
+--- Description ---
+Two import reference bugs on the paths that set a request up before it is
+
+sent. Both come from the same thing: ptlrpc_request_free() and
+
+ptlrpc_req_put() are not interchangeable, and the setup paths disagree about
+
+which one is correct. Related to LU-20050 (Gerrit 64945), which fixes the same
+
+kind of leak in ptlrpc_connect_import_locked().
+
+1. The reference is leaked when an idle reconnect fails
+
+In ptlrpc_request_alloc_internal() the request gets allocated first, and
+
+__ptlrpc_request_alloc() takes an import reference for it:
+
+request->rq_import = class_import_get(imp);
+
+atomic_inc(&imp->imp_reqs);{code}
+
+If the import isn't FULL we try an idle reconnect, and the failure path looks like this:
+
+if (ptlrpc_reconnect_if_idle(imp) imp_reqs);
+        ptlrpc_request_free(request);
+        return NULL;
+}
+{code}
+
+ptlrpc_request_free() only puts the request back on the slab or into the
+
+pool. It never calls class_import_put(), so the reference taken a few lines
+
+earlier is just lost. Every failed idle reconnect leaks one, the import is
+
+never freed, client_obd_cleanup() never runs, and the LDLM namespace kobject
+
+is left behind in sysfs. The next mount of the same target then fails with
+
+-EEXIST.
+
+The easiest way to see it is to set sptlrpc.send_sepol=-1 and break
+
+l_getsepol: any client whose import has gone idle fails the reconnect, and
+
+leaks on every RPC that triggers one.
+
+The fix is to call ptlrpc_req_put() instead — it goes through
+
+__ptlrpc_free_req(), which already drops the import reference and decrements
+
+imp_reqs. The open-coded atomic_dec() has to go at the same time, otherwise
+
+the counter drops twice and the assertion in __ptlrpc_free_req() trips.
+
+This has been there since 93d20d171c20 ("LU-11128 ptlrpc: new request vs
+
+disconnect race"), which moved the allocation above the idle check.
+
+2. The reference is released twice when packing fails
+
+ptlrpc_request_bufs_pack() has the opposite problem. Its out_free label drops
+
+the reference, but leaves rq_import pointing at the import:
+
+out_free:
+
+        atomic_dec(&imp->imp_reqs);
+
+        class_import_put(imp);
+
+        return rc;{code}
+
+__ptlrpc_free_req() releases the import whenever rq_import is set. So a
+
+caller that disposes of the failed request with ptlrpc_req_put() releases the
+
+same reference a second time.
+
+Two callers do exactly that today:
+
+	gss_cli_ctx_fini_rpc() in gss_cli_upcall.c jumps to out_ref on a pack
+
+error, and out_ref calls ptlrpc_req_put()
+
+	osp_sync_new_job() in osp_sync.c calls ptlrpc_req_put() on a pack error
+
+Both over-release the import and decrement imp_reqs twice. The assertion on
+
+imp_reqs in __ptlrpc_free_req() can fire, and the import can be freed while
+
+it is still in use.
+
+The fix is to clear rq_import once the reference has been dropped.
+
+__ptlrpc_free_req() already skips the release when rq_import is NULL, so
+
+after this both ptlrpc_request_free() and ptlrpc_req_put() are correct on a
+
+failed pack, and callers no longer have to know which one to use.
+
+This one dates to 8e86156c34f3 ("LU-10486 osp: fix request leak on error in
+
+osp_sync") for the osp caller; the gss caller is older.
+
+Why they are fixed together
+
+The two fixes meet in the middle. The first makes a setup path start using
+
+ptlrpc_req_put(); the second makes ptlrpc_req_put() safe on a setup path
+
+that has already failed. Together they make ptlrpc_req_put() the one correct
+
+way to dispose of a request that failed before it was sent, which is what lets
+
+the callers in mdc drop their second error label (LU-20050, Gerrit 65026).
+
+--- Comment (gerrit, Wed, 2 Sep 2026 13:54:00 +0000) ---
+"Hiroshi Nishida " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68582
+
+Subject: LU-20546 ptlrpc: fix import ref on request setup failures
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 134d3461b0dbc34377ae5349ecc8178e1b680dac
+
+--- Comment (gerrit, Mon, 5 Oct 2026 21:58:33 +0000) ---
+"Hiroshi Nishida " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69438
+
+Subject: LU-20546 osc: check request pack rc with "if (rc)"
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 8876abc6cb023a0f65bac37fa86a3dd34afe1490
+
+--- Comment (gerrit, Tue, 13 Oct 2026 04:28:28 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/68582/
+
+Subject: LU-20546 ptlrpc: fix import ref on request setup failures
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: bdb7948b87843b2609b135c37643f497613793d2
+
+--- Comment (pjo, Tue, 13 Oct 2026 14:28:05 +0000) ---
+Merged for 2.18

@@ -1,0 +1,711 @@
+Key:        LU-20614
+Summary:    obdclass: lustre_get_jobid() can return success without setting jobid
+Link:       https://jira.whamcloud.com/browse/LU-20614
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Oleg Drokin
+Reporter:   Oleg Drokin
+Created:    Thu, 20 Aug 2026 04:45:30 +0000
+Updated:    Fri, 18 Sep 2026 16:56:11 +0000
+
+--- Description ---
+AI generated content:
+
+Found while reviewing the kernel-doc conversion of
+
+lustre/obdclass/jobid.c (change 66941, commit c31894b79857). A
+
+documentation-only follow-up to that change documents the behaviour
+
+described below as it stands today; this ticket is for actually fixing
+
+it. No in-tree caller checks the return value, so none of this is
+
+visible as a failure today. Every claim below was traced to a specific
+
+line in current master.
+
+== Problem 1: "0 on success" is not what it returns ==
+
+The kernel-doc added by c31894b79857 said:
+
+Return: %0 on success, %-errno on error
+
+On the per-session / process-environment path the value from
+
+jobid_get_from_cache() is passed straight out of lustre_get_jobid(),
+
+and that helper ends with:
+
+lustre/obdclass/jobid.c, jobid_get_from_cache()
+
+out:
+
+return rc where joblen has been reassigned to a jobid length. So a direct lookup
+
+hit returns a positive number, not 0. The other paths - JOBSTATS_NODELOCAL,
+
+JOBSTATS_PROCNAME_UID, and any fallback through jobid_interpret_string()
+
+	return 0. The function is therefore inconsistent with itself as well
+
+as with its doc.
+
+Worse, the positive value is not reliably a length of anything (see
+
+Problem 3).
+
+Both in-tree callers ignore the value:
+
+lustre/llite/vvp_io.c:1847 (in vvp_io_init())
+
+lustre/ptlrpc/pack_generic.c (in lustre_msg_set_jobinfo())
+
+but lustre_get_jobid() is EXPORT_SYMBOL'd, and a return that is
+
+sometimes 0 and sometimes a length is a trap for the next caller that
+
+writes the obvious "if (rc) goto err".
+
+== Problem 2: success with an undefined output buffer ==
+
+There are at least two ways lustre_get_jobid() returns 0 without
+
+defining @jobid. The second is the broader one and does not need a
+
+kernel thread.
+
+(a) No branch runs at all. lustre_get_jobid() has no terminal else:
+
+if (obd_jobid_var == JOBSTATS_DISABLE)
+
+{ memset; RETURN(0); }
+
+if (obd_jobid_var == JOBSTATS_NODELOCAL) rc = ...;
+
+else if (obd_jobid_var == JOBSTATS_PROCNAME_UID) rc = ...;
+
+else if (obd_jobid_var == JOBSTATS_SESSION ||
+
+jobid_name_is_valid(current->comm))
+
+{ ... }
+
+RETURN(rc); /* still the initial 0 if nothing matched */
+
+So when obd_jobid_var names an environment variable (the usual HPC
+
+configuration, e.g. "SLURM_JOB_ID") and jobid_name_is_valid(current->comm)
+
+is false, rc stays 0 and the buffer is never touched.
+
+jobid_name_is_valid() rejects exactly the Lustre and kernel service
+
+thread names - "kworker", "kswapd", "writeback", "irq", "ksoftirq",
+
+"ptlrpc", "ldlm", "ll_ping", "ll_sa", "ll_ucp".
+
+(b) obd_jobid_name is "%j" and the lookup fails. This one fires in
+
+ordinary user context. When obd_jobid_name contains "%j" the direct
+
+jobid_get_from_cache() call is skipped, and the fallback expands
+
+obd_jobid_name through jobid_interpret_string(), whose "%j" case is:
+
+case 'j': /* jobid stored in process environment */
+
+l = jobid_get_from_cache(jobid, width);
+
+if (l On failure l is 0, so nothing is written and neither jobid nor joblen
+
+advances. The function then falls out to:
+
+out:
+
+jobid[joblen - 1] = '\0';
+
+return joblen i.e. it clears only the last byte of the capped buffer and returns
+
+0. jobid[0 .. joblen-2] is whatever the caller's buffer held.
+
+lustre_get_jobid() maps that rc2 == 0 to rc = 0 and returns success.
+
+== Where the undefined buffer goes ==
+
+lustre/llite/vvp_io.c, vvp_io_init()
+
+struct job_info ji; /* uninitialised */
+
+...
+
+lustre_get_jobid(ji.ji_jobid, sizeof(ji.ji_jobid)); /* rc ignored */
+
+ji.ji_uid = ...; ji.ji_gid = ...;
+
+write_seqlock(&lli->lli_jobinfo_seqlock);
+
+memcpy(&lli->lli_jobinfo, &ji, sizeof(ji)); /* unconditional */
+
+write_sequnlock(&lli->lli_jobinfo_seqlock);
+
+lli_jobinfo is later read by osc to fill pb_jobid on outgoing RPCs, so
+
+this is kernel stack residue reaching the wire and server-side jobstats.
+
+Two mitigations already exist, and both are accidental rather than
+
+designed:
+
+	lustre/llite/rw.c, in the async readahead path, does right after
+
+cl_io_rw_init() has run vvp_io_init():
+
+/* overwrite jobid inited in vvp_io_init() */
+
+write_seqlock(&lli->lli_jobinfo_seqlock);
+
+memcpy(&lli->lli_jobinfo, &work->lrw_jobinfo, sizeof(...));
+
+write_sequnlock(&lli->lli_jobinfo_seqlock);
+
+That comment is evidence the problem is known at that one site. It
+
+is still a fixup after the fact - lli_jobinfo holds the garbage for
+
+the remainder of cl_io_rw_init(), where a concurrent reader on the
+
+same inode can pick it up - and it does nothing for any other entry
+
+into vvp_io_init().
+
+	lustre_msg_set_jobinfo() is guarded by pb_jobid[0] == '\0' on an
+
+already-zeroed message buffer, so a no-write leaves it empty rather
+
+than filled with garbage. That is luck, not a contract.
+
+The default obd_jobid_var is "disable", which memsets and returns early,
+
+so a stock configuration is not affected.
+
+== Problem 3: the returned length is not a length ==
+
+Two independent defects mean the positive value from
+
+jobid_get_from_cache() can exceed both strlen(@jobid) and the caller's
+
+@joblen:
+
+	cfs_get_environ() does not update *val_len when it truncates:
+
+if (entry_len >= *val_len)
+
+{ memcpy(value, entry, *val_len); value[*val_len - 1] = 0; GOTO(out, rc = -EOVERFLOW); }
+
+memcpy(value, entry, entry_len);
+
+val_len = entry_len; / only on the success path */
+
+and jobid_get_from_environ() deliberately converts that -EOVERFLOW
+
+to rc = 0 (with a rate-limited LCONSOLE_WARN). So the caller takes
+
+the success branch with *val_len still equal to the buffer size.
+
+	jobid_get_from_cache() then stores that as the cached length and
+
+later returns it verbatim:
+
+pidmap->jp_joblen = env_len;
+
+strscpy(pidmap->jp_jobid, env_jobid, sizeof(pidmap->jp_jobid));
+
+...
+
+strscpy(jobid, pidmap->jp_jobid, joblen);
+
+joblen = pidmap->jp_joblen;
+
+Both strscpy() calls can truncate, and neither result feeds
+
+jp_joblen.
+
+== Suggested fix ==
+
+1. Make lustre_get_jobid() always define the output buffer - an
+
+unconditional jobid[0] = '\0' up front, or a terminal else - so a 0
+
+return always means "@jobid is set". This also covers the "%j"
+
+fallback path in jobid_interpret_string().
+
+2. Normalise lustre_get_jobid() to return 0-or-negative. Neither
+
+in-tree caller wants a length; the simplest form is to stop
+
+propagating jobid_get_from_cache()'s length out. Whether that
+
+helper should keep returning a length at all is a separate call -
+
+given Problem 3, returning it is arguably worse than useless.
+
+3. Zero-initialise "struct job_info ji" in vvp_io_init() regardless,
+
+since it is memcpy'd wholesale into the inode.
+
+4. Fix the truncation accounting: have cfs_get_environ() set *val_len
+
+to what it actually copied on the -EOVERFLOW path, and have
+
+jobid_get_from_cache() derive jp_joblen from the strscpy() result
+
+rather than from env_len.
+
+5. With 1-4 in place, re-examine the rw.c "overwrite jobid inited in
+
+vvp_io_init()" fixup. It may still be wanted so readahead records
+
+the submitting job rather than the kworker, but it should no longer
+
+be load-bearing for correctness.
+
+6. Update the kernel-doc Return: section to match, replacing whatever
+
+the doc-only follow-up to 66941 lands with.
+
+== Reproducer sketch (untested) ==
+
+	Problem 2(b), ordinary user context:
+
+lctl set_param jobid_var=SLURM_JOB_ID jobid_name='%j'
+
+	run I/O from a process with no SLURM_JOB_ID in its environment
+
+	instrument vvp_io_init() to dump ji.ji_jobid before the memcpy
+
+	Problem 2(a):
+
+lctl set_param jobid_var=SLURM_JOB_ID
+
+	drive async readahead so ll_readahead_handle_work() runs on a kworker
+
+	(that path is patched over in rw.c; instrument vvp_io_init() itself)
+
+--- Comment (green, Thu, 20 Aug 2026 16:35:38 +0000) ---
+More AI stuff:
+
+Correction to the description above.  It presents the uninitialized
+
+buffer as needing an unusual trigger – a Lustre/kernel service thread
+
+comm, or an obd_jobid_name of "%j" whose lookup fails.  Tracing the full
+
+path to the wire shows that is understated: once jobstats is enabled at
+
+all, every OSC RPC carries kernel stack residue, with no special
+
+trigger required.
+
+The reason is that the jobid is copied by size, not as a string.
+
+1. ll_lli_init() (lustre/llite/llite_lib.c, ~1485) correctly zeroes the
+
+   inode's cached jobinfo:
+
+        memset(ji->ji_jobid, 0, sizeof(ji->ji_jobid));
+
+        ji->ji_uid = (__u32) -1;
+
+        ji->ji_gid = (__u32) -1;
+
+2. vvp_io_init() (lustre/llite/vvp_io.c, ~1834-1859) then overwrites all
+
+   of it from an uninitialized stack struct:
+
+        struct job_info ji;                  /* uninitialised */
+
+        lustre_get_jobid(ji.ji_jobid, sizeof(ji.ji_jobid));
+
+        ji.ji_uid = ...; ji.ji_gid = ...;
+
+        write_seqlock(&lli->lli_jobinfo_seqlock);
+
+        memcpy(&lli->lli_jobinfo, &ji, sizeof(ji));
+
+        write_sequnlock(&lli->lli_jobinfo_seqlock);
+
+   lustre_get_jobid() writes only up to the jobid string's NUL.
+
+   ji_jobid is LUSTRE_JOBID_SIZE (32) bytes, so for any jobid shorter
+
+   than that – "dd.0" under procname_uid is five bytes – the remaining
+
+   ~27 bytes are stack residue from vvp_io_init()'s own frame, and they
+
+   are now stored in the inode.
+
+3. lustre/llite/vvp_object.c:204 copies the whole struct out:
+
+   lli_jobinfo_cpy(lli, &attr->cra_jobinfo) – a full sizeof(*out) memcpy.
+
+4. lustre/osc/osc_request.c:2943:
+
+   lustre_msg_set_jobinfo(req->rq_reqmsg, &crattr->cra_jobinfo)
+
+5. lustre/ptlrpc/pack_generic.c, lustre_msg_set_jobinfo():
+
+        memcpy(pb->pb_jobid, ji->ji_jobid, sizeof(pb->pb_jobid));
+
+   A fixed 32-byte memcpy, not a string copy.  Everything past the NUL
+
+   goes out on the wire.
+
+So the trigger is simply "jobstats is on and the jobid is shorter than 32
+
+bytes", which is the normal case.  What has been hiding it is that the
+
+default obd_jobid_var is "disable", and that path in lustre_get_jobid()
+
+does memset(jobid, 0, joblen) over the entire buffer – so the stock
+
+configuration leaks nothing, and any other setting leaks on every RPC.
+
+Both the vvp_io_init() declaration and the pack_generic.c memcpy were
+
+introduced by the same commit:
+
+    e7ab0f86e4 ("LU-17710 llite: protect parallel accesses to lli_*id")
+
+The undefined-buffer cases in the description are still real and still
+
+worth fixing – they are what makes the whole 32 bytes garbage rather
+
+than just the tail – but they are an aggravating factor, not the
+
+precondition.
+
+== Second correction: jobid_name_is_valid() is not kernel-thread-only ==
+
+The description says jobid_name_is_valid() "rejects exactly the Lustre and
+
+kernel service thread names".  That is also understated.  The function is a
+
+plain strncmp() prefix match with no PF_KTHREAD test at all:
+
+    static bool jobid_name_is_valid(char *jobid)
+
+    {
+
+            const char *const lustre_reserved[] = 
+
+{ "ll_ping", "ptlrpc",
+                                    "ldlm", "ll_sa", "kworker", "kswapd",
+                                    "writeback", "irq", "ksoftirq",
+                                    "ll_ucp", NULL }
+;
+
+            ...
+
+            for (i = 0; lustre_reserved[i] != NULL; i++) 
+
+{
+                    if (strncmp(jobid, lustre_reserved[i],
+                                strlen(lustre_reserved[i])) == 0)
+                            return false;
+            }
+            return true;
+
+    }
+
+Compare jobid_print_current_comm() (jobid.c:662) in the same file,
+
+which does the same style of prefix match but correctly guards it with
+
+"if (current->flags & PF_KTHREAD)".
+
+So any ordinary user process whose comm merely starts with one of those
+
+strings takes the no-branch path – and unlike a kernel thread it does have
+
+an environment that could have been read.  Note "irq" is a three-character
+
+prefix and irqbalance is a real, commonly-running userspace daemon; "ldlm"
+
+and "ptlrpc" would likewise catch any user binary named after them.
+
+This does not change the fix, but it does widen who is affected and is worth
+
+knowing when deciding how far to backport.
+
+== Confirmed on a live cluster, and it reaches server memory ==
+
+Measured on a rocky8 client (4.18.0-553) with jobid_var=procname_uid and a
+
+4 MB O_DIRECT dd, probing all 32 bytes at three points – vvp_io_init()
+
+before the memcpy, lustre_msg_set_jobinfo() after the pack, and
+
+tgt_request_handle() on receive:
+
+  unfixed:
+
+    vvp   ji_jobid 64642e300000000002000000000000001841b9fd9288ffff360c...
+
+    pack  pb_jobid 64642e300000000002000000000000001841b9fd9288ffff360c...
+
+    srv   pb_jobid 64642e300000000002000000000000001841b9fd9288ffff360c...
+
+  fixed:
+
+    vvp/pack/srv   64642e3000000000000000000000000000000000000000000000...
+
+"64 64 2e 30 00" is "dd.0\0".  Bytes 16..23 of the unfixed dump,
+
+1841b9fd9288ffff, are a live kernel pointer (0xffff8892fdb94118); bytes
+
+24-25 varied per RPC.  The three dumps are byte-identical, so the residue
+
+is not merely prepared locally – it is transmitted and arrives at the OST.
+
+It is also retained there.  lustre/obdclass/lprocfs_jobstats.c:220,
+
+job_alloc(), does:
+
+    memcpy(job->js_jobid, jobid, sizeof(job->js_jobid));
+
+another fixed 32-byte copy, so every job_stats entry on the server holds
+
+the client's stack residue for the lifetime of the entry.  This is not a
+
+functional bug – cmp_key_jobid() uses strcmp() and the seq_show loop stops
+
+at the first NUL, so job_stats output and hashing are unaffected (verified:
+
+"job_id: dd.0" with no trailing garbage) – but it does mean the exposure
+
+is memory-resident on the server, not only in flight.
+
+One correction to the numbers above: on the procname_uid path the residue
+
+is bytes 5..30, not 5..31.  jobid_interpret_string() advances @jobid and
+
+decrements @joblen in lockstep and ends with jobid[joblen - 1] = NUL, which
+
+always lands on buf[31].
+
+== It is not only an info leak: bogus job_ids are recorded on the OST ==
+
+Later measurement on a plain, uninstrumented master build with a plain
+
+renamed dd showed the residue is not merely trailing bytes – it becomes
+
+the job_id itself, recorded in obdfilter.*.job_stats on the OST:
+
+	job_id: "\x906\x1CM-k\x9B\x91M-?M-?\x80M-|M-M@A\xAAM-^?..."
+
+Those decode as kernel stack addresses (0xffff919beb1c3690,
+
+0xffffaa4140cdfc80).  The call site was confirmed with %pS: the garbage
+
+cases were 8/8 vvp_io_init+0x287, while 1190 clean ones came from
+
+ptlrpc_set_add_req/ptlrpcd_add_req filling an already-zeroed pb_jobid.
+
+The mechanism is that nothing drops an unterminated jobid.
+
+lustre_msg_get_jobid() deliberately force-terminates at byte 31 ("If
+
+clients send unterminated jobids, terminate them here so that there is
+
+no chance of string overflow later"), and lprocfs_job_stats_log()
+
+discards only strlen(jobid) == 0 – with a comment at the same site
+
+saying unterminated jobids are handled in lustre_msg_get_jobid().  So 32
+
+garbage bytes become a valid 31-character job_id, which is then stored,
+
+keys the NRS TBF jobid cache (nrs_tbf.c), and prints in every DEBUG_REQ.
+
+== Why this was missed twice, and why there is no regression test ==
+
+The symptom tracks the client debug mask.  Alternating only the mask on
+
+one unfixed build:
+
+    reduced 8/8 leaked | default 0/8 | reduced 8/8 | default 0/8
+
+An early measurement used the default mask and came back clean – a true
+
+negative for that configuration and a false one for the bug.  Anyone
+
+re-measuring this should sweep masks and state which one a negative was
+
+taken under.
+
+A sanity test was written and then dropped, because it passes on an
+
+unfixed build.  Measured three times, not inferred: the identical
+
+workload leaks 8/8 from an interactive shell and 0/8 from inside
+
+sanity.sh on the same unfixed build, because the harness disturbs the
+
+very stack the bug reads.  The post-patch direction is deterministic;
+
+the pre-patch direction cannot be staged on demand.  A test asserting
+
+"no non-printable bytes in an OST job_id" would therefore pass without
+
+the fix, which is worse than no test.
+
+(Two incidental traps for whoever revisits this: grep hides the evidence
+
+as "Binary file (standard input) matches" unless given -a, and jobid_var
+
+silently refuses values longer than JOBSTATS_JOBID_VAR_MAX_LEN = 20.)
+
+== Separate defect, deliberately NOT fixed by the patches below ==
+
+jobid_name_is_valid() rejecting an ordinary user process (above) means that
+
+process gets no jobid at all.  The patches below only make the buffer
+
+defined; after them an "irqbalance"-named job still reports no jobid.
+
+That is left alone on purpose.  Giving jobid_name_is_valid() the PF_KTHREAD
+
+guard its sibling jobid_print_current_comm() already has would change which
+
+processes get jobids, i.e. it changes jobstats output for real users.  That
+
+is a user-visible behaviour change needing its own review, and arguably its
+
+own discussion of whether a reserved-prefix list is the right mechanism at
+
+all – a three-character "irq" prefix matching irqbalance suggests it is not.
+
+It does not belong in a series whose premise is "no functional change".
+
+Recording it here so it is not lost.  Demonstrated on a live cluster: same
+
+command, same environment, only the binary's name differing –
+
+    comm='dd'          rc=0 nul=1 slen=4  buf='1234'
+
+    comm='irqbalance'  rc=0 nul=0 slen=32 buf='ZZZZ...'
+
+    comm='ldlm_worker' rc=0 nul=0 slen=32 buf='ZZZZ...'
+
+(nul=0 meaning no terminator anywhere in the 32-byte buffer.)
+
+== Also found: cfs_get_environ() does not terminate on success ==
+
+Its success path does "memcpy(value, entry, entry_len); *val_len = entry_len"
+
+and writes no NUL; only the -EOVERFLOW path terminates, via
+
+"value[*val_len - 1] = 0".  It is safe today solely because the single caller
+
+declares env_jobid[LUSTRE_JOBID_SIZE] initialised to the empty string, so the
+
+byte is already zero.  Any future caller allocating a fresh buffer – exactly
+
+what the newly documented retry protocol tells it to do – gets an
+
+unterminated string.  Being fixed as part of the length-accounting patch.
+
+--- Comment (gerrit, Thu, 20 Aug 2026 22:16:16 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68191
+
+Subject: LU-20614 obdclass: always define the jobid buffer
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 2e2424639e1e5f1847ecaaefb9460028476cc9b4
+
+--- Comment (gerrit, Thu, 20 Aug 2026 22:16:17 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68192
+
+Subject: LU-20614 obdclass: return 0 or an error from lustre_get_jobid
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 868de8ca9e5e80603e9b3a4ff2ec059a6d2d070f
+
+--- Comment (gerrit, Thu, 20 Aug 2026 22:16:18 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68193
+
+Subject: LU-20614 obdclass: fix the cfs_get_environ() out parameters
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 3ab651bb6630418253eca5610f173c373ef23003
+
+--- Comment (gerrit, Thu, 20 Aug 2026 22:23:46 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68194
+
+Subject: LU-20614 llite: zero job_info before caching it in the inode
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: f4ca093218a88dcda701cf5f30081bab384a77e9
+
+--- Comment (gerrit, Thu, 20 Aug 2026 22:23:47 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68195
+
+Subject: LU-20614 ptlrpc: do not pack bytes past the jobid's NUL
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: ae6d122f3c8c4732e3f0b7c41e3598db3b9b605d
+
+--- Comment (gerrit, Fri, 18 Sep 2026 16:56:03 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/68191/
+
+Subject: LU-20614 obdclass: always define the jobid buffer
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 1941d5106decf769f5f15e2e363a711475ef7c2e
+
+--- Comment (gerrit, Fri, 18 Sep 2026 16:56:11 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/68192/
+
+Subject: LU-20614 obdclass: return 0 or an error from lustre_get_jobid
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: ee42bb25f8b8d5fbcbe5fcc2e9e01c90570e9746

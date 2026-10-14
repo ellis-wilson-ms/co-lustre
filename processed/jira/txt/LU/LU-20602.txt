@@ -1,0 +1,84 @@
+Key:        LU-20602
+Summary:    MDT-internal objects carry no LMA flag marking them internal
+Link:       https://jira.whamcloud.com/browse/LU-20602
+Type:       Technical task
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Hiroshi Nishida
+Reporter:   Hiroshi Nishida
+Created:    Tue, 18 Aug 2026 14:05:06 +0000
+Updated:    Fri, 21 Aug 2026 13:15:55 +0000
+
+--- Description ---
+A scan that enumerates objects without namespace context classifies each one from `trusted.lma` and its FID, using the ladder in `osd_scrub_get_fid()` /`osd_iit_iget()`. Three MDT-internal objects pass it and come out user-visible:
+
+Object
+FID
+`lma_compat`
+`lma_incompat`
+
+—
+—
+—
+—
+
+`/CONFIGS/mountdata`
+`[0xe:0x0:0x0]` — IGIF, seq = its own inode number
+0
+0
+
+`/update_log_dir/[0x200000400:0x1:0x0]`
+normal sequence
+0
+0
+
+`/update_log_dir/[0x200000401:0x1:0x0]`
+normal sequence
+0
+0
+
+`LMAC_NOT_IN_OI` is set on the OI and sequence directories (`osd_compat.c`,`osd_oi.c`) but not on objects created through `local_storage.c`, nor on`mountdata`; and `fid_is_namespace_visible()` accepts both an IGIF and a normal sequence, so FID range does not separate them either. `FID_SEQ_UPDATE_LOG` / `FID_SEQ_UPDATE_LOG_DIR` would classify the update logs correctly, but the objects observed are not on those sequences — whether that is expected is a question for the reviewer.
+
+The flag is not what keeps the other internal objects out. No object stamped by `osd_ios_scan_one()` is flagged at all: `last_rcvd`, `CATALOGS`, `reply_data`, `fld`, `seq_ctl`, `seq_srv`, `lov_objid` and `health_check` all take `compat = 0` from `osd_scrub.c:1918`, exactly as a regular file under `ROOT` does. They stay out of a scan only because their `olm_fid` sits on `FID_SEQ_LOCAL_FILE`, which `fid_is_namespace_visible()` rejects. So the MDT's internal objects are held back by two unrelated mechanisms, and the three above are where both miss:
+
+mechanism
+covers
+misses
+
+`LMAC_NOT_IN_OI`
+OI files, seq directories, `O/`, index backup dir, fs root
+everything reached through `osd_ios_scan_one()`
+
+FID sequence
+the `FID_SEQ_LOCAL_FILE` objects listed above
+`mountdata` (IGIF), the two `update_log_dir` children (`FID_SEQ_NORMAL`)
+
+`/CONFIGS/mountdata` is reached by `osd_ios_varfid_fill()`, which passes `fid = NULL`, so a missing LMA becomes an IGIF built from the inode number – namespace-visible. `update_log_dir` is reached by `osd_ios_uld_fill()`, which parses the FID out of the file name; the two observed are on `0x200000400`/`0x200000401`, the first two normal sequences (`FID_SEQ_NORMAL = 0x200000400`), so they are namespace-visible too.
+
+Observed on RHEL 9.7, Lustre 2.17, `testfs-MDT0000` on `/dev/vdb`, 1024-byte inodes, MDT mounted and serving: inodes read straight from the inode table, FID set compared against `lfs find` + `lfs path2fid`. Exactly these three appear as extras at both 173 and 509 objects — zero missing, and the leak is bounded rather than proportional. (Three further extras are `.lustre`, `.lustre/fid` and `.lustre/lost+found`, which are genuinely visible and merely hidden from `lfs find`.)
+
+Impact. Every out-of-namespace scanner needs a hand-maintained denylist of internal inode numbers, tracking every future layout change, in every consumer. A flag on the object is durable; a denylist is not.
+
+Proposed fix. Add a new compat flag – `LMAC_INTERNAL`, "not part of the user namespace" – and set it in `osd_ios_scan_one()`. Not `LMAC_NOT_IN_OI`: that flag also means "does not need an OI mapping" and is acted on by `osd_scrub_get_fid()`, `osd_oi_insert()` and `osd_dirent_check_repair()`, and the `update_log_dir` children are located by FID and do need their OI mapping maintained.
+
+Both branches of `osd_ios_scan_one()` need it, not only `osd_scrub.c:1918`. That line runs only when the object has no LMA yet, so on a filesystem that has already completed its initial OI scrub `mountdata` carries an LMA with `lma_compat == 0` and takes the `else` at 1923, where nothing rewrites it. Setting the flag at 1918 alone would produce it on freshly formatted MDTs and never on deployed ones – a consumer would be correct on new filesystems and silently wrong everywhere else. The `else` path must upgrade an LMA that lacks the flag, which makes this an upgrade action: until a filesystem has had one scrub pass with the new code, an unflagged object proves nothing, and consumers need to say so.
+
+--- Comment (bzzz, Wed, 19 Aug 2026 04:06:41 +0000) ---
+objects with no LMAC_NOT_IN_OI set are internal and out of interests of regular users?
+
+--- Comment (JIRAUSER21604, Wed, 19 Aug 2026 15:38:06 +0000) ---
+For example, lfs find or LU-20462 needs to skip those entries.
+
+--- Comment (bzzz, Fri, 21 Aug 2026 04:04:08 +0000) ---
+For example, lfs find or LU-20462 needs to skip those entries.
+
+I don't follow, missing LMAC_NOT_IN_OI can be treated as LMAC_INTERNAL, no?
+
+--- Comment (JIRAUSER21604, Fri, 21 Aug 2026 04:57:05 +0000) ---
+It is the other way round, I think: LMAC_NOT_IN_OI is sufficient for "internal" but not necessary. Nothing user-visible carries it, so "set => internal" is safe, but plenty of internal objects lack it, so "clear" decides nothing. In fact no object stamped by osd_ios_scan_one() gets it – last_rcvd, CATALOGS, reply_data, fld, seq_ctl and the rest all take compat = 0 from osd_scrub.c:1918, exactly as a regular file under ROOT does. What keeps those out of a scan today is not the flag but their FID range: they sit on FID_SEQ_LOCAL_FILE, which fid_is_namespace_visible() rejects. The three in the table are where that second accident fails as well – /CONFIGS/mountdata is stamped with an IGIF built from its own inode number (osd_ios_varfid_fill passes fid = NULL), and the two update_log_dir children carry the FIDs parsed out of their names, on 0x200000400/0x200000401, i.e. FID_SEQ_NORMAL. Both ranges are namespace-visible, so a scan with only the LMA to go on takes them for user files. (lfs find is unaffected – it walks the namespace and never meets them; the consumer is a scan that enumerates inodes directly.)
+
+I would rather not widen LMAC_NOT_IN_OI onto them, because it carries operational meaning beyond "internal" – "does NOT need OI mapping" – and three sites act on it: osd_scrub_get_fid()/osd_ios_scan_one() skip the object, so its OI mapping is never checked or repaired; osd_oi_insert() excludes it from duplicate-FID detection; osd_dirent_check_repair() expects such an entry only as the '..' of a remote directory. The update_log_dir children are located by FID and do need their OI mapping maintained, hence a separate descriptive bit with no OI semantics attached. One correction to my own proposal while I am here: setting the new flag at osd_scrub.c:1918 only covers the -ENODATA branch, so it would appear on freshly formatted MDTs and never on existing ones, where mountdata already carries an LMA with compat = 0 and takes the else at 1923. It has to be set on that path too, which makes it an upgrade action – until a filesystem has had one scrub pass with the new code, an unflagged object still proves nothing. If you would prefer to widen LMAC_NOT_IN_OI and audit those three call sites instead, I am happy to go that way.
+
+--- Comment (JIRAUSER21604, Fri, 21 Aug 2026 13:14:58 +0000) ---
+I think this should be moved to LU-20462 Local Find Utility (LFU). Our scanners need it.

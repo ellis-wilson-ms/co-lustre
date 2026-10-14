@@ -1,0 +1,146 @@
+Key:        LU-20668
+Summary:    replay-single test_70b: (ldlm_lockd.c:1018:ldlm_server_completion_ast()) ASSERTION( data != NULL ) failed
+Link:       https://jira.whamcloud.com/browse/LU-20668
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Oleg Drokin
+Created:    Mon, 31 Aug 2026 05:42:32 +0000
+Updated:    Mon, 31 Aug 2026 17:59:53 +0000
+
+--- Description ---
+An MDT umount races with an intent enqueue that is handing its lock over to
+
+the client, and the umount LBUGs:
+
+LustreError: 1606211:0:(ldlm_lockd.c:1453:ldlm_handle_enqueue()) ### lock on destroyed export 0000000028bb2444 ns: mdt-lustre-MDT0002_UUID lock: ffff8b630263b800/0x5fb42379a3449023 lrc: 4/0,0 mode: PR/PR res: [0x2800007ed:0x3bb:0x0].0x0 bits 0x1b/0x0 rrc: 3 type: IBT gid 0 flags: 0x50306400000000 nid: 0@lo remote: 0x5fb42379a3449015 expref: 3 pid: 1606211 timeout: 0 lvb_type: 0 lru_score: 0 lru_type: 0
+LustreError: 1662531:0:(ldlm_lockd.c:1018:ldlm_server_completion_ast()) ASSERTION( data != ((void *)0) ) failed:
+LustreError: 1662531:0:(ldlm_lockd.c:1018:ldlm_server_completion_ast()) LBUG
+CPU: 1 PID: 1662531 Comm: umount Kdump: loaded Tainted: G           O      -------- -  - 4.18.0rocky8.10-debug #2
+Call Trace:
+ dump_stack+0x99/0xca
+ lbug_with_loc.cold.4+0xd/0x86 [libcfs]
+ ldlm_server_completion_ast+0x635/0xd80 [ptlrpc]
+ cleanup_resource+0x30d/0x490 [ptlrpc]
+ ldlm_resource_clean+0x3f/0x70 [ptlrpc]
+ cfs_hash_for_each_relax+0x267/0x5f0 [obdclass]
+ cfs_hash_for_each_nolock+0x1a0/0x2c0 [obdclass]
+ ldlm_namespace_cleanup+0x38/0xf0 [ptlrpc]
+ __ldlm_namespace_free+0x72/0x6a0 [ptlrpc]
+ ldlm_namespace_free_prior+0x87/0x2c0 [ptlrpc]
+ mdt_device_fini+0x233/0xb70 [mdt]
+ obd_precleanup.isra.17+0xb3/0x380 [obdclass]
+ class_cleanup+0x410/0xab0 [obdclass]
+ class_process_config+0xdb0/0x2450 [obdclass]
+ class_manual_cleanup+0x4b0/0xa60 [obdclass]
+ server_put_super+0x11dc/0x1cb0 [ptlrpc]
+ generic_shutdown_super+0xb7/0x1c0
+ kill_anon_super+0x20/0x50
+ lustre_kill_super+0x2e/0x60 [lustre]
+ deactivate_locked_super+0x59/0xd0
+ cleanup_mnt+0x63/0xe0
+Kernel panic - not syncing: LBUG
+
+Root cause
+
+cleanup_resource() (lustre/ldlm/ldlm_resource.c) decides to fake a
+
+blocking AST for any lock that still carries local references:
+
+		if (local_only && (lock->l_readers || lock->l_writers)) {
+			unlock_res(res);
+			...
+			if (lock->l_completion_ast)
+				lock->l_completion_ast(lock,
+						       LDLM_FL_FAILED, NULL);
+
+The reference counts are read under the resource lock, but
+
+l_completion_ast is dereferenced after unlock_res().  In that
+
+window an MDT service thread finishing an intent enqueue runs
+
+mdt_intent_lock_replace(), which - under lock_res_and_lock() on the
+
+same resource - zeroes l_readers/l_writers, sets l_export, clears
+
+LDLM_FL_LOCAL and replaces l_completion_ast with
+
+ldlm_server_completion_ast().  The cleanup thread then calls that server
+
+callback with data == NULL and hits its
+
+LASSERT(data != NULL), which needs a struct ldlm_cb_set_arg.
+
+The captured debug log shows exactly this lock going from
+
+lrc: 3/1,0 ... flags: 0x50210000000000 (local, one reader, still on the
+
+waiting queue) to
+
+lrc: 4/0,0 ... flags: 0x50306400000000 nid: 0@lo remote: 0x... (no
+
+readers, LDLM_FL_LOCAL cleared, exported) between the moment
+
+cleanup_resource() tested the counts and the moment it printed
+
+"setting FL_LOCAL_ONLY" and called the callback.
+
+Notes:
+
+	This is not specific to umount -f: server_put_super() sets
+
+  OBDF_FORCE unconditionally, so every MDT umount passes
+
+  LDLM_FL_LOCAL_ONLY to ldlm_namespace_cleanup().
+
+	Not a master-next regression.  The crash reproduces on plain master
+
+  (b285e26138) and both sides of the race are pre-LU-era code: the
+
+  l_completion_ast call site dates from 2004 and the
+
+  LASSERT(data != NULL) from 6b810c5a75e9 (2007, b=11301).
+
+	The lock handed over inside the window is not leaked:
+
+  class_cleanup() calls class_disconnect_exports() before
+
+  obd_precleanup() reaches mdt_fini(), so the enqueue always finds
+
+  rq_export->exp_disconnected and cancels the lock it just gave away.
+
+Reproducer
+
+Deterministic with two fault-injection pauses (added by the patch below) -
+
+park an MDT thread in mdt_intent_lock_replace() while a getattr intent
+
+holds the local lock, hold the umount's cleanup_resource() inside the
+
+window it has just sampled, and let the handover complete in between.
+
+This is replay-single test_204.
+
+On rocky9 / ldiskfs / 2 MDTs the unfixed server LBUGs on the first
+
+iteration; with the fix the same run passes 3/3 with the race provably
+
+exercised (the console shows the handover landing between the cleanup
+
+pause's start and end).
+
+--- Comment (gerrit, Mon, 31 Aug 2026 17:59:53 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68539
+
+Subject: LU-20668 ldlm: sample l_completion_ast under the resource lock
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: e0d87fd5a42c01f30411dcee26ebaa19cafb8405

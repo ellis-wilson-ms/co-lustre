@@ -1,0 +1,45 @@
+Key:        LU-20358
+Summary:    quiesce clients before maintenance for bounded recovery
+Link:       https://jira.whamcloud.com/browse/LU-20358
+Type:       Improvement
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Andreas Dilger
+Created:    Thu, 11 Jun 2026 23:11:41 +0000
+Updated:    Thu, 11 Jun 2026 23:11:41 +0000
+
+--- Description ---
+Allow an admin to quiesce a target's clients before a server upgrade so that the post-remount recovery window is minimized. This avoids minutes-long recovery windows and application stalls, without eviction of active clients.  Accessed via new "lctl maintenance start/stop" command-line interface and generic netlink. The quiesce confirms clients are clean (no cached write or replay backlog) before the reboot, so on remount recovery only has to wait out reconnect, not replay.
+
+Client side – two reverse-import directives over a dedicated RQF_LDLM_MAINTENANCE RPC (using struct ldlm_maintenance_desc), sent only to clients that negotiated OBD_CONNECT2_MAINTENANCE feature at connect time, so pre-feature clients on a mixed-version cluster are never targeted (and so never wrongly evicted).  There are three phases to the maintenance quiesce operation:
+
+Client Pre-Recovery Warm-up
+The client cancels unused locks (flushing their dirty data) and resets its adaptive-timeout estimates (at_reset on net-latency and per-portal service estimates to CONNECTION_SWITCH_MIN), so on the next mount it reconnects without first waiting out an inflated service estimate. This does not by itself necessarily shorten the import reconnect backoff; prompt reconnect relies on MGS-driven Imperative Recovery nudging clients as soon as the target accepts connections.
+
+Synchronous RPC Operations
+The client switches OST and MDT RPCs to write-through (via a new cl_maint_sync flag stored in the client import and checked in osc_enter_cache() so that no new replay backlog accumulates before server shutdown.  Existing dirty data and uncommitted RPCs drains via normal writeback. It self-reverts on reconnect to a new target instance (new ocd_instance from the server), so the maintenance mode is tied directly to the restart and does not need active external intervention to minimize the time that clients perform sync RPCs.
+
+Each directive evicts any client that does not ACK the state change, so once the quiesce completes every remaining client is accounted for – in-sync or pre-evicted.
+
+Server Side Changes
+A persistent OBD_INCOMPAT_MAINTENANCE flag saved persistently in the target's last_rcvd file indicates "no client has cached backlog". On the next mount the target detects this state and bounds recovery to reconnect time: the deadline is held maintenance_recovery_idle seconds past the most recent reconnect, so that an active reconnect stream keeps recovering as long as clients keep arriving, dynamically avoiding premature eviction with a large number of clients reconnecting to the target or busy MGS IR broadcast with 10k+ clients x N targets/server.  A client that is unresponsive past the grace time (a genuine no-show) is evicted.  Recovery completes immediately once all expected clients are back. The grace time is an idle gap, not a total time limit that needs to be tuned based on the client count, so a small value valid is even on large clusters. The flag is cleared and synced as recovery completes (tgt_boot_epoch_update), before normal service resumes, so a later unplanned restart recovers normally.
+
+Interfaces
+
+	lctl maintenance start|stop TARGET a NetLink target genl family (TARGET_CMD_MAINTENANCE + status dump)
+
+	per-target routine tgt_maintenance().
+
+	Operator observability: obdfilter.*.maintenance_status state machine (idle -> preparing -> draining -> quiesced -> resuming) + client counts.
+
+	Tunables: maintenance_recovery_idle (reconnect-idle recovery bound), maintenance_ack_grace (directive ACK wait before evicting a straggler).
+
+h3, Tests in lustre/tests/replay-single.sh
+
+	test lctl maintenance start/stop drives quiescedidle state and the flag target
+
+	a quiesced restart bounds recovery and preserves the live client
+
+	cancel-without-reboot resumes clients

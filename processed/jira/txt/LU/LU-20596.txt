@@ -1,0 +1,183 @@
+Key:        LU-20596
+Summary:    sanity-lnet test_233: ping failed with rc = 255
+Link:       https://jira.whamcloud.com/browse/LU-20596
+Type:       Bug
+Priority:   Medium
+Status:     Resolved
+Resolution: Fixed
+Assignee:   Chris Horn
+Reporter:   Maloo
+Created:    Sat, 15 Aug 2026 17:11:01 +0000
+Updated:    Tue, 29 Sep 2026 00:37:51 +0000
+Resolved:   Tue, 29 Sep 2026 00:37:51 +0000
+
+--- Description ---
+This issue was created by maloo for Chris Horn 
+
+This issue relates to the following test suite run: https://testing.whamcloud.com/test_sets/eda5fabb-b8fd-4e7f-bec0-164358ba588c
+
+test_233 failed with the following error:
+
+ping failed with rc = 255
+
+Test session details:
+
+clients: https://build.whamcloud.com/job/lustre-reviews/129435 - 5.14.0-611.5.1.el9_7.x86_64
+
+servers: https://build.whamcloud.com/job/lustre-reviews/129435 - 5.14.0-611.55.1.el9_7_lustre.x86_64
+
+Simulate intermittent remote_dropped
+CMD: trevis-155vm53.trevis.whamcloud.com /usr/sbin/lnetctl net set -h
+CMD: trevis-155vm53.trevis.whamcloud.com /usr/sbin/lnetctl global show
+CMD: trevis-155vm53.trevis.whamcloud.com /usr/sbin/lnetctl net set --net tcp --lnd-timeout 3
+CMD: trevis-155vm53.trevis.whamcloud.com /usr/sbin/lnetctl set transaction_timeout 10
+/usr/sbin/lnetctl fault drop add -s 10.240.45.211@tcp -d 10.240.46.98@tcp -m GET -e remote_dropped -r 2
+/usr/sbin/lnetctl fault drop add -s 10.240.45.211@tcp -d 10.240.46.98@tcp1 -m GET -e remote_dropped -r 2
+/usr/sbin/lnetctl fault drop add -s 10.240.45.211@tcp -d 10.240.45.211@tcp -m GET -e remote_dropped -r 2
+/usr/sbin/lctl net_drop add -s 10.240.45.211@tcp -d 10.240.45.211@tcp1 -m GET -e remote_dropped -r 2
+/usr/sbin/lctl net_drop add -s 10.240.45.211@tcp1 -d 10.240.46.98@tcp -m GET -e remote_dropped -r 2
+/usr/sbin/lctl net_drop add -s 10.240.45.211@tcp1 -d 10.240.46.98@tcp1 -m GET -e remote_dropped -r 2
+/usr/sbin/lnetctl fault drop add -s 10.240.45.211@tcp1 -d 10.240.45.211@tcp -m GET -e remote_dropped -r 2
+/usr/sbin/lnetctl fault drop add -s 10.240.45.211@tcp1 -d 10.240.45.211@tcp1 -m GET -e remote_dropped -r 2
+/usr/sbin/lnetctl ping --source 10.240.45.211@tcp 10.240.46.98@tcp
+manage:
+- ping:
+  errno: -5
+  descr: ! 'failed to ping 10.240.46.98@tcp: Input/output error'
+ sanity-lnet test_233: @@@@@@ FAIL: ping failed with rc = 255 
+
+VVVVVVV DO NOT REMOVE LINES BELOW, Added by Maloo for auto-association VVVVVVV
+
+sanity-lnet test_233 - ping failed with rc = 255
+
+--- Comment (hornc, Sat, 15 Aug 2026 17:13:26 +0000) ---
+analysis from claude
+
+Root cause
+
+Test_233 adds drop rules with rate 2. A rate 2 rule has a special case in
+
+lnet_drop_rule_add() (lnet/lnet/net_fault.c:212). The rule always drops the
+
+first message that it matches. Commit c892edc14a ("LU-18555 lnet: Track
+
+successful and failed resends") added this special case.
+
+After the first drop, drop_rule_match() (net_fault.c:499) drops exactly 1
+
+message in each pair. The drop position in each later pair is random.
+
+The ping gets 3 attempts, because lnet_retry_count is 2. The test fails only
+
+when all 3 attempts hit a drop slot. Two facts make this impossible on one
+
+rule alone:
+
+	Drops alternate. Two attempts in a row on one rule never both drop.
+
+	A resend keeps the source NI, because the ping pins it with --source. The
+
+peer NI on the same net stays the same. All 3 attempts use one rule.
+
+Therefore a foreign GET must consume a slot in that same rule between the
+
+attempts. The foreign GET shifts the parity of the drop schedule, and the
+
+resend then lands on a drop slot.
+
+LNet arms such a GET at the moment of the first drop. The kernel adds the
+
+peer NI to the recovery queue. The recovery ping then goes to the same source
+
+and destination pair as the test ping:
+
+ 
+
+{{lnet_health_check() health check: ...198@tcp->...177@tcp: GET: REMOTE_DROPPED
+
+lnet_peer_ni_add_to_recoveryq_locked() 172.16.100.177@tcp added to recovery
+
+    queue. ping count: 0 next ping: 28015 last alive: 28014 health: 900}}
+
+The local_* statuses do not have this problem. A local failure puts the
+
+local NI in recovery, and the local recovery ping goes to the NI itself. That
+
+GET matches the self rules, not the rule that the test ping uses.
+
+Evidence from the VM cluster
+
+I reproduced the drop rule accounting on the co3 cluster with 2 nodes and the
+
+same tunables as test_233. Results:
+
+Run
+Result
+
+30 clean iterations
+30 pass, 0 fail
+
+15 iterations, peer NI health lowered
+15 pass, 0 fail
+
+40 iterations, concurrent ping traffic
+40 pass, 0 fail
+
+Every pass shows the same trace. The first send drops, the resend keeps the
+
+same source and destination, and the resend passes as message 2 of the pair:
+
+ 
+
+{{lnet_send_error_simulation() src ...198@tcp->dst ...177@tcp: GET simulate
+
+    health error: REMOTE_DROPPED
+
+lnet_resend_pending_msgs_locked() resending ...198@tcp->...177@tcp: GET
+
+    recovery 0 try# 1
+
+drop_rule_match() Drop Rule ...198@tcp->...177@tcp: next drop: 3}}
+
+The window between the drop and the resend is microseconds, because one
+
+monitor thread pass does both. The recovery ping is due 1 s later. My VM
+
+cluster is quiet, so the recovery ping never landed in the window. The CI
+
+node hit the window once.
+
+Confidence: the arithmetic and the code path are proven. The identity of the
+
+foreign GET in the CI run is an inference. The CI debug logs are not in the
+
+Maloo artifact bundle, so I cannot name the message.
+
+--- Comment (gerrit, Tue, 25 Aug 2026 02:10:02 +0000) ---
+"Chris Horn " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68297
+
+Subject: LU-20596 tests: discover peer after the NI add
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 09a239142faf461d1da25a2fabeb90b87de75c80
+
+--- Comment (gerrit, Mon, 28 Sep 2026 21:30:18 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/68297/
+
+Subject: LU-20596 tests: discover peer after the NI add
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 16bd1e83b239403e5fb7c1a80ad0fd7886569e02
+
+--- Comment (pjo, Tue, 29 Sep 2026 00:37:51 +0000) ---
+Merged for 2.18

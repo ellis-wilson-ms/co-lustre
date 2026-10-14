@@ -1,0 +1,113 @@
+Key:        LU-20924
+Summary:    hybrid ldiskfs: metadata not allocated in IOPS groups
+Link:       https://jira.whamcloud.com/browse/LU-20924
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Andreas Dilger
+Created:    Fri, 9 Oct 2026 21:57:51 +0000
+Updated:    Tue, 13 Oct 2026 10:39:44 +0000
+Labels:     ldiskfs
+Links:      Related: is related to  LU-16750; Related: is related to LU-20926
+
+--- Description ---
+[Claude] Follow-up to LU-16750, whose ext4-mballoc-for-hybrid.patch (patch https://review.whamcloud.com/51625 ("LU-16750 ldiskfs: optimize metadata allocation for hybrid LUNs")) is meant to allocate dynamic ldiskfs metadata (directory, xattr and extent index blocks) in the EXT4_BG_IOPS groups on flash, and data in the non-IOPS (HDD) groups.  Review against the current code and the upstream linux-ext4 discussion (v1, v3) shows that dynamic metadata is almost never placed in the IOPS groups.  The measured hybrid speedups (dumpe2fs, e2fsck) come from packed_meta_blocks placing the static metadata on flash, not from the mballoc changes.
+
+Reproducer
+
+1000MiB dm-linear device on a rhel9.7 test VM, groups 0-3 (first 128MiB) marked EXT4_BG_IOPS and EXT2_FLAGS_HAS_IOPS set, formatted with -g 8192 -G 4 -O sparse_super2,flex_bg,^resize_inode -E packed_meta_blocks=1.  Nested directories with 150 entries each, 40 files with a 3000-byte xattr, and one file with 400 extents:
+
+mb_max_linear_groups
+dir blocks in IOPS
+xattr blocks in IOPS
+extent index blocks in IOPS
+
+4 (default, dm device is rotational)
+0/120
+0/40
+0/2
+
+0
+0/120
+0/40
+0/2
+
+Kernel defects
+
+	The goal group is always tried before the IOPS groups.  On rhel8/rhel9/rhel10.0 the group loop in ext4_mb_regular_allocator() scans ac_g_ex.fe_group before calling ext4_mb_choose_next_group().  On rhel10.2/linux-6.12 ext4_mb_scan_groups() scans s_mb_max_linear_groups groups linearly from the goal before the IOPS scan, and a dm device stacked over any HDD inherits BLK_FEAT_ROTATIONAL, so that is 4 groups.  The metadata goal is derived from the inode's (flex) group, which is in the HDD region, so directory, xattr and extent index blocks go to HDD whenever the goal groups have free space.
+
+	The data fallback into IOPS groups is dead code and the real fallback happens too early.  The CR_ANY_FREE branch in ext4_mb_scan_groups() is unreachable because should_optimize_scan() returns 0 for cr >= CR_GOAL_LEN_SLOW (pointed out by Ritesh on v3).  With mb_enable_iops_data=1 the only effect is that ext4_mb_good_group_nolock() stops skipping IOPS groups, so data goes into IOPS groups as soon as the fast lists miss (e.g. a fragmented filesystem), not only when the HDD groups are full.
+
+	Metadata falls back to HDD too early.  IOPS groups are only searched at CR_POWER2_ALIGNED and CR_GOAL_LEN_FAST.  If those miss (fragmented IOPS groups, multi-block xattr or EA inode allocations) the allocation proceeds to the HDD lists at the same criteria, before a slower pass over the IOPS groups is tried.
+
+	Free space accounting.  Free blocks in IOPS groups are counted in statfs and ext4_has_free_clusters(), but with the default mb_enable_iops_data=0 data can never use them.  ext4 delalloc can then fail at writeback after write() succeeded, and an OST reports space to clients and the grant code that it cannot allocate for objects.  Track free IOPS clusters in a percpu counter and exclude them from data availability when data allocation in IOPS groups is disabled.
+
+	IOPS groups are not usable right after mount.  Groups only enter the free-order/fragment lists once their buddy is initialized by prefetch, so on a large filesystem early metadata allocations see empty IOPS lists and go to HDD.  The IOPS groups are few and on flash, so initialize them at mount.
+
+	Lustre internal index files are allocated as data.  OI/IAM files, llogs, last_rcvd and quota files are regular files, so they get EXT4_MB_HINT_DATA and are placed in HDD groups.  OI lookups are the main small random IO on an OST.  osd-ldiskfs needs to mark these inodes so their blocks are allocated as metadata.
+
+	Smaller issues:
+	
+		The feature is silently inactive with mb_optimize_scan=0.
+
+		The EXT4_EA_INODE_FL change to EXT4_MB_HINT_DATA applies to every filesystem, not only hybrid ones; use ext4_test_inode_flag(inode, EXT4_INODE_EA_INODE).
+
+		The per-distro copies have diverged: rhel10.2 treats !EXT4_MB_HINT_DATA as metadata, the others use EXT4_MB_HINT_METADATA, and the older ones test s_es->s_flags without cpu_to_le32().
+
+		The _iops scan functions duplicate the existing p2_aligned/goal_fast scanners; pass the xarray (or list) base to the existing helpers instead.
+
+		There is no test of block placement, and no mkfs.lustre support.
+
+	
+	
+
+e2fsprogs defects (master-lustre)
+
+	mke2fs.c and tune2fs.c: iops_size = sizeof(iops_array) is 512 (bytes) for a 64-entry array, so more than 32 -E iops ranges overflow it.
+
+	ext2fs_set_clear_iops_group() does not bound the end group, so a range past the end of the filesystem writes beyond the group descriptor array.  It also rounds the end up, marking a partly-HDD last group as IOPS.
+
+	The man page uses : to separate ranges, while the LU-16750 commit message shows , (which separates -E options).
+
+Proposed kernel changes
+
+Following the upstream review (Ted: call the allocator twice; Ritesh/Ojaswin: a scan state instead of new criteria):
+
+	Pass 1 searches only the preferred group class (IOPS for metadata, non-IOPS for data) through all criteria; pass 2, if needed and allowed, searches the other class.  ext4_mb_good_group_nolock() rejects groups of the wrong class for the current pass, so the goal and linear scans obey it too.  Skip pass 1 when there are no free IOPS clusters.
+
+	For metadata, replace a non-IOPS goal with an IOPS goal group (e.g. the last IOPS group used) and do not try the original goal.
+
+	Keep each distro's ext4-mballoc-for-hybrid.patch self-contained, split into separate upstream patches (metadata placement first, data fallback knob second) only if needed for upstream size.
+
+Adding flash to an existing filesystem
+
+Since EXT4_BG_IOPS is per group, flash can be appended to an existing HDD filesystem (lvextend/dm-linear) instead of being placed at the start at format time:
+
+	extend the LV with the flash PV, then offline resize2fs (online resize is refused with sparse_super2, and online-added groups never get the IOPS flag);
+
+	mark the new groups IOPS (e.g. resize2fs E iops=... or tune2fs -E iops=);
+
+	relocate the journal, block/inode bitmaps and inode tables into the new IOPS groups.  resize2fs already has code to move inode tables and bitmaps and to fix up references when blocks are moved.  Because the new groups are empty and the copy does not overlap the old locations, it can be made crash safe by copying first and switching the group descriptors last.
+
+	optionally move existing directory, extent index and xattr blocks with the resize2fs block mover.
+
+The kernel inode allocator (orlov/flex group selection) also needs to ignore free blocks in IOPS groups, or the large empty appended groups attract new directories and pull data goals onto flash.
+
+Comparison with block-layer caching
+
+dm-cache/lvmcache and dm-writecache can be attached to an existing LV online without a reformat, and in writethrough mode losing the cache device is harmless, which makes them the lowest-risk way to add flash to an existing filesystem today.  However, they place blocks by access history, so cold full scans (e2fsck, find, ls -lR after mount) mostly miss, data competes with metadata for the cache, and the flash adds no capacity.  bcache needs the backing device to be reformatted.  IOPS groups give deterministic placement of all metadata with no runtime overhead, but the flash holds the only copy, so it must be redundant (and shared for HA failover).  The two approaches can be combined, e.g. IOPS groups for metadata plus dm-writecache for small synchronous data writes.
+
+--- Comment (gerrit, Tue, 13 Oct 2026 10:39:44 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/tools/e2fsprogs/+/69647
+
+Subject: LU-20924 misc: fix '-E iops' range handling
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 1
+
+Commit: a72b64bfc20f30b0163aa3eed377474680638177

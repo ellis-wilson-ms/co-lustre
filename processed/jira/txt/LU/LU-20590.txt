@@ -1,0 +1,606 @@
+Key:        LU-20590
+Summary:    llite: IO restarts when a cancel does not change the layout
+Link:       https://jira.whamcloud.com/browse/LU-20590
+Type:       Bug
+Priority:   Medium
+Status:     In Progress
+Resolution: Unresolved
+Assignee:   Chris Horn
+Reporter:   Chris Horn
+Created:    Thu, 13 Aug 2026 16:50:51 +0000
+Updated:    Tue, 13 Oct 2026 04:22:06 +0000
+Links:      Related: is related to  LU-6389; Related: is related to  LU-18416; Related: is related to  LU-18435; Related: is related to  LU-20589; Related: is related to  LU-2017; Related: is related to  LU-14760
+
+--- Description ---
+can_populate_pages() in lustre/llite/vvp_io.c restarts a read or a write
+
+if the cached layout generation is not the same as the generation that the
+
+IO recorded at cl_io_init() time:
+
+                if (ll_layout_version_get(lli) != vio->vui_layout_gen ||
+                    CFS_FAIL_CHECK_QUIET(OBD_FAIL_LLITE_LOST_LAYOUT)) {
+                        io->ci_need_restart = 1;
+                        /* this will cause a short read/write */
+                        io->ci_continue = 0;
+                        rc = false;
+                }
+
+Three sites write lli_layout_gen:
+
+1. llite_lib.c:1440 - the client initializes the inode.
+
+2. vvp_object.c:119 - the client discards the cached layout. This site writes the CL_LAYOUT_GEN_NONE sentinel.
+
+3. file.c:6827 - the client applies a layout that it fetched.
+
+The client cannot see the difference between a layout that changed and a
+
+layout that the client no longer keeps in its cache. Two events write site
+
+2. A remote layout change that revokes the lock writes it. The LDLM LRU
+
+shrinker of the client also writes it when the shrinker cancels the lock
+
+during memory reclaim. After the second event, the layout is the same
+
+before and after the cancel, but the IO restarts.
+
+Why the loop does not stop
+
+One restart is not a problem. The problem is that no mechanism limits the
+
+loop. ll_layout_refresh() does not keep the layout lock. Its own comment
+
+gives this warning:
+
+"This function will not hold layout lock so it may be revoked any time
+
+after this function returns."
+
+ll_layout_lock_set() releases the reference in all conditions at
+
+file.c:6971. The window between the refresh and the can_populate_pages()
+
+check is therefore open to the next cancel. If memory reclaim continues,
+
+the client discards the layout again at each attempt. The IO then uses all
+
+of the RETRY_ATTEMPTS budget of 1000 in ll_file_io_generic(), and it makes
+
+no progress.
+
+The check also runs more than one time in a single cl_io.
+
+lov_io_rw_advance() sets io->ci_continue to next lis_io_endpos at
+
+lov_io.c:1270. cl_io_loop() then enters cio_start again. Thus
+
+can_populate_pages() runs one time for each stripe extent. The
+
+cl_io_init() window is not the only exposure.
+
+Field data
+
+These data come from a soak run. The load was buffered fio on a client at version 2.14.0.
+
+	The failing IO did 1001 restarts and used all of the budget.
+
+	The layout did not change. dump_lsm gave the same layout_gen of 3 in
+
+1614 of 1694 iterations.
+
+	All 106 calls to vvp_io_write_start() from the failing thread stopped
+
+at the can_populate_pages() return.
+
+	The client sent all of the cancels. The captures hold 71733 server
+
+blocking callbacks in 15 samples, and none of them is for a layout
+
+lock. The same captures hold 7179 client-side layout cancels on the
+
+failing files.
+
+	The shrinker was a second application thread on the same node in
+
+direct reclaim. That thread made 13301 calls to ldlm_pool_shrink() in
+
+14.4 s.
+
+	The lock was a correct LRU candidate. Its reference counts were
+
+lrc: 2/0,0 in 2018 of 2027 cancels, because ll_layout_refresh()
+
+releases its reference by design.
+
+	The window between the refresh and the check is approximately 0.4 ms.
+
+The shrinker entered that window in 85 of 106 attempts.
+
+Relation to LU-20589
+
+LU-20589 holds the result that the user sees when the IO uses all of the
+
+budget: a buffered write(2) returns 0. This ticket holds the restart
+
+itself. A correction to the restart removes the livelock. LU-20589 only
+
+makes the livelock visible.
+
+What the check protects
+
+The comment above can_populate_pages() tells you that the check is safe
+
+because a layout swap must hold the group lock. That statement is not
+
+correct:
+
+	ll_swap_layouts() takes the group lock only if user space gives a gid
+
+that is not zero (file.c:3718).
+
+	ll_swap_layouts_close() (file.c:1588) takes no group lock. This is the
+
+path that lfs migrate and HSM use.
+
+lo_active_ios is the mechanism that keeps an IO from putting pages onto
+
+the wrong stripe. lov_conf_set() returns -EBUSY while an IO is active
+
+(lov_object.c:1512). The client holds the count for the full span from
+
+cl_io_init() to cl_io_fini().
+
+The generation check is still necessary. __cl_io_init() walks the slice
+
+stack from the top down. vvp_io_init() records vui_layout_gen
+
+(vvp_io.c:1878) before lov_io_init() pins the LSM (lov_io.c:2192). A swap
+
+in that gap is a real change, and only this check finds it.
+
+Why you cannot make the check more narrow
+
+The first idea is to read CL_LAYOUT_GEN_NONE as "the client discarded the
+
+cache" and not as "the layout changed", and then to restart only for a
+
+known generation that is different. That idea is wrong. Record the reason,
+
+so that no one tries it again.
+
+The sentinel is the only signal in an IO that a real layout change exists:
+
+	A remote layout change comes to the client first, and only, as
+
+OBJECT_CONF_INVALIDATE. That path sets LO_LAYOUT_INVALID and returns
+
+without a change to lo_lsm (lov_object.c:1460). lsm_layout_gen thus
+
+keeps the old value. No reader on the IO path examines
+
+LO_LAYOUT_INVALID.
+
+	The client fetches the new generation only when it must.
+
+ll_layout_refresh() returns immediately unless the cached generation
+
+is already the sentinel (file.c:7092). ll_layout_lock_set() is the
+
+only site that writes a real generation, and ll_layout_refresh() is
+
+its only caller (file.c:7112).
+
+The sentinel is therefore a precondition for the client to learn the new
+
+generation. It is not an alternative to the new generation. If you ignore
+
+the sentinel, you delete the detection. You do not make it more narrow.
+
+Change 38020 removed the check, and reads crashed.
+
+A comparison against a generation that you get in place has the same
+
+fault. cl_object_layout_get() (lov_object.c:2293) is an example. Its value
+
+comes from lo_lsm, and the invalidate leaves lo_lsm stale on purpose.
+
+You also cannot make the decision from the type of the cancel. The client
+
+enters ll_lock_cancel_bits() in the same way from ldlm_cancel_lru() and
+
+from ll_md_blocking_ast(). No state shows which one called it.
+
+A correct comparison needs a refreshed generation. You cannot do a refresh
+
+from can_populate_pages(), because that function runs with the OST extent
+
+lock, lli_trunc_sem and the range lock held. vvp_io_fini() (vvp_io.c:344
+
+and vvp_io.c:388) shows a shape that works. It compares vui_layout_gen
+
+against the generation that a new ll_layout_refresh() returns, at a point
+
+where it holds no extent lock.
+
+Directions that remain
+
+Two directions remain. Neither of them changes the condition.
+
+	Compare the content of the refreshed layout, and not its generation.
+
+Then a discard and a re-fetch of the same layout does not restart the
+
+IO.
+
+	Keep voluntary LRU reclaim from taking a layout lock that supports a
+
+live IO. Apply this to LRU reclaim only, and never to a server
+
+blocking callback. If you defer a real callback, you close a wait-for
+
+cycle with lfs migrate --block, which holds an OST group lock across
+
+MDS_SWAP_LAYOUTS. Also note that a layout lock is not a separate lock.
+
+The MDT grants MDS_INODELOCK_LAYOUT together with LOOKUP, UPDATE, PERM
+
+and DOM in one ibits lock (mdt_open.c:927 and 951-959), and LDLM has
+
+no reference for a single bit. A reader reference that you hold for
+
+the life of an IO therefore also delays operations on the same file
+
+that have no relation to the layout.
+
+Related history
+
+	LU-2017 (4af3ab1945) added can_populate_pages() and
+
+CL_LAYOUT_GEN_NONE in one commit. It did not examine the interaction
+
+between them.
+
+	LU-6389 found the same mechanism ("File layout as not changed and when
+
+lock is taken back, layout_gen is still 0") and corrected the other
+
+side of it. It also records the basic difficulty: "the client doesn't
+
+know if the layout is still the same."
+
+	Change 14123 asked the question in review. A reviewer wrote that the
+
+client can cancel the LAYOUT bit without a change to the layout, and
+
+that the client must not set ci_need_restart in that condition. The
+
+gap has a name, but no one closed it.
+
+	Change 5866 ("don't set lli_layout_gen unnecessarily") is the only
+
+change with the shape of this fix. Its author abandoned it and did not
+
+send a new patch set.
+
+	Change 38020 removed the check. Its author abandoned it, because reads
+
+crash without the check.
+
+	LU-14760 (change 43995) set RETRY_ATTEMPTS to 1000 to put a limit on a
+
+loop that "is stuck forever". No one gave a reason for that value.
+
+	LU-18416 and LU-18435 report the same behavior, 1000 restarts and a
+
+write that returns 0, from a trigger on the server. Both have a
+
+correction on the server.
+
+--- Comment (hornc, Thu, 13 Aug 2026 23:37:38 +0000) ---
+Proposed correction, and the test results for it.
+
+The approach
+
+The client cannot make the check more accurate, for the reasons in the
+
+description. This correction removes the trigger instead. It keeps the
+
+layout lock in place for an IO that makes no progress.
+
+The client counts the restarts of one IO in ll_file_io_generic(). The
+
+count returns to zero if the IO moves data, or if the layout generation is
+
+a real value. Thus only a restart that gives no progress and leaves the
+
+CL_LAYOUT_GEN_NONE sentinel increases the count. After 4 such restarts,
+
+the client calls ll_layout_pin(). That function refreshes the layout,
+
+finds the MDS_INODELOCK_LAYOUT ibits lock with ll_take_md_lock(), and
+
+excludes that lock from voluntary LRU reclaim. The IO releases the
+
+exclusion at one point, immediately after the restart block.
+
+Two new functions in ldlm do the work:
+
+	ldlm_lock_pin_lru() sets LDLM_FL_NO_LRU and removes the lock from the
+
+    LRU. It gives -ESTALE if the lock is not granted, if a cancel started,
+
+    or if a different owner already set the flag.
+
+	ldlm_lock_unpin_lru() releases one pin. On the last pin it clears the
+
+    flag and puts the lock back on the LRU, but only if the lock is still
+
+    granted and has no references.
+
+The pins nest through a new l_lru_pins count in struct ldlm_lock. The
+
+resource lock protects the count.
+
+ldlm_lock_add_to_lru_nolock() also refuses to file a lock that carries
+
+LDLM_FL_NO_LRU. This is necessary, because some callers decide list
+
+membership without an examination of the flag. The check must be at the
+
+point where the client adds a lock, and not at each caller.
+
+Why the pin is safe
+
+The pin adds no reader reference and no writer reference. l_readers and
+
+l_writers stay at their previous values. Therefore:
+
+	ldlm_handle_bl_callback() takes its immediate branch and sends the
+
+    CANCEL at once. A server blocking callback is never late.
+
+	cleanup_resource() cannot enter its deferral branch, because that
+
+    branch needs a reader or a writer.
+
+	An eviction and a namespace cleanup also cancel the lock immediately.
+
+The pin thus stops voluntary reclaim only. Voluntary reclaim is local to
+
+the client, and no remote peer waits for it.
+
+A necessary correction to ldlm
+
+ldlm_cli_inodebits_convert() (ldlm_inodebits.c:585-590) puts a lock back
+
+on the LRU without an examination of LDLM_FL_NO_LRU, and without a test
+
+for a reader or a writer. Locks that use LDLM_FL_NO_LRU today escape this
+
+fault only by accident, because a lease carries LDLM_FL_EXCL and
+
+lock_matches() rejects it. The refusal in ldlm_lock_add_to_lru_nolock()
+
+corrects this for all present and future callers. Test T7c below examines
+
+this path.
+
+The shape of the series
+
+Three patches:
+
+  1. ldlm: the pin primitive and the refusal in
+
+     ldlm_lock_add_to_lru_nolock().
+
+  2. llite: the restart count, ll_layout_pin(), and the release point.
+
+  3. tests: a fault injection site and sanity test_251c.
+
+The client keeps can_populate_pages() and both of its callers without a
+
+change.
+
+Test results
+
+The tests ran on a virtual cluster with 4 nodes and 2 clients, at a page
+
+size of 4 KB. Before each measurement, the test compared the srcversion of
+
+the loaded module against the module on disk, and confirmed that the pin
+
+symbol was present or absent as that test needs. A result without both
+
+checks is not valid.
+
+The fault injection site cancels the layout lock of the client in the
+
+window between the refresh and the check. This is the same window that the
+
+field data show, and it is approximately 0.4 ms wide.
+
+  T1 Negative control. The same cluster and the same image, with the
+
+     injection site but without the correction.
+
+     RESULT: 1000 restarts, EIO, a file of 0 bytes. The failure occurs.
+
+  T2 The correction, with the threshold at 4.
+
+     RESULT: 4 restarts, 1 pin, rc=0, and the full 1 MiB of data. No
+
+     exhaustion message. PASS.
+
+  T3 Liveness of the injection site. During the successful write of T2,
+
+     lock_count went from 82 to 2.
+
+     RESULT: the injection site still cancels other MDC locks. PASS.
+
+  T4 Mechanism control. The same build and the same injection site, but
+
+     with the threshold at 100000.
+
+     RESULT: 1000 restarts, EIO, 0 pins. The failure comes back. Only the
+
+     threshold changed, so the pin is the cause of the correct behavior.
+
+     PASS.
+
+  T5 Detection. Tests 251a, 251b and the new 251c.
+
+     RESULT: all three pass. Test 251a, which does a real layout change,
+
+     shows no escalation. PASS.
+
+  T7a A peer does lfs migrate --block -c 2 against a held pin.
+
+     RESULT: the migration and the write both give rc=0. The MDS shows no
+
+     callback timeout and no eviction. The pin does not delay a blocking
+
+     callback. PASS.
+
+  T7c A peer does chmod and stat continuously for 25 s against a held pin.
+
+     This drives the ldlm_cli_inodebits_convert() path above.
+
+     RESULT: the write gives rc=0. There is no LBUG and no assertion
+
+     failure, and the assertion on l_lru_pins is compiled in. PASS.
+
+  T7d A small LRU. lru_size=1 with 16 starving writers.
+
+     RESULT: lock_count 13, ns_nr_unused 1. The set that the client cannot
+
+     reclaim stayed near 12, which is the number of starving threads. All
+
+     16 writes gave rc=0. PASS at this scale.
+
+  T10 Leaks and regressions. lru_size=clear, then a full module unload.
+
+     RESULT: lock_count 0, no leak message and no assertion failure.
+
+     Tests 120a to 120g, 124a, 124b and 425 all pass. PASS.
+
+What the tests do not show
+
+Record these limits. Do not read the results above as more than they are.
+
+	The starvation is proven against the fault injection site only. A loop
+
+    of lru_size=clear against a real writer gave 3243 correct writes and
+
+    no failure. Memory pressure on a small virtual machine does not starve
+
+    an IO. The field data remain the only evidence of the organic form.
+
+	Test T6, which tries to cause a restart with a real layout change, did
+
+    not meet its own criterion. lfs migrate and lfs swap_layouts gave 0
+
+    restarts. The pin was not held in any of those runs, so it cannot have
+
+    suppressed the detection, but the test is not a pass. Tests 251a and
+
+    251b are the only evidence that the detection still operates.
+
+	Test T8 shows no hang and a correct ESHUTDOWN when the client
+
+    deactivates the MDC import. The variant with an explicit eviction gave
+
+    no message on the client, so that half is not proven.
+
+	The threshold of 4 is the lowest value with evidence behind it. Test
+
+    251a stays correct at a threshold of 1, because a restart that a real
+
+    layout change causes moves data first and thus returns the count to
+
+    zero. The margin protects the other events that leave the sentinel:
+
+    an import invalidate, an eviction, and a LAYOUT LCK_EX that the client
+
+    causes itself. No test measures those events.
+
+	T7d used a virtual machine with 2 CPUs. It is not a test at scale.
+
+--- Comment (gerrit, Fri, 14 Aug 2026 04:20:47 +0000) ---
+"Chris Horn " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/67994
+
+Subject: LU-20590 ldlm: never file an LRU-excluded lock on the LRU
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 01e0fc8553f2842bae923a0e9388608b7bc60809
+
+--- Comment (gerrit, Fri, 14 Aug 2026 04:20:48 +0000) ---
+"Chris Horn " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/67995
+
+Subject: LU-20590 ldlm: pin a lock out of the client LRU
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 76d20abf48fe7c83e4b788f8feacb826d57e835f
+
+--- Comment (gerrit, Fri, 14 Aug 2026 04:20:49 +0000) ---
+"Chris Horn " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/67996
+
+Subject: LU-20590 llite: pin the layout lock for a starving IO
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 9566b7a67873159fd5d1ee62aa18d9d6999727a9
+
+--- Comment (gerrit, Fri, 14 Aug 2026 04:20:49 +0000) ---
+"Chris Horn " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/67997
+
+Subject: LU-20590 tests: inject layout lock reclaim during an IO
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 11f7ed572589fa7dbd41f7e18a63b404b2a53e1d
+
+--- Comment (gerrit, Tue, 13 Oct 2026 04:21:10 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/67994/
+
+Subject: LU-20590 ldlm: never file an LRU-excluded lock on the LRU
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: b3db6ec33d2f68ea16e8b787e2f372cf8ea5f749
+
+--- Comment (gerrit, Tue, 13 Oct 2026 04:22:06 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/67995/
+
+Subject: LU-20590 ldlm: pin a lock out of the client LRU
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 044578fc81486ad16c7c43bb114e07adc2d9f10d

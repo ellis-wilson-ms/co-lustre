@@ -1,0 +1,139 @@
+Key:        LU-20698
+Summary:    osd-ldiskfs: unlocked os_has_ml_file bitfield store races osd_scrub_oi_insert()
+Link:       https://jira.whamcloud.com/browse/LU-20698
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Oleg Drokin
+Created:    Sun, 6 Sep 2026 05:29:24 +0000
+Updated:    Sun, 6 Sep 2026 05:33:54 +0000
+
+--- Description ---
+osd_iit_iget() sets the os_has_ml_file bit of struct lustre_scrub
+
+without holding ->os_lock, from the LFSCK otable iterator thread. That bit
+
+shares a byte with os_full_scrub, which osd_scrub_oi_insert() sets from
+
+a different thread while holding ->os_lock. Because both compile to a plain
+
+(non-atomic) read-modify-write of the same byte, either update can be lost.
+
+The struct's own comment already states the rule that is being broken:
+
+	/* Some of these bits can be set by different threads so
+	 * all updates must be protected by ->os_lock to avoid
+	 * racing read-modify-write cycles causing corruption.
+	 */
+	unsigned int		os_in_prior:1,
+				os_waiting:1,
+				...
+				os_running:1,
+				os_full_scrub:1,
+				os_has_ml_file:1;
+
+The offending store
+
+lustre/osd-ldiskfs/osd_scrub.c:699, in osd_iit_iget():
+
+	if (dev->od_is_ost && S_ISREG(inode->i_mode) && inode->i_nlink > 1)
+		dev->od_scrub.os_scrub.os_has_ml_file = 1;
+
+osd_iit_iget() is shared between the OI scrub thread
+
+(osd_scrub_next(), is_scrub=true) and the LFSCK otable iterator thread
+
+(osd_preload_next(), is_scrub=false), so this store runs on the iterator
+
+thread. Every other writer of a bit in that storage unit takes ->os_lock;
+
+this one does not.
+
+Racing threads
+
+Disassembly of osd_ldiskfs.ko (gcc, x86_64, RHEL8) shows the two bits share a
+
+byte and that both accesses are plain, unlocked byte RMWs:
+
+:         orb    $0x2,0xef79(%rbx)   :  orb    $0x1,0xef79(%r15)   
+
+	osd_iit_iget() runs on the otable iterator kthread (LFSCK).
+
+	osd_scrub_oi_insert() runs on whichever thread hit an OI mapping
+
+  inconsistency during normal operation, and sets os_full_scrub under
+
+  ->os_lock once the bad-OI-map rate exceeds
+
+  od_full_scrub_threshold_rate.
+
+Neither orb carries a lock prefix, so the two are not atomic against
+
+each other and one update can be dropped.
+
+Failure modes
+
+	A lost os_has_ml_file = 1 makes osd_scrub_main() skip
+
+  osd_scan_ml_file_main(), so multiply-linked OST objects are not processed
+
+  during that scrub pass.
+
+	A lost os_full_scrub = 1 means the OI scrub is not escalated to a full
+
+  scrub when the bad-OI-map rate crosses the threshold.
+
+Both are missed work rather than corruption or a hang, and both self-correct on
+
+a later pass or trigger, hence the low severity.
+
+Note on scope
+
+On this compiler and layout gcc narrows both accesses to the byte holding
+
+os_full_scrub and os_has_ml_file only, so os_running (and the rest
+
+of the bitfield, which lives in the adjacent byte) is not currently at risk.
+
+That narrowing is a compiler/target artifact, not a guarantee – C treats
+
+adjacent bit-fields as one memory location, so a compiler is free to
+
+read-modify-write the whole unsigned int. If that happened, or if an
+
+eleventh bit were added, a lost os_running = 0 would leave
+
+osd_otable_it_next() blocked forever in
+
+wait_var_event(scrub, !scrub->os_running).
+
+osd-zfs has the same os_has_ml_file = 1 store
+
+(lustre/osd-zfs/osd_scrub.c:258) but is not affected: there it sits in
+
+osd_scrub_check_update(), reached only from osd_scrub_exec() in the
+
+scrub thread's own loop, so nothing runs concurrently with it.
+
+How it was found
+
+Static review while fixing LU-18023 (a NULL dereference on os_ls_fids in
+
+the same function); confirmed by reading the generated code rather than only
+
+the source. Not observed as a test failure.
+
+--- Comment (gerrit, Sun, 6 Sep 2026 05:33:54 +0000) ---
+"Oleg Drokin " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68675
+
+Subject: LU-20698 osd: lock the os_has_ml_file scrub bit
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: dc2a2713edd978da3af4f8ced7b4fb93c451a86f

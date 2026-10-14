@@ -1,0 +1,258 @@
+Key:        LU-20939
+Summary:    OST umount stuck in inode cache cleanup
+Link:       https://jira.whamcloud.com/browse/LU-20939
+Type:       Bug
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Etienne Aujames
+Created:    Mon, 12 Oct 2026 21:16:15 +0000
+Updated:    Tue, 13 Oct 2026 16:48:55 +0000
+Labels:     ldiskfs
+
+--- Environment ---
+2.18.8.ocean2 HDD OST server, 625.9 TB target (80-85% full)
+
+RHEL 8.8
+
+--- Description ---
+An unusually long umount duration was observed on the HDD OSTs during the maintenance window. After 25 minutes, the decision was made by the administrators to reboot the OSS.
+
+They take one OSS crash:
+
+crash> foreach 'umount' bt -s
+ #0  __schedule at
+ #1  schedule at
+ #2  io_schedule at
+ #3  bit_wait_io at
+ #4  __wait_on_bit at
+ #5  out_of_line_wait_on_bit at
+ #6  ldiskfs_wait_block_bitmap at [ldiskfs]
+ #7  ldiskfs_mb_init_cache at [ldiskfs]
+ #8  ldiskfs_mb_load_buddy_gfp at [ldiskfs]
+ #9  ldiskfs_discard_preallocations at [ldiskfs]
+#10  ldiskfs_clear_inode at [ldiskfs]
+#11  ldiskfs_evict_inode at [ldiskfs]
+#12  evict at
+#13  dispose_list at
+#14  evict_inodes at
+#15  generic_shutdown_super at
+#16  kill_block_super at
+#17  deactivate_locked_super at
+#18  cleanup_mnt at
+#19  osd_umount at [osd_ldiskfs]
+#20  osd_device_fini at [osd_ldiskfs]
+#21  class_cleanup at [obdclass]
+#22  class_process_config at [obdclass]
+#23  class_manual_cleanup at [obdclass]
+#24  osd_obd_disconnect at [osd_ldiskfs]
+#25  lustre_put_lsi at [obdclass]
+#26  server_put_super at [obdclass]
+#27  generic_shutdown_super at
+#28  kill_anon_super at
+#29  deactivate_locked_super at
+#30  cleanup_mnt at
+#31  task_work_run at
+#32  exit_to_usermode_loop at
+#33  do_syscall_64 at
+#34  entry_SYSCALL_64_after_hwframe at 
+
+The OST device target was busy at 100% doing 4k IOs. The umount process seems stuck reading block bitmaps for freeing/clearing inode block preallocations:
+
+crash> kmem -s | grep ldiskfs_prealloc
+      104     312822    616902  15818     4k ldiskfs_prealloc_space 
+crash> kmem -i
+                 PAGES        TOTAL      PERCENTAGE
+    TOTAL MEM  18157679      69.3 GB         ----
+         FREE  3099014      11.8 GB   17% of TOTAL MEM
+         USED  15058665      57.4 GB   82% of TOTAL MEM
+       SHARED  4001901      15.3 GB   22% of TOTAL MEM
+      BUFFERS  4976421        19 GB   27% of TOTAL MEM
+       CACHED  6445517      24.6 GB   35% of TOTAL MEM
+         SLAB   738982       2.8 GB    4% of TOTAL MEM
+
+   TOTAL HUGE        0            0         ----
+    HUGE FREE        0            0    0% of TOTAL HUGE
+
+   TOTAL SWAP        0            0         ----
+    SWAP USED        0            0    0% of TOTAL SWAP
+    SWAP FREE        0            0    0% of TOTAL SWAP
+
+ COMMIT LIMIT  9078839      34.6 GB         ----
+    COMMITTED  1131056       4.3 GB   12% of TOTAL LIMIT 
+
+Hypothesis
+
+The ldiskfs inodes still in kernel cache reference block preallocations using different ext4 groups distributed on all the volume surface. The group bitmaps does not seems to be in cache, so a read is needed (due to cache eviction?). This is causing random 4K IO to read all the bitmaps.
+
+Here some preallocation information:
+
+struct ldiskfs_sb_info {
+  s_blocks_per_group = 32768,
+  s_clusters_per_group = 32768,
+  s_inodes_per_group = 128,
+  s_itb_per_group = 16,
+  s_gdb_count = 80112,
+  s_desc_per_block = 64,
+  s_groups_count = 5127168,
+
+  s_stripe = 1024,
+  s_mb_small_req = 1024,
+  s_mb_large_req = 8192,
+  s_mb_max_to_scan = 200,
+  s_mb_min_to_scan = 10,
+  s_mb_stats = 0,
+  s_mb_order2_reqs = 8,
+  s_mb_c1_blocks = 42001760250,
+  s_mb_c2_blocks = 25201056150,
+  s_mb_c3_blocks = 8400352050,
+  s_mb_prealloc_table = 0xff12c8e1a9cd0c00,
+  s_mb_group_prealloc = 4096,
+  s_mb_max_inode_prealloc = 512,
+  s_max_dir_size_kb = 0,
+  s_warning_dir_size = 0,
+  s_mb_last_group = 1885531,
+  s_mb_last_start = 12288,
+  s_mb_prefetch = 2048,
+  s_mb_prefetch_limit = 8192, 
+
+The s_stripe = 1024 value appears to be a FS formatting error: the admin intended to define a stripe width of 1 MB, but the unit used is ext4 blocks, which results in 4 MB.
+
+This means that the minimum allocation size is 4MB which not helping our issue.
+
+# cat /proc/fs/ldiskfs/sdb/prealloc_table
+1024 2048 4096
+
+I have checked some inode preallocation, most of time, there is 1 preallocation per inode. These preallocation are usually at an offset of 1024-8192 blocks (non aligned write on small files).
+
+Reproducer
+
+I have been able to reproduce this type of behaviour on the OSTs after the maintenance window (~100000 prealloc entries in slab):
+
+echo 2 > /proc/sys/vm/drop_caches
+
+This took ~6s
+
+On another OST:
+
+echo 1 > /proc/sys/vm/drop_caches
+echo 2 > /proc/sys/vm/drop_caches
+
+ This took ~15min.
+
+--- Comment (sebastien, Tue, 13 Oct 2026 09:58:47 +0000) ---
+Hi eaujames, thanks for the detailed analysis. Do you plan on investigating further and push a tentative patch, or do you need an ldiskfs expert's eyes?
+
+--- Comment (eaujames, Tue, 13 Oct 2026 10:40:40 +0000) ---
+I have some ideas but I need to discuss about it
+
+--- Comment (eaujames, Tue, 13 Oct 2026 14:27:59 +0000) ---
+adilger, ablagodarenko and bzzz can you comment about this?
+
+For now, I see 2 way to workaround this issue:
+
+	Do we need to keep ldiskfs inodes in kernel LRU cache after the osd objects died? If not, we can mark the inode to be dropped with the preallocation space:
+
+static void iput_final(struct inode *inode) 
+{
+        struct super_block *sb = inode->i_sb;
+        const struct super_operations *op = inode->i_sb->s_op;
+        int drop;
+                
+        WARN_ON(inode->i_state & I_NEW);
+
+        if (op->drop_inode)
+                drop = op->drop_inode(inode);
+        else
+                drop = generic_drop_inode(inode);
+
+        if (!drop &&
+            !(inode->i_state & I_DONTCACHE) &&           s_flags & SB_ACTIVE)) {
+                inode_add_lru(inode);
+                spin_unlock(&inode->i_lock); 
+                return;
+        }
+
+        if (!drop) {
+                inode->i_state |= I_WILL_FREE;
+                spin_unlock(&inode->i_lock);
+                write_inode_now(inode, 1);
+                spin_lock(&inode->i_lock);
+                WARN_ON(inode->i_state & I_NEW);
+                inode->i_state &= ~I_WILL_FREE;
+        }
+
+        inode->i_state |= I_FREEING;
+        if (!list_empty(&inode->i_lru))
+                inode_lru_list_del(inode);
+        spin_unlock(&inode->i_lock);
+
+        evict(inode);
+}
+
+We could set the I_DONTCACHE flag to force the inode to be freed .
+
+void d_mark_dontcache(struct inode *inode)
+{       
+        struct dentry *de;      
+        
+        spin_lock(&inode->i_lock);
+        hlist_for_each_entry(de, &inode->i_dentry, d_u.d_alias) {
+                spin_lock(&de->d_lock); 
+                de->d_flags |= DCACHE_DONTCACHE;
+                spin_unlock(&de->d_lock);
+        }
+        inode->i_state |= I_DONTCACHE;
+        spin_unlock(&inode->i_lock);
+}
+EXPORT_SYMBOL(d_mark_dontcache);
+
+I know that delbaryg ran into issues benchmarking MDS with mdtest: the kswapd kernel threads couldn't keep up with the Lustre threads, and direct reclaim operations were slowing everything down. He had to tune the cache pressure and use tbf to make it work.
+
+	Dropping the per-inode preallocation space is not efficient on HDD: it causes random I/O across the entire surface of the target volume.
+
+Before unmounting the target, we can use ldiskfs_mb_discard_preallocations() to discard preallocations group by group. So we can take advantage of the volume readahead cache (even with flex_bg, the group bitmap are packed by 16).
+
+--- Comment (bzzz, Tue, 13 Oct 2026 14:37:39 +0000) ---
+if this is umount, then it's safe to discard preallocation and do not mark bitmaps at all:
+
+void generic_shutdown_super(struct super_block *sb)
+{
+	const struct super_operations *sop = sb->s_op;
+
+	if (sb->s_root) {
+		shrink_dcache_for_umount(sb);
+		sync_filesystem(sb);
+		sb->s_flags &= ~SB_ACTIVE;
+
+		cgroup_writeback_umount();
+
+		/* Evict all inodes with zero refcount. */
+		evict_inodes(sb);
+
+so SB_ACTIVE has been cleared and we can check that in ldiskfs_discard_preallocations()
+
+--- Comment (bzzz, Tue, 13 Oct 2026 16:48:55 +0000) ---
+just checked and this code seems to pass simple tests:
+
+--- ../head1/ldiskfs/mballoc.c	2026-10-02 17:15:07.088743878 +0300
++++ ldiskfs/mballoc.c	2026-10-13 19:47:09.496665241 +0300
+@@ -5920,6 +5920,17 @@ repeat:
+ 	}
+ 	write_unlock(&ei->i_prealloc_lock);
+ 
++	if (!(sb->s_flags & SB_ACTIVE)) {
++		list_for_each_entry_safe(pa, tmp, &list, u.pa_tmp_list) {
++			ldiskfs_lock_group(sb, group);
++			list_del(&pa->pa_group_list);
++			ldiskfs_unlock_group(sb, group);
++			list_del(&pa->u.pa_tmp_list);
++			ldiskfs_mb_pa_free(pa);
++		}
++		return;
++	}
++
+ 	list_for_each_entry_safe(pa, tmp, &list, u.pa_tmp_list) {
+ 		BUG_ON(pa->pa_type != MB_INODE_PA);
+ 		group = ldiskfs_get_group_number(sb, pa->pa_pstart);

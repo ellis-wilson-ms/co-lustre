@@ -8,7 +8,7 @@ Resolution: Duplicate
 Assignee:   Sonia Sharma
 Reporter:   Sonia Sharma
 Created:    Wed, 20 Aug 2025 21:38:30 +0000
-Updated:    Thu, 26 Feb 2026 23:55:54 +0000
+Updated:    Wed, 11 Mar 2026 11:48:36 +0000
 Resolved:   Thu, 26 Feb 2026 23:47:02 +0000
 Links:      Duplicate: duplicates LU-17985
 
@@ -54,18 +54,112 @@ CX recently encountered this issue where they run many of their OSTs to full cap
 [442991.334214]  ? set_kthread_struct+0x50/0x50
 [442991.334716]  ret_from_fork+0x1f/0x40
 
---- Comment (JIRAUSER19573, Thu, 26 Feb 2026 23:55:54 +0000) ---
-Alex Zhuravlev 
+--- Comment (JIRAUSER19573, Wed, 20 Aug 2025 21:46:37 +0000) ---
+Debugging the coredump and see that the inode is NULL.
 
-I still think it would be just a good check for NULL inode before get_attr call, in case we find there could be other situation where osd_object is not dropped when it should have?
+So it kind of understood now that the crash happened because of osd_get_attr()->osd_inode_getattr() with inode value being NULL.
 
---- Comment (JIRAUSER19573, Thu, 6 Nov 2025 07:35:23 +0000) ---
-Looks like it 
+One quick fix I can do is to have a NULL check of inode before accessing it. 
 
-Thanks Alex
+At the same time, trying to root cause why osd_attr_get() was called for the object with NULL inode.
 
---- Comment (bzzz, Thu, 6 Nov 2025 07:26:28 +0000) ---
-I think you need https://review.whamcloud.com/c/fs/lustre-release/+/55571
+I believe at the time of creation, the osd objects always have inode set to NULL which then later gets updated once the ldiskfs call for the object completes. In this case, looks like ldiskfs call didn't succeed and still osd object wasn't cleared
+
+crash> struct osd_object ff4eb8320c953c00
+struct osd_object {
+  oo_dt = {
+    do_lu = {
+      lo_header = 0xff4eb837ed2ac600,
+      lo_dev = 0xff4eb834a5160000,
+      lo_ops = 0xffffffffc1add440 ,
+      lo_linkage = {
+        next = 0xff4eb837ed2ac638,
+        prev = 0xff4eb837ed2ac670
+      },
+      lo_dev_ref = {}
+    },
+    do_ops = 0xffffffffc1add320 ,
+    do_body_ops = 0xffffffffc1ade780 ,
+    do_index_ops = 0x0
+  },
+  oo_inode = 0x0,
+
+--- Comment (JIRAUSER19573, Fri, 22 Aug 2025 20:30:27 +0000) ---
+The interesting thing in the logs I found was that though we see the "reached max size limit" message but we never see the "is approaching max size limit" from osd_ldisks_add_entry()
+
+[442990.802602] Lustre: 308494:0:(osd_handler.c:586:osd_ldiskfs_add_entry()) lustrefs-OST00a4: directory (inode: 157548816, FID: [0x9640110:0xabb62bd4:0x0]) has reached max size limit
+
+Had verified that large_dir is enabled
+
+dumpe2fs 1.47.1-wc1 (28-May-2024)
+Filesystem volume name:   lustrefs-MDT0000
+Last mounted on:          /
+Filesystem UUID:          10aaa27d-efe3-4672-b8be-0be2711bcec6
+Filesystem magic number:  0xEF53
+Filesystem revision #:    1 (dynamic)
+Filesystem features:      has_journal ext_attr resize_inode dir_index filetype needs_recovery mmp flex_bg ea_inode dirdata large_dir sparse_super large_file huge_file uninit_bg dir_nlink quota project
+
+I see this issue created but they had not enabled large_dir enabled. Also looks like they were seeing both the messages from -ENOBUFS and -ENOSPC errors.
+
+So I am thinking, this issue is different. Are we seeing hash collision and that is why ext4 returning just ENOSPC without ever reporting ENOBUFS?
+
+Has such an issue seen before?
+
+--- Comment (JIRAUSER19573, Mon, 25 Aug 2025 19:56:16 +0000) ---
+@Alex Zhuravlev I would really appreciate if you can share any thoughts you might have here. Thank you
+
+--- Comment (gerrit, Wed, 5 Nov 2025 21:03:35 +0000) ---
+"Sonia Sharma " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/62391
+
+Subject: LU-19278 osd: check null inode in osd_attr_get
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 76618afa2a35a28c5377c63f646cef6c1f145041
+
+--- Comment (bzzz, Thu, 6 Nov 2025 05:27:40 +0000) ---
+I believe at the time of creation, the osd objects always have inode set to NULL which then later gets updated once the ldiskfs call for the object completes. In this case, looks like ldiskfs call didn't succeed and still osd object wasn't cleared
+
+if an object creation fails, then no LOHA_EXIST is set
+
+--- Comment (JIRAUSER19573, Thu, 6 Nov 2025 06:34:33 +0000) ---
+Thanks @Alex Zhuravlev for reviewing, appreciate your prompt response on the patch.
+
+I was wondering, in osd_object_init(), if this condition is false then it will skip setting LOHA_EXISTS
+
+if (result == 0 && obj->oo_inode != NULL)
+
+    if (OBD_FAIL_PRECHECK(OBD_FAIL_MDS_LLOG_UMOUNT_RACE) &&
+        cfs_fail_val == 2) {
+        struct osd_thread_info *info = osd_oti_get(env);
+        struct osd_idmap_cache *oic = &info->oti_cache;
+        /* invalidate thread cache */
+        memset(&oic->oic_fid, 0, sizeof(oic->oic_fid));
+    }
+    if (fid_is_otable_it(&l->lo_header->loh_fid)) {
+        obj->oo_dt.do_ops = &osd_obj_otable_it_ops;
+        l->lo_header->loh_attr |= LOHA_EXISTS;
+        return 0;
+    }    result = osd_fid_lookup(env, obj, lu_object_fid(l), conf);
+
+    obj->oo_dt.do_body_ops = &osd_body_ops_new;
+
+    if (result == 0 && obj->oo_inode != NULL) { oti_ost_attrs;
+        osd_object_init0(obj);
+        if (unlikely(obj->oo_header))
+            return 0;
+
+   }
+
+--- Comment (bzzz, Thu, 6 Nov 2025 06:46:38 +0000) ---
+and then, if LOHA_EXIST is not set, then osd_attr_get() exits right away:
+
+	if (unlikely(!dt_object_exists(dt)))
+		return -ENOENT;
 
 --- Comment (JIRAUSER19573, Thu, 6 Nov 2025 07:02:39 +0000) ---
 Hmm make sense.
@@ -122,48 +216,21 @@ The thing is - not one but 2 OSTs in this filesystem met with same fate. Another
 [442950.221708]  ? set_kthread_struct+0x50/0x50
 [442950.222213]  ret_from_fork+0x1f/0x40
 
---- Comment (bzzz, Thu, 6 Nov 2025 06:46:38 +0000) ---
-and then, if LOHA_EXIST is not set, then osd_attr_get() exits right away:
+--- Comment (bzzz, Thu, 6 Nov 2025 07:26:28 +0000) ---
+I think you need https://review.whamcloud.com/c/fs/lustre-release/+/55571
 
-	if (unlikely(!dt_object_exists(dt)))
-		return -ENOENT;
+--- Comment (JIRAUSER19573, Thu, 6 Nov 2025 07:35:23 +0000) ---
+Looks like it 
 
---- Comment (JIRAUSER19573, Thu, 6 Nov 2025 06:34:33 +0000) ---
-Thanks @Alex Zhuravlev for reviewing, appreciate your prompt response on the patch.
+Thanks Alex
 
-I was wondering, in osd_object_init(), if this condition is false then it will skip setting LOHA_EXISTS
+--- Comment (JIRAUSER19573, Thu, 26 Feb 2026 23:55:54 +0000) ---
+Alex Zhuravlev 
 
-if (result == 0 && obj->oo_inode != NULL)
+I still think it would be just a good check for NULL inode before get_attr call, in case we find there could be other situation where osd_object is not dropped when it should have?
 
-    if (OBD_FAIL_PRECHECK(OBD_FAIL_MDS_LLOG_UMOUNT_RACE) &&
-        cfs_fail_val == 2) {
-        struct osd_thread_info *info = osd_oti_get(env);
-        struct osd_idmap_cache *oic = &info->oti_cache;
-        /* invalidate thread cache */
-        memset(&oic->oic_fid, 0, sizeof(oic->oic_fid));
-    }
-    if (fid_is_otable_it(&l->lo_header->loh_fid)) {
-        obj->oo_dt.do_ops = &osd_obj_otable_it_ops;
-        l->lo_header->loh_attr |= LOHA_EXISTS;
-        return 0;
-    }    result = osd_fid_lookup(env, obj, lu_object_fid(l), conf);
-
-    obj->oo_dt.do_body_ops = &osd_body_ops_new;
-
-    if (result == 0 && obj->oo_inode != NULL) { oti_ost_attrs;
-        osd_object_init0(obj);
-        if (unlikely(obj->oo_header))
-            return 0;
-
-   }
-
---- Comment (bzzz, Thu, 6 Nov 2025 05:27:40 +0000) ---
-I believe at the time of creation, the osd objects always have inode set to NULL which then later gets updated once the ldiskfs call for the object completes. In this case, looks like ldiskfs call didn't succeed and still osd object wasn't cleared
-
-if an object creation fails, then no LOHA_EXIST is set
-
---- Comment (gerrit, Wed, 5 Nov 2025 21:03:35 +0000) ---
-"Sonia Sharma " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/62391
+--- Comment (gerrit, Wed, 11 Mar 2026 11:48:36 +0000) ---
+"Sonia Sharma " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/64497
 
 Subject: LU-19278 osd: check null inode in osd_attr_get
 
@@ -173,58 +240,4 @@ Branch: master
 
 Current Patch Set: 1
 
-Commit: 76618afa2a35a28c5377c63f646cef6c1f145041
-
---- Comment (JIRAUSER19573, Mon, 25 Aug 2025 19:56:16 +0000) ---
-@Alex Zhuravlev I would really appreciate if you can share any thoughts you might have here. Thank you
-
---- Comment (JIRAUSER19573, Fri, 22 Aug 2025 20:30:27 +0000) ---
-The interesting thing in the logs I found was that though we see the "reached max size limit" message but we never see the "is approaching max size limit" from osd_ldisks_add_entry()
-
-[442990.802602] Lustre: 308494:0:(osd_handler.c:586:osd_ldiskfs_add_entry()) lustrefs-OST00a4: directory (inode: 157548816, FID: [0x9640110:0xabb62bd4:0x0]) has reached max size limit
-
-Had verified that large_dir is enabled
-
-dumpe2fs 1.47.1-wc1 (28-May-2024)
-Filesystem volume name:   lustrefs-MDT0000
-Last mounted on:          /
-Filesystem UUID:          10aaa27d-efe3-4672-b8be-0be2711bcec6
-Filesystem magic number:  0xEF53
-Filesystem revision #:    1 (dynamic)
-Filesystem features:      has_journal ext_attr resize_inode dir_index filetype needs_recovery mmp flex_bg ea_inode dirdata large_dir sparse_super large_file huge_file uninit_bg dir_nlink quota project
-
-I see this issue created but they had not enabled large_dir enabled. Also looks like they were seeing both the messages from -ENOBUFS and -ENOSPC errors.
-
-So I am thinking, this issue is different. Are we seeing hash collision and that is why ext4 returning just ENOSPC without ever reporting ENOBUFS?
-
-Has such an issue seen before?
-
---- Comment (JIRAUSER19573, Wed, 20 Aug 2025 21:46:37 +0000) ---
-Debugging the coredump and see that the inode is NULL.
-
-So it kind of understood now that the crash happened because of osd_get_attr()->osd_inode_getattr() with inode value being NULL.
-
-One quick fix I can do is to have a NULL check of inode before accessing it. 
-
-At the same time, trying to root cause why osd_attr_get() was called for the object with NULL inode.
-
-I believe at the time of creation, the osd objects always have inode set to NULL which then later gets updated once the ldiskfs call for the object completes. In this case, looks like ldiskfs call didn't succeed and still osd object wasn't cleared
-
-crash> struct osd_object ff4eb8320c953c00
-struct osd_object {
-  oo_dt = {
-    do_lu = {
-      lo_header = 0xff4eb837ed2ac600,
-      lo_dev = 0xff4eb834a5160000,
-      lo_ops = 0xffffffffc1add440 ,
-      lo_linkage = {
-        next = 0xff4eb837ed2ac638,
-        prev = 0xff4eb837ed2ac670
-      },
-      lo_dev_ref = {}
-    },
-    do_ops = 0xffffffffc1add320 ,
-    do_body_ops = 0xffffffffc1ade780 ,
-    do_index_ops = 0x0
-  },
-  oo_inode = 0x0,
+Commit: 8be070baf55e66c261c8ceae6b8b66e74166a01d

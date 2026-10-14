@@ -8,7 +8,7 @@ Resolution: Fixed
 Assignee:   Hongchao Zhang
 Reporter:   Hongchao Zhang
 Created:    Thu, 14 Sep 2023 03:29:53 +0000
-Updated:    Fri, 24 Nov 2023 09:25:40 +0000
+Updated:    Tue, 25 Aug 2026 07:40:49 +0000
 Resolved:   Thu, 9 Nov 2023 00:30:55 +0000
 
 --- Description ---
@@ -41,8 +41,18 @@ kernel: [] ptlrpc_server_handle_request+0x253/0xbe0 [ptlrpc]
 kernel: [] ptlrpc_main+0xc09/0x1c30 [ptlrpc]
 kernel: [] kthread+0xd1/0xe0
 
---- Comment (pjones, Thu, 9 Nov 2023 00:30:55 +0000) ---
-Landed for 2.16
+--- Comment (gerrit, Thu, 14 Sep 2023 05:42:24 +0000) ---
+"Hongchao Zhang " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/52371
+
+Subject: LU-17115 quota: fix race of acquiring locks in qmt
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 23cb30a4dab493a554ec86eb0a9dcf13eb4efc13
 
 --- Comment (gerrit, Wed, 8 Nov 2023 22:02:52 +0000) ---
 "Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/52371/
@@ -57,15 +67,59 @@ Current Patch Set:
 
 Commit: ee0e9447e7022e2caa8b161657d505e17ccdc4a1
 
---- Comment (gerrit, Thu, 14 Sep 2023 05:42:24 +0000) ---
-"Hongchao Zhang " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/52371
+--- Comment (pjones, Thu, 9 Nov 2023 00:30:55 +0000) ---
+Landed for 2.16
+
+--- Comment (gerrit, Mon, 24 Aug 2026 11:07:13 +0000) ---
+"HeonJe Lee " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68270
 
 Subject: LU-17115 quota: fix race of acquiring locks in qmt
 
 Project: fs/lustre-release
 
-Branch: master
+Branch: b2_15
 
 Current Patch Set: 1
 
-Commit: 23cb30a4dab493a554ec86eb0a9dcf13eb4efc13
+Commit: aa4161ff9e5536dde558a8420d41d18333348fca
+
+--- Comment (JIRAUSER23800, Tue, 25 Aug 2026 07:40:49 +0000) ---
+We hit this deadlock on Lustre 2.15.8 in production, and I have pushed a b2_15 backport for review:
+
+https://review.whamcloud.com/c/fs/lustre-release/+/68270
+
+The fix landed on master for 2.16.0 but was never backported to b2_15, so 2.15.x is still affected. Note that later quota fixes such as lqe_is_global )" class="issue-link" data-issue-key="LU-17974">LU-17974 and LU-18516 have been backported to b2_15, so this one appears to have simply been missed rather than deliberately skipped.
+
+Two requests, if this seems reasonable:
+
+	Please consider adding 2.15.x to the "Affects Version" field. It is currently empty, which I suspect is why this never showed up in backport triage.
+
+	Please consider re-evaluating the Minor priority. On our systems the effect was a complete MDT stall with no recovery path other than resetting the node.
+
+The osd-zfs variant
+
+The original report shows the lock inversion on ldiskfs (jbd2). We hit the same inversion on osd-zfs, where the threads wait on the ZFS transaction group instead of the ldiskfs journal, which confirms the issue is not backend specific:
+
+qmt_delete_qid holds lqe_write_lock and waits for the txg to commit
+  qmt_quotactl -> qmt_delete_qid -> osd_trans_stop
+    -> txg_wait_synced -> cv_wait
+
+qmt_dqacq0 holds an open dmu tx handle and waits for lqe_write_lock
+  mdt_quota_dqacq -> qmt_dqacq -> qmt_dqacq0
+    -> qmt_trans_start_with_slv -> osd_trans_start
+      -> dmu_tx_assign -> dmu_tx_wait
+
+txg_quiesce_thread waits for the open tx handles to drain
+  txg_quiesce_thread -> cv_wait
+
+The MDT pool stayed in the quiescing state (state Q in /proc/spl/kstat/zfs//txgs) indefinitely. The ZFS sync thread itself was idle and other pools on the same node kept cycling normally, so only the pool holding the MDT was affected. Every subsequent quota request piled up behind lqe_write_lock in qmt_get, and the MDT stopped answering MDS_REINT entirely.
+
+Reproduction
+
+The trigger needs a concurrent quota reader alongside the delete. In our case an on-demand monitor issues "lfs quota -p  " right after each quota API call, which supplies the qmt_dqacq0 side. With that reader present the stall reproduces within about 8 rounds (~7 minutes) of a create / fill to EDQUOT / delete loop on a project quota; with the reader disabled, 20 rounds pass cleanly. That single variable is the difference, so it is straightforward to demonstrate on demand.
+
+lustre  2.15.8
+zfs     2.2.9
+kernel  4.18.0-553.111.1.el8_10.x86_64
+
+Happy to provide stack dumps or run further tests if that would help.
